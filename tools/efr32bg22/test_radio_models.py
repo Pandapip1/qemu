@@ -188,6 +188,13 @@ class FrcTests(unittest.TestCase):
             dev.write(off, 0xFFFFFFFF)
             self.assertEqual(dev.read(off), expected)
 
+    def test_public_rx_and_packet_buffer_configuration_masks(self):
+        _, dev = attach(models.FRC("FRC"))
+        dev.write(dev.RXCTRL, 0xFFFF07FF)
+        dev.write(dev.PKTBUFCTRL, 0xFFFFFFFF)
+        self.assertEqual(dev.read(dev.RXCTRL), 0x000007FF)
+        self.assertEqual(dev.read(dev.PKTBUFCTRL), 0x0103FFFF)
+
 
 class GuestMemoryTests(unittest.TestCase):
     def test_model_guest_read_delegates_to_bridge_transport(self):
