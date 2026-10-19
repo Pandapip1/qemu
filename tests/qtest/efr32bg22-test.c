@@ -7,6 +7,7 @@
 #include "libqtest-single.h"
 
 #define FRC_BASE             0xa8004000
+#define AGC_BASE             0xa800c000
 #define FRC_WHITEPOLY        0x034
 #define MODEM_BASE           0xa8014000
 #define MODEM_SHAPING1       0x098
@@ -19,6 +20,7 @@
 #define PROTIMER_STATE        0x030
 #define PROTIMER_PERIOD       0x038
 #define PROTIMER_CMP0         0x100
+#define SYNTH_BASE            0xa8018000
 #define RAC_BASE              0xa8020000
 #define RAC_STATUS            0x00c
 #define RAC_CMD               0x010
@@ -77,6 +79,23 @@ static void test_rfcrc_masks(void)
 
     g_assert_cmphex(readl(RFCRC_BASE + RFCRC_EN), ==, 1);
     g_assert_cmphex(readl(RFCRC_BASE + RFCRC_CTRL), ==, 0x1fef);
+}
+
+static void test_radio_enable_masks(void)
+{
+    const uint32_t blocks[] = {
+        FRC_BASE,
+        AGC_BASE,
+        RFCRC_BASE,
+        MODEM_BASE,
+        SYNTH_BASE,
+        RAC_BASE,
+    };
+
+    for (size_t i = 0; i < G_N_ELEMENTS(blocks); i++) {
+        writel(blocks[i] + 0x004, UINT32_MAX);
+        g_assert_cmphex(readl(blocks[i] + 0x004), ==, 1);
+    }
 }
 
 static void test_bufc_data_port(void)
@@ -152,6 +171,7 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/register-aliases", test_register_aliases);
     qtest_add_func("/efr32bg22/modem-masks", test_modem_masks);
     qtest_add_func("/efr32bg22/rfcrc-masks", test_rfcrc_masks);
+    qtest_add_func("/efr32bg22/radio-enable-masks", test_radio_enable_masks);
     qtest_add_func("/efr32bg22/bufc-data-port", test_bufc_data_port);
     qtest_add_func("/efr32bg22/bufc-sparse-threshold-flag",
                    test_bufc_sparse_threshold_flag);

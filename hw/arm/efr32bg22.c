@@ -31,6 +31,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 
 /* Radio block addresses and source-backed register offsets. */
 #define EFR32_FRC_BASE 0xa8004000u
+#define EFR32_AGC_BASE 0xa800c000u
 #define EFR32_RFCRC_BASE 0xa8010000u
 #define EFR32_MODEM_BASE 0xa8014000u
 #define EFR32_SYNTH_BASE 0xa8018000u
@@ -111,7 +112,8 @@ typedef struct Efr32RegisterMask
 } Efr32RegisterMask;
 
 static const Efr32RegisterMask efr32_frc_masks[] = {
-    {0x00c, 0x01ffff7f}, {0x010, 0x0000ffff}, {0x020, 0x00000fff},
+    {0x004, 0x00000001}, {0x00c, 0x01ffff7f}, {0x010, 0x0000ffff},
+    {0x020, 0x00000fff},
     {0x024, 0x00000fff}, {0x030, 0x00001f7f}, {0x034, 0x0000ffff},
     {0x038, 0x0000ffff}, {0x03c, 0x003ffff7}, {0x040, 0xfffffffc},
     {0x044, 0xfffffffc}, {0x048, 0x001f3ff7}, {0x04c, 0x000007ff},
@@ -123,7 +125,8 @@ static const Efr32RegisterMask efr32_frc_masks[] = {
 };
 
 static const Efr32RegisterMask efr32_agc_masks[] = {
-    {0x020, 0xfecfffff}, {0x024, 0xffffffff}, {0x028, 0xe3ffffff},
+    {0x004, 0x00000001}, {0x020, 0xfecfffff}, {0x024, 0xffffffff},
+    {0x028, 0xe3ffffff},
     {0x02c, 0xffffffff}, {0x030, 0xfe00ffff}, {0x034, 0x00ffffff},
     {0x038, 0xc0000000}, {0x03c, 0x3fffffff}, {0x040, 0x0001ffff},
     {0x050, 0x0fffffff}, {0x054, 0xffffffff}, {0x058, 0xffffffff},
@@ -134,7 +137,8 @@ static const Efr32RegisterMask efr32_agc_masks[] = {
 };
 
 static const Efr32RegisterMask efr32_modem_masks[] = {
-    {0x01c, 0x0000001f}, {0x020, 0xffffffff}, {0x024, 0xffffdfff},
+    {0x004, 0x00000001}, {0x01c, 0x0000001f}, {0x020, 0xffffffff},
+    {0x024, 0xffffdfff},
     {0x028, 0xffffffff}, {0x02c, 0xffffff81}, {0x030, 0xbfffffff},
     {0x034, 0x607007fe}, {0x038, 0xf6000000}, {0x058, 0x00ffffff},
     {0x05c, 0x00001fff}, {0x060, 0xcfffffff}, {0x064, 0xffff1fff},
@@ -295,7 +299,11 @@ static uint32_t efr32_radio_mask_write(uint32_t address, uint32_t value)
 {
     uint32_t offset = address & 0xfff;
 
-    if ((address & ~0x3fffu) == 0xa8018000 && offset >= 0x34 &&
+    if ((address & ~0x3fffu) == EFR32_SYNTH_BASE && offset == 0x004)
+    {
+        return value & 1;
+    }
+    if ((address & ~0x3fffu) == EFR32_SYNTH_BASE && offset >= 0x34 &&
         offset <= 0x44 && !(offset & 3))
     {
         static const uint32_t m[] = {0x0fffffffu, 0x001fffffu, 0x1ff, 0x3f,
@@ -314,7 +322,7 @@ static uint32_t efr32_radio_mask_write(uint32_t address, uint32_t value)
         return efr32_apply_register_mask(
             efr32_frc_masks, G_N_ELEMENTS(efr32_frc_masks), offset, value);
     }
-    if ((address & ~0x3fffu) == 0xa800c000)
+    if ((address & ~0x3fffu) == EFR32_AGC_BASE)
     {
         return efr32_apply_register_mask(
             efr32_agc_masks, G_N_ELEMENTS(efr32_agc_masks), offset, value);
