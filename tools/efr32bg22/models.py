@@ -415,6 +415,29 @@ class RAC(Dev):
 SimRAC = RAC
 
 
+class Synth(Dev):
+    """EFR32xG22 SYNTH frequency/channel controls from the public revB2 model.
+
+    Frequency synthesis itself remains outside this bridge; retaining the
+    architecturally visible field masks lets firmware select a BLE channel and
+    makes the configuration observable to higher-level radio simulation.
+    """
+    FREQ, IFFREQ, DIVCTRL, CHCTRL, CHSP = 0x034, 0x038, 0x03C, 0x040, 0x044
+    MASKS = {
+        FREQ: 0x0FFFFFFF,
+        IFFREQ: 0x001FFFFF,
+        DIVCTRL: 0x000001FF,
+        CHCTRL: 0x0000003F,
+        CHSP: 0x0003FFFF,
+    }
+
+    def write(self, off, val):
+        if off in self.MASKS:
+            self.regs[off] = val & self.MASKS[off]
+        else:
+            super().write(off, val)
+
+
 class PCF8575:
     """16-bit quasi-bidirectional I/O expander.  Two data bytes per transfer, P0-P7 first."""
     def __init__(self, addr7=0x20):
@@ -1233,6 +1256,7 @@ def build(m, reset=False, cause=1):
     m.add(USART("USART0", "USART0_RX"), 0x4005C000)
     m.add(USART("USART1", "USART1_RX"), 0x40060000)
     m.rac = m.add(RAC("RAC"), 0xA8020000)
+    m.synth = m.add(Synth("SYNTH"), 0xA8018000)
     m.bufc = m.add(BUFC("BUFC"), 0xAA000000)
     trng = m.add(TRNG("TRNG", ""), 0x4C021000, 0x1000)
     m.add(TRNGFifo("TRNGFIFO", trng), 0x4C024000, 0x1000)

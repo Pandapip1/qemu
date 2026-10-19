@@ -105,5 +105,18 @@ class RacTests(unittest.TestCase):
         self.assertTrue(machine.irq & (1 << models.resets.IRQS["RAC_SEQ"]))
 
 
+class SynthTests(unittest.TestCase):
+    def test_public_xg22_channel_and_frequency_field_masks(self):
+        _, dev = attach(models.Synth("SYNTH"))
+        dev.write(dev.CHCTRL, 0xFF)
+        dev.write(dev.FREQ, 0xF1234567)
+        dev.write(dev.IFFREQ, 0xFF123456)
+        dev.write(dev.CHSP, 0xFFFABCDE)
+        self.assertEqual(dev.read(dev.CHCTRL), 0x3F)
+        self.assertEqual(dev.read(dev.FREQ), 0x01234567)
+        self.assertEqual(dev.read(dev.IFFREQ), 0x00123456)
+        self.assertEqual(dev.read(dev.CHSP), 0x0002BCDE)
+
+
 if __name__ == "__main__":
     unittest.main()
