@@ -212,6 +212,28 @@ class FrcTests(unittest.TestCase):
         self.assertEqual(dev.read(dev.PKTBUFCTRL), 0x0103FFFF)
 
 
+class AgcTests(unittest.TestCase):
+    def test_public_ble_configuration_masks(self):
+        _, dev = attach(models.AGC("AGC"))
+        expectations = {
+            dev.CTRL0: 0xFECFFFFF, dev.CTRL1: 0xFFFFFFFF,
+            dev.CTRL2: 0xE3FFFFFF, dev.CTRL3: 0xFFFFFFFF,
+            dev.CTRL4: 0xFE00FFFF, dev.CTRL5: 0x00FFFFFF,
+            dev.CTRL6: 0xC0000000, dev.RSSISTEPTHR: 0x3FFFFFFF,
+            dev.MANGAIN: 0x0001FFFF, dev.GAINRANGE: 0x0FFFFFFF,
+            dev.AGCPERIOD: 0xFFFFFFFF, dev.HICNTREGION: 0xFFFFFFFF,
+            dev.STEPDWN: 0x0003FFFF, dev.GAINSTEPLIM: 0x3FFFFFFF,
+            dev.PNRFATT0: 0x3FFFFFFF, dev.PNRFATT1: 0x3FFFFFFF,
+            dev.PNRFATT2: 0x03FFFFFF, dev.PNRFATT3: 0x07FFFFFF,
+            dev.LNAMIXCODE0: 0x3FFFFFFF, dev.LNAMIXCODE1: 0x3FFFFFFF,
+            dev.PGACODE0: 0xFFFFFFFF, dev.PGACODE1: 0x00000FFF,
+            dev.LBT: 0x0000007F,
+        }
+        for off, expected in expectations.items():
+            dev.write(off, 0xFFFFFFFF)
+            self.assertEqual(dev.read(off), expected)
+
+
 class GuestMemoryTests(unittest.TestCase):
     def test_model_guest_read_delegates_to_bridge_transport(self):
         m = server.Machine()

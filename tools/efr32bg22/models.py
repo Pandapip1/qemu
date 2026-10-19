@@ -523,6 +523,39 @@ class FRC(Dev):
             super().write(off, val)
 
 
+class AGC(Dev):
+    """Public xG22 AGC BLE configurator registers.
+
+    The public generated rev-B2 model supplies these masks for the AGC
+    targets in the BLE 1M configuration table. They are retained for software
+    visibility only; gain control, RSSI updates, and interrupts are unmodelled.
+    """
+    CTRL0, CTRL1, CTRL2, CTRL3, CTRL4, CTRL5, CTRL6 = (0x020 + 4 * n for n in range(7))
+    RSSISTEPTHR, MANGAIN = 0x03C, 0x040
+    GAINRANGE, AGCPERIOD, HICNTREGION, STEPDWN = (0x050 + 4 * n for n in range(4))
+    GAINSTEPLIM = 0x064
+    PNRFATT0, PNRFATT1, PNRFATT2, PNRFATT3 = (0x068 + 4 * n for n in range(4))
+    LNAMIXCODE0, LNAMIXCODE1, PGACODE0, PGACODE1, LBT = (0x078 + 4 * n for n in range(5))
+    MASKS = {
+        CTRL0: 0xFECFFFFF, CTRL1: 0xFFFFFFFF, CTRL2: 0xE3FFFFFF,
+        CTRL3: 0xFFFFFFFF, CTRL4: 0xFE00FFFF, CTRL5: 0x00FFFFFF,
+        CTRL6: 0xC0000000, RSSISTEPTHR: 0x3FFFFFFF, MANGAIN: 0x0001FFFF,
+        GAINRANGE: 0x0FFFFFFF, AGCPERIOD: 0xFFFFFFFF,
+        HICNTREGION: 0xFFFFFFFF, STEPDWN: 0x0003FFFF,
+        GAINSTEPLIM: 0x3FFFFFFF, PNRFATT0: 0x3FFFFFFF,
+        PNRFATT1: 0x3FFFFFFF, PNRFATT2: 0x03FFFFFF,
+        PNRFATT3: 0x07FFFFFF, LNAMIXCODE0: 0x3FFFFFFF,
+        LNAMIXCODE1: 0x3FFFFFFF, PGACODE0: 0xFFFFFFFF,
+        PGACODE1: 0x00000FFF, LBT: 0x0000007F,
+    }
+
+    def write(self, off, val):
+        if off in self.MASKS:
+            self.regs[off] = val & self.MASKS[off]
+        else:
+            super().write(off, val)
+
+
 class Modem(Dev):
     """Public xG22 MODEM BLE configuration registers.
 
@@ -1413,6 +1446,7 @@ def build(m, reset=False, cause=1):
     m.synth = m.add(Synth("SYNTH"), 0xA8018000)
     m.rfcrc = m.add(RFCRC("RFCRC"), 0xA8010000)
     m.frc = m.add(FRC("FRC"), 0xA8004000)
+    m.agc = m.add(AGC("AGC"), 0xA800C000)
     m.modem = m.add(Modem("MODEM"), 0xA8014000)
     m.bufc = m.add(BUFC("BUFC"), 0xAA000000)
     trng = m.add(TRNG("TRNG", ""), 0x4C021000, 0x1000)
