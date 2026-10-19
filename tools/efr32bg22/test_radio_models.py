@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import heapq
 import pathlib
+import socket
 import sys
+import threading
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
@@ -191,6 +193,21 @@ class GuestMemoryTests(unittest.TestCase):
         m = server.Machine()
         m.mem_read = lambda addr, length: bytes((addr + n) & 0xFF for n in range(length))
         self.assertEqual(m.guest_read(0x20000010, 4), b"\x10\x11\x12\x13")
+
+    def test_bridge_memory_read_frame_and_payload(self):
+        server_sock, qemu_sock = socket.socketpair()
+        result = []
+        reader = server.guest_memory_reader(server_sock)
+        worker = threading.Thread(target=lambda: result.append(reader(0x20000010, 4)))
+        worker.start()
+        request = qemu_sock.recv(server.REP.size)
+        self.assertEqual(server.REP.unpack(request),
+                         (0x20000010, server.MEM_READ_REQ, 0, 4))
+        qemu_sock.sendall(b"\x10\x11\x12\x13")
+        worker.join()
+        self.assertEqual(result, [b"\x10\x11\x12\x13"])
+        server_sock.close()
+        qemu_sock.close()
 
 
 class ModemTests(unittest.TestCase):

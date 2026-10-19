@@ -139,6 +139,23 @@ class Machine:
         return 0
 
 
+def guest_memory_reader(sock):
+    """Build the synchronous server-side half of the bridge memory-read exchange."""
+    def read(addr, length):
+        if not 0 <= length <= 64 * 1024:
+            raise ValueError("invalid guest-memory read length")
+        sock.sendall(REP.pack(addr, MEM_READ_REQ, 0, length))
+        out = bytearray()
+        while len(out) < length:
+            data = sock.recv(length - len(out))
+            if not data:
+                raise ConnectionError("QEMU closed during guest-memory read")
+            out += data
+        return bytes(out)
+
+    return read
+
+
 def serve(m, path):
     if os.path.exists(path):
         os.unlink(path)
@@ -149,19 +166,7 @@ def serve(m, path):
     c, _ = srv.accept()
     c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1) if c.family == socket.AF_INET else None
 
-    def read_guest_memory(addr, length):
-        if not 0 <= length <= 64 * 1024:
-            raise ValueError("invalid guest-memory read length")
-        c.sendall(REP.pack(addr, MEM_READ_REQ, 0, length))
-        out = bytearray()
-        while len(out) < length:
-            d = c.recv(length - len(out))
-            if not d:
-                raise ConnectionError("QEMU closed during guest-memory read")
-            out += d
-        return bytes(out)
-
-    m.mem_read = read_guest_memory
+    m.mem_read = guest_memory_reader(c)
     buf = b""
     while True:
         while len(buf) < REQ.size:
