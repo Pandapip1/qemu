@@ -16,6 +16,13 @@
 #define PROTIMER_STATE        0x030
 #define PROTIMER_PERIOD       0x038
 #define PROTIMER_CMP0         0x100
+#define RAC_BASE              0xa8020000
+#define RAC_STATUS            0x00c
+#define RAC_CMD               0x010
+#define RAC_CMD_TXEN          (1u << 0)
+#define RAC_CMD_TXDIS         (1u << 5)
+#define RAC_STATUS_STATE_MASK 0x0f000000
+#define RAC_STATUS_STATE_TX   (9u << 24)
 #define BUFC_BASE            0xaa000000
 #define BUFC_CH0             0x00c
 #define BUFC_CH1             0x04c
@@ -94,6 +101,17 @@ static void test_protimer_trace_latches(void)
     g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_CMP0), ==, 0x01000003);
 }
 
+static void test_rac_tx_commands(void)
+{
+    writel(RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+    g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK, ==,
+                    RAC_STATUS_STATE_TX);
+
+    writel(RAC_BASE + RAC_CMD, RAC_CMD_TXDIS);
+    g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK, ==,
+                    0);
+}
+
 int main(int argc, char **argv)
 {
     int result;
@@ -108,6 +126,7 @@ int main(int argc, char **argv)
                    test_bufc_sparse_threshold_flag);
     qtest_add_func("/efr32bg22/protimer-trace-latches",
                    test_protimer_trace_latches);
+    qtest_add_func("/efr32bg22/rac-tx-commands", test_rac_tx_commands);
 
     result = g_test_run();
     qtest_end();
