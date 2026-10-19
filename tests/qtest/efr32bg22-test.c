@@ -12,6 +12,7 @@
 #define FRC_IF               0x068
 #define FRC_IEN              0x06c
 #define FRC_IF_TXDONE        (1u << 0)
+#define FRC_IF_RXDONE        (1u << 4)
 #define AGC_BASE             0xa800c000
 #define FRC_WHITEPOLY        0x034
 #define FRC_BUFFERMODE       0x078
@@ -123,6 +124,16 @@ static void test_frc_interrupt_register_masks(void)
         writel(FRC_BASE + registers[i], UINT32_MAX);
         g_assert_cmphex(readl(FRC_BASE + registers[i]), ==, 0x7f7fffff);
     }
+}
+
+static void test_frc_completion_interrupt_enable(void)
+{
+    const uint32_t completion = FRC_IF_TXDONE | FRC_IF_RXDONE;
+
+    writel(FRC_BASE + FRC_IEN + REGISTER_CLEAR_WINDOW, completion);
+    writel(FRC_BASE + FRC_IEN + REGISTER_SET_WINDOW, completion);
+
+    g_assert_cmphex(readl(FRC_BASE + FRC_IEN) & completion, ==, completion);
 }
 
 static void test_radio_enable_masks(void)
@@ -328,6 +339,8 @@ int main(int argc, char **argv)
                    test_frc_buffer_register_masks);
     qtest_add_func("/efr32bg22/frc-interrupt-register-masks",
                    test_frc_interrupt_register_masks);
+    qtest_add_func("/efr32bg22/frc-completion-interrupt-enable",
+                   test_frc_completion_interrupt_enable);
     qtest_add_func("/efr32bg22/radio-enable-masks", test_radio_enable_masks);
     qtest_add_func("/efr32bg22/radio-nonsecure-alias",
                    test_radio_nonsecure_alias);
