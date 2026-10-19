@@ -145,10 +145,12 @@ class FrcTests(unittest.TestCase):
 
     def test_public_ble_frame_configuration_masks(self):
         _, dev = attach(models.FRC("FRC"))
+        dev.write(dev.DFLCTRL, 0xFE018101)
         dev.write(dev.MAXLENGTH, 0xFFFF4101)
         dev.write(dev.CTRL, 0xFFFF07A0)
         for off in (dev.FCD0, dev.FCD1, dev.FCD2, dev.FCD3):
             dev.write(off, 0xFFFF4CFF)
+        self.assertEqual(dev.read(dev.DFLCTRL), 0x00018101)
         self.assertEqual(dev.read(dev.MAXLENGTH), 0x00004101)
         self.assertEqual(dev.read(dev.CTRL), 0x001F07A0)
         for off in (dev.FCD0, dev.FCD1, dev.FCD2, dev.FCD3):

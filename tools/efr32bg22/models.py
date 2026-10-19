@@ -472,11 +472,12 @@ class FRC(Dev):
     FRC/SEQ behavior and is deliberately not modelled here.  Retaining these
     public register masks makes the source-backed BLE setup observable.
     """
-    MAXLENGTH = 0x010
+    DFLCTRL, MAXLENGTH = 0x00C, 0x010
     WHITECTRL, WHITEPOLY, WHITEINIT = 0x030, 0x034, 0x038
     CTRL = 0x048
     FCD0, FCD1, FCD2, FCD3 = 0x104, 0x108, 0x10C, 0x110
     MASKS = {
+        DFLCTRL: 0x01FFFF7F,
         MAXLENGTH: 0x0000FFFF,
         WHITECTRL: 0x00001F7F,
         WHITEPOLY: 0x0000FFFF,
