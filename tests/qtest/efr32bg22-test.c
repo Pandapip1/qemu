@@ -57,6 +57,7 @@
 #define BUFC_THRESHOLD       0x024
 #define BUFC_CMD             0x028
 
+#define BUFC_SECURE_BASE     0xaa000000
 #define RADIO_NONSECURE_ALIAS 0x10000000
 
 #define REGISTER_SET_WINDOW  0x1000
@@ -151,14 +152,23 @@ static void test_radio_nonsecure_alias(void)
 
 static void test_bufc_data_port(void)
 {
-    uint32_t channel = BUFC_BASE + BUFC_CH0;
+    uint32_t tx_channel = BUFC_BASE + BUFC_CH0;
+    uint32_t sequencer_channel = BUFC_SECURE_BASE + BUFC_CH1;
+    uint32_t nonsecure_rx_channel = BUFC_BASE + BUFC_CH1;
 
-    writel(channel + BUFC_WRITEDATA, 0x5a);
-    writel(channel + BUFC_WRITEDATA, 0xa5);
-    writel(channel + BUFC_READOFFSET, 0);
+    writel(tx_channel + BUFC_WRITEDATA, 0x5a);
+    writel(tx_channel + BUFC_WRITEDATA, 0xa5);
+    writel(tx_channel + BUFC_READOFFSET, 0);
 
-    g_assert_cmphex(readl(channel + BUFC_READDATA), ==, 0x5a);
-    g_assert_cmphex(readl(channel + BUFC_READDATA), ==, 0xa5);
+    g_assert_cmphex(readl(tx_channel + BUFC_READDATA), ==, 0x5a);
+    g_assert_cmphex(readl(tx_channel + BUFC_READDATA), ==, 0xa5);
+
+    /* The recovered sequencer image writes RX buffer 1 via its secure alias. */
+    writel(sequencer_channel + BUFC_CMD, 1);
+    writel(sequencer_channel + BUFC_WRITEDATA, 0x3c);
+    writel(nonsecure_rx_channel + BUFC_READOFFSET, 0);
+    g_assert_cmphex(readl(nonsecure_rx_channel + BUFC_READDATA), ==, 0x3c);
+    writel(sequencer_channel + BUFC_CMD, 1);
 }
 
 static void test_bufc_tx_fifo_setup_latches(void)
