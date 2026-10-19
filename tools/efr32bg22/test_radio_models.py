@@ -66,25 +66,43 @@ class BufcTests(unittest.TestCase):
         self.assertFalse(machine.irq & (1 << models.resets.IRQS["BUFC"]))
 
 
-class SimRacTests(unittest.TestCase):
-    def test_tx_completes_and_raises_rac_seq(self):
-        machine, dev = attach(models.SimRAC("RAC_SIM"))
-        dev.write(dev.IEN_OFF, 1)
-        dev.write(0x10, 3)
-        self.assertEqual(dev.read(0x14), dev.TX)
+class RacTests(unittest.TestCase):
+    def test_tx_completes_and_raises_real_rac_seq(self):
+        machine, dev = attach(models.RAC("RAC"))
+        dev.write(dev.SEQIEN_OFF, dev.SEQ_STATEOFF)
+        dev.write(dev.CMD, dev.CMD_TXEN)
+        self.assertEqual((dev.read(dev.STATUS) >> 24) & 0xF, dev.STATETX)
+        self.assertTrue(dev.read(dev.STATUS) & (1 << 30))
         machine.advance(149_999)
-        self.assertEqual(dev.read(0x14), dev.TX)
+        self.assertEqual((dev.read(dev.STATUS) >> 24) & 0xF, dev.STATETX)
         machine.advance(1)
-        self.assertEqual(dev.read(0x14), dev.IDLE)
+        self.assertEqual((dev.read(dev.STATUS) >> 24) & 0xF, dev.STATEOFF)
         self.assertTrue(machine.irq & (1 << models.resets.IRQS["RAC_SEQ"]))
 
     def test_disable_cancels_pending_tx_completion(self):
-        machine, dev = attach(models.SimRAC("RAC_SIM"))
-        dev.write(0x10, 3)
-        dev.write(0x10, 1)
+        machine, dev = attach(models.RAC("RAC"))
+        dev.write(dev.CMD, dev.CMD_FORCETX)
+        dev.write(dev.CMD, dev.CMD_TXDIS)
         machine.advance(150_000)
-        self.assertEqual(dev.read(0x14), dev.IDLE)
-        self.assertEqual(dev.read(dev.IF_OFF), 0)
+        self.assertEqual((dev.read(dev.STATUS) >> 24) & 0xF, dev.STATEOFF)
+
+    def test_software_rx_enable_and_rx_disable(self):
+        _, dev = attach(models.RAC("RAC"))
+        dev.write(dev.RXENSRCEN, 1)
+        self.assertEqual((dev.read(dev.STATUS) >> 24) & 0xF,
+                         dev.STATERXSEARCH)
+        self.assertTrue(dev.read(dev.STATUS) & (1 << 31))
+        dev.write(dev.CMD, dev.CMD_RXDIS)
+        self.assertEqual((dev.read(dev.STATUS) >> 24) & 0xF, dev.STATEOFF)
+
+    def test_rsm_and_seq_interrupts_are_distinct(self):
+        machine, dev = attach(models.RAC("RAC"))
+        dev.write(dev.IEN_OFF, dev.IF_STATECHANGE)
+        dev.write(dev.RXENSRCEN, 1)
+        self.assertTrue(machine.irq & (1 << models.resets.IRQS["RAC_RSM"]))
+        self.assertFalse(machine.irq & (1 << models.resets.IRQS["RAC_SEQ"]))
+        dev.write(dev.SEQIEN_OFF, dev.SEQ_STATERXSEARCH)
+        self.assertTrue(machine.irq & (1 << models.resets.IRQS["RAC_SEQ"]))
 
 
 if __name__ == "__main__":

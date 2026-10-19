@@ -328,40 +328,91 @@ class BUFC(IrqDev):
         return bytes(self.data[n])
 
 
-class SimRAC(IrqDev):
-    """Simulator-only radio state machine; not an asserted xG22 register map.
+class RAC(Dev):
+    """EFR32xG22 RAC command/state and interrupt core.
 
-    CMD(+0x10): 1=disable, 2=RX, 3=TX. STATUS(+0x14): 0=idle, 1=RX,
-    2=TX. EVENT IF/IEN are +0x18/+0x1c, bit 0. TX completes after 150 us;
-    RX remains active until disabled.  Keeping this contract separate and named
-    SIM_* prevents these offsets being mistaken for hardware facts.
+    The register layout and field names are from Silicon Labs' public generated
+    revB2 register model.  Packet modulation remains deliberately abstract: a
+    TXEN/FORCETX command enters state 9 (TX), then completes after 150 us.
+    RXENSRCEN.SWRXEN enters state 2 (RXSEARCH) until RXDIS clears it.
     """
-    IF_OFF, IEN_OFF = 0x018, 0x01C
-    irq_name = "RAC_SEQ"
-    IDLE, RX, TX = 0, 1, 2
+    RXENSRCEN, STATUS, CMD = 0x008, 0x00C, 0x010
+    IF_OFF, IEN_OFF = 0x01C, 0x020
+    SEQIF_OFF, SEQIEN_OFF = 0x028, 0x02C
+
+    CMD_TXEN = 1 << 0
+    CMD_FORCETX = 1 << 1
+    CMD_TXDIS = 1 << 5
+    CMD_RXCAL = 1 << 7
+    CMD_RXDIS = 1 << 8
+
+    STATEOFF, STATERXSEARCH, STATETX = 0, 2, 9
+    IF_STATECHANGE = 1 << 0
+    SEQ_STATEOFF = 1 << 16
+    SEQ_STATERXSEARCH = 1 << 18
+    SEQ_STATETX = 1 << 25
 
     def __init__(self, name):
         super().__init__(name, "")
-        self.state = self.IDLE
+        self.state = self.STATEOFF
         self.generation = 0
 
-    def r_014(self):
-        return self.state
+    def status(self):
+        active = self.state != self.STATEOFF
+        tx = self.state == self.STATETX
+        rx = self.state == self.STATERXSEARCH
+        return self.state << 24 | active << 28 | tx << 30 | rx << 31
+
+    def r_00c(self):
+        return self.status()
+
+    def irq_update(self):
+        rsm = resets.IRQS.get("RAC_RSM")
+        seq = resets.IRQS.get("RAC_SEQ")
+        if rsm is not None:
+            self.m.set_irq(rsm, bool(self.regs.get(self.IF_OFF, 0) &
+                                     self.regs.get(self.IEN_OFF, 0)))
+        if seq is not None:
+            self.m.set_irq(seq, bool(self.regs.get(self.SEQIF_OFF, 0) &
+                                     self.regs.get(self.SEQIEN_OFF, 0)))
+
+    def set_state(self, state, seq_flag):
+        if state == self.state:
+            return
+        self.state = state
+        self.regs[self.IF_OFF] = self.regs.get(self.IF_OFF, 0) | self.IF_STATECHANGE
+        self.regs[self.SEQIF_OFF] = self.regs.get(self.SEQIF_OFF, 0) | seq_flag
+        self.irq_update()
+
+    def write(self, off, val):
+        if off == self.RXENSRCEN:
+            self.regs[off] = val & 0x3FFF
+            if val & 0xFF:
+                self.generation += 1
+                self.set_state(self.STATERXSEARCH, self.SEQ_STATERXSEARCH)
+            elif self.state == self.STATERXSEARCH:
+                self.generation += 1
+                self.set_state(self.STATEOFF, self.SEQ_STATEOFF)
+            return
+        super().write(off, val)
+        if off in (self.IF_OFF, self.IEN_OFF, self.SEQIF_OFF, self.SEQIEN_OFF):
+            self.irq_update()
 
     def w_010(self, value):
         self.generation += 1
         generation = self.generation
-        if value == 1:
-            self.state = self.IDLE
-        elif value == 2:
-            self.state = self.RX
-        elif value == 3:
-            self.state = self.TX
+        if value & (self.CMD_TXDIS | self.CMD_RXDIS):
+            self.set_state(self.STATEOFF, self.SEQ_STATEOFF)
+        elif value & (self.CMD_TXEN | self.CMD_FORCETX):
+            self.set_state(self.STATETX, self.SEQ_STATETX)
             def complete():
-                if generation == self.generation and self.state == self.TX:
-                    self.state = self.IDLE
-                    self.raise_if(1)
+                if generation == self.generation and self.state == self.STATETX:
+                    self.set_state(self.STATEOFF, self.SEQ_STATEOFF)
             self.m.after(150_000, complete)
+
+
+# Compatibility for out-of-tree scripts written against patch 0006.
+SimRAC = RAC
 
 
 class PCF8575:
@@ -1181,7 +1232,7 @@ def build(m, reset=False, cause=1):
     m.add(IADC("IADC0"), 0x4A004000)
     m.add(USART("USART0", "USART0_RX"), 0x4005C000)
     m.add(USART("USART1", "USART1_RX"), 0x40060000)
-    m.rac = m.add(SimRAC("RAC_SIM"), 0xA8020000)
+    m.rac = m.add(RAC("RAC"), 0xA8020000)
     m.bufc = m.add(BUFC("BUFC"), 0xAA000000)
     trng = m.add(TRNG("TRNG", ""), 0x4C021000, 0x1000)
     m.add(TRNGFifo("TRNGFIFO", trng), 0x4C024000, 0x1000)
