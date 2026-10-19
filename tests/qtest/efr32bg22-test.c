@@ -18,9 +18,14 @@
 #define PROTIMER_CMP0         0x100
 #define BUFC_BASE            0xaa000000
 #define BUFC_CH0             0x00c
+#define BUFC_CH1             0x04c
+#define BUFC_IF              0x114
+#define BUFC_IEN             0x118
 #define BUFC_READOFFSET      0x00c
 #define BUFC_READDATA        0x014
 #define BUFC_WRITEDATA       0x018
+#define BUFC_STATUS          0x020
+#define BUFC_THRESHOLD       0x024
 
 #define REGISTER_SET_WINDOW  0x1000
 #define REGISTER_CLEAR_WINDOW 0x2000
@@ -62,6 +67,20 @@ static void test_bufc_data_port(void)
     g_assert_cmphex(readl(channel + BUFC_READDATA), ==, 0xa5);
 }
 
+static void test_bufc_sparse_threshold_flag(void)
+{
+    uint32_t channel = BUFC_BASE + BUFC_CH1;
+    uint32_t threshold_flag = 1u << 10;
+
+    writel(BUFC_BASE + BUFC_IEN, threshold_flag);
+    writel(channel + BUFC_THRESHOLD, 0);
+    writel(channel + BUFC_WRITEDATA, 0x5a);
+
+    g_assert_cmphex(readl(BUFC_BASE + BUFC_IF) & threshold_flag, ==,
+                    threshold_flag);
+    g_assert_cmphex(readl(channel + BUFC_STATUS), ==, (1u << 20) | 1u);
+}
+
 static void test_protimer_trace_latches(void)
 {
     writel(PROTIMER_BASE + PROTIMER_CTRL, 0x00011102);
@@ -85,6 +104,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/register-aliases", test_register_aliases);
     qtest_add_func("/efr32bg22/modem-masks", test_modem_masks);
     qtest_add_func("/efr32bg22/bufc-data-port", test_bufc_data_port);
+    qtest_add_func("/efr32bg22/bufc-sparse-threshold-flag",
+                   test_bufc_sparse_threshold_flag);
     qtest_add_func("/efr32bg22/protimer-trace-latches",
                    test_protimer_trace_latches);
 
