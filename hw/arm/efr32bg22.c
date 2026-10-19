@@ -40,6 +40,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 
 #define EFR32_FRC_IF 0x068u
 #define EFR32_FRC_IEN 0x06cu
+#define EFR32_FRC_RXRAWDATA 0x090u
 
 #define EFR32_RAC_STATUS 0x00cu
 #define EFR32_RAC_RXENSRCEN 0x008u
@@ -541,6 +542,13 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
             break;
         }
     }
+
+    /* FRC drives RXRAWDATA; the captured sequencer only reads it. */
+    if (register_address == EFR32_FRC_BASE + EFR32_FRC_RXRAWDATA)
+    {
+        return;
+    }
+
     efr32_register_put(s, register_address,
                        efr32_radio_mask_write(register_address, next));
 

@@ -8,6 +8,7 @@
 
 #define FRC_BASE             0xa8004000
 #define FRC_DATABUFFER       0x018
+#define FRC_RXRAWDATA        0x090
 #define FRC_IF               0x068
 #define FRC_IEN              0x06c
 #define AGC_BASE             0xa800c000
@@ -101,9 +102,11 @@ static void test_frc_buffer_register_masks(void)
 {
     writel(FRC_BASE + FRC_DATABUFFER, UINT32_MAX);
     writel(FRC_BASE + FRC_BUFFERMODE, UINT32_MAX);
+    writel(FRC_BASE + FRC_RXRAWDATA, UINT32_MAX);
 
     g_assert_cmphex(readl(FRC_BASE + FRC_DATABUFFER), ==, 0xff);
     g_assert_cmphex(readl(FRC_BASE + FRC_BUFFERMODE), ==, 0xf);
+    g_assert_cmphex(readl(FRC_BASE + FRC_RXRAWDATA), ==, 0);
 }
 
 static void test_frc_interrupt_register_masks(void)
