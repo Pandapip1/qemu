@@ -172,6 +172,22 @@ static void test_bufc_tx_fifo_setup_latches(void)
     g_assert_cmphex(readl(channel + BUFC_CMD), ==, 2);
 }
 
+static void test_bufc_rx_fifo_setup_latches(void)
+{
+    uint32_t channel = BUFC_BASE + BUFC_CH1;
+
+    /* RAIL configures the RX FIFO as a 512-byte channel-1 buffer. */
+    writel(channel + BUFC_CMD, 1);
+    writel(channel, 3);
+    writel(channel + 0x004, 0x20002000);
+    writel(channel + BUFC_THRESHOLD, 0x0fff);
+
+    g_assert_cmphex(readl(channel), ==, 3);
+    g_assert_cmphex(readl(channel + 0x004), ==, 0x20002000);
+    g_assert_cmphex(readl(channel + BUFC_THRESHOLD), ==, 0x0fff);
+    g_assert_cmphex(readl(channel + BUFC_CMD), ==, 1);
+}
+
 static void test_bufc_sparse_threshold_flag(void)
 {
     uint32_t channel = BUFC_BASE + BUFC_CH1;
@@ -243,6 +259,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/bufc-data-port", test_bufc_data_port);
     qtest_add_func("/efr32bg22/bufc-tx-fifo-setup-latches",
                    test_bufc_tx_fifo_setup_latches);
+    qtest_add_func("/efr32bg22/bufc-rx-fifo-setup-latches",
+                   test_bufc_rx_fifo_setup_latches);
     qtest_add_func("/efr32bg22/bufc-sparse-threshold-flag",
                    test_bufc_sparse_threshold_flag);
     qtest_add_func("/efr32bg22/protimer-trace-latches",
