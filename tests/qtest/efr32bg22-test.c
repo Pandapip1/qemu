@@ -188,6 +188,15 @@ static void test_bufc_rx_fifo_setup_latches(void)
     g_assert_cmphex(readl(channel + BUFC_CMD), ==, 1);
 }
 
+static void test_bufc_interrupt_register_masks(void)
+{
+    writel(BUFC_BASE + BUFC_IF, UINT32_MAX);
+    writel(BUFC_BASE + BUFC_IEN, UINT32_MAX);
+
+    g_assert_cmphex(readl(BUFC_BASE + BUFC_IF), ==, 0x8f0f0f0f);
+    g_assert_cmphex(readl(BUFC_BASE + BUFC_IEN), ==, 0x8f0f0f0f);
+}
+
 static void test_bufc_sparse_threshold_flag(void)
 {
     uint32_t channel = BUFC_BASE + BUFC_CH1;
@@ -261,6 +270,8 @@ int main(int argc, char **argv)
                    test_bufc_tx_fifo_setup_latches);
     qtest_add_func("/efr32bg22/bufc-rx-fifo-setup-latches",
                    test_bufc_rx_fifo_setup_latches);
+    qtest_add_func("/efr32bg22/bufc-interrupt-register-masks",
+                   test_bufc_interrupt_register_masks);
     qtest_add_func("/efr32bg22/bufc-sparse-threshold-flag",
                    test_bufc_sparse_threshold_flag);
     qtest_add_func("/efr32bg22/protimer-trace-latches",

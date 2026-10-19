@@ -331,6 +331,11 @@ static uint32_t efr32_radio_mask_write(uint32_t address, uint32_t value)
         if (offset == 8)
             return value & 0x1fef;
     }
+    if ((address & ~0x3fffu) == EFR32_BUFC_BASE &&
+        (offset == EFR32_BUFC_IF || offset == EFR32_BUFC_IEN))
+    {
+        return value & 0x8f0f0f0f;
+    }
     if ((address & ~0x3fffu) == EFR32_FRC_BASE)
     {
         return efr32_apply_register_mask(
