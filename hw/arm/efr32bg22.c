@@ -41,6 +41,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_FRC_IF 0x068u
 #define EFR32_FRC_IEN 0x06cu
 #define EFR32_FRC_RXRAWDATA 0x090u
+#define EFR32_FRC_IF_TXDONE (1u << 0)
 
 #define EFR32_RAC_STATUS 0x00cu
 #define EFR32_RAC_RXENSRCEN 0x008u
@@ -119,6 +120,14 @@ static void efr32_frc_update_irq(Efr32Periph *s)
     uint32_t enabled = efr32_register_get(s, EFR32_FRC_BASE + EFR32_FRC_IEN);
 
     qemu_set_irq(s->irq[34], !!(pending & enabled));
+}
+
+static void efr32_frc_raise(Efr32Periph *s, uint32_t flags)
+{
+    efr32_register_put(s, EFR32_FRC_BASE + EFR32_FRC_IF,
+                       efr32_register_get(s, EFR32_FRC_BASE + EFR32_FRC_IF) |
+                           flags);
+    efr32_frc_update_irq(s);
 }
 
 typedef struct Efr32RegisterMask
@@ -324,7 +333,10 @@ static void efr32_rac_set_state(Efr32Periph *s, uint32_t state)
 
 static void efr32_rac_tx_complete(void *opaque)
 {
-    efr32_rac_set_state(EFR32_PERIPH(opaque), EFR32_RAC_STATE_OFF);
+    Efr32Periph *s = EFR32_PERIPH(opaque);
+
+    efr32_rac_set_state(s, EFR32_RAC_STATE_OFF);
+    efr32_frc_raise(s, EFR32_FRC_IF_TXDONE);
 }
 
 static uint32_t efr32_radio_mask_write(uint32_t address, uint32_t value)
@@ -504,7 +516,10 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
     {
         next &= 0xc000fdff;
         if (next & (EFR32_RAC_CMD_TXDIS | EFR32_RAC_CMD_RXDIS))
+        {
+            timer_del(s->rac_tx_timer);
             efr32_rac_set_state(s, EFR32_RAC_STATE_OFF);
+        }
         else if (next & EFR32_RAC_CMD_TXEN)
         {
             efr32_rac_set_state(s, EFR32_RAC_STATE_TX);

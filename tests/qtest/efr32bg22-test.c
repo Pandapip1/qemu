@@ -11,6 +11,7 @@
 #define FRC_RXRAWDATA        0x090
 #define FRC_IF               0x068
 #define FRC_IEN              0x06c
+#define FRC_IF_TXDONE        (1u << 0)
 #define AGC_BASE             0xa800c000
 #define FRC_WHITEPOLY        0x034
 #define FRC_BUFFERMODE       0x078
@@ -274,6 +275,20 @@ static void test_rac_tx_commands(void)
                     RAC_SEQIF_STATEOFF);
 }
 
+static void test_rac_tx_completion(void)
+{
+    writel(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW, FRC_IF_TXDONE);
+    writel(RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(150001);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+
+    g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK, ==,
+                    0);
+    g_assert_cmphex(readl(FRC_BASE + FRC_IF) & FRC_IF_TXDONE, ==,
+                    FRC_IF_TXDONE);
+}
+
 static void test_rac_software_rx_enable(void)
 {
     writel(RAC_BASE + RAC_RXENSRCEN + REGISTER_SET_WINDOW,
@@ -330,6 +345,7 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/protimer-trace-latches",
                    test_protimer_trace_latches);
     qtest_add_func("/efr32bg22/rac-tx-commands", test_rac_tx_commands);
+    qtest_add_func("/efr32bg22/rac-tx-completion", test_rac_tx_completion);
     qtest_add_func("/efr32bg22/rac-software-rx-enable",
                    test_rac_software_rx_enable);
     qtest_add_func("/efr32bg22/rac-masks", test_rac_masks);
