@@ -257,6 +257,19 @@ static void test_bufc_backing_memory_wrap(void)
     g_assert_cmphex(readl(channel + BUFC_WRITEOFFSET), ==, 513);
 }
 
+static void test_bufc_overflow_latch(void)
+{
+    const uint32_t channel = BUFC_BASE + BUFC_CH0;
+
+    writel(channel + BUFC_CMD, 1);
+    writel(channel, 0); /* 64-byte FIFO */
+    for (unsigned i = 0; i <= 64; i++) {
+        writel(channel + BUFC_WRITEDATA, i);
+    }
+
+    g_assert_cmphex(readl(BUFC_BASE + BUFC_IF) & 1, ==, 1);
+}
+
 static void test_bufc_rx_fifo_setup_latches(void)
 {
     uint32_t channel = BUFC_BASE + BUFC_CH1;
@@ -408,6 +421,8 @@ int main(int argc, char **argv)
                    test_bufc_tx_fifo_setup_latches);
     qtest_add_func("/efr32bg22/bufc-backing-memory-wrap",
                    test_bufc_backing_memory_wrap);
+    qtest_add_func("/efr32bg22/bufc-overflow-latch",
+                   test_bufc_overflow_latch);
     qtest_add_func("/efr32bg22/bufc-rx-fifo-setup-latches",
                    test_bufc_rx_fifo_setup_latches);
     qtest_add_func("/efr32bg22/bufc-interrupt-register-masks",

@@ -282,12 +282,17 @@ static void efr32_bufc_update_threshold(Efr32Periph *s, unsigned channel)
     uint32_t base = efr32_bufc_channel_base(channel);
     uint32_t config = efr32_register_get(s, base + EFR32_BUFC_THRESHOLD);
     uint32_t count = efr32_bufc_count(s, channel);
+    uint32_t capacity = efr32_bufc_capacity(s, channel);
     uint32_t threshold = config & 0xfff;
     uint32_t flag = 1u << (8 * channel + 2);
     bool hit = config & 0x2000 ? count <= threshold : count > threshold;
     uint32_t pending = efr32_register_get(s, EFR32_BUFC_BASE + EFR32_BUFC_IF);
 
     pending = hit ? pending | flag : pending & ~flag;
+    if (capacity && count > capacity)
+    {
+        pending |= 1u << (8 * channel);
+    }
     efr32_register_put(s, EFR32_BUFC_BASE + EFR32_BUFC_IF, pending);
     efr32_bufc_update_irq(s);
 }
