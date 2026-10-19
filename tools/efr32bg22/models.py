@@ -524,16 +524,49 @@ class FRC(Dev):
 
 
 class Modem(Dev):
-    """Public xG22 MODEM sync-word register.
+    """Public xG22 MODEM BLE configuration registers.
 
-    This preserves software-visible programming only.  Sync detection and
-    interpreting a value as a Bluetooth access address are FRC/SEQ behavior.
+    These retain the public configurator's software-visible values only.
+    Sync detection, demodulation, and interpreting SYNC0 as a Bluetooth access
+    address remain FRC/SEQ behavior and are deliberately not modelled here.
     """
-    SYNC0 = 0x068
+    MIXCTRL = 0x01C
+    CTRL0, CTRL1, CTRL2, CTRL3, CTRL4, CTRL5, CTRL6 = (0x020 + 4 * n for n in range(7))
+    TXBR, RXBR, CF, PRE, SYNC0, SYNC1 = (0x058 + 4 * n for n in range(6))
+    SHAPING10, SHAPING11 = 0x0BC, 0x0C0
+    DCCOMP, DCCOMPFILTINIT = 0x0E0, 0x0E4
+    DSATHD0, DSATHD1 = 0x0F4, 0x0F8
+    AUTOCG = 0x124
+    DSATHD2, DIRECTMODE = 0x130, 0x134
+    LRFRC, DSATHD3, DSATHD4 = 0x154, 0x168, 0x16C
+    BLEIQDSA, SYNCPROPERTIES = 0x230, 0x238
+    DIGIGAINCTRL, PADEBUG = 0x23C, 0x244
+    ETSCTRL, ANTSWCTRL, ANTSWSTART, ANTSWEND = 0x254, 0x258, 0x25C, 0x260
+    TRECPMPATT, TRECPMDET, CFGANTPATT, ETSTIM = 0x264, 0x268, 0x26C, 0x270
+    ANTSWCTRL1, ANTDIVCTRL, BLEIQDSAEXT2 = 0x274, 0x27C, 0x280
+    MASKS = {
+        MIXCTRL: 0x0000001F,
+        CTRL0: 0xFFFFFFFF, CTRL1: 0xFFFFDFFF, CTRL2: 0xFFFFFFFF,
+        CTRL3: 0xFFFFFF81, CTRL4: 0xBFFFFFFF, CTRL5: 0x607007FE,
+        CTRL6: 0xF6000000, TXBR: 0x00FFFFFF, RXBR: 0x00001FFF,
+        CF: 0xCFFFFFFF, PRE: 0xFFFF1FFF, SYNC0: 0xFFFFFFFF,
+        SYNC1: 0xFFFFFFFF, SHAPING10: 0xFFFFFFFF, SHAPING11: 0xFFFFFFFF,
+        DCCOMP: 0x000001FF, DCCOMPFILTINIT: 0x7FFFFFFF,
+        DSATHD0: 0xFFFFFFFF, DSATHD1: 0x7FFFFFFF, AUTOCG: 0x0000FFFF,
+        DSATHD2: 0x7FFFFEFF, DIRECTMODE: 0x00001F0F, LRFRC: 0x000001FF,
+        DSATHD3: 0xFFFFFFFF, DSATHD4: 0x07FFFFFF, BLEIQDSA: 0xFFFFFFFF,
+        SYNCPROPERTIES: 0x000000FF, DIGIGAINCTRL: 0x000001FF,
+        PADEBUG: 0x00001E00, ETSCTRL: 0x3FFFF7FF, ANTSWCTRL: 0x01FFFFFF,
+        ANTSWSTART: 0x0003FFFF, ANTSWEND: 0x0003FFFF,
+        TRECPMPATT: 0xFFFFFFFF, TRECPMDET: 0xBFFFC3FF,
+        CFGANTPATT: 0x3FFFFFFF, ETSTIM: 0x0003FFFF,
+        ANTSWCTRL1: 0x00FFFFFF, ANTDIVCTRL: 0x000001FF,
+        BLEIQDSAEXT2: 0x000007FF,
+    }
 
     def write(self, off, val):
-        if off == self.SYNC0:
-            self.regs[off] = val & 0xFFFFFFFF
+        if off in self.MASKS:
+            self.regs[off] = val & self.MASKS[off]
         else:
             super().write(off, val)
 

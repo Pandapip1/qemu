@@ -219,8 +219,44 @@ class GuestMemoryTests(unittest.TestCase):
 
 
 class ModemTests(unittest.TestCase):
-    def test_public_sync0_is_a_32_bit_configuration_register(self):
+    def test_public_ble_baseline_configuration_masks(self):
         _, dev = attach(models.Modem("MODEM"))
+        expectations = {
+            dev.MIXCTRL: 0x0000001F,
+            dev.CTRL1: 0xFFFFDFFF,
+            dev.CTRL3: 0xFFFFFF81,
+            dev.CTRL4: 0xBFFFFFFF,
+            dev.CTRL5: 0x607007FE,
+            dev.CTRL6: 0xF6000000,
+            dev.TXBR: 0x00FFFFFF,
+            dev.RXBR: 0x00001FFF,
+            dev.CF: 0xCFFFFFFF,
+            dev.PRE: 0xFFFF1FFF,
+            dev.DCCOMP: 0x000001FF,
+            dev.DCCOMPFILTINIT: 0x7FFFFFFF,
+            dev.DSATHD1: 0x7FFFFFFF,
+            dev.AUTOCG: 0x0000FFFF,
+            dev.DSATHD2: 0x7FFFFEFF,
+            dev.DIRECTMODE: 0x00001F0F,
+            dev.LRFRC: 0x000001FF,
+            dev.DSATHD4: 0x07FFFFFF,
+            dev.SYNCPROPERTIES: 0x000000FF,
+            dev.DIGIGAINCTRL: 0x000001FF,
+            dev.PADEBUG: 0x00001E00,
+            dev.ETSCTRL: 0x3FFFF7FF,
+            dev.ANTSWCTRL: 0x01FFFFFF,
+            dev.ANTSWSTART: 0x0003FFFF,
+            dev.ANTSWEND: 0x0003FFFF,
+            dev.TRECPMDET: 0xBFFFC3FF,
+            dev.CFGANTPATT: 0x3FFFFFFF,
+            dev.ETSTIM: 0x0003FFFF,
+            dev.ANTSWCTRL1: 0x00FFFFFF,
+            dev.ANTDIVCTRL: 0x000001FF,
+            dev.BLEIQDSAEXT2: 0x000007FF,
+        }
+        for off, expected in expectations.items():
+            dev.write(off, 0xFFFFFFFF)
+            self.assertEqual(dev.read(off), expected)
         dev.write(dev.SYNC0, 0x89ABCDEF)
         self.assertEqual(dev.read(dev.SYNC0), 0x89ABCDEF)
 
