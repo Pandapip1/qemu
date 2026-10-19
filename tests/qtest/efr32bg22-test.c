@@ -240,6 +240,23 @@ static void test_bufc_tx_fifo_setup_latches(void)
     g_assert_cmphex(readl(channel + BUFC_STATUS), ==, 18 | (1u << 20));
 }
 
+static void test_bufc_backing_memory_wrap(void)
+{
+    const uint32_t channel = BUFC_BASE + BUFC_CH0;
+    const uint32_t buffer = 0x20001000;
+
+    writel(channel + BUFC_CMD, 1);
+    writel(channel, 3); /* 512-byte FIFO */
+    writel(channel + 0x004, buffer);
+    writel(channel + BUFC_WRITEOFFSET, 511);
+    writel(channel + BUFC_WRITEDATA, 0x31);
+    writel(channel + BUFC_WRITEDATA, 0x32);
+
+    g_assert_cmphex(qtest_readb(global_qtest, buffer + 511), ==, 0x31);
+    g_assert_cmphex(qtest_readb(global_qtest, buffer), ==, 0x32);
+    g_assert_cmphex(readl(channel + BUFC_WRITEOFFSET), ==, 513);
+}
+
 static void test_bufc_rx_fifo_setup_latches(void)
 {
     uint32_t channel = BUFC_BASE + BUFC_CH1;
@@ -389,6 +406,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/bufc-data-port", test_bufc_data_port);
     qtest_add_func("/efr32bg22/bufc-tx-fifo-setup-latches",
                    test_bufc_tx_fifo_setup_latches);
+    qtest_add_func("/efr32bg22/bufc-backing-memory-wrap",
+                   test_bufc_backing_memory_wrap);
     qtest_add_func("/efr32bg22/bufc-rx-fifo-setup-latches",
                    test_bufc_rx_fifo_setup_latches);
     qtest_add_func("/efr32bg22/bufc-interrupt-register-masks",

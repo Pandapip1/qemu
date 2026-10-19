@@ -249,6 +249,23 @@ static uint32_t efr32_bufc_channel_base(unsigned channel)
     return EFR32_BUFC_BASE + EFR32_BUFC_FIRST + channel * EFR32_BUFC_STRIDE;
 }
 
+static uint32_t efr32_bufc_capacity(Efr32Periph *s, unsigned channel)
+{
+    uint32_t config =
+        efr32_register_get(s, efr32_bufc_channel_base(channel) + EFR32_BUFC_CTRL);
+
+    /* RAIL encodes supported 64..4096-byte power-of-two FIFO sizes as 0..6. */
+    return config <= 6 ? 64u << config : 0;
+}
+
+static uint32_t efr32_bufc_storage_offset(Efr32Periph *s, unsigned channel,
+                                          uint32_t offset)
+{
+    uint32_t capacity = efr32_bufc_capacity(s, channel);
+
+    return capacity ? offset & (capacity - 1) : offset;
+}
+
 static uint32_t efr32_bufc_count(Efr32Periph *s, unsigned channel)
 {
     uint32_t base = efr32_bufc_channel_base(channel);
@@ -280,8 +297,9 @@ static void efr32_bufc_write_data(Efr32Periph *s, unsigned channel,
 {
     uint32_t base = efr32_bufc_channel_base(channel);
     uint32_t buffer_address = efr32_register_get(s, base + 0x004);
-    uint32_t position =
+    uint32_t write_offset =
         efr32_register_get(s, base + EFR32_BUFC_WRITEOFFSET) & 0x1fff;
+    uint32_t position = efr32_bufc_storage_offset(s, channel, write_offset);
     GByteArray *data = s->bufc_data[channel];
 
     if (position >= data->len)
@@ -294,7 +312,7 @@ static void efr32_bufc_write_data(Efr32Periph *s, unsigned channel,
         address_space_write(&address_space_memory, buffer_address + position,
                             MEMTXATTRS_UNSPECIFIED, &data->data[position], 1);
     }
-    efr32_register_put(s, base + EFR32_BUFC_WRITEOFFSET, position + 1);
+    efr32_register_put(s, base + EFR32_BUFC_WRITEOFFSET, write_offset + 1);
     efr32_bufc_update_threshold(s, channel);
 }
 
@@ -461,8 +479,10 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
         {
             uint32_t buffer_address =
                 efr32_register_get(s, base + 0x004);
-            uint32_t position =
+            uint32_t read_offset =
                 efr32_register_get(s, base + EFR32_BUFC_READOFFSET) & 0x1fff;
+            uint32_t position =
+                efr32_bufc_storage_offset(s, channel, read_offset);
             uint8_t value = position < s->bufc_data[channel]->len
                                 ? s->bufc_data[channel]->data[position]
                                 : 0;
@@ -474,7 +494,7 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
                                    MEMTXATTRS_UNSPECIFIED, &value, 1);
             }
 
-            efr32_register_put(s, base + EFR32_BUFC_READOFFSET, position + 1);
+            efr32_register_put(s, base + EFR32_BUFC_READOFFSET, read_offset + 1);
             efr32_bufc_update_threshold(s, channel);
             return value;
         }
