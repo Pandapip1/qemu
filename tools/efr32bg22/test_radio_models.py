@@ -66,6 +66,12 @@ class BufcTests(unittest.TestCase):
         self.assertEqual(dev.contents(1), b"")
         self.assertFalse(machine.irq & (1 << models.resets.IRQS["BUFC"]))
 
+    def test_public_command_mask_retains_unassigned_trace_bit(self):
+        _, dev = attach(models.BUFC("BUFC"))
+        base = dev.BUF0 + 3 * dev.STRIDE
+        dev.write(base + 0x28, 0xF4)
+        self.assertEqual(dev.read(base + 0x28), 0x4)
+
 
 class RacTests(unittest.TestCase):
     def test_tx_completes_and_raises_real_rac_seq(self):

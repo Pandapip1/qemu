@@ -314,6 +314,7 @@ class BUFC(IrqDev):
         elif reg == 0x1C:                       # XWRITE
             self.push(n, val & 0xFF, xor=True)
         elif reg == 0x28:                       # CMD
+            self.regs[base + reg] = val & 0xF   # public xG21 CMD mask; bit 2 is unassigned there.
             if val & 1:                         # CLEAR
                 self.data[n].clear()
                 self.regs[base + 0x08] = self.regs[base + 0x0C] = 0
