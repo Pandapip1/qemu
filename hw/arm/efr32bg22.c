@@ -48,6 +48,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_RAC_STATE_OFF 0u
 #define EFR32_RAC_STATE_TX  9u
 
+/* Observed in rfhal_protimer.o and the retained stock trace; latch only. */
+#define EFR32_PROTIMER_EN       0x004u
+#define EFR32_PROTIMER_CTRL     0x008u
+#define EFR32_PROTIMER_CMD      0x00cu
+#define EFR32_PROTIMER_STATE    0x030u
+#define EFR32_PROTIMER_PERIOD   0x038u
+#define EFR32_PROTIMER_TRACE_60 0x060u
+#define EFR32_PROTIMER_TRACE_64 0x064u
+#define EFR32_PROTIMER_TRACE_74 0x074u
+#define EFR32_PROTIMER_TRACE_78 0x078u
+#define EFR32_PROTIMER_CMP0     0x100u
+#define EFR32_PROTIMER_CMP1     0x110u
+#define EFR32_PROTIMER_CMP2     0x120u
+#define EFR32_PROTIMER_CMP3     0x130u
+#define EFR32_PROTIMER_CMP4     0x140u
+
 #define EFR32_BUFC_BASE        0xaa000000u
 #define EFR32_BUFC_FIRST       0x00cu
 #define EFR32_BUFC_STRIDE      0x040u
@@ -519,6 +535,24 @@ struct Efr32State {
 #define TYPE_EFR32BG22_MACHINE MACHINE_TYPE_NAME("efr32bg22")
 OBJECT_DECLARE_SIMPLE_TYPE(Efr32State, EFR32BG22_MACHINE)
 static void cpu_reset_cb(void *o) { cpu_reset(CPU(o)); }
+
+static void efr32_initialize_devinfo(MemoryRegion *devinfo)
+{
+    uint8_t *contents = memory_region_get_ram_ptr(devinfo);
+    uint32_t value;
+
+    /* USERDATA/CHIPCONFIG are erased.  DEVINFO holds only public size data
+     * and an intentionally synthetic EUI-64; calibration words stay zero. */
+    memset(contents, 0xff, 0x8000);
+    memset(contents + 0x8000, 0, 0x2000);
+    value = cpu_to_le32(512 | (32 << 16));
+    memcpy(contents + 0x800c, &value, sizeof(value));
+    value = cpu_to_le32(0x0000beef);
+    memcpy(contents + 0x8048, &value, sizeof(value));
+    value = cpu_to_le32(0x00000a00);
+    memcpy(contents + 0x804c, &value, sizeof(value));
+}
+
 static void init(MachineState *m) {
     Efr32State *s = EFR32BG22_MACHINE(m);
     DeviceState *nvic, *p;
@@ -560,6 +594,7 @@ static void init(MachineState *m) {
     memory_region_add_subregion(sm, 0xb0000000, ns);
     memory_region_init_ram(di, NULL, "efr32.devinfo", 0x10000, &error_fatal);
     memory_region_add_subregion(sm, 0x0fe00000, di);
+    efr32_initialize_devinfo(di);
     if (s->image) {
         gchar *d;
         gsize n;
