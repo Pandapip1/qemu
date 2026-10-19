@@ -103,6 +103,17 @@ static const Efr32RegisterMask efr32_frc_masks[] = {
     {0x110, 0x0001ffff},
 };
 
+static const Efr32RegisterMask efr32_agc_masks[] = {
+    {0x020, 0xfecfffff}, {0x024, 0xffffffff}, {0x028, 0xe3ffffff},
+    {0x02c, 0xffffffff}, {0x030, 0xfe00ffff}, {0x034, 0x00ffffff},
+    {0x038, 0xc0000000}, {0x03c, 0x3fffffff}, {0x040, 0x0001ffff},
+    {0x050, 0x0fffffff}, {0x054, 0xffffffff}, {0x058, 0xffffffff},
+    {0x05c, 0x0003ffff}, {0x064, 0x3fffffff}, {0x068, 0x3fffffff},
+    {0x06c, 0x3fffffff}, {0x070, 0x03ffffff}, {0x074, 0x07ffffff},
+    {0x078, 0x3fffffff}, {0x07c, 0x3fffffff}, {0x080, 0xffffffff},
+    {0x084, 0x00000fff}, {0x088, 0x0000007f},
+};
+
 static uint32_t efr32_apply_register_mask(const Efr32RegisterMask *masks,
                                           size_t count, uint32_t offset,
                                           uint32_t value)
@@ -235,6 +246,11 @@ static uint32_t efr32_radio_mask_write(uint32_t address, uint32_t value) {
     if ((address & ~0x3fffu) == EFR32_FRC_BASE) {
         return efr32_apply_register_mask(efr32_frc_masks,
                                          G_N_ELEMENTS(efr32_frc_masks),
+                                         offset, value);
+    }
+    if ((address & ~0x3fffu) == 0xa800c000) {
+        return efr32_apply_register_mask(efr32_agc_masks,
+                                         G_N_ELEMENTS(efr32_agc_masks),
                                          offset, value);
     }
     return value;
