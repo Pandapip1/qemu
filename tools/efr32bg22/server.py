@@ -9,6 +9,7 @@ import argparse, heapq, os, socket, struct, sys, collections
 REQ = struct.Struct("<BBHIIIQ")
 REP = struct.Struct("<IIQQ")
 RESET_REQ = 0x80000000
+MEM_READ_REQ = 0x40000000
 
 
 class Machine:
@@ -27,6 +28,7 @@ class Machine:
         self.unknown = collections.Counter()
         self.pinlog = []
         self.mem_writes = []      # (addr, bytes) to apply to guest memory with the next reply
+        self.mem_read = None       # synchronous callback installed by the bridge transport
         self.reset_requested = False
         self.resets = 0
         self.pin_watchers = {}
@@ -81,6 +83,12 @@ class Machine:
 
     def guest_write(self, addr, data):
         self.mem_writes.append((addr, bytes(data)))
+
+    def guest_read(self, addr, length):
+        """Read guest RAM through the bridge; models call this only for traced DMA."""
+        if self.mem_read is None:
+            raise RuntimeError("guest-memory reads require the QEMU bridge transport")
+        return self.mem_read(addr, length)
 
     def request_reset(self):
         self.reset_requested = True
@@ -140,6 +148,20 @@ def serve(m, path):
     print("listening", path, file=sys.stderr, flush=True)
     c, _ = srv.accept()
     c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1) if c.family == socket.AF_INET else None
+
+    def read_guest_memory(addr, length):
+        if not 0 <= length <= 64 * 1024:
+            raise ValueError("invalid guest-memory read length")
+        c.sendall(REP.pack(addr, MEM_READ_REQ, 0, length))
+        out = bytearray()
+        while len(out) < length:
+            d = c.recv(length - len(out))
+            if not d:
+                raise ConnectionError("QEMU closed during guest-memory read")
+            out += d
+        return bytes(out)
+
+    m.mem_read = read_guest_memory
     buf = b""
     while True:
         while len(buf) < REQ.size:

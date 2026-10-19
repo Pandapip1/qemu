@@ -6,6 +6,7 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import models
+import server
 
 
 class Machine:
@@ -176,6 +177,13 @@ class FrcTests(unittest.TestCase):
         for off, expected in expectations.items():
             dev.write(off, 0xFFFFFFFF)
             self.assertEqual(dev.read(off), expected)
+
+
+class GuestMemoryTests(unittest.TestCase):
+    def test_model_guest_read_delegates_to_bridge_transport(self):
+        m = server.Machine()
+        m.mem_read = lambda addr, length: bytes((addr + n) & 0xFF for n in range(length))
+        self.assertEqual(m.guest_read(0x20000010, 4), b"\x10\x11\x12\x13")
 
 
 class ModemTests(unittest.TestCase):

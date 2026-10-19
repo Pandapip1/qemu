@@ -14,7 +14,9 @@
  *   reply   : u32 value, u32 nwr|flags, u64 irq_mask, u64 next_ns, then nwr x
  *             { u32 addr, u32 len, len bytes padded to 4 } guest memory writes
  *   op: 0 read, 1 write, 2 tick, 3 reset notification
- *   flags (bit 31 of the second word): the server asks for a system reset
+ *   flags: bit 31 asks for a system reset; bit 30 makes this record a guest
+ *          memory-read request (value=address, next_ns=byte count).  QEMU
+ *          replies with that many raw bytes, then receives the normal reply.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -67,6 +69,8 @@ typedef struct __attribute__((packed)) {
 
 #define REP_NWR(r)        ((r)->nwr_flags & 0xffff)
 #define REP_RESET         0x80000000u
+#define REP_MEM_READ      0x40000000u
+#define REP_MEM_READ_MAX  (64 * 1024)
 
 struct OwoBridge {
     SysBusDevice parent_obj;
@@ -107,11 +111,35 @@ static uint32_t bridge_xfer(OwoBridge *s, uint8_t op, hwaddr addr,
                     .now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) };
     BridgeRep r;
 
-    if (qemu_chr_fe_write_all(&s->chr, (uint8_t *)&q, sizeof(q)) != sizeof(q) ||
-        qemu_chr_fe_read_all(&s->chr, (uint8_t *)&r, sizeof(r)) != sizeof(r)) {
+    if (qemu_chr_fe_write_all(&s->chr, (uint8_t *)&q, sizeof(q)) != sizeof(q)) {
         error_report("efr32bg22: peripheral server went away");
         exit(EXIT_FAILURE);
     }
+    do {
+        if (qemu_chr_fe_read_all(&s->chr, (uint8_t *)&r, sizeof(r)) != sizeof(r)) {
+            error_report("efr32bg22: peripheral server went away");
+            exit(EXIT_FAILURE);
+        }
+        if (r.nwr_flags & REP_MEM_READ) {
+            size_t len = r.next_ns;
+            g_autofree uint8_t *buf = NULL;
+
+            if (len > REP_MEM_READ_MAX) {
+                error_report("efr32bg22: oversized memory read from peripheral server");
+                exit(EXIT_FAILURE);
+            }
+            buf = g_malloc0(len);
+            if (address_space_read(&address_space_memory, r.value,
+                                   MEMTXATTRS_UNSPECIFIED, buf, len) != MEMTX_OK) {
+                error_report("efr32bg22: guest memory read for peripheral server failed");
+                exit(EXIT_FAILURE);
+            }
+            if (qemu_chr_fe_write_all(&s->chr, buf, len) != len) {
+                error_report("efr32bg22: peripheral server went away");
+                exit(EXIT_FAILURE);
+            }
+        }
+    } while (r.nwr_flags & REP_MEM_READ);
     for (uint32_t i = 0; i < REP_NWR(&r); i++) {
         uint32_t hdr[2];
         g_autofree uint8_t *buf = NULL;
