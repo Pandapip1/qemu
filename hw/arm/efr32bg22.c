@@ -8,6 +8,7 @@
 #include "qemu/error-report.h"
 #include "exec/memory.h"
 #include "exec/address-spaces.h"
+#include "qemu/timer.h"
 #include "hw/boards.h"
 #include "hw/qdev-clock.h"
 #include "hw/qdev-properties.h"
@@ -68,6 +69,7 @@ struct Efr32Periph {
     GHashTable *registers;
     uint32_t trng_state;
     uint32_t rac_state;
+    QEMUTimer *rac_tx_timer;
     GByteArray *bufc_data[4];
     qemu_irq irq[64];
 };
@@ -190,6 +192,29 @@ static void efr32_rac_update_irqs(Efr32Periph *s)
                                  efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_IEN)));
     qemu_set_irq(s->irq[38], !!(efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_SEQIF) &
                                  efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_SEQIEN)));
+}
+
+static void efr32_rac_set_state(Efr32Periph *s, uint32_t state)
+{
+    uint32_t sequence_flag;
+
+    if (s->rac_state == state) {
+        return;
+    }
+
+    s->rac_state = state;
+    efr32_register_put(s, EFR32_RAC_BASE + EFR32_RAC_IF,
+                       efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_IF) | 1);
+    sequence_flag = state == EFR32_RAC_STATE_TX ? 1u << 25 : 1u << 16;
+    efr32_register_put(s, EFR32_RAC_BASE + EFR32_RAC_SEQIF,
+                       efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_SEQIF) |
+                           sequence_flag);
+    efr32_rac_update_irqs(s);
+}
+
+static void efr32_rac_tx_complete(void *opaque)
+{
+    efr32_rac_set_state(EFR32_PERIPH(opaque), EFR32_RAC_STATE_OFF);
 }
 
 static uint32_t efr32_radio_mask_write(uint32_t address, uint32_t value) {
@@ -315,9 +340,12 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
 
     if (register_address == EFR32_RAC_BASE + EFR32_RAC_CMD) {
         if (next & (EFR32_RAC_CMD_TXDIS | EFR32_RAC_CMD_RXDIS))
-            s->rac_state = EFR32_RAC_STATE_OFF;
-        else if (next & EFR32_RAC_CMD_TXEN)
-            s->rac_state = EFR32_RAC_STATE_TX;
+            efr32_rac_set_state(s, EFR32_RAC_STATE_OFF);
+        else if (next & EFR32_RAC_CMD_TXEN) {
+            efr32_rac_set_state(s, EFR32_RAC_STATE_TX);
+            timer_mod(s->rac_tx_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 150000);
+        }
         return;
     }
     if ((register_address & ~0x3fffu) == EFR32_BUFC_BASE &&
@@ -404,6 +432,7 @@ static void efr32_periph_init(Object *o) {
     s->registers = g_hash_table_new(g_direct_hash, g_direct_equal);
     s->trng_state = 0x2545f491;
     s->rac_state = EFR32_RAC_STATE_OFF;
+    s->rac_tx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_rac_tx_complete, s);
     for (unsigned channel = 0; channel < G_N_ELEMENTS(s->bufc_data); channel++) {
         s->bufc_data[channel] = g_byte_array_new();
     }
@@ -422,6 +451,7 @@ static void efr32_periph_reset_hold(Object *o, ResetType t) {
     g_hash_table_remove_all(s->registers);
     s->trng_state = 0x2545f491;
     s->rac_state = EFR32_RAC_STATE_OFF;
+    timer_del(s->rac_tx_timer);
     for (unsigned irq = 0; irq < G_N_ELEMENTS(s->irq); irq++) {
         qemu_set_irq(s->irq[irq], 0);
     }
