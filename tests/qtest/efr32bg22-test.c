@@ -42,6 +42,7 @@
 #define BUFC_BASE            0xaa000000
 #define BUFC_CH0             0x00c
 #define BUFC_CH1             0x04c
+#define BUFC_CH2             0x08c
 #define BUFC_IF              0x114
 #define BUFC_IEN             0x118
 #define BUFC_WRITEOFFSET     0x008
@@ -197,6 +198,23 @@ static void test_bufc_interrupt_register_masks(void)
     g_assert_cmphex(readl(BUFC_BASE + BUFC_IEN), ==, 0x8f0f0f0f);
 }
 
+static void test_bufc_channel_register_masks(void)
+{
+    uint32_t channel = BUFC_BASE + BUFC_CH2;
+
+    writel(channel + BUFC_CMD, UINT32_MAX);
+    writel(channel, UINT32_MAX);
+    writel(channel + BUFC_WRITEOFFSET, UINT32_MAX);
+    writel(channel + BUFC_READOFFSET, UINT32_MAX);
+    writel(channel + BUFC_THRESHOLD, UINT32_MAX);
+
+    g_assert_cmphex(readl(channel), ==, 0x7);
+    g_assert_cmphex(readl(channel + BUFC_WRITEOFFSET), ==, 0x1fff);
+    g_assert_cmphex(readl(channel + BUFC_READOFFSET), ==, 0x1fff);
+    g_assert_cmphex(readl(channel + BUFC_THRESHOLD), ==, 0x2fff);
+    g_assert_cmphex(readl(channel + BUFC_CMD), ==, 0xf);
+}
+
 static void test_bufc_sparse_threshold_flag(void)
 {
     uint32_t channel = BUFC_BASE + BUFC_CH1;
@@ -272,6 +290,8 @@ int main(int argc, char **argv)
                    test_bufc_rx_fifo_setup_latches);
     qtest_add_func("/efr32bg22/bufc-interrupt-register-masks",
                    test_bufc_interrupt_register_masks);
+    qtest_add_func("/efr32bg22/bufc-channel-register-masks",
+                   test_bufc_channel_register_masks);
     qtest_add_func("/efr32bg22/bufc-sparse-threshold-flag",
                    test_bufc_sparse_threshold_flag);
     qtest_add_func("/efr32bg22/protimer-trace-latches",

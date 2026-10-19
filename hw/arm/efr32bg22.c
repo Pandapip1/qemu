@@ -74,6 +74,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_BUFC_STRIDE 0x040u
 #define EFR32_BUFC_IF 0x114u
 #define EFR32_BUFC_IEN 0x118u
+#define EFR32_BUFC_CTRL 0x000u
 #define EFR32_BUFC_WRITEOFFSET 0x008u
 #define EFR32_BUFC_READOFFSET 0x00cu
 #define EFR32_BUFC_READDATA 0x014u
@@ -359,6 +360,22 @@ static uint32_t efr32_radio_mask_write(uint32_t address, uint32_t value)
     return value;
 }
 
+static uint32_t efr32_bufc_mask_write(uint32_t offset, uint32_t value)
+{
+    switch (offset)
+    {
+    case EFR32_BUFC_CTRL:
+        return value & 0x7;
+    case EFR32_BUFC_WRITEOFFSET:
+    case EFR32_BUFC_READOFFSET:
+        return value & 0x1fff;
+    case EFR32_BUFC_THRESHOLD:
+        return value & 0x2fff;
+    default:
+        return value;
+    }
+}
+
 static uint32_t efr32_rac_status(Efr32Periph *s)
 {
     uint32_t state = s->rac_state;
@@ -503,6 +520,7 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
             }
             return;
         default:
+            next = efr32_bufc_mask_write(register_offset, next);
             break;
         }
     }
