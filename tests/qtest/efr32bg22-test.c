@@ -35,9 +35,13 @@
 #define RAC_SEQIF             0x028
 #define RAC_CMD_TXEN          (1u << 0)
 #define RAC_CMD_TXDIS         (1u << 5)
+#define RAC_CMD_RXDIS         (1u << 8)
+#define RAC_RXENSRCEN_SWRXEN  (1u << 1)
 #define RAC_STATUS_STATE_MASK 0x0f000000
+#define RAC_STATUS_STATE_RXSEARCH (2u << 24)
 #define RAC_STATUS_STATE_TX   (9u << 24)
 #define RAC_SEQIF_STATEOFF    (1u << 16)
+#define RAC_SEQIF_STATERXSEARCH (1u << 18)
 #define RAC_SEQIF_STATETX     (1u << 25)
 #define BUFC_BASE            0xaa000000
 #define BUFC_CH0             0x00c
@@ -257,6 +261,22 @@ static void test_rac_tx_commands(void)
                     RAC_SEQIF_STATEOFF);
 }
 
+static void test_rac_software_rx_enable(void)
+{
+    writel(RAC_BASE + RAC_RXENSRCEN + REGISTER_SET_WINDOW,
+           RAC_RXENSRCEN_SWRXEN);
+    g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK, ==,
+                    RAC_STATUS_STATE_RXSEARCH);
+    g_assert_cmphex(readl(RAC_BASE + RAC_SEQIF) & RAC_SEQIF_STATERXSEARCH, ==,
+                    RAC_SEQIF_STATERXSEARCH);
+
+    writel(RAC_BASE + RAC_CMD, RAC_CMD_RXDIS);
+    g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK, ==,
+                    0);
+    g_assert_cmphex(readl(RAC_BASE + RAC_SEQIF) & RAC_SEQIF_STATEOFF, ==,
+                    RAC_SEQIF_STATEOFF);
+}
+
 static void test_rac_masks(void)
 {
     writel(RAC_BASE + RAC_RXENSRCEN, UINT32_MAX);
@@ -297,6 +317,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/protimer-trace-latches",
                    test_protimer_trace_latches);
     qtest_add_func("/efr32bg22/rac-tx-commands", test_rac_tx_commands);
+    qtest_add_func("/efr32bg22/rac-software-rx-enable",
+                   test_rac_software_rx_enable);
     qtest_add_func("/efr32bg22/rac-masks", test_rac_masks);
 
     result = g_test_run();

@@ -42,6 +42,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_FRC_IEN 0x06cu
 
 #define EFR32_RAC_STATUS 0x00cu
+#define EFR32_RAC_RXENSRCEN 0x008u
 #define EFR32_RAC_CMD 0x010u
 #define EFR32_RAC_IF 0x01cu
 #define EFR32_RAC_IEN 0x020u
@@ -50,7 +51,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_RAC_CMD_TXEN (1u << 0)
 #define EFR32_RAC_CMD_TXDIS (1u << 5)
 #define EFR32_RAC_CMD_RXDIS (1u << 8)
+#define EFR32_RAC_RXENSRCEN_SWRXEN (1u << 1)
 #define EFR32_RAC_STATE_OFF 0u
+#define EFR32_RAC_STATE_RXSEARCH 2u
 #define EFR32_RAC_STATE_TX 9u
 
 /* Observed in rfhal_protimer.o and the retained stock trace; latch only. */
@@ -297,7 +300,20 @@ static void efr32_rac_set_state(Efr32Periph *s, uint32_t state)
     efr32_register_put(s, EFR32_RAC_BASE + EFR32_RAC_IF,
                        efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_IF) |
                            1);
-    sequence_flag = state == EFR32_RAC_STATE_TX ? 1u << 25 : 1u << 16;
+    switch (state)
+    {
+    case EFR32_RAC_STATE_OFF:
+        sequence_flag = 1u << 16;
+        break;
+    case EFR32_RAC_STATE_RXSEARCH:
+        sequence_flag = 1u << 18;
+        break;
+    case EFR32_RAC_STATE_TX:
+        sequence_flag = 1u << 25;
+        break;
+    default:
+        g_assert_not_reached();
+    }
     efr32_register_put(s, EFR32_RAC_BASE + EFR32_RAC_SEQIF,
                        efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_SEQIF) |
                            sequence_flag);
@@ -381,7 +397,8 @@ static uint32_t efr32_rac_status(Efr32Periph *s)
     uint32_t state = s->rac_state;
 
     return state << 24 | (state != EFR32_RAC_STATE_OFF) << 28 |
-           (state == EFR32_RAC_STATE_TX) << 30;
+           (state == EFR32_RAC_STATE_TX) << 30 |
+           (state == EFR32_RAC_STATE_RXSEARCH) << 31;
 }
 
 static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
@@ -526,6 +543,18 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
     }
     efr32_register_put(s, register_address,
                        efr32_radio_mask_write(register_address, next));
+
+    /*
+     * RAIL_StartRx writes SWRXEN through the RXENSRCEN SET alias.  The
+     * hardware sequencer has many intermediate states; RXSEARCH is the
+     * first stable receive state that its public register model exposes.
+     */
+    if (register_address == EFR32_RAC_BASE + EFR32_RAC_RXENSRCEN &&
+        ((word >> 12) & 3) == 1 &&
+        (next & EFR32_RAC_RXENSRCEN_SWRXEN))
+    {
+        efr32_rac_set_state(s, EFR32_RAC_STATE_RXSEARCH);
+    }
 
     if (register_address == EFR32_RAC_BASE + EFR32_RAC_IF ||
         register_address == EFR32_RAC_BASE + EFR32_RAC_IEN ||
