@@ -11,6 +11,11 @@
 #define MODEM_BASE           0xa8014000
 #define MODEM_SHAPING1       0x098
 #define MODEM_LONGRANGE5     0x14c
+#define PROTIMER_BASE         0xa801c000
+#define PROTIMER_CTRL         0x008
+#define PROTIMER_STATE        0x030
+#define PROTIMER_PERIOD       0x038
+#define PROTIMER_CMP0         0x100
 #define BUFC_BASE            0xaa000000
 #define BUFC_CH0             0x00c
 #define BUFC_READOFFSET      0x00c
@@ -57,6 +62,19 @@ static void test_bufc_data_port(void)
     g_assert_cmphex(readl(channel + BUFC_READDATA), ==, 0xa5);
 }
 
+static void test_protimer_trace_latches(void)
+{
+    writel(PROTIMER_BASE + PROTIMER_CTRL, 0x00011102);
+    writel(PROTIMER_BASE + PROTIMER_STATE, 0x00001233);
+    writel(PROTIMER_BASE + PROTIMER_PERIOD, 0x80015558);
+    writel(PROTIMER_BASE + PROTIMER_CMP0, 0x01000003);
+
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_CTRL), ==, 0x00011102);
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_STATE), ==, 0x00001233);
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_PERIOD), ==, 0x80015558);
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_CMP0), ==, 0x01000003);
+}
+
 int main(int argc, char **argv)
 {
     int result;
@@ -67,6 +85,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/register-aliases", test_register_aliases);
     qtest_add_func("/efr32bg22/modem-masks", test_modem_masks);
     qtest_add_func("/efr32bg22/bufc-data-port", test_bufc_data_port);
+    qtest_add_func("/efr32bg22/protimer-trace-latches",
+                   test_protimer_trace_latches);
 
     result = g_test_run();
     qtest_end();
