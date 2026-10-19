@@ -43,6 +43,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_FRC_RXRAWDATA 0x090u
 #define EFR32_FRC_IF_TXDONE (1u << 0)
 
+#define EFR32_AGC_RSSI 0x018u
+#define EFR32_AGC_FRAMERSSI 0x01cu
+
 #define EFR32_RAC_STATUS 0x00cu
 #define EFR32_RAC_RXENSRCEN 0x008u
 #define EFR32_RAC_CMD 0x010u
@@ -565,6 +568,13 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         return;
     }
 
+    /* AGC RSSI registers are generated-model read-only status values. */
+    if (register_address == EFR32_AGC_BASE + EFR32_AGC_RSSI ||
+        register_address == EFR32_AGC_BASE + EFR32_AGC_FRAMERSSI)
+    {
+        return;
+    }
+
     efr32_register_put(s, register_address,
                        efr32_radio_mask_write(register_address, next));
 
@@ -674,6 +684,8 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     s->trng_state = 0x2545f491;
     s->rac_state = EFR32_RAC_STATE_OFF;
     timer_del(s->rac_tx_timer);
+    efr32_register_put(s, EFR32_AGC_BASE + EFR32_AGC_RSSI, 0x8000);
+    efr32_register_put(s, EFR32_AGC_BASE + EFR32_AGC_FRAMERSSI, 0x8000);
     for (unsigned irq = 0; irq < G_N_ELEMENTS(s->irq); irq++)
     {
         qemu_set_irq(s->irq[irq], 0);

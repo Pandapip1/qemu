@@ -14,6 +14,8 @@
 #define FRC_IF_TXDONE        (1u << 0)
 #define FRC_IF_RXDONE        (1u << 4)
 #define AGC_BASE             0xa800c000
+#define AGC_RSSI             0x018
+#define AGC_FRAMERSSI        0x01c
 #define FRC_WHITEPOLY        0x034
 #define FRC_BUFFERMODE       0x078
 #define FRC_TRAILRXDATA       0x054
@@ -99,6 +101,15 @@ static void test_rfcrc_masks(void)
 
     g_assert_cmphex(readl(RFCRC_BASE + RFCRC_EN), ==, 1);
     g_assert_cmphex(readl(RFCRC_BASE + RFCRC_CTRL), ==, 0x1fef);
+}
+
+static void test_agc_rssi_status_registers(void)
+{
+    writel(AGC_BASE + AGC_RSSI, UINT32_MAX);
+    writel(AGC_BASE + AGC_FRAMERSSI, UINT32_MAX);
+
+    g_assert_cmphex(readl(AGC_BASE + AGC_RSSI), ==, 0x8000);
+    g_assert_cmphex(readl(AGC_BASE + AGC_FRAMERSSI), ==, 0x8000);
 }
 
 static void test_frc_buffer_register_masks(void)
@@ -338,6 +349,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/register-aliases", test_register_aliases);
     qtest_add_func("/efr32bg22/modem-masks", test_modem_masks);
     qtest_add_func("/efr32bg22/rfcrc-masks", test_rfcrc_masks);
+    qtest_add_func("/efr32bg22/agc-rssi-status-registers",
+                   test_agc_rssi_status_registers);
     qtest_add_func("/efr32bg22/frc-buffer-register-masks",
                    test_frc_buffer_register_masks);
     qtest_add_func("/efr32bg22/frc-interrupt-register-masks",
