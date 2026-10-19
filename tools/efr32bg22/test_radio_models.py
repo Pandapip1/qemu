@@ -156,6 +156,27 @@ class FrcTests(unittest.TestCase):
         for off in (dev.FCD0, dev.FCD1, dev.FCD2, dev.FCD3):
             self.assertEqual(dev.read(off), 0x00014CFF)
 
+    def test_public_ble_baseline_configuration_masks(self):
+        _, dev = attach(models.FRC("FRC"))
+        expectations = {
+            dev.WCNTCMP0: 0x00000FFF,
+            dev.WCNTCMP1: 0x00000FFF,
+            dev.FECCTRL: 0x003FFFF7,
+            dev.BLOCKRAMADDR: 0xFFFFFFFC,
+            dev.CONVRAMADDR: 0xFFFFFFFC,
+            dev.TRAILTXDATACTRL: 0x007FFFFF,
+            dev.CONVGENERATOR: 0x00037F7F,
+            dev.PUNCTCTRL: 0x00007F7F,
+            dev.AUTOCG: 0x0000FFFF,
+            dev.WCNTCMP3: 0x00000FFF,
+            dev.BOICTRL: 0x0001FFFF,
+            dev.DSLCTRL: 0x7FFFFF7F,
+            dev.WCNTCMP4: 0x00000FFF,
+        }
+        for off, expected in expectations.items():
+            dev.write(off, 0xFFFFFFFF)
+            self.assertEqual(dev.read(off), expected)
+
 
 class ModemTests(unittest.TestCase):
     def test_public_sync0_is_a_32_bit_configuration_register(self):
