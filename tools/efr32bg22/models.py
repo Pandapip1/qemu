@@ -465,6 +465,27 @@ class RFCRC(Dev):
             super().write(off, val)
 
 
+class FRC(Dev):
+    """Public xG22 FRC whitening configuration registers.
+
+    The packet pipeline, including applying the whitening LFSR, belongs to
+    FRC/SEQ behavior and is deliberately not modelled here.  Retaining these
+    public register masks makes the source-backed BLE setup observable.
+    """
+    WHITECTRL, WHITEPOLY, WHITEINIT = 0x030, 0x034, 0x038
+    MASKS = {
+        WHITECTRL: 0x00001F7F,
+        WHITEPOLY: 0x0000FFFF,
+        WHITEINIT: 0x0000FFFF,
+    }
+
+    def write(self, off, val):
+        if off in self.MASKS:
+            self.regs[off] = val & self.MASKS[off]
+        else:
+            super().write(off, val)
+
+
 class PCF8575:
     """16-bit quasi-bidirectional I/O expander.  Two data bytes per transfer, P0-P7 first."""
     def __init__(self, addr7=0x20):
@@ -1285,6 +1306,7 @@ def build(m, reset=False, cause=1):
     m.rac = m.add(RAC("RAC"), 0xA8020000)
     m.synth = m.add(Synth("SYNTH"), 0xA8018000)
     m.rfcrc = m.add(RFCRC("RFCRC"), 0xA8010000)
+    m.frc = m.add(FRC("FRC"), 0xA8004000)
     m.bufc = m.add(BUFC("BUFC"), 0xAA000000)
     trng = m.add(TRNG("TRNG", ""), 0x4C021000, 0x1000)
     m.add(TRNGFifo("TRNGFIFO", trng), 0x4C024000, 0x1000)

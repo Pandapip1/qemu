@@ -133,5 +133,16 @@ class RfcrcTests(unittest.TestCase):
         self.assertEqual(dev.read(dev.STATUS), 0)
 
 
+class FrcTests(unittest.TestCase):
+    def test_public_whitening_configuration_masks(self):
+        _, dev = attach(models.FRC("FRC"))
+        dev.write(dev.WHITECTRL, 0xFFFFFFFF)
+        dev.write(dev.WHITEPOLY, 0x1234ABCD)
+        dev.write(dev.WHITEINIT, 0xABCD1234)
+        self.assertEqual(dev.read(dev.WHITECTRL), 0x00001F7F)
+        self.assertEqual(dev.read(dev.WHITEPOLY), 0x0000ABCD)
+        self.assertEqual(dev.read(dev.WHITEINIT), 0x00001234)
+
+
 if __name__ == "__main__":
     unittest.main()
