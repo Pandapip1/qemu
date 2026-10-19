@@ -64,6 +64,7 @@ class BufcTests(unittest.TestCase):
         dev.write(base + 0x1C, 0x55)
         self.assertEqual(dev.contents(1), b"U")
         self.assertEqual(dev.read(dev.IF_OFF), 1 << 10)
+        self.assertEqual(dev.read(base + 0x20) & (1 << 20), 1 << 20)
         self.assertTrue(machine.irq & (1 << models.resets.IRQS["BUFC"]))
         dev.write(base + 0x28, 1)
         self.assertEqual(dev.contents(1), b"")

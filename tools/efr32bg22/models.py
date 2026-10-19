@@ -303,7 +303,9 @@ class BUFC(IrqDev):
         if reg == 0x20:                         # STATUS
             rd = self.regs.get(base + 0x0C, 0) & 0x1FFF
             count = max(0, len(self.data[n]) - rd) & 0x1FFF
-            flag = (1 << 20) if self.regs.get(self.IF_OFF, 0) & (1 << n) else 0
+            # STATUS.THRESHOLDFLAG is bit 20 for every buffer.  Its source
+            # is that buffer's sparse global IF threshold bit, 8*n+2.
+            flag = (1 << 20) if self.regs.get(self.IF_OFF, 0) & (1 << (8 * n + 2)) else 0
             return count | flag
         return super().read(off, size)
 
