@@ -16,6 +16,8 @@
 #define AGC_BASE             0xa800c000
 #define AGC_RSSI             0x018
 #define AGC_FRAMERSSI        0x01c
+#define AGC_IF               0x044
+#define AGC_IEN              0x048
 #define FRC_WHITEPOLY        0x034
 #define FRC_BUFFERMODE       0x078
 #define FRC_TRAILRXDATA       0x054
@@ -110,6 +112,18 @@ static void test_agc_rssi_status_registers(void)
 
     g_assert_cmphex(readl(AGC_BASE + AGC_RSSI), ==, 0x8000);
     g_assert_cmphex(readl(AGC_BASE + AGC_FRAMERSSI), ==, 0x8000);
+}
+
+static void test_agc_rssi_valid_latches(void)
+{
+    writel(AGC_BASE + AGC_IF, UINT32_MAX);
+    writel(AGC_BASE + AGC_IEN, UINT32_MAX);
+
+    g_assert_cmphex(readl(AGC_BASE + AGC_IF), ==, 0x37d);
+    g_assert_cmphex(readl(AGC_BASE + AGC_IEN), ==, 0x37d);
+
+    writel(AGC_BASE + REGISTER_CLEAR_WINDOW + AGC_IF, 1);
+    g_assert_cmphex(readl(AGC_BASE + AGC_IF), ==, 0x37c);
 }
 
 static void test_frc_buffer_register_masks(void)
@@ -351,6 +365,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/rfcrc-masks", test_rfcrc_masks);
     qtest_add_func("/efr32bg22/agc-rssi-status-registers",
                    test_agc_rssi_status_registers);
+    qtest_add_func("/efr32bg22/agc-rssi-valid-latches",
+                   test_agc_rssi_valid_latches);
     qtest_add_func("/efr32bg22/frc-buffer-register-masks",
                    test_frc_buffer_register_masks);
     qtest_add_func("/efr32bg22/frc-interrupt-register-masks",
