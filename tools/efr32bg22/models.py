@@ -625,6 +625,19 @@ class Modem(Dev):
             super().write(off, val)
 
 
+class Protimer(Dev):
+    """Observed xG22 PROTIMER register latches.
+
+    The stock trace and RAIL archive establish the base and these software
+    visible registers, but not the command bits, tick rate, compare semantics,
+    or interrupt behavior.  Retain values only; do not synthesize timing.
+    """
+    EN, CTRL, CMD = 0x004, 0x008, 0x00C
+    STATE, PERIOD = 0x030, 0x038
+    TRACE_100, TRACE_110, TRACE_120, TRACE_130, TRACE_140 = (
+        0x100, 0x110, 0x120, 0x130, 0x140)
+
+
 class PCF8575:
     """16-bit quasi-bidirectional I/O expander.  Two data bytes per transfer, P0-P7 first."""
     def __init__(self, addr7=0x20):
@@ -1448,6 +1461,7 @@ def build(m, reset=False, cause=1):
     m.frc = m.add(FRC("FRC"), 0xA8004000)
     m.agc = m.add(AGC("AGC"), 0xA800C000)
     m.modem = m.add(Modem("MODEM"), 0xA8014000)
+    m.protimer = m.add(Protimer("PROTIMER"), 0xA801C000)
     m.bufc = m.add(BUFC("BUFC"), 0xAA000000)
     trng = m.add(TRNG("TRNG", ""), 0x4C021000, 0x1000)
     m.add(TRNGFifo("TRNGFIFO", trng), 0x4C024000, 0x1000)

@@ -312,5 +312,38 @@ class ModemTests(unittest.TestCase):
         self.assertEqual(dev.read(dev.SYNC0), 0x89ABCDEF)
 
 
+class ProtimerTests(unittest.TestCase):
+    def test_stock_trace_register_latches(self):
+        """stock radio trace lines 64-73, 194-210, and 301."""
+        _, dev = attach(models.Protimer("PROTIMER"))
+        writes = {
+            dev.EN: 0x00000001,
+            dev.CTRL: 0x00011102,
+            dev.CMD: 0x00040000,
+            dev.STATE: 0x00001233,
+            dev.PERIOD: 0x80015558,
+            0x060: 0x00000000,
+            0x064: 0x00000000,
+            0x070: 0x03001804,
+            0x074: 0x01010000,
+            0x078: 0x00000000,
+            dev.TRACE_100: 0x03000003,
+            dev.TRACE_110: 0x00200003,
+            dev.TRACE_120: 0x00000000,
+            dev.TRACE_130: 0x00000000,
+            dev.TRACE_140: 0x00000000,
+        }
+        for off, value in writes.items():
+            dev.write(off, value)
+            self.assertEqual(dev.read(off), value)
+
+    def test_machine_maps_protimer_without_fallback(self):
+        m = server.Machine()
+        models.build(m)
+        m.access(1, 0xA801C008, 0x00011102, 4)
+        self.assertEqual(m.protimer.read(models.Protimer.CTRL), 0x00011102)
+        self.assertEqual(m.unknown, {})
+
+
 if __name__ == "__main__":
     unittest.main()
