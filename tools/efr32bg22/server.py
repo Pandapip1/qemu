@@ -157,6 +157,9 @@ def guest_memory_reader(sock):
 
 
 def serve(m, path):
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
     if os.path.exists(path):
         os.unlink(path)
     srv = socket.socket(socket.AF_UNIX)
@@ -196,7 +199,7 @@ def serve(m, path):
 def main():
     import models
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sock", default="/tmp/claude/efr32.sock")
+    ap.add_argument("--sock", default="build/qemu-runtime/efr32.sock")
     ap.add_argument("--trace", action="store_true")
     ap.add_argument("--no-stuck-exit", action="store_true")
     ap.add_argument("--flash", help="flash image given to QEMU (-M efr32bg22,flash=...); the server keeps a shadow")
