@@ -44,6 +44,8 @@
 #define BUFC_STATUS          0x020
 #define BUFC_THRESHOLD       0x024
 
+#define RADIO_NONSECURE_ALIAS 0x10000000
+
 #define REGISTER_SET_WINDOW  0x1000
 #define REGISTER_CLEAR_WINDOW 0x2000
 #define REGISTER_TOGGLE_WINDOW 0x3000
@@ -96,6 +98,18 @@ static void test_radio_enable_masks(void)
         writel(blocks[i] + 0x004, UINT32_MAX);
         g_assert_cmphex(readl(blocks[i] + 0x004), ==, 1);
     }
+}
+
+static void test_radio_nonsecure_alias(void)
+{
+    uint32_t secure_address = FRC_BASE + FRC_WHITEPOLY;
+    uint32_t nonsecure_address = secure_address + RADIO_NONSECURE_ALIAS;
+
+    writel(secure_address, 0);
+    writel(nonsecure_address, UINT32_MAX);
+
+    g_assert_cmphex(readl(secure_address), ==, 0xffff);
+    g_assert_cmphex(readl(nonsecure_address), ==, 0xffff);
 }
 
 static void test_bufc_data_port(void)
@@ -172,6 +186,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/modem-masks", test_modem_masks);
     qtest_add_func("/efr32bg22/rfcrc-masks", test_rfcrc_masks);
     qtest_add_func("/efr32bg22/radio-enable-masks", test_radio_enable_masks);
+    qtest_add_func("/efr32bg22/radio-nonsecure-alias",
+                   test_radio_nonsecure_alias);
     qtest_add_func("/efr32bg22/bufc-data-port", test_bufc_data_port);
     qtest_add_func("/efr32bg22/bufc-sparse-threshold-flag",
                    test_bufc_sparse_threshold_flag);
