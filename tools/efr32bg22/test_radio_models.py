@@ -118,5 +118,20 @@ class SynthTests(unittest.TestCase):
         self.assertEqual(dev.read(dev.CHSP), 0x0002BCDE)
 
 
+class RfcrcTests(unittest.TestCase):
+    def test_public_configuration_masks_and_command_side_effects(self):
+        _, dev = attach(models.RFCRC("RFCRC"))
+        dev.write(dev.EN, 3)
+        dev.write(dev.CTRL, 0xFFFFF7FF)
+        dev.write(dev.INIT, 0x00AAAAAA)
+        dev.write(dev.POLY, 0x00DA6000)
+        dev.write(dev.CMD, 1)
+        self.assertEqual(dev.read(dev.EN), 1)
+        self.assertEqual(dev.read(dev.CTRL), 0x000017EF)
+        self.assertEqual(dev.read(dev.INIT), 0x00AAAAAA)
+        self.assertEqual(dev.read(dev.POLY), 0x00DA6000)
+        self.assertEqual(dev.read(dev.STATUS), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -438,6 +438,33 @@ class Synth(Dev):
             super().write(off, val)
 
 
+class RFCRC(Dev):
+    """EFR32xG22 RFCRC register file from the public revB2 model.
+
+    This records configuration and exposes the documented masks.  Feeding the
+    FRC packet pipeline and calculating DATA are sequencer behavior, not yet
+    represented by the bridge.
+    """
+    EN, CTRL, STATUS, CMD = 0x004, 0x008, 0x00C, 0x010
+    INPUTDATA, INIT, DATA, POLY = 0x014, 0x018, 0x01C, 0x020
+    MASKS = {
+        EN: 0x00000001,
+        CTRL: 0x00001FEF,
+        INIT: 0xFFFFFFFF,
+        POLY: 0xFFFFFFFF,
+    }
+
+    def write(self, off, val):
+        if off in self.MASKS:
+            self.regs[off] = val & self.MASKS[off]
+        elif off == self.CMD:
+            pass                            # INITIALIZE is sequencer-owned here.
+        elif off == self.INPUTDATA:
+            pass                            # Packet CRC calculation is unmodelled.
+        else:
+            super().write(off, val)
+
+
 class PCF8575:
     """16-bit quasi-bidirectional I/O expander.  Two data bytes per transfer, P0-P7 first."""
     def __init__(self, addr7=0x20):
@@ -1257,6 +1284,7 @@ def build(m, reset=False, cause=1):
     m.add(USART("USART1", "USART1_RX"), 0x40060000)
     m.rac = m.add(RAC("RAC"), 0xA8020000)
     m.synth = m.add(Synth("SYNTH"), 0xA8018000)
+    m.rfcrc = m.add(RFCRC("RFCRC"), 0xA8010000)
     m.bufc = m.add(BUFC("BUFC"), 0xAA000000)
     trng = m.add(TRNG("TRNG", ""), 0x4C021000, 0x1000)
     m.add(TRNGFifo("TRNGFIFO", trng), 0x4C024000, 0x1000)
