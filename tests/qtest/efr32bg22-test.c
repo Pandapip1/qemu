@@ -16,6 +16,7 @@
 #define AGC_BASE             0xa800c000
 #define FRC_WHITEPOLY        0x034
 #define FRC_BUFFERMODE       0x078
+#define FRC_TRAILRXDATA       0x054
 #define FRC_SEQIF            0x0b4
 #define FRC_SEQIEN           0x0b8
 #define MODEM_BASE           0xa8014000
@@ -104,10 +105,12 @@ static void test_frc_buffer_register_masks(void)
 {
     writel(FRC_BASE + FRC_DATABUFFER, UINT32_MAX);
     writel(FRC_BASE + FRC_BUFFERMODE, UINT32_MAX);
+    writel(FRC_BASE + FRC_TRAILRXDATA, UINT32_MAX);
     writel(FRC_BASE + FRC_RXRAWDATA, UINT32_MAX);
 
     g_assert_cmphex(readl(FRC_BASE + FRC_DATABUFFER), ==, 0xff);
     g_assert_cmphex(readl(FRC_BASE + FRC_BUFFERMODE), ==, 0xf);
+    g_assert_cmphex(readl(FRC_BASE + FRC_TRAILRXDATA), ==, 0x3f);
     g_assert_cmphex(readl(FRC_BASE + FRC_RXRAWDATA), ==, 0);
 }
 
