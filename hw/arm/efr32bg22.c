@@ -18,6 +18,7 @@
 #include "sysemu/reset.h"
 #include "target/arm/cpu.h"
 #include "target/arm/idau.h"
+#include "trace.h"
 
 #define TYPE_EFR32_PERIPH "efr32bg22-periph"
 OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
@@ -433,6 +434,7 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
             timer_mod(s->rac_tx_timer,
                       qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 150000);
         }
+        trace_efr32bg22_rac_command(next, s->rac_state);
         return;
     }
     if ((register_address & ~0x3fffu) == EFR32_BUFC_BASE &&
