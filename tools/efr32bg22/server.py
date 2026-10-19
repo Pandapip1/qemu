@@ -26,6 +26,10 @@ class Machine:
         self.reset_requested = False
         self.resets = 0
         self.pin_watchers = {}
+        self.spilog, self.spi_slaves = [], {}
+        self.adc_inputs, self.adc_log = {}, []
+        self.reset_cause_next = 0x40
+        self.wdog_expired = None
         self.stuck = (None, 0)
         self.stuck_limit = int(os.environ.get("STUCK", 20000))
         self.exit_on_stuck = True
@@ -65,7 +69,8 @@ class Machine:
         self.events.clear()
         self.stuck = (None, 0)
         keep_flash, keep_pins = self.flash, self.pinlog
-        models.build(self, reset=not first, cause=1 if first else 0x40)
+        models.build(self, reset=not first, cause=1 if first else self.reset_cause_next)
+        self.reset_cause_next = 0x40
         self.built = True
         self.resets += 1
 
@@ -162,9 +167,17 @@ def main():
     m = Machine(a.trace)
     m.exit_on_stuck = not a.no_stuck_exit
     m.flash = bytearray(open(a.flash, 'rb').read()) if a.flash else bytearray(b'\xff' * 0x80000)
+    import signal
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:
         serve(m, a.sock)
     finally:
+        for t_ns, pin, lv in m.pinlog:
+            print("PIN %12d %s %s" % (t_ns, pin, lv), file=sys.stderr)
+        for t_ns, dev, tx, rx in m.spilog:
+            print("SPI %12d %s tx=%02x rx=%02x" % (t_ns, dev, tx, rx), file=sys.stderr)
+        for t_ns, key, v in m.adc_log:
+            print("ADC %12d %s %d" % (t_ns, key, v), file=sys.stderr)
         print("unmodelled:", dict(m.unknown.most_common(20)), file=sys.stderr)
 
 
