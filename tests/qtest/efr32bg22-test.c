@@ -198,6 +198,7 @@ static void test_bufc_data_port(void)
     uint32_t tx_channel = BUFC_BASE + BUFC_CH0;
     uint32_t sequencer_channel = BUFC_SECURE_BASE + BUFC_CH1;
     uint32_t nonsecure_rx_channel = BUFC_BASE + BUFC_CH1;
+    const uint32_t rx_buffer = 0x20002000;
 
     writel(tx_channel + BUFC_WRITEDATA, 0x5a);
     writel(tx_channel + BUFC_WRITEDATA, 0xa5);
@@ -208,9 +209,11 @@ static void test_bufc_data_port(void)
 
     /* The recovered sequencer image writes RX buffer 1 via its secure alias. */
     writel(sequencer_channel + BUFC_CMD, 1);
+    writel(sequencer_channel + 0x004, rx_buffer);
     writel(sequencer_channel + BUFC_WRITEDATA, 0x3c);
     writel(nonsecure_rx_channel + BUFC_READOFFSET, 0);
     g_assert_cmphex(readl(nonsecure_rx_channel + BUFC_READDATA), ==, 0x3c);
+    g_assert_cmphex(qtest_readb(global_qtest, rx_buffer), ==, 0x3c);
     writel(sequencer_channel + BUFC_CMD, 1);
 }
 

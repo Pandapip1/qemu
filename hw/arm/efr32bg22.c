@@ -268,6 +268,7 @@ static void efr32_bufc_write_data(Efr32Periph *s, unsigned channel,
                                   uint8_t value, bool xor_write)
 {
     uint32_t base = efr32_bufc_channel_base(channel);
+    uint32_t buffer_address = efr32_register_get(s, base + 0x004);
     uint32_t position =
         efr32_register_get(s, base + EFR32_BUFC_WRITEOFFSET) & 0x1fff;
     GByteArray *data = s->bufc_data[channel];
@@ -277,6 +278,11 @@ static void efr32_bufc_write_data(Efr32Periph *s, unsigned channel,
         g_byte_array_set_size(data, position + 1);
     }
     data->data[position] = xor_write ? data->data[position] ^ value : value;
+    if (buffer_address)
+    {
+        address_space_write(&address_space_memory, buffer_address + position,
+                            MEMTXATTRS_UNSPECIFIED, &data->data[position], 1);
+    }
     efr32_register_put(s, base + EFR32_BUFC_WRITEOFFSET, position + 1);
     efr32_bufc_update_threshold(s, channel);
 }
