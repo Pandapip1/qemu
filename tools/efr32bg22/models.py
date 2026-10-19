@@ -267,7 +267,9 @@ class BUFC(IrqDev):
         cfg = self.regs.get(base + 0x24, 0)
         threshold = cfg & 0xFFF
         hit = len(self.data[n]) <= threshold if cfg & 0x2000 else len(self.data[n]) > threshold
-        bit = 1 << n
+        # Public xG21 BUFC_IF places each buffer's threshold flag at bit
+        # 8*n+2 (BUF0THR=2, BUF1THR=10, BUF2THR=18, BUF3THR=26).
+        bit = 1 << (8 * n + 2)
         if hit:
             self.regs[self.IF_OFF] = self.regs.get(self.IF_OFF, 0) | bit
         else:

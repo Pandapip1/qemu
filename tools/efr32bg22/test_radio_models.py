@@ -57,10 +57,11 @@ class BufcTests(unittest.TestCase):
     def test_xwrite_clear_threshold_and_irq(self):
         machine, dev = attach(models.BUFC("BUFC"))
         base = dev.BUF0 + dev.STRIDE
-        dev.write(dev.IEN_OFF, 1 << 1)
+        dev.write(dev.IEN_OFF, 1 << (8 * 1 + 2))
         dev.write(base + 0x24, 0)             # larger than zero
         dev.write(base + 0x1C, 0x55)
         self.assertEqual(dev.contents(1), b"U")
+        self.assertEqual(dev.read(dev.IF_OFF), 1 << 10)
         self.assertTrue(machine.irq & (1 << models.resets.IRQS["BUFC"]))
         dev.write(base + 0x28, 1)
         self.assertEqual(dev.contents(1), b"")
