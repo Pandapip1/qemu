@@ -29,56 +29,57 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define SRAM_SIZE (32 * 1024)
 
 /* Radio block addresses and source-backed register offsets. */
-#define EFR32_FRC_BASE      0xa8004000u
-#define EFR32_RFCRC_BASE    0xa8010000u
-#define EFR32_MODEM_BASE    0xa8014000u
-#define EFR32_SYNTH_BASE    0xa8018000u
+#define EFR32_FRC_BASE 0xa8004000u
+#define EFR32_RFCRC_BASE 0xa8010000u
+#define EFR32_MODEM_BASE 0xa8014000u
+#define EFR32_SYNTH_BASE 0xa8018000u
 #define EFR32_PROTIMER_BASE 0xa801c000u
-#define EFR32_RAC_BASE      0xa8020000u
+#define EFR32_RAC_BASE 0xa8020000u
 
-#define EFR32_RAC_STATUS    0x00cu
-#define EFR32_RAC_CMD       0x010u
-#define EFR32_RAC_IF         0x01cu
-#define EFR32_RAC_IEN        0x020u
-#define EFR32_RAC_SEQIF      0x028u
-#define EFR32_RAC_SEQIEN     0x02cu
-#define EFR32_RAC_CMD_TXEN  (1u << 0)
+#define EFR32_RAC_STATUS 0x00cu
+#define EFR32_RAC_CMD 0x010u
+#define EFR32_RAC_IF 0x01cu
+#define EFR32_RAC_IEN 0x020u
+#define EFR32_RAC_SEQIF 0x028u
+#define EFR32_RAC_SEQIEN 0x02cu
+#define EFR32_RAC_CMD_TXEN (1u << 0)
 #define EFR32_RAC_CMD_TXDIS (1u << 5)
 #define EFR32_RAC_CMD_RXDIS (1u << 8)
 #define EFR32_RAC_STATE_OFF 0u
-#define EFR32_RAC_STATE_TX  9u
+#define EFR32_RAC_STATE_TX 9u
 
 /* Observed in rfhal_protimer.o and the retained stock trace; latch only. */
-#define EFR32_PROTIMER_EN       0x004u
-#define EFR32_PROTIMER_CTRL     0x008u
-#define EFR32_PROTIMER_CMD      0x00cu
-#define EFR32_PROTIMER_STATE    0x030u
-#define EFR32_PROTIMER_PERIOD   0x038u
+#define EFR32_PROTIMER_EN 0x004u
+#define EFR32_PROTIMER_CTRL 0x008u
+#define EFR32_PROTIMER_CMD 0x00cu
+#define EFR32_PROTIMER_STATE 0x030u
+#define EFR32_PROTIMER_PERIOD 0x038u
 #define EFR32_PROTIMER_TRACE_60 0x060u
 #define EFR32_PROTIMER_TRACE_64 0x064u
 #define EFR32_PROTIMER_TRACE_74 0x074u
 #define EFR32_PROTIMER_TRACE_78 0x078u
-#define EFR32_PROTIMER_CMP0     0x100u
-#define EFR32_PROTIMER_CMP1     0x110u
-#define EFR32_PROTIMER_CMP2     0x120u
-#define EFR32_PROTIMER_CMP3     0x130u
-#define EFR32_PROTIMER_CMP4     0x140u
+#define EFR32_PROTIMER_CMP0 0x100u
+#define EFR32_PROTIMER_CMP1 0x110u
+#define EFR32_PROTIMER_CMP2 0x120u
+#define EFR32_PROTIMER_CMP3 0x130u
+#define EFR32_PROTIMER_CMP4 0x140u
 
-#define EFR32_BUFC_BASE        0xaa000000u
-#define EFR32_BUFC_FIRST       0x00cu
-#define EFR32_BUFC_STRIDE      0x040u
-#define EFR32_BUFC_IF          0x114u
-#define EFR32_BUFC_IEN         0x118u
+#define EFR32_BUFC_BASE 0xaa000000u
+#define EFR32_BUFC_FIRST 0x00cu
+#define EFR32_BUFC_STRIDE 0x040u
+#define EFR32_BUFC_IF 0x114u
+#define EFR32_BUFC_IEN 0x118u
 #define EFR32_BUFC_WRITEOFFSET 0x008u
-#define EFR32_BUFC_READOFFSET  0x00cu
-#define EFR32_BUFC_READDATA    0x014u
-#define EFR32_BUFC_WRITEDATA   0x018u
-#define EFR32_BUFC_XWRITEDATA  0x01cu
-#define EFR32_BUFC_STATUS      0x020u
-#define EFR32_BUFC_THRESHOLD   0x024u
-#define EFR32_BUFC_CMD         0x028u
+#define EFR32_BUFC_READOFFSET 0x00cu
+#define EFR32_BUFC_READDATA 0x014u
+#define EFR32_BUFC_WRITEDATA 0x018u
+#define EFR32_BUFC_XWRITEDATA 0x01cu
+#define EFR32_BUFC_STATUS 0x020u
+#define EFR32_BUFC_THRESHOLD 0x024u
+#define EFR32_BUFC_CMD 0x028u
 
-struct Efr32Periph {
+struct Efr32Periph
+{
     SysBusDevice parent_obj;
     MemoryRegion peripheral_mmio;
     MemoryRegion radio_mmio;
@@ -102,7 +103,8 @@ static void efr32_bufc_update_irq(Efr32Periph *s)
     qemu_set_irq(s->irq[32], !!(pending & enabled));
 }
 
-typedef struct Efr32RegisterMask {
+typedef struct Efr32RegisterMask
+{
     uint16_t offset;
     uint32_t writable_mask;
 } Efr32RegisterMask;
@@ -139,15 +141,14 @@ static const Efr32RegisterMask efr32_modem_masks[] = {
     {0x09c, 0xffffffff}, {0x0a0, 0xffffffff}, {0x0a4, 0xffffffff},
     {0x0a8, 0xffffffff}, {0x0ac, 0xffffffff}, {0x0b0, 0xffffffff},
     {0x0b4, 0xffffffff}, {0x0b8, 0xffffffff}, {0x0bc, 0xffffffff},
-    {0x0c0, 0xffffffff}, {0x0e0, 0x000001ff},
-    {0x0e4, 0x7fffffff}, {0x0ec, 0xeffff8ff}, {0x0f4, 0xffffffff},
-    {0x0f8, 0x7fffffff}, {0x0fc, 0xffefffff}, {0x100, 0xffffffff},
-    {0x104, 0xffffffff}, {0x10c, 0x007fffff}, {0x110, 0x7fffffff},
-    {0x114, 0xffffffff}, {0x124, 0x0000ffff}, {0x128, 0x0000ffff},
-    {0x130, 0x7ffffeff}, {0x134, 0x00001f0f}, {0x138, 0x7fffffff},
-    {0x13c, 0x3fff7fff}, {0x140, 0xffffffff}, {0x144, 0xffffffff},
-    {0x148, 0xffffffff}, {0x14c, 0x0fffffff}, {0x150, 0xfff7ffff},
-    {0x154, 0x000001ff},
+    {0x0c0, 0xffffffff}, {0x0e0, 0x000001ff}, {0x0e4, 0x7fffffff},
+    {0x0ec, 0xeffff8ff}, {0x0f4, 0xffffffff}, {0x0f8, 0x7fffffff},
+    {0x0fc, 0xffefffff}, {0x100, 0xffffffff}, {0x104, 0xffffffff},
+    {0x10c, 0x007fffff}, {0x110, 0x7fffffff}, {0x114, 0xffffffff},
+    {0x124, 0x0000ffff}, {0x128, 0x0000ffff}, {0x130, 0x7ffffeff},
+    {0x134, 0x00001f0f}, {0x138, 0x7fffffff}, {0x13c, 0x3fff7fff},
+    {0x140, 0xffffffff}, {0x144, 0xffffffff}, {0x148, 0xffffffff},
+    {0x14c, 0x0fffffff}, {0x150, 0xfff7ffff}, {0x154, 0x000001ff},
     {0x168, 0xffffffff}, {0x16c, 0x07ffffff}, {0x170, 0x0000fff3},
     {0x230, 0xffffffff}, {0x234, 0x3fffffff}, {0x238, 0x000000ff},
     {0x23c, 0x000001ff}, {0x244, 0x00001e00}, {0x248, 0xe01fffff},
@@ -161,8 +162,10 @@ static uint32_t efr32_apply_register_mask(const Efr32RegisterMask *masks,
                                           size_t count, uint32_t offset,
                                           uint32_t value)
 {
-    for (size_t i = 0; i < count; i++) {
-        if (offset == masks[i].offset) {
+    for (size_t i = 0; i < count; i++)
+    {
+        if (offset == masks[i].offset)
+        {
             return value & masks[i].writable_mask;
         }
     }
@@ -176,7 +179,8 @@ static bool efr32_bufc_decode(uint32_t offset, unsigned *channel,
     uint32_t relative;
 
     if (offset < EFR32_BUFC_FIRST ||
-        offset >= EFR32_BUFC_FIRST + 4 * EFR32_BUFC_STRIDE) {
+        offset >= EFR32_BUFC_FIRST + 4 * EFR32_BUFC_STRIDE)
+    {
         return false;
     }
 
@@ -188,8 +192,7 @@ static bool efr32_bufc_decode(uint32_t offset, unsigned *channel,
 
 static uint32_t efr32_bufc_channel_base(unsigned channel)
 {
-    return EFR32_BUFC_BASE + EFR32_BUFC_FIRST +
-           channel * EFR32_BUFC_STRIDE;
+    return EFR32_BUFC_BASE + EFR32_BUFC_FIRST + channel * EFR32_BUFC_STRIDE;
 }
 
 static void efr32_bufc_update_threshold(Efr32Periph *s, unsigned channel)
@@ -211,11 +214,12 @@ static void efr32_bufc_write_data(Efr32Periph *s, unsigned channel,
                                   uint8_t value, bool xor_write)
 {
     uint32_t base = efr32_bufc_channel_base(channel);
-    uint32_t position = efr32_register_get(s, base + EFR32_BUFC_WRITEOFFSET) &
-                        0x1fff;
+    uint32_t position =
+        efr32_register_get(s, base + EFR32_BUFC_WRITEOFFSET) & 0x1fff;
     GByteArray *data = s->bufc_data[channel];
 
-    if (position >= data->len) {
+    if (position >= data->len)
+    {
         g_byte_array_set_size(data, position + 1);
     }
     data->data[position] = xor_write ? data->data[position] ^ value : value;
@@ -224,17 +228,19 @@ static void efr32_bufc_write_data(Efr32Periph *s, unsigned channel,
 }
 
 /* Each Series-2 block has normal, SET, CLR, and TGL 4-KiB windows. */
-static uint32_t efr32_register_key(uint32_t address) {
+static uint32_t efr32_register_key(uint32_t address)
+{
     return (address & ~0x3fffu) | (address & 0xffcu);
 }
 
-static uint32_t efr32_register_get(Efr32Periph *s, uint32_t address) {
+static uint32_t efr32_register_get(Efr32Periph *s, uint32_t address)
+{
     return GPOINTER_TO_UINT(g_hash_table_lookup(
         s->registers, GUINT_TO_POINTER(efr32_register_key(address))));
 }
 
-static void efr32_register_put(Efr32Periph *s, uint32_t address,
-                               uint32_t value) {
+static void efr32_register_put(Efr32Periph *s, uint32_t address, uint32_t value)
+{
     g_hash_table_insert(s->registers,
                         GUINT_TO_POINTER(efr32_register_key(address)),
                         GUINT_TO_POINTER(value));
@@ -242,23 +248,27 @@ static void efr32_register_put(Efr32Periph *s, uint32_t address,
 
 static void efr32_rac_update_irqs(Efr32Periph *s)
 {
-    qemu_set_irq(s->irq[37], !!(efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_IF) &
-                                 efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_IEN)));
-    qemu_set_irq(s->irq[38], !!(efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_SEQIF) &
-                                 efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_SEQIEN)));
+    qemu_set_irq(s->irq[37],
+                 !!(efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_IF) &
+                    efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_IEN)));
+    qemu_set_irq(s->irq[38],
+                 !!(efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_SEQIF) &
+                    efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_SEQIEN)));
 }
 
 static void efr32_rac_set_state(Efr32Periph *s, uint32_t state)
 {
     uint32_t sequence_flag;
 
-    if (s->rac_state == state) {
+    if (s->rac_state == state)
+    {
         return;
     }
 
     s->rac_state = state;
     efr32_register_put(s, EFR32_RAC_BASE + EFR32_RAC_IF,
-                       efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_IF) | 1);
+                       efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_IF) |
+                           1);
     sequence_flag = state == EFR32_RAC_STATE_TX ? 1u << 25 : 1u << 16;
     efr32_register_put(s, EFR32_RAC_BASE + EFR32_RAC_SEQIF,
                        efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_SEQIF) |
@@ -271,35 +281,38 @@ static void efr32_rac_tx_complete(void *opaque)
     efr32_rac_set_state(EFR32_PERIPH(opaque), EFR32_RAC_STATE_OFF);
 }
 
-static uint32_t efr32_radio_mask_write(uint32_t address, uint32_t value) {
+static uint32_t efr32_radio_mask_write(uint32_t address, uint32_t value)
+{
     uint32_t offset = address & 0xfff;
 
     if ((address & ~0x3fffu) == 0xa8018000 && offset >= 0x34 &&
-        offset <= 0x44 && !(offset & 3)) {
+        offset <= 0x44 && !(offset & 3))
+    {
         static const uint32_t m[] = {0x0fffffffu, 0x001fffffu, 0x1ff, 0x3f,
                                      0x3ffff};
         return value & m[(offset - 0x34) / 4];
     }
-    if ((address & ~0x3fffu) == 0xa8010000) {
+    if ((address & ~0x3fffu) == 0xa8010000)
+    {
         if (offset == 4)
             return value & 1;
         if (offset == 8)
             return value & 0x1fef;
     }
-    if ((address & ~0x3fffu) == EFR32_FRC_BASE) {
-        return efr32_apply_register_mask(efr32_frc_masks,
-                                         G_N_ELEMENTS(efr32_frc_masks),
-                                         offset, value);
+    if ((address & ~0x3fffu) == EFR32_FRC_BASE)
+    {
+        return efr32_apply_register_mask(
+            efr32_frc_masks, G_N_ELEMENTS(efr32_frc_masks), offset, value);
     }
-    if ((address & ~0x3fffu) == 0xa800c000) {
-        return efr32_apply_register_mask(efr32_agc_masks,
-                                         G_N_ELEMENTS(efr32_agc_masks),
-                                         offset, value);
+    if ((address & ~0x3fffu) == 0xa800c000)
+    {
+        return efr32_apply_register_mask(
+            efr32_agc_masks, G_N_ELEMENTS(efr32_agc_masks), offset, value);
     }
-    if ((address & ~0x3fffu) == EFR32_MODEM_BASE) {
-        return efr32_apply_register_mask(efr32_modem_masks,
-                                         G_N_ELEMENTS(efr32_modem_masks),
-                                         offset, value);
+    if ((address & ~0x3fffu) == EFR32_MODEM_BASE)
+    {
+        return efr32_apply_register_mask(
+            efr32_modem_masks, G_N_ELEMENTS(efr32_modem_masks), offset, value);
     }
     return value;
 }
@@ -312,44 +325,49 @@ static uint32_t efr32_rac_status(Efr32Periph *s)
            (state == EFR32_RAC_STATE_TX) << 30;
 }
 
-static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address) {
+static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
+{
     uint32_t offset = address & 0xfff;
     unsigned channel;
     uint32_t register_offset;
 
     if ((address & ~0x3fffu) == EFR32_BUFC_BASE &&
-        efr32_bufc_decode(offset, &channel, &register_offset)) {
+        efr32_bufc_decode(offset, &channel, &register_offset))
+    {
         uint32_t base = efr32_bufc_channel_base(channel);
 
-        if (register_offset == EFR32_BUFC_READDATA) {
+        if (register_offset == EFR32_BUFC_READDATA)
+        {
             uint32_t position =
                 efr32_register_get(s, base + EFR32_BUFC_READOFFSET) & 0x1fff;
-            uint32_t value = position < s->bufc_data[channel]->len ?
-                                 s->bufc_data[channel]->data[position] :
-                                 0;
+            uint32_t value = position < s->bufc_data[channel]->len
+                                 ? s->bufc_data[channel]->data[position]
+                                 : 0;
 
             efr32_register_put(s, base + EFR32_BUFC_READOFFSET, position + 1);
             efr32_bufc_update_threshold(s, channel);
             return value;
         }
-        if (register_offset == EFR32_BUFC_STATUS) {
+        if (register_offset == EFR32_BUFC_STATUS)
+        {
             uint32_t read_offset =
                 efr32_register_get(s, base + EFR32_BUFC_READOFFSET) & 0x1fff;
-            uint32_t count = s->bufc_data[channel]->len > read_offset ?
-                                 s->bufc_data[channel]->len - read_offset :
-                                 0;
+            uint32_t count = s->bufc_data[channel]->len > read_offset
+                                 ? s->bufc_data[channel]->len - read_offset
+                                 : 0;
             uint32_t threshold_flag =
                 efr32_register_get(s, EFR32_BUFC_BASE + EFR32_BUFC_IF) &
-                        (1u << (8 * channel + 2)) ?
-                    1u << 20 :
-                    0;
+                        (1u << (8 * channel + 2))
+                    ? 1u << 20
+                    : 0;
 
             return (count & 0x1fff) | threshold_flag;
         }
     }
     if (address == 0x4400003c)
         return 0x20; /* RADIOAES.STATUS WAITING */
-    if ((address & ~0xfffu) == 0x4c024000) {
+    if ((address & ~0xfffu) == 0x4c024000)
+    {
         uint32_t x = s->trng_state;
         x ^= x << 13;
         x ^= x >> 17;
@@ -377,12 +395,14 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address) {
     return efr32_register_get(s, address);
 }
 static uint64_t efr32_peripheral_read(Efr32Periph *s, uint32_t address,
-                                      unsigned size) {
+                                      unsigned size)
+{
     return extract32(efr32_peripheral_read_word(s, address & ~3u),
                      (address & 3) * 8, size * 8);
 }
 static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
-                                   uint64_t value, unsigned size) {
+                                   uint64_t value, unsigned size)
+{
     unsigned channel;
     uint32_t register_offset;
     uint32_t word = address & ~3u;
@@ -391,7 +411,8 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
              shift = (address & 3) * 8,
              mask = size == 4 ? UINT32_MAX : ((1u << (size * 8)) - 1) << shift,
              next = (old & ~mask) | (((uint32_t)value << shift) & mask);
-    switch ((address >> 12) & 3) {
+    switch ((address >> 12) & 3)
+    {
     case 1:
         next = old | next;
         break;
@@ -402,10 +423,12 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         next = old ^ next;
     }
 
-    if (register_address == EFR32_RAC_BASE + EFR32_RAC_CMD) {
+    if (register_address == EFR32_RAC_BASE + EFR32_RAC_CMD)
+    {
         if (next & (EFR32_RAC_CMD_TXDIS | EFR32_RAC_CMD_RXDIS))
             efr32_rac_set_state(s, EFR32_RAC_STATE_OFF);
-        else if (next & EFR32_RAC_CMD_TXEN) {
+        else if (next & EFR32_RAC_CMD_TXEN)
+        {
             efr32_rac_set_state(s, EFR32_RAC_STATE_TX);
             timer_mod(s->rac_tx_timer,
                       qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 150000);
@@ -413,11 +436,12 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         return;
     }
     if ((register_address & ~0x3fffu) == EFR32_BUFC_BASE &&
-        efr32_bufc_decode(register_address & 0xfff, &channel,
-                          &register_offset)) {
+        efr32_bufc_decode(register_address & 0xfff, &channel, &register_offset))
+    {
         uint32_t base = efr32_bufc_channel_base(channel);
 
-        switch (register_offset) {
+        switch (register_offset)
+        {
         case EFR32_BUFC_WRITEDATA:
             efr32_bufc_write_data(s, channel, next, false);
             return;
@@ -426,7 +450,8 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
             return;
         case EFR32_BUFC_CMD:
             efr32_register_put(s, register_address, next & 0xf);
-            if (next & 1) {
+            if (next & 1)
+            {
                 g_byte_array_set_size(s->bufc_data[channel], 0);
                 efr32_register_put(s, base + EFR32_BUFC_WRITEOFFSET, 0);
                 efr32_register_put(s, base + EFR32_BUFC_READOFFSET, 0);
@@ -443,12 +468,14 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
     if (register_address == EFR32_RAC_BASE + EFR32_RAC_IF ||
         register_address == EFR32_RAC_BASE + EFR32_RAC_IEN ||
         register_address == EFR32_RAC_BASE + EFR32_RAC_SEQIF ||
-        register_address == EFR32_RAC_BASE + EFR32_RAC_SEQIEN) {
+        register_address == EFR32_RAC_BASE + EFR32_RAC_SEQIEN)
+    {
         efr32_rac_update_irqs(s);
     }
 
     if (register_address == EFR32_BUFC_BASE + EFR32_BUFC_IF ||
-        register_address == EFR32_BUFC_BASE + EFR32_BUFC_IEN) {
+        register_address == EFR32_BUFC_BASE + EFR32_BUFC_IEN)
+    {
         efr32_bufc_update_irq(s);
     }
 
@@ -457,27 +484,32 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
                           &register_offset) &&
         (register_offset == 0 || register_offset == EFR32_BUFC_WRITEOFFSET ||
          register_offset == EFR32_BUFC_READOFFSET ||
-         register_offset == EFR32_BUFC_THRESHOLD)) {
+         register_offset == EFR32_BUFC_THRESHOLD))
+    {
         efr32_bufc_update_threshold(s, channel);
     }
 }
 static uint64_t efr32_peripheral_mmio_read(void *opaque, hwaddr offset,
-                                           unsigned size) {
+                                           unsigned size)
+{
     return efr32_peripheral_read(EFR32_PERIPH(opaque), PERIPH_BASE + offset,
                                  size);
 }
 static void efr32_peripheral_mmio_write(void *opaque, hwaddr offset,
-                                        uint64_t value, unsigned size) {
+                                        uint64_t value, unsigned size)
+{
     efr32_peripheral_write(EFR32_PERIPH(opaque), PERIPH_BASE + offset, value,
                            size);
 }
 static uint64_t efr32_radio_mmio_read(void *opaque, hwaddr offset,
-                                      unsigned size) {
+                                      unsigned size)
+{
     return efr32_peripheral_read(EFR32_PERIPH(opaque), RADIO_BASE + offset,
                                  size);
 }
 static void efr32_radio_mmio_write(void *opaque, hwaddr offset, uint64_t value,
-                                   unsigned size) {
+                                   unsigned size)
+{
     efr32_peripheral_write(EFR32_PERIPH(opaque), RADIO_BASE + offset, value,
                            size);
 }
@@ -491,13 +523,16 @@ static const MemoryRegionOps ro = {
     .write = efr32_radio_mmio_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = {.min_access_size = 1, .max_access_size = 4}};
-static void efr32_periph_init(Object *o) {
+static void efr32_periph_init(Object *o)
+{
     Efr32Periph *s = EFR32_PERIPH(o);
     s->registers = g_hash_table_new(g_direct_hash, g_direct_equal);
     s->trng_state = 0x2545f491;
     s->rac_state = EFR32_RAC_STATE_OFF;
-    s->rac_tx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_rac_tx_complete, s);
-    for (unsigned channel = 0; channel < G_N_ELEMENTS(s->bufc_data); channel++) {
+    s->rac_tx_timer =
+        timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_rac_tx_complete, s);
+    for (unsigned channel = 0; channel < G_N_ELEMENTS(s->bufc_data); channel++)
+    {
         s->bufc_data[channel] = g_byte_array_new();
     }
     memory_region_init_io(&s->peripheral_mmio, o, &po, s, "efr32bg22-periph",
@@ -506,24 +541,29 @@ static void efr32_periph_init(Object *o) {
                           RADIO_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(o), &s->peripheral_mmio);
     sysbus_init_mmio(SYS_BUS_DEVICE(o), &s->radio_mmio);
-    for (unsigned irq = 0; irq < G_N_ELEMENTS(s->irq); irq++) {
+    for (unsigned irq = 0; irq < G_N_ELEMENTS(s->irq); irq++)
+    {
         sysbus_init_irq(SYS_BUS_DEVICE(o), &s->irq[irq]);
     }
 }
-static void efr32_periph_reset_hold(Object *o, ResetType t) {
+static void efr32_periph_reset_hold(Object *o, ResetType t)
+{
     Efr32Periph *s = EFR32_PERIPH(o);
     g_hash_table_remove_all(s->registers);
     s->trng_state = 0x2545f491;
     s->rac_state = EFR32_RAC_STATE_OFF;
     timer_del(s->rac_tx_timer);
-    for (unsigned irq = 0; irq < G_N_ELEMENTS(s->irq); irq++) {
+    for (unsigned irq = 0; irq < G_N_ELEMENTS(s->irq); irq++)
+    {
         qemu_set_irq(s->irq[irq], 0);
     }
-    for (unsigned channel = 0; channel < G_N_ELEMENTS(s->bufc_data); channel++) {
+    for (unsigned channel = 0; channel < G_N_ELEMENTS(s->bufc_data); channel++)
+    {
         g_byte_array_set_size(s->bufc_data[channel], 0);
     }
 }
-static void efr32_periph_class_init(ObjectClass *o, void *d) {
+static void efr32_periph_class_init(ObjectClass *o, void *d)
+{
     RESETTABLE_CLASS(o)->phases.hold = efr32_periph_reset_hold;
 }
 static const TypeInfo periph_info = {.name = TYPE_EFR32_PERIPH,
@@ -532,7 +572,8 @@ static const TypeInfo periph_info = {.name = TYPE_EFR32_PERIPH,
                                      .instance_init = efr32_periph_init,
                                      .class_init = efr32_periph_class_init};
 
-struct Efr32State {
+struct Efr32State
+{
     MachineState parent_obj;
     ARMv7MState armv7m;
     MemoryRegion flash, sram;
@@ -560,7 +601,8 @@ static void efr32_initialize_devinfo(MemoryRegion *devinfo)
     memcpy(contents + 0x804c, &value, sizeof(value));
 }
 
-static void init(MachineState *m) {
+static void init(MachineState *m)
+{
     Efr32State *s = EFR32BG22_MACHINE(m);
     DeviceState *nvic, *p;
     MemoryRegion *sm = get_system_memory(), *alias = g_new(MemoryRegion, 1),
@@ -588,7 +630,8 @@ static void init(MachineState *m) {
     sysbus_realize_and_unref(SYS_BUS_DEVICE(p), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(p), 0, PERIPH_BASE);
     sysbus_mmio_map(SYS_BUS_DEVICE(p), 1, RADIO_BASE);
-    for (unsigned irq = 0; irq < 64; irq++) {
+    for (unsigned irq = 0; irq < 64; irq++)
+    {
         sysbus_connect_irq(SYS_BUS_DEVICE(p), irq, qdev_get_gpio_in(nvic, irq));
     }
     memory_region_init_alias(alias, NULL, "radio-ns",
@@ -602,10 +645,12 @@ static void init(MachineState *m) {
     memory_region_init_ram(di, NULL, "efr32.devinfo", 0x10000, &error_fatal);
     memory_region_add_subregion(sm, 0x0fe00000, di);
     efr32_initialize_devinfo(di);
-    if (s->image) {
+    if (s->image)
+    {
         gchar *d;
         gsize n;
-        if (!g_file_get_contents(s->image, &d, &n, NULL) || n > FLASH_SIZE) {
+        if (!g_file_get_contents(s->image, &d, &n, NULL) || n > FLASH_SIZE)
+        {
             error_report("efr32bg22: cannot load flash image %s", s->image);
             exit(EXIT_FAILURE);
         }
@@ -615,21 +660,25 @@ static void init(MachineState *m) {
     qemu_register_reset(cpu_reset_cb, ARM_CPU(first_cpu));
 }
 static void idau(IDAUInterface *i, uint32_t a, int *r, bool *e, bool *n,
-                 bool *c) {
+                 bool *c)
+{
     *r = extract32(a, 28, 4);
     *e = (a & 0xeff00000) == 0xe0000000;
     *n = *r == 5 || *r == 0xb;
     *c = false;
 }
-static char *image_get(Object *o, Error **e) {
+static char *image_get(Object *o, Error **e)
+{
     return g_strdup(EFR32BG22_MACHINE(o)->image);
 }
-static void image_set(Object *o, const char *v, Error **e) {
+static void image_set(Object *o, const char *v, Error **e)
+{
     Efr32State *s = EFR32BG22_MACHINE(o);
     g_free(s->image);
     s->image = g_strdup(v);
 }
-static void mc(ObjectClass *o, void *d) {
+static void mc(ObjectClass *o, void *d)
+{
     MachineClass *m = MACHINE_CLASS(o);
     IDAUInterfaceClass *i = IDAU_INTERFACE_CLASS(o);
     static const char *const cpu[] = {ARM_CPU_TYPE_NAME("cortex-m33"), NULL};
@@ -648,7 +697,8 @@ static const TypeInfo machine_info = {
     .instance_size = sizeof(Efr32State),
     .class_init = mc,
     .interfaces = (InterfaceInfo[]){{TYPE_IDAU_INTERFACE}, {}}};
-static void register_types(void) {
+static void register_types(void)
+{
     type_register_static(&periph_info);
     type_register_static(&machine_info);
 }
