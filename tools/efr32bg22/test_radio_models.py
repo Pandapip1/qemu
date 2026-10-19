@@ -143,6 +143,17 @@ class FrcTests(unittest.TestCase):
         self.assertEqual(dev.read(dev.WHITEPOLY), 0x0000ABCD)
         self.assertEqual(dev.read(dev.WHITEINIT), 0x00001234)
 
+    def test_public_ble_frame_configuration_masks(self):
+        _, dev = attach(models.FRC("FRC"))
+        dev.write(dev.MAXLENGTH, 0xFFFF4101)
+        dev.write(dev.CTRL, 0xFFFF07A0)
+        for off in (dev.FCD0, dev.FCD1, dev.FCD2, dev.FCD3):
+            dev.write(off, 0xFFFF4CFF)
+        self.assertEqual(dev.read(dev.MAXLENGTH), 0x00004101)
+        self.assertEqual(dev.read(dev.CTRL), 0x001F07A0)
+        for off in (dev.FCD0, dev.FCD1, dev.FCD2, dev.FCD3):
+            self.assertEqual(dev.read(off), 0x00014CFF)
+
 
 class ModemTests(unittest.TestCase):
     def test_public_sync0_is_a_32_bit_configuration_register(self):

@@ -466,17 +466,26 @@ class RFCRC(Dev):
 
 
 class FRC(Dev):
-    """Public xG22 FRC whitening configuration registers.
+    """Public xG22 FRC BLE configuration registers.
 
     The packet pipeline, including applying the whitening LFSR, belongs to
     FRC/SEQ behavior and is deliberately not modelled here.  Retaining these
     public register masks makes the source-backed BLE setup observable.
     """
+    MAXLENGTH = 0x010
     WHITECTRL, WHITEPOLY, WHITEINIT = 0x030, 0x034, 0x038
+    CTRL = 0x048
+    FCD0, FCD1, FCD2, FCD3 = 0x104, 0x108, 0x10C, 0x110
     MASKS = {
+        MAXLENGTH: 0x0000FFFF,
         WHITECTRL: 0x00001F7F,
         WHITEPOLY: 0x0000FFFF,
         WHITEINIT: 0x0000FFFF,
+        CTRL: 0x001F3FF7,
+        FCD0: 0x0001FFFF,
+        FCD1: 0x0001FFFF,
+        FCD2: 0x0001FFFF,
+        FCD3: 0x0001FFFF,
     }
 
     def write(self, off, val):
