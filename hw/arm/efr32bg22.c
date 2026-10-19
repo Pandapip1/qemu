@@ -249,11 +249,22 @@ static uint32_t efr32_bufc_channel_base(unsigned channel)
     return EFR32_BUFC_BASE + EFR32_BUFC_FIRST + channel * EFR32_BUFC_STRIDE;
 }
 
+static uint32_t efr32_bufc_count(Efr32Periph *s, unsigned channel)
+{
+    uint32_t base = efr32_bufc_channel_base(channel);
+    uint32_t write_offset =
+        efr32_register_get(s, base + EFR32_BUFC_WRITEOFFSET) & 0x1fff;
+    uint32_t read_offset =
+        efr32_register_get(s, base + EFR32_BUFC_READOFFSET) & 0x1fff;
+
+    return (write_offset - read_offset) & 0x1fff;
+}
+
 static void efr32_bufc_update_threshold(Efr32Periph *s, unsigned channel)
 {
     uint32_t base = efr32_bufc_channel_base(channel);
     uint32_t config = efr32_register_get(s, base + EFR32_BUFC_THRESHOLD);
-    uint32_t count = s->bufc_data[channel]->len;
+    uint32_t count = efr32_bufc_count(s, channel);
     uint32_t threshold = config & 0xfff;
     uint32_t flag = 1u << (8 * channel + 2);
     bool hit = config & 0x2000 ? count <= threshold : count > threshold;
@@ -469,11 +480,7 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
         }
         if (register_offset == EFR32_BUFC_STATUS)
         {
-            uint32_t read_offset =
-                efr32_register_get(s, base + EFR32_BUFC_READOFFSET) & 0x1fff;
-            uint32_t count = s->bufc_data[channel]->len > read_offset
-                                 ? s->bufc_data[channel]->len - read_offset
-                                 : 0;
+            uint32_t count = efr32_bufc_count(s, channel);
             uint32_t threshold_flag =
                 efr32_register_get(s, EFR32_BUFC_BASE + EFR32_BUFC_IF) &
                         (1u << (8 * channel + 2))

@@ -237,6 +237,7 @@ static void test_bufc_tx_fifo_setup_latches(void)
     g_assert_cmphex(readl(channel), ==, 3);
     g_assert_cmphex(readl(channel + 0x004), ==, 0x20001000);
     g_assert_cmphex(readl(channel + BUFC_CMD), ==, 2);
+    g_assert_cmphex(readl(channel + BUFC_STATUS), ==, 18 | (1u << 20));
 }
 
 static void test_bufc_rx_fifo_setup_latches(void)
