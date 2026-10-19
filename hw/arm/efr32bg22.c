@@ -40,6 +40,7 @@
 #include "sysemu/sysemu.h"
 #include "exec/address-spaces.h"
 #include "target/arm/idau.h"
+#include "target/arm/cpu.h"
 
 #define TYPE_OWO_BRIDGE "owo-mmio-bridge"
 OBJECT_DECLARE_SIMPLE_TYPE(OwoBridge, OWO_BRIDGE)
@@ -55,7 +56,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(OwoBridge, OWO_BRIDGE)
 typedef struct __attribute__((packed)) {
     uint8_t op, size;
     uint16_t pad0;
-    uint32_t addr, value, pad1;
+    uint32_t addr, value, pc;
     uint64_t now_ns;
 } BridgeReq;
 
@@ -75,6 +76,9 @@ struct OwoBridge {
     qemu_irq irq[NUM_IRQ];
     QEMUTimer *timer;
     uint64_t irq_mask;
+    bool wdog_valid[2];
+    uint32_t wdog_val[2];
+    int64_t wdog_last_cmd;
 };
 
 static void bridge_apply(OwoBridge *s, const BridgeRep *r)
@@ -99,6 +103,7 @@ static uint32_t bridge_xfer(OwoBridge *s, uint8_t op, hwaddr addr,
 {
     BridgeReq q = { .op = op, .size = size, .addr = addr,
                     .value = val,
+                    .pc = first_cpu ? ARM_CPU(first_cpu)->env.regs[15] : 0,
                     .now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) };
     BridgeRep r;
 
@@ -131,8 +136,40 @@ static uint32_t bridge_xfer(OwoBridge *s, uint8_t op, hwaddr addr,
     return r.value;
 }
 
+/*
+ * Fast path for the watchdog: the stock firmware's main loop spins in WDOG_Feed (read EN,
+ * read SYNCBUSY, write CMD) millions of times, and each access would be a round trip to the
+ * peripheral server. EN and SYNCBUSY only change through writes other than CMD, so reads
+ * of them are cached until such a write; CMD writes are forwarded at most every 500 us of
+ * virtual time (the watchdog period is milliseconds).
+ */
+#define WDOG_BASE 0x4A018000u
+#define WDOG_NS_BIT 0x10000000u
+
+static bool wdog_reg(hwaddr a, unsigned *reg)
+{
+    uint32_t x = (uint32_t)a + BRIDGE_BASE;
+    x &= ~WDOG_NS_BIT;
+    if (x < WDOG_BASE || x >= WDOG_BASE + 0x4000) {
+        return false;
+    }
+    *reg = (x - WDOG_BASE) & 0xFFF;
+    return true;
+}
+
 static uint64_t bridge_read(void *opaque, hwaddr addr, unsigned size)
 {
+    OwoBridge *s = opaque;
+    unsigned reg;
+
+    if (wdog_reg(addr, &reg) && (reg == 0x04 || reg == 0x24)) {
+        int i = reg == 0x04 ? 0 : 1;
+        if (!s->wdog_valid[i]) {
+            s->wdog_val[i] = bridge_xfer(s, 0, addr + BRIDGE_BASE, 0, size);
+            s->wdog_valid[i] = true;
+        }
+        return s->wdog_val[i];
+    }
     return bridge_xfer(opaque, 0, addr + BRIDGE_BASE, 0, size);
 }
 
@@ -150,6 +187,21 @@ static void bridge_write_radio(void *opaque, hwaddr addr, uint64_t val,
 static void bridge_write(void *opaque, hwaddr addr, uint64_t val,
                          unsigned size)
 {
+    OwoBridge *s = opaque;
+    unsigned reg;
+
+    if (wdog_reg(addr, &reg)) {
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+        if (reg == 0x0C) {
+            if (now - s->wdog_last_cmd < 500000 && s->wdog_last_cmd) {
+                return;
+            }
+            s->wdog_last_cmd = now;
+        } else {
+            s->wdog_valid[0] = s->wdog_valid[1] = false;
+        }
+    }
     bridge_xfer(opaque, 1, addr + BRIDGE_BASE, val, size);
 }
 
@@ -202,6 +254,8 @@ static void bridge_reset_hold(Object *obj, ResetType type)
     OwoBridge *s = OWO_BRIDGE(obj);
 
     s->irq_mask = 0;
+    s->wdog_valid[0] = s->wdog_valid[1] = false;
+    s->wdog_last_cmd = 0;
     if (s->timer) {
         timer_del(s->timer);
     }

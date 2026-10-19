@@ -498,6 +498,7 @@ class Timer(IrqDev):
         self.t0 = 0
         self.out = [0, 0, 0]
         self.gen = 0
+        self.pending = []
 
     # time base ---------------------------------------------------------
     def tick_hz(self):
@@ -601,16 +602,17 @@ class Timer(IrqDev):
         ev = self.edge_times()
         if ev:
             t = ev[0][0]
+            self.pending = [e for e in ev if e[0] <= t + 1]
             self.m.at(int(t) + 1, lambda: self.fire(gen))
 
     def fire(self, gen):
         if gen != self.gen or not self.running:
             return
         now = self.m.now
-        # re-anchor at the event so cnt wrapping stays exact
-        for t, kind, n in self.edge_times():
-            if t > now + 1:
-                break
+        pend, self.pending = self.pending, []
+        # re-anchor so the counter stays exact across the wrap
+        self.cnt0, self.t0 = self.count(), now
+        for t, kind, n in pend:
             if kind == "of":
                 self.raise_if(self.OF)
                 for c in range(3):
@@ -778,6 +780,8 @@ class WDOG(IrqDev):
             if gen != self.gen:
                 return
             self.m.wdog_expired = self.m.now
+            import sys
+            print('WDOG expired t=%d lastpc=%08x recent=%s' % (self.m.now, self.m.pc, ['%08x:%s' % x for x in list(self.m.recent)]), file=sys.stderr)
             if not self.regs.get(0x08, 0) & 0x100:        # WDOGRSTDIS clear -> reset
                 self.m.reset_cause_next = self.CAUSE
                 self.m.request_reset()
@@ -796,23 +800,67 @@ class WDOG(IrqDev):
         return 0
 
 
-class RTCC(Dev):
-    """Free-running 32.768 kHz counter, started by CMD.START."""
+class RTCC(IrqDev):
+    """Real-time counter + 3 compare channels (efr32bg22_rtcc.h).  Counts the 32768 Hz LF clock
+    divided by CFG.CNTPRESC once CMD.START has run.  CC[n] in output-compare mode (CTRL.MODE=2)
+    sets IF.CCn (bit 4+2n) when CNT reaches OCVALUE; wrapping raises IF.OF (bit 0).  IRQ: RTCC."""
+    IF_OFF, IEN_OFF = 0x14, 0x18
+    irq_name = "RTCC"
+
     def __init__(self, name):
         super().__init__(name)
         self.t0 = None
         self.base = 0
+        self.gen = 0
+
+    def hz(self):
+        return 32768 >> ((self.regs.get(0x08, 0) >> 4) & 0xF)
 
     def cnt(self):
         if self.t0 is None:
             return self.base
-        return (self.base + ((self.m.now - self.t0) * 32768) // 1_000_000_000) & 0xFFFFFFFF
+        return (self.base + ((self.m.now - self.t0) * self.hz()) // 1_000_000_000) & 0xFFFFFFFF
+
+    def reschedule(self):
+        self.gen += 1
+        gen = self.gen
+        if self.t0 is None or not self.regs.get(0x04, 0) & 1:
+            return
+        cur = self.cnt()
+        best = None
+        for n in range(3):
+            if (self.regs.get(0x30 + 12 * n, 0) & 3) == 2:             # CC[n].CTRL.MODE = output compare
+                d = (self.regs.get(0x34 + 12 * n, 0) - cur) & 0xFFFFFFFF
+                if d == 0:
+                    d = 0x100000000                                     # already matched: next lap
+                if best is None or d < best[0]:
+                    best = (d, n)
+        d_ovf = 0x100000000 - cur
+        if best is None or d_ovf < best[0]:
+            best = (d_ovf, -1)
+        d, n = best
+        when = self.m.now + (d * 1_000_000_000 + self.hz() - 1) // self.hz() + 1
+        def fire():
+            if gen != self.gen:
+                return
+            if n < 0:
+                self.raise_if(1)
+            else:
+                self.raise_if(1 << (4 + 2 * n))
+            self.reschedule()
+        self.m.at(when, fire)
+
+    def write(self, off, val):
+        super().write(off, val)
+        if off in (0x04, 0x08) or 0x30 <= off < 0x54:
+            self.reschedule()
 
     def w_00c(self, v):
         if v & 1 and self.t0 is None and self.regs.get(0x04, 0) & 1:
             self.t0 = self.m.now
         if v & 2 and self.t0 is not None:
             self.base, self.t0 = self.cnt(), None
+        self.reschedule()
 
     def r_020(self):
         return self.cnt()

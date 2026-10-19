@@ -16,9 +16,13 @@ class Machine:
         self.devs = []            # (base, size, dev)
         self.irq = 0              # NVIC line levels, bit n = IRQ n
         self.now = 0
+        self.pc = 0
+        self.pchist = collections.Counter()
+        self.recent = collections.deque(maxlen=12)
         self.events = []          # heap of (when_ns, seq, callback)
         self.seq = 0
         self.trace = trace
+        self.notrace = set(os.environ.get('NOTRACE', 'WDOG0').split(','))
         self.seen = collections.Counter()
         self.unknown = collections.Counter()
         self.pinlog = []
@@ -110,8 +114,8 @@ class Machine:
                       file=sys.stderr, flush=True)
                 if self.exit_on_stuck:
                     os._exit(3)
-            if self.trace:
-                print(f"{self.now:>12} R {name}+{off:03x} = {r:08x}", file=sys.stderr)
+            if self.trace and name not in self.notrace:
+                print(f"{self.now:>12} {self.pc:08x} R {name}+{off:03x} = {r:08x}", file=sys.stderr)
             return r
         if alias:
             cur = dev.read(off, 4)
@@ -121,8 +125,8 @@ class Machine:
             sh = (addr & 3) * 8
             msk = ((1 << (size * 8)) - 1) << sh
             val = (dev.read(off & ~3, 4) & ~msk) | ((val << sh) & msk)
-        if self.trace:
-            print(f"{self.now:>12} W {name}+{off:03x} <- {val:08x}", file=sys.stderr)
+        if self.trace and name not in self.notrace:
+            print(f"{self.now:>12} {self.pc:08x} W {name}+{off:03x} <- {val:08x}", file=sys.stderr)
         dev.write(off & ~3, val)
         return 0
 
@@ -144,9 +148,11 @@ def serve(m, path):
                 return
             buf += d
         while len(buf) >= REQ.size:
-            op, size, _, addr, val, _, now = REQ.unpack(buf[:REQ.size])
+            op, size, _, addr, val, pc, now = REQ.unpack(buf[:REQ.size])
             buf = buf[REQ.size:]
-            m.now = now
+            m.now, m.pc = now, pc
+            m.pchist[pc] += 1
+            m.recent.append((pc, '%s@%x' % ('RW'[op & 1] if op < 2 else 'T', addr)))
             m.run_events()
             if op == 3:
                 m.reset()
@@ -176,6 +182,8 @@ def main():
     try:
         serve(m, a.sock)
     finally:
+        for pc_, n_ in m.pchist.most_common(25):
+            print('PCHIST %08x %d' % (pc_, n_), file=sys.stderr)
         for t_ns, pin, lv in m.pinlog:
             print("PIN %12d %s %s" % (t_ns, pin, lv), file=sys.stderr)
         for t_ns, dev, tx, rx in m.spilog:
