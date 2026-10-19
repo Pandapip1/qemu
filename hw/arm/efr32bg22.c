@@ -111,6 +111,14 @@ static uint32_t efr32_register_get(Efr32Periph *s, uint32_t address);
 static void efr32_register_put(Efr32Periph *s, uint32_t address,
                                uint32_t value);
 
+static void efr32_agc_update_irq(Efr32Periph *s)
+{
+    uint32_t pending = efr32_register_get(s, EFR32_AGC_BASE + EFR32_AGC_IF);
+    uint32_t enabled = efr32_register_get(s, EFR32_AGC_BASE + EFR32_AGC_IEN);
+
+    qemu_set_irq(s->irq[31], !!(pending & enabled));
+}
+
 static void efr32_bufc_update_irq(Efr32Periph *s)
 {
     uint32_t pending = efr32_register_get(s, EFR32_BUFC_BASE + EFR32_BUFC_IF);
@@ -611,6 +619,12 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         register_address == EFR32_FRC_BASE + EFR32_FRC_IEN)
     {
         efr32_frc_update_irq(s);
+    }
+
+    if (register_address == EFR32_AGC_BASE + EFR32_AGC_IF ||
+        register_address == EFR32_AGC_BASE + EFR32_AGC_IEN)
+    {
+        efr32_agc_update_irq(s);
     }
 
     if ((register_address & ~0x3fffu) == EFR32_BUFC_BASE &&
