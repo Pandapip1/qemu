@@ -106,6 +106,13 @@ class RacTests(unittest.TestCase):
         dev.write(dev.CMD, dev.CMD_RXDIS)
         self.assertEqual((dev.read(dev.STATUS) >> 24) & 0xF, dev.STATEOFF)
 
+    def test_separate_disable_commands_leave_rac_off(self):
+        _, dev = attach(models.RAC("RAC"))
+        dev.write(dev.CMD, dev.CMD_FORCETX)
+        dev.write(dev.CMD, dev.CMD_TXDIS)
+        dev.write(dev.CMD, dev.CMD_RXDIS)
+        self.assertEqual((dev.read(dev.STATUS) >> 24) & 0xF, dev.STATEOFF)
+
     def test_rsm_and_seq_interrupts_are_distinct(self):
         machine, dev = attach(models.RAC("RAC"))
         dev.write(dev.IEN_OFF, dev.IF_STATECHANGE)
