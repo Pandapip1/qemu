@@ -113,6 +113,15 @@ class RacTests(unittest.TestCase):
         dev.write(dev.CMD, dev.CMD_RXDIS)
         self.assertEqual((dev.read(dev.STATUS) >> 24) & 0xF, dev.STATEOFF)
 
+    def test_stock_rx_disable_then_tx_disable_leaves_rac_off(self):
+        """stock radio trace lines 201 and 208: RXDIS, then TXDIS."""
+        _, dev = attach(models.RAC("RAC"))
+        dev.write(dev.CMD, dev.CMD_FORCETX)
+        dev.write(dev.CMD, dev.CMD_RXDIS)
+        self.assertEqual((dev.read(dev.STATUS) >> 24) & 0xF, dev.STATEOFF)
+        dev.write(dev.CMD, dev.CMD_TXDIS)
+        self.assertEqual((dev.read(dev.STATUS) >> 24) & 0xF, dev.STATEOFF)
+
     def test_rsm_and_seq_interrupts_are_distinct(self):
         machine, dev = attach(models.RAC("RAC"))
         dev.write(dev.IEN_OFF, dev.IF_STATECHANGE)
