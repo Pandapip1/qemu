@@ -33,6 +33,23 @@ class Fallback(Dev):
         super().__init__("?")
 
 
+class SyncFallback(Fallback):
+    """Unmodelled block whose register at +0x40 is a self-clearing busy flag.  Inferred
+    from the stock firmware (0x199ea..0x199f4 sets bit 0 via the SET alias and spins until
+    it reads 0), not from documentation: the radio register headers are not public."""
+    def r_040(self):
+        return 0
+
+
+SYNC_BLOCKS = (0xA8028000, 0xA802C000)
+
+
+def fallback_for(m, base):
+    d = SyncFallback() if base in SYNC_BLOCKS else Fallback()
+    d.m = m
+    return d
+
+
 class DCDC(Dev):
     """IPVERSION 0, EN 4, CTRL 8 (MODE bit0), IF 0x24, STATUS 0x2C."""
     BYPSW, WARM, RUNNING, REGULATION = 1, 2, 4, 0x20
@@ -946,6 +963,14 @@ class IADC(IrqDev):
         return self.last
 
 def build(m, reset=False, cause=1):
+    # USERDATA/CHIPCONFIG read as erased flash; DEVINFO: only what is known from the
+    # datasheet (sizes) plus a made-up, obviously fake EUI-64. Calibration words are zero.
+    import struct
+    m.guest_write(0x0FE00000, b"\xff" * 0x8000)
+    dev = bytearray(0x2000)
+    struct.pack_into("<I", dev, 0x0C, 512 | (32 << 16))           # MSIZE: flash KiB, SRAM KiB
+    struct.pack_into("<II", dev, 0x48, 0x0000BEEF, 0x00000A00)    # EUI64L/H (fake)
+    m.guest_write(0x0FE08000, bytes(dev))
     m.reset_cause = cause
     m.devs = []
     m.fallback = Fallback()

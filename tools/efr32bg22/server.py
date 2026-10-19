@@ -26,6 +26,7 @@ class Machine:
         self.reset_requested = False
         self.resets = 0
         self.pin_watchers = {}
+        self.fallbacks = {}
         self.spilog, self.spi_slaves = [], {}
         self.adc_inputs, self.adc_log = {}, []
         self.reset_cause_next = 0x40
@@ -82,7 +83,7 @@ class Machine:
 
     # -- bus -------------------------------------------------------------
     def find(self, addr):
-        a = (addr & ~0x10000000) if 0x50000000 <= addr < 0x60000000 else addr
+        a = (addr & ~0x10000000) if (0x50000000 <= addr < 0x60000000 or 0xB8000000 <= addr < 0xBC000000) else addr
         for base, size, dev in self.devs:
             if base <= a < base + size:
                 return dev, a - base
@@ -95,7 +96,10 @@ class Machine:
         off &= 0xFFF
         if dev is None:
             self.unknown[name] += 1
-            dev = self.fallback
+            dev = self.fallbacks.get(name)
+            if dev is None:
+                import models
+                dev = self.fallbacks[name] = models.fallback_for(self, addr & ~0x3FFF)
         if op == 0:
             r = dev.read(off, size)
             key = (addr, r)

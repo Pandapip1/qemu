@@ -46,6 +46,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(OwoBridge, OWO_BRIDGE)
 
 #define BRIDGE_BASE 0x40000000
 #define BRIDGE_SIZE 0x20000000
+#define RADIO_BASE  0xA8000000
+#define RADIO_SIZE  0x04000000
 #define NUM_IRQ     64
 #define FLASH_SIZE  (512 * 1024)
 #define SRAM_SIZE   (32 * 1024)
@@ -68,6 +70,7 @@ typedef struct __attribute__((packed)) {
 struct OwoBridge {
     SysBusDevice parent_obj;
     MemoryRegion mmio;
+    MemoryRegion mmio_radio;     /* 0xA8000000.. (radio and friends) */
     CharBackend chr;
     qemu_irq irq[NUM_IRQ];
     QEMUTimer *timer;
@@ -94,7 +97,7 @@ static void bridge_apply(OwoBridge *s, const BridgeRep *r)
 static uint32_t bridge_xfer(OwoBridge *s, uint8_t op, hwaddr addr,
                             uint32_t val, unsigned size)
 {
-    BridgeReq q = { .op = op, .size = size, .addr = addr + BRIDGE_BASE,
+    BridgeReq q = { .op = op, .size = size, .addr = addr,
                     .value = val,
                     .now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) };
     BridgeRep r;
@@ -130,13 +133,24 @@ static uint32_t bridge_xfer(OwoBridge *s, uint8_t op, hwaddr addr,
 
 static uint64_t bridge_read(void *opaque, hwaddr addr, unsigned size)
 {
-    return bridge_xfer(opaque, 0, addr, 0, size);
+    return bridge_xfer(opaque, 0, addr + BRIDGE_BASE, 0, size);
+}
+
+static uint64_t bridge_read_radio(void *opaque, hwaddr addr, unsigned size)
+{
+    return bridge_xfer(opaque, 0, addr + RADIO_BASE, 0, size);
+}
+
+static void bridge_write_radio(void *opaque, hwaddr addr, uint64_t val,
+                               unsigned size)
+{
+    bridge_xfer(opaque, 1, addr + RADIO_BASE, val, size);
 }
 
 static void bridge_write(void *opaque, hwaddr addr, uint64_t val,
                          unsigned size)
 {
-    bridge_xfer(opaque, 1, addr, val, size);
+    bridge_xfer(opaque, 1, addr + BRIDGE_BASE, val, size);
 }
 
 static void bridge_tick(void *opaque)
@@ -152,6 +166,14 @@ static const MemoryRegionOps bridge_ops = {
     .valid.max_access_size = 4,
 };
 
+static const MemoryRegionOps bridge_radio_ops = {
+    .read = bridge_read_radio,
+    .write = bridge_write_radio,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
 static void bridge_init(Object *obj)
 {
     OwoBridge *s = OWO_BRIDGE(obj);
@@ -159,6 +181,9 @@ static void bridge_init(Object *obj)
     memory_region_init_io(&s->mmio, obj, &bridge_ops, s, "efr32bg22-periph",
                           BRIDGE_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
+    memory_region_init_io(&s->mmio_radio, obj, &bridge_radio_ops, s,
+                          "efr32bg22-radio", RADIO_SIZE);
+    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio_radio);
     for (int i = 0; i < NUM_IRQ; i++) {
         sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq[i]);
     }
@@ -269,6 +294,28 @@ static void efr32_init(MachineState *machine)
     qdev_prop_set_chr(br, "chardev", chr);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(br), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(br), 0, BRIDGE_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(br), 1, RADIO_BASE);
+    {   /* Non-secure alias of the radio block, and the radio RAMs */
+        MemoryRegion *sm = get_system_memory();
+        MemoryRegion *ra = g_new(MemoryRegion, 1);
+        MemoryRegion *radio_ram = g_new(MemoryRegion, 1);
+        MemoryRegion *radio_ram_ns = g_new(MemoryRegion, 1);
+        MemoryRegion *devinfo = g_new(MemoryRegion, 1);
+        SysBusDevice *sbd = SYS_BUS_DEVICE(br);
+
+        memory_region_init_alias(ra, NULL, "radio-ns", sysbus_mmio_get_region(sbd, 1),
+                                 0, RADIO_SIZE);
+        memory_region_add_subregion(sm, 0xB8000000, ra);
+        /* SEQRAM (16K) + FRCRAM (16K) */
+        memory_region_init_ram(radio_ram, NULL, "efr32.radioram", 0x8000, &error_fatal);
+        memory_region_add_subregion(sm, 0xA0000000, radio_ram);
+        memory_region_init_alias(radio_ram_ns, NULL, "efr32.radioram-ns", radio_ram,
+                                 0, 0x8000);
+        memory_region_add_subregion(sm, 0xB0000000, radio_ram_ns);
+        /* USERDATA / DEVINFO / CHIPCONFIG (populated by the server at reset) */
+        memory_region_init_ram(devinfo, NULL, "efr32.devinfo", 0x10000, &error_fatal);
+        memory_region_add_subregion(sm, 0x0FE00000, devinfo);
+    }
     for (int i = 0; i < NUM_IRQ; i++) {
         sysbus_connect_irq(SYS_BUS_DEVICE(br), i, qdev_get_gpio_in(nvic, i));
     }
