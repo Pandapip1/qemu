@@ -38,6 +38,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_PROTIMER_BASE 0xa801c000u
 #define EFR32_RAC_BASE 0xa8020000u
 
+#define EFR32_FRC_IF 0x068u
+#define EFR32_FRC_IEN 0x06cu
+
 #define EFR32_RAC_STATUS 0x00cu
 #define EFR32_RAC_CMD 0x010u
 #define EFR32_RAC_IF 0x01cu
@@ -103,6 +106,14 @@ static void efr32_bufc_update_irq(Efr32Periph *s)
     uint32_t enabled = efr32_register_get(s, EFR32_BUFC_BASE + EFR32_BUFC_IEN);
 
     qemu_set_irq(s->irq[32], !!(pending & enabled));
+}
+
+static void efr32_frc_update_irq(Efr32Periph *s)
+{
+    uint32_t pending = efr32_register_get(s, EFR32_FRC_BASE + EFR32_FRC_IF);
+    uint32_t enabled = efr32_register_get(s, EFR32_FRC_BASE + EFR32_FRC_IEN);
+
+    qemu_set_irq(s->irq[34], !!(pending & enabled));
 }
 
 typedef struct Efr32RegisterMask
@@ -505,6 +516,12 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         register_address == EFR32_BUFC_BASE + EFR32_BUFC_IEN)
     {
         efr32_bufc_update_irq(s);
+    }
+
+    if (register_address == EFR32_FRC_BASE + EFR32_FRC_IF ||
+        register_address == EFR32_FRC_BASE + EFR32_FRC_IEN)
+    {
+        efr32_frc_update_irq(s);
     }
 
     if ((register_address & ~0x3fffu) == EFR32_BUFC_BASE &&
