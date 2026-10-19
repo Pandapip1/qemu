@@ -38,11 +38,13 @@
 #define BUFC_CH1             0x04c
 #define BUFC_IF              0x114
 #define BUFC_IEN             0x118
+#define BUFC_WRITEOFFSET     0x008
 #define BUFC_READOFFSET      0x00c
 #define BUFC_READDATA        0x014
 #define BUFC_WRITEDATA       0x018
 #define BUFC_STATUS          0x020
 #define BUFC_THRESHOLD       0x024
+#define BUFC_CMD             0x028
 
 #define RADIO_NONSECURE_ALIAS 0x10000000
 
@@ -124,6 +126,27 @@ static void test_bufc_data_port(void)
     g_assert_cmphex(readl(channel + BUFC_READDATA), ==, 0xa5);
 }
 
+static void test_bufc_tx_fifo_setup_latches(void)
+{
+    uint32_t channel = BUFC_BASE + BUFC_CH0;
+
+    /* Values and command sequence observed in rfhal_bufc.o. */
+    writel(channel, 0x400);
+    writel(channel + 0x004, 0x20001000);
+    writel(channel + BUFC_WRITEOFFSET, 18);
+
+    g_assert_cmphex(readl(channel), ==, 0x400);
+    g_assert_cmphex(readl(channel + 0x004), ==, 0x20001000);
+    g_assert_cmphex(readl(channel + BUFC_WRITEOFFSET), ==, 18);
+
+    writel(channel + BUFC_CMD, 1);
+    writel(channel + BUFC_CMD, 2);
+
+    g_assert_cmphex(readl(channel), ==, 0x400);
+    g_assert_cmphex(readl(channel + 0x004), ==, 0x20001000);
+    g_assert_cmphex(readl(channel + BUFC_CMD), ==, 2);
+}
+
 static void test_bufc_sparse_threshold_flag(void)
 {
     uint32_t channel = BUFC_BASE + BUFC_CH1;
@@ -189,6 +212,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/radio-nonsecure-alias",
                    test_radio_nonsecure_alias);
     qtest_add_func("/efr32bg22/bufc-data-port", test_bufc_data_port);
+    qtest_add_func("/efr32bg22/bufc-tx-fifo-setup-latches",
+                   test_bufc_tx_fifo_setup_latches);
     qtest_add_func("/efr32bg22/bufc-sparse-threshold-flag",
                    test_bufc_sparse_threshold_flag);
     qtest_add_func("/efr32bg22/protimer-trace-latches",
