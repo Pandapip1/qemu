@@ -259,6 +259,7 @@ static void efr32_rac_update_irqs(Efr32Periph *s)
 
 static void efr32_rac_set_state(Efr32Periph *s, uint32_t state)
 {
+    uint32_t previous_state;
     uint32_t sequence_flag;
 
     if (s->rac_state == state)
@@ -266,6 +267,7 @@ static void efr32_rac_set_state(Efr32Periph *s, uint32_t state)
         return;
     }
 
+    previous_state = s->rac_state;
     s->rac_state = state;
     efr32_register_put(s, EFR32_RAC_BASE + EFR32_RAC_IF,
                        efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_IF) |
@@ -275,6 +277,7 @@ static void efr32_rac_set_state(Efr32Periph *s, uint32_t state)
                        efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_SEQIF) |
                            sequence_flag);
     efr32_rac_update_irqs(s);
+    trace_efr32bg22_rac_state(previous_state, state);
 }
 
 static void efr32_rac_tx_complete(void *opaque)
