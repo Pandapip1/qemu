@@ -11,6 +11,9 @@
 #define MODEM_BASE           0xa8014000
 #define MODEM_SHAPING1       0x098
 #define MODEM_LONGRANGE5     0x14c
+#define RFCRC_BASE           0xa8010000
+#define RFCRC_EN             0x004
+#define RFCRC_CTRL           0x008
 #define PROTIMER_BASE         0xa801c000
 #define PROTIMER_CTRL         0x008
 #define PROTIMER_STATE        0x030
@@ -60,6 +63,15 @@ static void test_modem_masks(void)
 
     writel(MODEM_BASE + MODEM_LONGRANGE5, UINT32_MAX);
     g_assert_cmphex(readl(MODEM_BASE + MODEM_LONGRANGE5), ==, 0x0fffffff);
+}
+
+static void test_rfcrc_masks(void)
+{
+    writel(RFCRC_BASE + RFCRC_EN, UINT32_MAX);
+    writel(RFCRC_BASE + RFCRC_CTRL, UINT32_MAX);
+
+    g_assert_cmphex(readl(RFCRC_BASE + RFCRC_EN), ==, 1);
+    g_assert_cmphex(readl(RFCRC_BASE + RFCRC_CTRL), ==, 0x1fef);
 }
 
 static void test_bufc_data_port(void)
@@ -121,6 +133,7 @@ int main(int argc, char **argv)
 
     qtest_add_func("/efr32bg22/register-aliases", test_register_aliases);
     qtest_add_func("/efr32bg22/modem-masks", test_modem_masks);
+    qtest_add_func("/efr32bg22/rfcrc-masks", test_rfcrc_masks);
     qtest_add_func("/efr32bg22/bufc-data-port", test_bufc_data_port);
     qtest_add_func("/efr32bg22/bufc-sparse-threshold-flag",
                    test_bufc_sparse_threshold_flag);
