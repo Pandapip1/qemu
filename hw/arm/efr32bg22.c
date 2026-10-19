@@ -1,0 +1,253 @@
+/*
+ * Silicon Labs EFR32BG22 (Cortex-M33) machine with an out-of-process
+ * peripheral model.
+ *
+ * Flash and SRAM are modelled in QEMU. Every access to the peripheral
+ * window 0x40000000..0x5fffffff is forwarded synchronously over a chardev to
+ * an external server (see tools/efr32bg22/server.py). Each reply carries the
+ * level of every NVIC interrupt line and the virtual time at which the server
+ * wants to be called next, so peripherals can be written in Python without
+ * touching QEMU.
+ *
+ * Wire format (little endian, packed):
+ *   request : u8 op, u8 size, u16 pad, u32 addr, u32 value, u32 pad, u64 now_ns
+ *   reply   : u32 value, u32 pad, u64 irq_mask, u64 next_ns
+ *   op: 0 read, 1 write, 2 tick
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+#include "qemu/osdep.h"
+#include "qapi/error.h"
+#include "qemu/error-report.h"
+#include "qemu/log.h"
+#include "qemu/timer.h"
+#include "hw/boards.h"
+#include "hw/qdev-properties.h"
+#include "hw/qdev-clock.h"
+#include "hw/arm/armv7m.h"
+#include "hw/arm/boot.h"
+#include "hw/sysbus.h"
+#include "hw/irq.h"
+#include "hw/qdev-properties-system.h"
+#include "hw/loader.h"
+#include "chardev/char-fe.h"
+#include "sysemu/sysemu.h"
+#include "exec/address-spaces.h"
+
+#define TYPE_OWO_BRIDGE "owo-mmio-bridge"
+OBJECT_DECLARE_SIMPLE_TYPE(OwoBridge, OWO_BRIDGE)
+
+#define BRIDGE_BASE 0x40000000
+#define BRIDGE_SIZE 0x20000000
+#define NUM_IRQ     64
+#define FLASH_SIZE  (512 * 1024)
+#define SRAM_SIZE   (32 * 1024)
+
+typedef struct __attribute__((packed)) {
+    uint8_t op, size;
+    uint16_t pad0;
+    uint32_t addr, value, pad1;
+    uint64_t now_ns;
+} BridgeReq;
+
+typedef struct __attribute__((packed)) {
+    uint32_t value, pad;
+    uint64_t irq_mask, next_ns;
+} BridgeRep;
+
+struct OwoBridge {
+    SysBusDevice parent_obj;
+    MemoryRegion mmio;
+    CharBackend chr;
+    qemu_irq irq[NUM_IRQ];
+    QEMUTimer *timer;
+    uint64_t irq_mask;
+};
+
+static void bridge_apply(OwoBridge *s, const BridgeRep *r)
+{
+    uint64_t diff = s->irq_mask ^ r->irq_mask;
+
+    for (int i = 0; i < NUM_IRQ && diff; i++) {
+        if (diff & (1ULL << i)) {
+            qemu_set_irq(s->irq[i], !!(r->irq_mask & (1ULL << i)));
+        }
+    }
+    s->irq_mask = r->irq_mask;
+    if (r->next_ns) {
+        timer_mod(s->timer, r->next_ns);
+    } else {
+        timer_del(s->timer);
+    }
+}
+
+static uint32_t bridge_xfer(OwoBridge *s, uint8_t op, hwaddr addr,
+                            uint32_t val, unsigned size)
+{
+    BridgeReq q = { .op = op, .size = size, .addr = addr + BRIDGE_BASE,
+                    .value = val,
+                    .now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) };
+    BridgeRep r;
+
+    if (qemu_chr_fe_write_all(&s->chr, (uint8_t *)&q, sizeof(q)) != sizeof(q) ||
+        qemu_chr_fe_read_all(&s->chr, (uint8_t *)&r, sizeof(r)) != sizeof(r)) {
+        error_report("efr32bg22: peripheral server went away");
+        exit(EXIT_FAILURE);
+    }
+    bridge_apply(s, &r);
+    return r.value;
+}
+
+static uint64_t bridge_read(void *opaque, hwaddr addr, unsigned size)
+{
+    return bridge_xfer(opaque, 0, addr, 0, size);
+}
+
+static void bridge_write(void *opaque, hwaddr addr, uint64_t val,
+                         unsigned size)
+{
+    bridge_xfer(opaque, 1, addr, val, size);
+}
+
+static void bridge_tick(void *opaque)
+{
+    bridge_xfer(opaque, 2, 0, 0, 4);
+}
+
+static const MemoryRegionOps bridge_ops = {
+    .read = bridge_read,
+    .write = bridge_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
+static void bridge_init(Object *obj)
+{
+    OwoBridge *s = OWO_BRIDGE(obj);
+
+    memory_region_init_io(&s->mmio, obj, &bridge_ops, s, "efr32bg22-periph",
+                          BRIDGE_SIZE);
+    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
+    for (int i = 0; i < NUM_IRQ; i++) {
+        sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq[i]);
+    }
+}
+
+static void bridge_realize(DeviceState *dev, Error **errp)
+{
+    OwoBridge *s = OWO_BRIDGE(dev);
+
+    s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, bridge_tick, s);
+    /* Blocking reads are used, so no handlers are installed. */
+}
+
+static Property bridge_props[] = {
+    DEFINE_PROP_CHR("chardev", OwoBridge, chr),
+    DEFINE_PROP_END_OF_LIST(),
+};
+
+static void bridge_class_init(ObjectClass *oc, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(oc);
+
+    dc->realize = bridge_realize;
+    device_class_set_props(dc, bridge_props);
+}
+
+static const TypeInfo bridge_info = {
+    .name = TYPE_OWO_BRIDGE,
+    .parent = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(OwoBridge),
+    .instance_init = bridge_init,
+    .class_init = bridge_class_init,
+};
+
+/* ---- machine ---------------------------------------------------------- */
+
+struct Efr32State {
+    MachineState parent_obj;
+    ARMv7MState armv7m;
+    MemoryRegion flash, sram;
+    Clock *sysclk;
+};
+
+#define TYPE_EFR32BG22_MACHINE MACHINE_TYPE_NAME("efr32bg22")
+OBJECT_DECLARE_SIMPLE_TYPE(Efr32State, EFR32BG22_MACHINE)
+
+static void efr32_init(MachineState *machine)
+{
+    Efr32State *s = EFR32BG22_MACHINE(machine);
+    DeviceState *nvic;
+    DeviceState *br;
+    Chardev *chr = serial_hd(0);
+
+    s->sysclk = clock_new(OBJECT(machine), "SYSCLK");
+    clock_set_hz(s->sysclk, 38400000);
+
+    memory_region_init_ram(&s->flash, NULL, "efr32.flash", FLASH_SIZE,
+                           &error_fatal);
+    memory_region_add_subregion(get_system_memory(), 0, &s->flash);
+    memory_region_init_ram(&s->sram, NULL, "efr32.sram", SRAM_SIZE,
+                           &error_fatal);
+    memory_region_add_subregion(get_system_memory(), 0x20000000, &s->sram);
+
+    object_initialize_child(OBJECT(machine), "armv7m", &s->armv7m,
+                            TYPE_ARMV7M);
+    nvic = DEVICE(&s->armv7m);
+    qdev_prop_set_uint32(nvic, "num-irq", NUM_IRQ);
+    qdev_connect_clock_in(nvic, "cpuclk", s->sysclk);
+    qdev_prop_set_string(nvic, "cpu-type", machine->cpu_type);
+    object_property_set_link(OBJECT(&s->armv7m), "memory",
+                             OBJECT(get_system_memory()), &error_abort);
+    sysbus_realize(SYS_BUS_DEVICE(&s->armv7m), &error_fatal);
+
+    if (!chr) {
+        error_report("efr32bg22: needs -serial chardev:<id> for the "
+                     "peripheral server");
+        exit(EXIT_FAILURE);
+    }
+    br = qdev_new(TYPE_OWO_BRIDGE);
+    qdev_prop_set_chr(br, "chardev", chr);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(br), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(br), 0, BRIDGE_BASE);
+    for (int i = 0; i < NUM_IRQ; i++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(br), i, qdev_get_gpio_in(nvic, i));
+    }
+
+    /*
+     * Reset vector is at 0 like on the real part: -kernel is the Gecko
+     * Bootloader image, which in turn starts the application that is placed
+     * at 0x16000 with -device loader.
+     */
+    armv7m_load_kernel(ARM_CPU(first_cpu), machine->kernel_filename, 0,
+                       FLASH_SIZE);
+}
+
+static void efr32_class_init(ObjectClass *oc, void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    static const char *const valid[] = { ARM_CPU_TYPE_NAME("cortex-m33"),
+                                         NULL };
+
+    mc->desc = "Silicon Labs EFR32BG22 (Cortex-M33), peripherals out of process";
+    mc->init = efr32_init;
+    mc->valid_cpu_types = valid;
+    mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-m33");
+    mc->default_ram_size = 0;
+    mc->ignore_memory_transaction_failures = true;
+}
+
+static const TypeInfo efr32_info = {
+    .name = TYPE_EFR32BG22_MACHINE,
+    .parent = TYPE_MACHINE,
+    .instance_size = sizeof(Efr32State),
+    .class_init = efr32_class_init,
+};
+
+static void efr32_register(void)
+{
+    type_register_static(&bridge_info);
+    type_register_static(&efr32_info);
+}
+type_init(efr32_register)

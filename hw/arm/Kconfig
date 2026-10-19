@@ -401,6 +401,12 @@ config STM32F405_SOC
     select STM32F4XX_SYSCFG
     select STM32F4XX_EXTI
 
+config EFR32BG22
+    bool
+    default y
+    depends on TCG && ARM
+    select ARM_V7M
+
 config B_L475E_IOT01A
     bool
     default y
