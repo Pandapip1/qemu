@@ -159,6 +159,12 @@ static const Efr32RegisterMask efr32_modem_masks[] = {
     {0x278, 0x80000000}, {0x27c, 0x000001ff}, {0x280, 0x000007ff},
 };
 
+static const Efr32RegisterMask efr32_rac_masks[] = {
+    {0x004, 0x00000001}, {0x008, 0x00003fff}, {0x014, 0x1f0107ef},
+    {0x018, 0x0000000f}, {0x01c, 0x00ff000f}, {0x020, 0x00ff000f},
+    {0x024, 0x00000003}, {0x028, 0x3fff000f}, {0x02c, 0x3fff000f},
+};
+
 static uint32_t efr32_apply_register_mask(const Efr32RegisterMask *masks,
                                           size_t count, uint32_t offset,
                                           uint32_t value)
@@ -318,6 +324,11 @@ static uint32_t efr32_radio_mask_write(uint32_t address, uint32_t value)
         return efr32_apply_register_mask(
             efr32_modem_masks, G_N_ELEMENTS(efr32_modem_masks), offset, value);
     }
+    if ((address & ~0x3fffu) == EFR32_RAC_BASE)
+    {
+        return efr32_apply_register_mask(
+            efr32_rac_masks, G_N_ELEMENTS(efr32_rac_masks), offset, value);
+    }
     return value;
 }
 
@@ -429,6 +440,7 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
 
     if (register_address == EFR32_RAC_BASE + EFR32_RAC_CMD)
     {
+        next &= 0xc000fdff;
         if (next & (EFR32_RAC_CMD_TXDIS | EFR32_RAC_CMD_RXDIS))
             efr32_rac_set_state(s, EFR32_RAC_STATE_OFF);
         else if (next & EFR32_RAC_CMD_TXEN)

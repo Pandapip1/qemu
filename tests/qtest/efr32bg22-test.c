@@ -22,6 +22,8 @@
 #define RAC_BASE              0xa8020000
 #define RAC_STATUS            0x00c
 #define RAC_CMD               0x010
+#define RAC_RXENSRCEN         0x008
+#define RAC_IEN               0x020
 #define RAC_SEQIF             0x028
 #define RAC_CMD_TXEN          (1u << 0)
 #define RAC_CMD_TXDIS         (1u << 5)
@@ -131,6 +133,15 @@ static void test_rac_tx_commands(void)
                     RAC_SEQIF_STATEOFF);
 }
 
+static void test_rac_masks(void)
+{
+    writel(RAC_BASE + RAC_RXENSRCEN, UINT32_MAX);
+    writel(RAC_BASE + RAC_IEN, UINT32_MAX);
+
+    g_assert_cmphex(readl(RAC_BASE + RAC_RXENSRCEN), ==, 0x00003fff);
+    g_assert_cmphex(readl(RAC_BASE + RAC_IEN), ==, 0x00ff000f);
+}
+
 int main(int argc, char **argv)
 {
     int result;
@@ -147,6 +158,7 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/protimer-trace-latches",
                    test_protimer_trace_latches);
     qtest_add_func("/efr32bg22/rac-tx-commands", test_rac_tx_commands);
+    qtest_add_func("/efr32bg22/rac-masks", test_rac_masks);
 
     result = g_test_run();
     qtest_end();
