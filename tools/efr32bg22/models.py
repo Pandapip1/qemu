@@ -486,6 +486,21 @@ class FRC(Dev):
             super().write(off, val)
 
 
+class Modem(Dev):
+    """Public xG22 MODEM sync-word register.
+
+    This preserves software-visible programming only.  Sync detection and
+    interpreting a value as a Bluetooth access address are FRC/SEQ behavior.
+    """
+    SYNC0 = 0x068
+
+    def write(self, off, val):
+        if off == self.SYNC0:
+            self.regs[off] = val & 0xFFFFFFFF
+        else:
+            super().write(off, val)
+
+
 class PCF8575:
     """16-bit quasi-bidirectional I/O expander.  Two data bytes per transfer, P0-P7 first."""
     def __init__(self, addr7=0x20):
@@ -1307,6 +1322,7 @@ def build(m, reset=False, cause=1):
     m.synth = m.add(Synth("SYNTH"), 0xA8018000)
     m.rfcrc = m.add(RFCRC("RFCRC"), 0xA8010000)
     m.frc = m.add(FRC("FRC"), 0xA8004000)
+    m.modem = m.add(Modem("MODEM"), 0xA8014000)
     m.bufc = m.add(BUFC("BUFC"), 0xAA000000)
     trng = m.add(TRNG("TRNG", ""), 0x4C021000, 0x1000)
     m.add(TRNGFifo("TRNGFIFO", trng), 0x4C024000, 0x1000)

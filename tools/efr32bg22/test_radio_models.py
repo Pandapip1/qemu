@@ -144,5 +144,12 @@ class FrcTests(unittest.TestCase):
         self.assertEqual(dev.read(dev.WHITEINIT), 0x00001234)
 
 
+class ModemTests(unittest.TestCase):
+    def test_public_sync0_is_a_32_bit_configuration_register(self):
+        _, dev = attach(models.Modem("MODEM"))
+        dev.write(dev.SYNC0, 0x89ABCDEF)
+        self.assertEqual(dev.read(dev.SYNC0), 0x89ABCDEF)
+
+
 if __name__ == "__main__":
     unittest.main()
