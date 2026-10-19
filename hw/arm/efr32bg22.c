@@ -11,8 +11,10 @@
  *
  * Wire format (little endian, packed):
  *   request : u8 op, u8 size, u16 pad, u32 addr, u32 value, u32 pad, u64 now_ns
- *   reply   : u32 value, u32 pad, u64 irq_mask, u64 next_ns
- *   op: 0 read, 1 write, 2 tick
+ *   reply   : u32 value, u32 nwr|flags, u64 irq_mask, u64 next_ns, then nwr x
+ *             { u32 addr, u32 len, len bytes padded to 4 } guest memory writes
+ *   op: 0 read, 1 write, 2 tick, 3 reset notification
+ *   flags (bit 31 of the second word): the server asks for a system reset
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -24,6 +26,10 @@
 #include "hw/boards.h"
 #include "hw/qdev-properties.h"
 #include "hw/qdev-clock.h"
+#include "sysemu/reset.h"
+#include "sysemu/runstate.h"
+#include "exec/memory.h"
+#include "exec/address-spaces.h"
 #include "hw/arm/armv7m.h"
 #include "hw/arm/boot.h"
 #include "hw/sysbus.h"
@@ -33,6 +39,7 @@
 #include "chardev/char-fe.h"
 #include "sysemu/sysemu.h"
 #include "exec/address-spaces.h"
+#include "target/arm/idau.h"
 
 #define TYPE_OWO_BRIDGE "owo-mmio-bridge"
 OBJECT_DECLARE_SIMPLE_TYPE(OwoBridge, OWO_BRIDGE)
@@ -51,9 +58,12 @@ typedef struct __attribute__((packed)) {
 } BridgeReq;
 
 typedef struct __attribute__((packed)) {
-    uint32_t value, pad;
+    uint32_t value, nwr_flags;
     uint64_t irq_mask, next_ns;
 } BridgeRep;
+
+#define REP_NWR(r)        ((r)->nwr_flags & 0xffff)
+#define REP_RESET         0x80000000u
 
 struct OwoBridge {
     SysBusDevice parent_obj;
@@ -94,7 +104,27 @@ static uint32_t bridge_xfer(OwoBridge *s, uint8_t op, hwaddr addr,
         error_report("efr32bg22: peripheral server went away");
         exit(EXIT_FAILURE);
     }
+    for (uint32_t i = 0; i < REP_NWR(&r); i++) {
+        uint32_t hdr[2];
+        g_autofree uint8_t *buf = NULL;
+
+        if (qemu_chr_fe_read_all(&s->chr, (uint8_t *)hdr, 8) != 8) {
+            error_report("efr32bg22: truncated memory write from server");
+            exit(EXIT_FAILURE);
+        }
+        buf = g_malloc(ROUND_UP(hdr[1], 4));
+        if (qemu_chr_fe_read_all(&s->chr, buf, ROUND_UP(hdr[1], 4)) !=
+            ROUND_UP(hdr[1], 4)) {
+            error_report("efr32bg22: truncated memory write from server");
+            exit(EXIT_FAILURE);
+        }
+        address_space_write(&address_space_memory, hdr[0],
+                            MEMTXATTRS_UNSPECIFIED, buf, hdr[1]);
+    }
     bridge_apply(s, &r);
+    if (r.nwr_flags & REP_RESET) {
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    }
     return r.value;
 }
 
@@ -142,6 +172,19 @@ static void bridge_realize(DeviceState *dev, Error **errp)
     /* Blocking reads are used, so no handlers are installed. */
 }
 
+static void bridge_reset_hold(Object *obj, ResetType type)
+{
+    OwoBridge *s = OWO_BRIDGE(obj);
+
+    s->irq_mask = 0;
+    if (s->timer) {
+        timer_del(s->timer);
+    }
+    if (qemu_chr_fe_backend_connected(&s->chr)) {
+        bridge_xfer(s, 3, 0, 0, 4);
+    }
+}
+
 static Property bridge_props[] = {
     DEFINE_PROP_CHR("chardev", OwoBridge, chr),
     DEFINE_PROP_END_OF_LIST(),
@@ -151,7 +194,10 @@ static void bridge_class_init(ObjectClass *oc, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
+    ResettableClass *rc = RESETTABLE_CLASS(oc);
+
     dc->realize = bridge_realize;
+    rc->phases.hold = bridge_reset_hold;
     device_class_set_props(dc, bridge_props);
 }
 
@@ -170,10 +216,20 @@ struct Efr32State {
     ARMv7MState armv7m;
     MemoryRegion flash, sram;
     Clock *sysclk;
+    char *flash_image;
 };
 
 #define TYPE_EFR32BG22_MACHINE MACHINE_TYPE_NAME("efr32bg22")
 OBJECT_DECLARE_SIMPLE_TYPE(Efr32State, EFR32BG22_MACHINE)
+
+/*
+ * The CPU is reset once before the machine is complete; reset it again after the
+ * flash holds its contents so it picks up the bootloader's vector table.
+ */
+static void efr32_cpu_reset(void *opaque)
+{
+    cpu_reset(CPU(opaque));
+}
 
 static void efr32_init(MachineState *machine)
 {
@@ -198,6 +254,8 @@ static void efr32_init(MachineState *machine)
     qdev_prop_set_uint32(nvic, "num-irq", NUM_IRQ);
     qdev_connect_clock_in(nvic, "cpuclk", s->sysclk);
     qdev_prop_set_string(nvic, "cpu-type", machine->cpu_type);
+    object_property_set_link(OBJECT(&s->armv7m), "idau", OBJECT(machine),
+                             &error_abort);
     object_property_set_link(OBJECT(&s->armv7m), "memory",
                              OBJECT(get_system_memory()), &error_abort);
     sysbus_realize(SYS_BUS_DEVICE(&s->armv7m), &error_fatal);
@@ -216,17 +274,63 @@ static void efr32_init(MachineState *machine)
     }
 
     /*
-     * Reset vector is at 0 like on the real part: -kernel is the Gecko
-     * Bootloader image, which in turn starts the application that is placed
-     * at 0x16000 with -device loader.
+     * Flash is initialised once from a full flash image (bootloader at 0,
+     * application at its slot, ...) and then only changes through the MSC
+     * model, so it survives system resets like the real part. Execution starts
+     * at the reset vector in the bootloader at address 0.
      */
-    armv7m_load_kernel(ARM_CPU(first_cpu), machine->kernel_filename, 0,
-                       FLASH_SIZE);
+    if (s->flash_image) {
+        gchar *data;
+        gsize len;
+
+        if (!g_file_get_contents(s->flash_image, &data, &len, NULL) ||
+            len > FLASH_SIZE) {
+            error_report("efr32bg22: cannot load flash image %s", s->flash_image);
+            exit(EXIT_FAILURE);
+        }
+        memcpy(memory_region_get_ram_ptr(&s->flash), data, len);
+        g_free(data);
+    }
+    qemu_register_reset(efr32_cpu_reset, ARM_CPU(first_cpu));
+}
+
+/*
+ * External secure attribution unit (AN1374 section 3.3). Peripherals at
+ * 0x4xxxxxxx and radio at 0xAxxxxxxx are always Secure, 0x5xxxxxxx and
+ * 0xBxxxxxxx always Non-secure. Flash and RAM follow movable boundaries set
+ * through the SMU; they are modelled as entirely Secure, which is the reset
+ * state used by the bootloader and by apps that do not use TrustZone.
+ */
+static void efr32_idau_check(IDAUInterface *ii, uint32_t address,
+                             int *iregion, bool *exempt, bool *ns, bool *nsc)
+{
+    int region = extract32(address, 28, 4);
+
+    *iregion = region;
+    *exempt = (address & 0xeff00000) == 0xe0000000;
+    *ns = region == 5 || region == 0xb;
+    *nsc = false;
+}
+
+static char *efr32_get_flash(Object *obj, Error **errp)
+{
+    return g_strdup(EFR32BG22_MACHINE(obj)->flash_image);
+}
+
+static void efr32_set_flash(Object *obj, const char *v, Error **errp)
+{
+    Efr32State *s = EFR32BG22_MACHINE(obj);
+
+    g_free(s->flash_image);
+    s->flash_image = g_strdup(v);
 }
 
 static void efr32_class_init(ObjectClass *oc, void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
+    IDAUInterfaceClass *iic = IDAU_INTERFACE_CLASS(oc);
+
+    iic->check = efr32_idau_check;
     static const char *const valid[] = { ARM_CPU_TYPE_NAME("cortex-m33"),
                                          NULL };
 
@@ -234,8 +338,11 @@ static void efr32_class_init(ObjectClass *oc, void *data)
     mc->init = efr32_init;
     mc->valid_cpu_types = valid;
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-m33");
-    mc->default_ram_size = 0;
+    mc->default_ram_size = FLASH_SIZE; /* only bounds -device loader */
     mc->ignore_memory_transaction_failures = true;
+    object_class_property_add_str(oc, "flash", efr32_get_flash, efr32_set_flash);
+    object_class_property_set_description(oc, "flash",
+        "512K flash image (bootloader at 0, application at its slot)");
 }
 
 static const TypeInfo efr32_info = {
@@ -243,6 +350,10 @@ static const TypeInfo efr32_info = {
     .parent = TYPE_MACHINE,
     .instance_size = sizeof(Efr32State),
     .class_init = efr32_class_init,
+    .interfaces = (InterfaceInfo[]) {
+        { TYPE_IDAU_INTERFACE },
+        { }
+    },
 };
 
 static void efr32_register(void)
