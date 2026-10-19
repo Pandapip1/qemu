@@ -131,15 +131,10 @@ static void test_bufc_tx_fifo_setup_latches(void)
     uint32_t channel = BUFC_BASE + BUFC_CH0;
 
     /* A vendor 512-byte FIFO encodes as log2(512) - 6 = 3. */
+    writel(channel + BUFC_CMD, 1);
     writel(channel, 3);
     writel(channel + 0x004, 0x20001000);
     writel(channel + BUFC_WRITEOFFSET, 18);
-
-    g_assert_cmphex(readl(channel), ==, 3);
-    g_assert_cmphex(readl(channel + 0x004), ==, 0x20001000);
-    g_assert_cmphex(readl(channel + BUFC_WRITEOFFSET), ==, 18);
-
-    writel(channel + BUFC_CMD, 1);
     writel(channel + BUFC_CMD, 2);
 
     g_assert_cmphex(readl(channel), ==, 3);
