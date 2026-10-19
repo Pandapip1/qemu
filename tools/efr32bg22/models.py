@@ -235,6 +235,135 @@ class IrqDev(Dev):
             self.irq_update()
 
 
+class BUFC(IrqDev):
+    """xG22 four-channel radio byte-buffer controller.
+
+    xG22's public device headers omit this block.  The layout and bit fields here
+    combine the public efr32xg21_bufc.h with offsets observed in the xG22 stock
+    trace: channels start at +0x0c with a 0x40 stride; IF/IEN are +0x114/+0x118.
+    This model covers the programmed data port, offsets, status, clear command,
+    threshold flags and IRQ.  DMA through BUF.ADDR still needs guest-memory reads
+    in the bridge protocol and is deliberately not pretended here.
+    """
+    IF_OFF, IEN_OFF = 0x114, 0x118
+    irq_name = "BUFC"
+    BUF0, STRIDE = 0x00C, 0x040
+
+    def __init__(self, name):
+        super().__init__(name, "")
+        self.data = [bytearray() for _ in range(4)]
+
+    def decode(self, off):
+        rel = off - self.BUF0
+        if 0 <= rel < 4 * self.STRIDE:
+            return rel // self.STRIDE, rel % self.STRIDE
+        return None, None
+
+    def capacity(self, n):
+        return 64 << (self.regs.get(self.BUF0 + n * self.STRIDE, 0) & 7)
+
+    def update_threshold(self, n):
+        base = self.BUF0 + n * self.STRIDE
+        cfg = self.regs.get(base + 0x24, 0)
+        threshold = cfg & 0xFFF
+        hit = len(self.data[n]) <= threshold if cfg & 0x2000 else len(self.data[n]) > threshold
+        bit = 1 << n
+        if hit:
+            self.regs[self.IF_OFF] = self.regs.get(self.IF_OFF, 0) | bit
+        else:
+            self.regs[self.IF_OFF] = self.regs.get(self.IF_OFF, 0) & ~bit
+        self.irq_update()
+
+    def push(self, n, value, xor=False):
+        base = self.BUF0 + n * self.STRIDE
+        pos = self.regs.get(base + 0x08, 0) & 0x1FFF
+        buf = self.data[n]
+        if pos >= self.capacity(n):
+            return
+        if pos >= len(buf):
+            buf.extend(b"\0" * (pos + 1 - len(buf)))
+        buf[pos] = (buf[pos] ^ value) if xor else value
+        self.regs[base + 0x08] = (pos + 1) & 0x1FFF
+        self.update_threshold(n)
+
+    def read(self, off, size=4):
+        n, reg = self.decode(off & ~3)
+        if n is None:
+            return super().read(off, size)
+        base = self.BUF0 + n * self.STRIDE
+        if reg == 0x14:                         # READDATA
+            pos = self.regs.get(base + 0x0C, 0) & 0x1FFF
+            value = self.data[n][pos] if pos < len(self.data[n]) else 0
+            self.regs[base + 0x0C] = (pos + 1) & 0x1FFF
+            self.update_threshold(n)
+            return value
+        if reg == 0x20:                         # STATUS
+            rd = self.regs.get(base + 0x0C, 0) & 0x1FFF
+            count = max(0, len(self.data[n]) - rd) & 0x1FFF
+            flag = (1 << 20) if self.regs.get(self.IF_OFF, 0) & (1 << n) else 0
+            return count | flag
+        return super().read(off, size)
+
+    def write(self, off, val):
+        n, reg = self.decode(off)
+        if n is None:
+            return super().write(off, val)
+        base = self.BUF0 + n * self.STRIDE
+        if reg == 0x18:                         # WRITEDATA
+            self.push(n, val & 0xFF)
+        elif reg == 0x1C:                       # XWRITE
+            self.push(n, val & 0xFF, xor=True)
+        elif reg == 0x28:                       # CMD
+            if val & 1:                         # CLEAR
+                self.data[n].clear()
+                self.regs[base + 0x08] = self.regs[base + 0x0C] = 0
+                self.update_threshold(n)
+        else:
+            super().write(off, val)
+            if reg in (0x00, 0x08, 0x0C, 0x24):
+                self.update_threshold(n)
+
+    def contents(self, n):
+        """Return bytes currently exposed by a channel (test/pcap hook)."""
+        return bytes(self.data[n])
+
+
+class SimRAC(IrqDev):
+    """Simulator-only radio state machine; not an asserted xG22 register map.
+
+    CMD(+0x10): 1=disable, 2=RX, 3=TX. STATUS(+0x14): 0=idle, 1=RX,
+    2=TX. EVENT IF/IEN are +0x18/+0x1c, bit 0. TX completes after 150 us;
+    RX remains active until disabled.  Keeping this contract separate and named
+    SIM_* prevents these offsets being mistaken for hardware facts.
+    """
+    IF_OFF, IEN_OFF = 0x018, 0x01C
+    irq_name = "RAC_SEQ"
+    IDLE, RX, TX = 0, 1, 2
+
+    def __init__(self, name):
+        super().__init__(name, "")
+        self.state = self.IDLE
+        self.generation = 0
+
+    def r_014(self):
+        return self.state
+
+    def w_010(self, value):
+        self.generation += 1
+        generation = self.generation
+        if value == 1:
+            self.state = self.IDLE
+        elif value == 2:
+            self.state = self.RX
+        elif value == 3:
+            self.state = self.TX
+            def complete():
+                if generation == self.generation and self.state == self.TX:
+                    self.state = self.IDLE
+                    self.raise_if(1)
+            self.m.after(150_000, complete)
+
+
 class PCF8575:
     """16-bit quasi-bidirectional I/O expander.  Two data bytes per transfer, P0-P7 first."""
     def __init__(self, addr7=0x20):
@@ -1052,5 +1181,7 @@ def build(m, reset=False, cause=1):
     m.add(IADC("IADC0"), 0x4A004000)
     m.add(USART("USART0", "USART0_RX"), 0x4005C000)
     m.add(USART("USART1", "USART1_RX"), 0x40060000)
+    m.rac = m.add(SimRAC("RAC_SIM"), 0xA8020000)
+    m.bufc = m.add(BUFC("BUFC"), 0xAA000000)
     trng = m.add(TRNG("TRNG", ""), 0x4C021000, 0x1000)
     m.add(TRNGFifo("TRNGFIFO", trng), 0x4C024000, 0x1000)
