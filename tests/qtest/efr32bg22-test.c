@@ -8,9 +8,13 @@
 
 #define FRC_BASE             0xa8004000
 #define FRC_DATABUFFER       0x018
+#define FRC_IF               0x068
+#define FRC_IEN              0x06c
 #define AGC_BASE             0xa800c000
 #define FRC_WHITEPOLY        0x034
 #define FRC_BUFFERMODE       0x078
+#define FRC_SEQIF            0x0b4
+#define FRC_SEQIEN           0x0b8
 #define MODEM_BASE           0xa8014000
 #define MODEM_SHAPING1       0x098
 #define MODEM_LONGRANGE5     0x14c
@@ -94,6 +98,21 @@ static void test_frc_buffer_register_masks(void)
 
     g_assert_cmphex(readl(FRC_BASE + FRC_DATABUFFER), ==, 0xff);
     g_assert_cmphex(readl(FRC_BASE + FRC_BUFFERMODE), ==, 0xf);
+}
+
+static void test_frc_interrupt_register_masks(void)
+{
+    const uint32_t registers[] = {
+        FRC_IF,
+        FRC_IEN,
+        FRC_SEQIF,
+        FRC_SEQIEN,
+    };
+
+    for (size_t i = 0; i < G_N_ELEMENTS(registers); i++) {
+        writel(FRC_BASE + registers[i], UINT32_MAX);
+        g_assert_cmphex(readl(FRC_BASE + registers[i]), ==, 0x7f7fffff);
+    }
 }
 
 static void test_radio_enable_masks(void)
@@ -216,6 +235,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/rfcrc-masks", test_rfcrc_masks);
     qtest_add_func("/efr32bg22/frc-buffer-register-masks",
                    test_frc_buffer_register_masks);
+    qtest_add_func("/efr32bg22/frc-interrupt-register-masks",
+                   test_frc_interrupt_register_masks);
     qtest_add_func("/efr32bg22/radio-enable-masks", test_radio_enable_masks);
     qtest_add_func("/efr32bg22/radio-nonsecure-alias",
                    test_radio_nonsecure_alias);
