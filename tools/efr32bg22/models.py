@@ -242,8 +242,9 @@ class BUFC(IrqDev):
     combine the public efr32xg21_bufc.h with offsets observed in the xG22 stock
     trace: channels start at +0x0c with a 0x40 stride; IF/IEN are +0x114/+0x118.
     This model covers the programmed data port, offsets, status, clear command,
-    threshold flags and IRQ.  DMA through BUF.ADDR still needs guest-memory reads
-    in the bridge protocol and is deliberately not pretended here.
+    threshold flags and IRQ.  The bridge can now read guest memory, but the
+    trace has not established BUFC's DMA trigger or transfer length, so DMA is
+    deliberately not pretended here.
     """
     IF_OFF, IEN_OFF = 0x114, 0x118
     irq_name = "BUFC"
