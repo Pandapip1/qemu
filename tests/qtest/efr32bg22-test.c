@@ -207,6 +207,12 @@ static void test_bufc_data_port(void)
     g_assert_cmphex(readl(tx_channel + BUFC_READDATA), ==, 0x5a);
     g_assert_cmphex(readl(tx_channel + BUFC_READDATA), ==, 0xa5);
 
+    /* RAIL permits TX FIFO contents to be preloaded in its backing RAM. */
+    writel(tx_channel + 0x004, 0x20001000);
+    qtest_writeb(global_qtest, 0x20001000, 0x6b);
+    writel(tx_channel + BUFC_READOFFSET, 0);
+    g_assert_cmphex(readl(tx_channel + BUFC_READDATA), ==, 0x6b);
+
     /* The recovered sequencer image writes RX buffer 1 via its secure alias. */
     writel(sequencer_channel + BUFC_CMD, 1);
     writel(sequencer_channel + 0x004, rx_buffer);

@@ -448,11 +448,20 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
 
         if (register_offset == EFR32_BUFC_READDATA)
         {
+            uint32_t buffer_address =
+                efr32_register_get(s, base + 0x004);
             uint32_t position =
                 efr32_register_get(s, base + EFR32_BUFC_READOFFSET) & 0x1fff;
-            uint32_t value = position < s->bufc_data[channel]->len
-                                 ? s->bufc_data[channel]->data[position]
-                                 : 0;
+            uint8_t value = position < s->bufc_data[channel]->len
+                                ? s->bufc_data[channel]->data[position]
+                                : 0;
+
+            if (buffer_address)
+            {
+                address_space_read(&address_space_memory,
+                                   buffer_address + position,
+                                   MEMTXATTRS_UNSPECIFIED, &value, 1);
+            }
 
             efr32_register_put(s, base + EFR32_BUFC_READOFFSET, position + 1);
             efr32_bufc_update_threshold(s, channel);
