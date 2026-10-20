@@ -17,6 +17,7 @@
 #include "hw/irq.h"
 #include "hw/sysbus.h"
 #include "hw/arm/armv7m.h"
+#include "sysemu/reset.h"
 #include "target/arm/cpu.h"
 #include "target/arm/idau.h"
 #include "trace.h"
@@ -956,6 +957,7 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     ptimer_run(s->protimer_counter, 0);
     ptimer_transaction_commit(s->protimer_counter);
     timer_del(s->rac_tx_timer);
+    s->rx_offer_pending = false;
     efr32_rf_medium_reset_radio(s->rf_medium, EFR32_RF_RADIO(s));
     efr32_register_put(s, EFR32_CMU_BASE + EFR32_CMU_SYSCLKCTRL,
                        EFR32_CMU_SYSCLKCTRL_CLKSEL_FSRCO);
@@ -1045,6 +1047,13 @@ struct Efr32State
 };
 #define TYPE_EFR32BG22_MACHINE MACHINE_TYPE_NAME("efr32bg22")
 OBJECT_DECLARE_SIMPLE_TYPE(Efr32State, EFR32BG22_MACHINE)
+
+/* ARMv7M CPUs require an explicit board reset registration. */
+static void efr32_cpu_reset(void *opaque)
+{
+    cpu_reset(CPU(opaque));
+}
+
 static void efr32_initialize_devinfo(MemoryRegion *devinfo)
 {
     uint8_t *contents = memory_region_get_ram_ptr(devinfo);
@@ -1194,6 +1203,7 @@ static void init(MachineState *m)
         memcpy(memory_region_get_ram_ptr(&s->soc.flash), d, n);
         g_free(d);
     }
+    qemu_register_reset(efr32_cpu_reset, s->soc.armv7m.cpu);
 }
 static void idau(IDAUInterface *i, uint32_t a, int *r, bool *e, bool *n,
                  bool *c)
