@@ -18,6 +18,7 @@
 #define AGC_FRAMERSSI        0x01c
 #define AGC_IF               0x044
 #define AGC_IEN              0x048
+#define AGC_CMD              0x04c
 #define FRC_WHITEPOLY        0x034
 #define FRC_BUFFERMODE       0x078
 #define FRC_TRAILRXDATA       0x054
@@ -133,6 +134,15 @@ static void test_agc_rssi_valid_latches(void)
 
     writel(AGC_BASE + REGISTER_CLEAR_WINDOW + AGC_IF, 1);
     g_assert_cmphex(readl(AGC_BASE + AGC_IF), ==, 0x37c);
+}
+
+static void test_agc_rssi_start_command(void)
+{
+    writel(AGC_BASE + AGC_CMD, 1);
+
+    /* The public command register is write-only; no RF source is modeled. */
+    g_assert_cmphex(readl(AGC_BASE + AGC_CMD), ==, 0);
+    g_assert_cmphex(readl(AGC_BASE + AGC_IF) & 1, ==, 0);
 }
 
 static void test_frc_buffer_register_masks(void)
@@ -441,6 +451,8 @@ int main(int argc, char **argv)
                    test_agc_rssi_status_registers);
     qtest_add_func("/efr32bg22/agc-rssi-valid-latches",
                    test_agc_rssi_valid_latches);
+    qtest_add_func("/efr32bg22/agc-rssi-start-command",
+                   test_agc_rssi_start_command);
     qtest_add_func("/efr32bg22/frc-buffer-register-masks",
                    test_frc_buffer_register_masks);
     qtest_add_func("/efr32bg22/frc-interrupt-register-masks",

@@ -47,6 +47,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_AGC_FRAMERSSI 0x01cu
 #define EFR32_AGC_IF 0x044u
 #define EFR32_AGC_IEN 0x048u
+#define EFR32_AGC_CMD 0x04cu
 
 #define EFR32_RAC_STATUS 0x00cu
 #define EFR32_RAC_RXENSRCEN 0x008u
@@ -565,6 +566,8 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
         return 0;
     if (address == EFR32_RAC_BASE + EFR32_RAC_STATUS)
         return efr32_rac_status(s);
+    if (address == EFR32_AGC_BASE + EFR32_AGC_CMD)
+        return 0; /* AGC.CMD is write-only in the public register model. */
     if (((address & ~0x3fffu) == 0xa8028000 ||
          (address & ~0x3fffu) == 0xa802c000) &&
         offset == 0x40)
@@ -655,6 +658,12 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
     /* AGC RSSI registers are generated-model read-only status values. */
     if (register_address == EFR32_AGC_BASE + EFR32_AGC_RSSI ||
         register_address == EFR32_AGC_BASE + EFR32_AGC_FRAMERSSI)
+    {
+        return;
+    }
+
+    /* RSSISTART is accepted, but this model has no RF input to sample. */
+    if (register_address == EFR32_AGC_BASE + EFR32_AGC_CMD)
     {
         return;
     }
