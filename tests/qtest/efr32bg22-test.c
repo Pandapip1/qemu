@@ -99,6 +99,8 @@
 #define BUFC_STATUS          0x020
 #define BUFC_THRESHOLD       0x024
 #define BUFC_CMD             0x028
+#define BUFC_TX_CHANNEL       BUFC_CH0
+#define BUFC_RX_CHANNEL       BUFC_CH1
 
 #define BUFC_SECURE_BASE     0xaa000000
 #define RADIO_NONSECURE_ALIAS 0x10000000
@@ -362,6 +364,30 @@ static void test_bufc_data_port(void)
     g_assert_cmphex(readl(nonsecure_rx_channel + BUFC_READDATA), ==, 0x3c);
     g_assert_cmphex(qtest_readb(global_qtest, rx_buffer), ==, 0x3c);
     writel(sequencer_channel + BUFC_CMD, 1);
+}
+
+static void test_bufc_packet_channels_are_independent(void)
+{
+    const uint32_t tx_channel = BUFC_BASE + BUFC_TX_CHANNEL;
+    const uint32_t rx_channel = BUFC_BASE + BUFC_RX_CHANNEL;
+    const uint32_t tx_buffer = 0x20001000;
+    const uint32_t rx_buffer = 0x20002000;
+
+    /* RAIL's recovered FIFO helpers use channel 0 for TX and channel 1 for RX. */
+    writel(tx_channel + BUFC_CMD, 1);
+    writel(rx_channel + BUFC_CMD, 1);
+    writel(tx_channel, 3);
+    writel(rx_channel, 3);
+    writel(tx_channel + 0x004, tx_buffer);
+    writel(rx_channel + 0x004, rx_buffer);
+
+    writel(tx_channel + BUFC_WRITEDATA, 0x31);
+    writel(rx_channel + BUFC_WRITEDATA, 0x72);
+
+    g_assert_cmphex(qtest_readb(global_qtest, tx_buffer), ==, 0x31);
+    g_assert_cmphex(qtest_readb(global_qtest, rx_buffer), ==, 0x72);
+    g_assert_cmphex(readl(tx_channel + BUFC_READDATA), ==, 0x31);
+    g_assert_cmphex(readl(rx_channel + BUFC_READDATA), ==, 0x72);
 }
 
 static void test_bufc_tx_fifo_setup_latches(void)
@@ -632,6 +658,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/msc-status-reset", test_msc_status_reset);
     qtest_add_func("/efr32bg22/hfxo-ready-status", test_hfxo_ready_status);
     qtest_add_func("/efr32bg22/bufc-data-port", test_bufc_data_port);
+    qtest_add_func("/efr32bg22/bufc-packet-channels-are-independent",
+                   test_bufc_packet_channels_are_independent);
     qtest_add_func("/efr32bg22/bufc-tx-fifo-setup-latches",
                    test_bufc_tx_fifo_setup_latches);
     qtest_add_func("/efr32bg22/bufc-backing-memory-wrap",

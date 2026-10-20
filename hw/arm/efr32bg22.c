@@ -345,8 +345,14 @@ static void efr32_bufc_update_threshold(Efr32Periph *s, unsigned channel)
     efr32_bufc_update_irq(s);
 }
 
-static void efr32_bufc_write_data(Efr32Periph *s, unsigned channel,
-                                  uint8_t value, bool xor_write)
+/*
+ * BUFC data ports are the boundary between the packet engines and the FIFO
+ * backing store.  Host/RF ingress is not modeled yet, but keeping this write
+ * path separate from MMIO dispatch gives a future FRC/RF producer the same
+ * circular-buffer and guest-RAM behavior as sequencer programmed I/O.
+ */
+static void efr32_bufc_write_data_port(Efr32Periph *s, unsigned channel,
+                                       uint8_t value, bool xor_write)
 {
     uint32_t base = efr32_bufc_channel_base(channel);
     uint32_t buffer_address = efr32_register_get(s, base + 0x004);
@@ -366,6 +372,38 @@ static void efr32_bufc_write_data(Efr32Periph *s, unsigned channel,
                             MEMTXATTRS_UNSPECIFIED, &data->data[position], 1);
     }
     efr32_register_put(s, base + EFR32_BUFC_WRITEOFFSET, write_offset + 1);
+    efr32_bufc_update_threshold(s, channel);
+}
+
+static uint8_t efr32_bufc_read_data_port(Efr32Periph *s, unsigned channel)
+{
+    uint32_t base = efr32_bufc_channel_base(channel);
+    uint32_t buffer_address = efr32_register_get(s, base + 0x004);
+    uint32_t read_offset =
+        efr32_register_get(s, base + EFR32_BUFC_READOFFSET) & 0x1fff;
+    uint32_t position = efr32_bufc_storage_offset(s, channel, read_offset);
+    uint8_t value = position < s->bufc_data[channel]->len
+                        ? s->bufc_data[channel]->data[position]
+                        : 0;
+
+    if (buffer_address)
+    {
+        address_space_read(&address_space_memory, buffer_address + position,
+                           MEMTXATTRS_UNSPECIFIED, &value, 1);
+    }
+
+    efr32_register_put(s, base + EFR32_BUFC_READOFFSET, read_offset + 1);
+    efr32_bufc_update_threshold(s, channel);
+    return value;
+}
+
+static void efr32_bufc_clear(Efr32Periph *s, unsigned channel)
+{
+    uint32_t base = efr32_bufc_channel_base(channel);
+
+    g_byte_array_set_size(s->bufc_data[channel], 0);
+    efr32_register_put(s, base + EFR32_BUFC_WRITEOFFSET, 0);
+    efr32_register_put(s, base + EFR32_BUFC_READOFFSET, 0);
     efr32_bufc_update_threshold(s, channel);
 }
 
@@ -560,30 +598,9 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
     if ((address & ~0x3fffu) == EFR32_BUFC_BASE &&
         efr32_bufc_decode(offset, &channel, &register_offset))
     {
-        uint32_t base = efr32_bufc_channel_base(channel);
-
         if (register_offset == EFR32_BUFC_READDATA)
         {
-            uint32_t buffer_address =
-                efr32_register_get(s, base + 0x004);
-            uint32_t read_offset =
-                efr32_register_get(s, base + EFR32_BUFC_READOFFSET) & 0x1fff;
-            uint32_t position =
-                efr32_bufc_storage_offset(s, channel, read_offset);
-            uint8_t value = position < s->bufc_data[channel]->len
-                                ? s->bufc_data[channel]->data[position]
-                                : 0;
-
-            if (buffer_address)
-            {
-                address_space_read(&address_space_memory,
-                                   buffer_address + position,
-                                   MEMTXATTRS_UNSPECIFIED, &value, 1);
-            }
-
-            efr32_register_put(s, base + EFR32_BUFC_READOFFSET, read_offset + 1);
-            efr32_bufc_update_threshold(s, channel);
-            return value;
+            return efr32_bufc_read_data_port(s, channel);
         }
         if (register_offset == EFR32_BUFC_STATUS)
         {
@@ -706,24 +723,19 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
     if ((register_address & ~0x3fffu) == EFR32_BUFC_BASE &&
         efr32_bufc_decode(register_address & 0xfff, &channel, &register_offset))
     {
-        uint32_t base = efr32_bufc_channel_base(channel);
-
         switch (register_offset)
         {
         case EFR32_BUFC_WRITEDATA:
-            efr32_bufc_write_data(s, channel, next, false);
+            efr32_bufc_write_data_port(s, channel, next, false);
             return;
         case EFR32_BUFC_XWRITEDATA:
-            efr32_bufc_write_data(s, channel, next, true);
+            efr32_bufc_write_data_port(s, channel, next, true);
             return;
         case EFR32_BUFC_CMD:
             efr32_register_put(s, register_address, next & 0xf);
             if (next & 1)
             {
-                g_byte_array_set_size(s->bufc_data[channel], 0);
-                efr32_register_put(s, base + EFR32_BUFC_WRITEOFFSET, 0);
-                efr32_register_put(s, base + EFR32_BUFC_READOFFSET, 0);
-                efr32_bufc_update_threshold(s, channel);
+                efr32_bufc_clear(s, channel);
             }
             return;
         default:
