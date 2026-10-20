@@ -2624,7 +2624,16 @@ config_host_data.set('HAVE_GETIFADDRS', cc.has_function('getifaddrs'))
 config_host_data.set('HAVE_GLIB_WITH_SLICE_ALLOCATOR', glib_has_gslice)
 config_host_data.set('HAVE_GLIB_WITH_ALIGNED_ALLOC', glib_has_aligned_alloc)
 config_host_data.set('HAVE_OPENPTY', cc.has_function('openpty', dependencies: util))
-config_host_data.set('HAVE_STRCHRNUL', cc.has_function('strchrnul'))
+# Checking only the symbol misses macOS availability annotations: a new SDK
+# can export strchrnul while the configured deployment target cannot call it.
+config_host_data.set('HAVE_STRCHRNUL',
+                     cc.has_function('strchrnul') and
+                     cc.compiles('''
+                       #include <string.h>
+                       int main(void)
+                       {
+                         return strchrnul("", 0) == NULL;
+                       }''', name: 'callable strchrnul'))
 config_host_data.set('HAVE_SYSTEM_FUNCTION', cc.has_function('system', prefix: '#include <stdlib.h>'))
 if rbd.found()
   config_host_data.set('HAVE_RBD_NAMESPACE_EXISTS',
