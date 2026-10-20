@@ -45,6 +45,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_FRC_IEN 0x06cu
 #define EFR32_FRC_RXRAWDATA 0x090u
 #define EFR32_FRC_IF_TXDONE (1u << 0)
+#define EFR32_FRC_IF_RXDONE (1u << 4)
 
 #define EFR32_AGC_RSSI 0x018u
 #define EFR32_AGC_FRAMERSSI 0x01cu
@@ -155,6 +156,7 @@ struct Efr32Periph
     Clock *protimer_clk;
     ptimer_state *protimer_counter;
     QEMUTimer *rac_tx_timer;
+    QEMUTimer *rac_rx_timer;
     GByteArray *bufc_data[4];
     Efr32RfMedium *rf_medium;
     qemu_irq irq[64];
@@ -557,6 +559,64 @@ static void efr32_rac_schedule_tx_completion(Efr32Periph *s)
                   EFR32_RAC_TX_COMPLETION_DELAY_NS);
 }
 
+/*
+ * An RX offer is deferred out of the transmitter's RAC.CMD write path.  This
+ * is a QEMU scheduling boundary, not a claim about propagation or packet-air
+ * time.  It also gives a receiver that turns RX off before dispatch a chance
+ * to leave its offer pending until a later RXSEARCH entry.
+ */
+static void efr32_rac_schedule_rx_handoff(Efr32Periph *s)
+{
+    timer_mod(s->rac_rx_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+}
+
+static void efr32_rac_rx_handoff(void *opaque)
+{
+    Efr32Periph *s = EFR32_PERIPH(opaque);
+    Efr32RfRxDeliveryRequest *request;
+    const Efr32RfRxMetadata *metadata;
+    const uint8_t *data;
+    gsize length;
+
+    if (s->rac_state != EFR32_RAC_STATE_RXSEARCH) {
+        return;
+    }
+
+    request = efr32_rf_medium_take_rx_offer_for_radio(
+        s->rf_medium, EFR32_RF_RADIO(s));
+    if (!request) {
+        s->rx_offer_pending = false;
+        return;
+    }
+
+    metadata = efr32_rf_rx_delivery_request_get_metadata(request);
+    g_assert(metadata->buffer_channel == EFR32_RF_RX_BUFC_CHANNEL);
+    data = g_bytes_get_data(efr32_rf_rx_delivery_request_get_data(request),
+                            &length);
+
+    /*
+     * The retained sequencer reads FRC.RXRAWDATA then writes its four byte
+     * lanes to secure BUFC channel 1 WRITEDATA.  Replay only that observed
+     * data path: these bytes are not framed, CRC checked, or made into a
+     * channel-2 descriptor.
+     */
+    for (gsize index = 0; index < length; index++) {
+        efr32_register_put(s, EFR32_FRC_BASE + EFR32_FRC_RXRAWDATA,
+                           data[index]);
+        efr32_bufc_write_data_port(s, EFR32_RF_RX_BUFC_CHANNEL,
+                                   data[index], false);
+    }
+    efr32_rf_rx_delivery_request_free(request);
+    efr32_frc_raise(s, EFR32_FRC_IF_RXDONE);
+
+    /* One mailbox record is consumed per deferred handoff. */
+    s->rx_offer_pending = efr32_rf_medium_has_rx_offer_for_radio(
+        s->rf_medium, EFR32_RF_RADIO(s));
+    if (s->rx_offer_pending) {
+        efr32_rac_schedule_rx_handoff(s);
+    }
+}
+
 static void efr32_rac_capture_tx_snapshot(Efr32Periph *s)
 {
     Efr32RfTxMetadata metadata = {
@@ -810,10 +870,12 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         if (next & (EFR32_RAC_CMD_TXDIS | EFR32_RAC_CMD_RXDIS))
         {
             efr32_rac_cancel_tx_completion(s);
+            timer_del(s->rac_rx_timer);
             efr32_rac_set_state(s, EFR32_RAC_STATE_OFF);
         }
         else if (next & EFR32_RAC_CMD_TXEN)
         {
+            timer_del(s->rac_rx_timer);
             efr32_rac_capture_tx_snapshot(s);
             efr32_rac_set_state(s, EFR32_RAC_STATE_TX);
             efr32_rac_schedule_tx_completion(s);
@@ -878,6 +940,7 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         (next & EFR32_RAC_CTRL_FORCEDISABLE))
     {
         efr32_rac_cancel_tx_completion(s);
+        timer_del(s->rac_rx_timer);
         efr32_rac_set_state(s, EFR32_RAC_STATE_OFF);
     }
 
@@ -893,6 +956,9 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         /* RX replaces this model's active synthetic TX operation. */
         efr32_rac_cancel_tx_completion(s);
         efr32_rac_set_state(s, EFR32_RAC_STATE_RXSEARCH);
+        if (s->rx_offer_pending) {
+            efr32_rac_schedule_rx_handoff(s);
+        }
     }
 
     if (register_address == EFR32_RAC_BASE + EFR32_RAC_IF ||
@@ -982,6 +1048,8 @@ static void efr32_periph_init(Object *o)
                                       PTIMER_POLICY_TRIGGER_ONLY_ON_DECREMENT);
     s->rac_tx_timer =
         timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_rac_tx_complete, s);
+    s->rac_rx_timer =
+        timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_rac_rx_handoff, s);
     for (unsigned channel = 0; channel < G_N_ELEMENTS(s->bufc_data); channel++)
     {
         s->bufc_data[channel] = g_byte_array_new();
@@ -1011,6 +1079,7 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     ptimer_run(s->protimer_counter, 0);
     ptimer_transaction_commit(s->protimer_counter);
     efr32_rac_cancel_tx_completion(s);
+    timer_del(s->rac_rx_timer);
     s->rx_offer_pending = false;
     efr32_rf_medium_reset_radio(s->rf_medium, EFR32_RF_RADIO(s));
     efr32_register_put(s, EFR32_CMU_BASE + EFR32_CMU_SYSCLKCTRL,
@@ -1031,6 +1100,19 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     }
 }
 
+static void efr32_periph_finalize(Object *obj)
+{
+    Efr32Periph *s = EFR32_PERIPH(obj);
+
+    timer_free(s->rac_rx_timer);
+    timer_free(s->rac_tx_timer);
+    ptimer_free(s->protimer_counter);
+    for (unsigned channel = 0; channel < G_N_ELEMENTS(s->bufc_data); channel++) {
+        g_byte_array_unref(s->bufc_data[channel]);
+    }
+    g_hash_table_destroy(s->registers);
+}
+
 static bool efr32_periph_is_rx_ready(Efr32RfRadio *radio)
 {
     Efr32Periph *s = EFR32_PERIPH(radio);
@@ -1042,8 +1124,9 @@ static void efr32_periph_rx_offer_available(Efr32RfRadio *radio)
 {
     Efr32Periph *s = EFR32_PERIPH(radio);
 
-    /* A mailbox notification only; FRC/BUFC/CRC/IRQ delivery is unmodelled. */
+    /* Delivery occurs from the virtual-clock callback, never in TXEN's path. */
     s->rx_offer_pending = true;
+    efr32_rac_schedule_rx_handoff(s);
 }
 
 static void efr32_periph_class_init(ObjectClass *o, void *d)
@@ -1058,6 +1141,7 @@ static const TypeInfo periph_info = {.name = TYPE_EFR32_PERIPH,
                                      .parent = TYPE_SYS_BUS_DEVICE,
                                      .instance_size = sizeof(Efr32Periph),
                                      .instance_init = efr32_periph_init,
+                                     .instance_finalize = efr32_periph_finalize,
                                      .class_init = efr32_periph_class_init,
                                      .interfaces =
                                          (InterfaceInfo[]){{

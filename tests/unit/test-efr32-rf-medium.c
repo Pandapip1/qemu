@@ -323,6 +323,10 @@ static void test_rx_offers_are_receiver_scoped(RfMediumFixture *fixture,
     efr32_rf_medium_set_latest_tx_snapshot(fixture->medium, snapshot);
     g_assert_cmpuint(efr32_rf_medium_offer_latest_tx(fixture->medium,
                                                        &error_abort), ==, 2);
+    g_assert_true(efr32_rf_medium_has_rx_offer_for_radio(fixture->medium,
+                                                          first_peer));
+    g_assert_true(efr32_rf_medium_has_rx_offer_for_radio(fixture->medium,
+                                                          second_peer));
 
     request = efr32_rf_medium_take_rx_offer_for_radio(fixture->medium,
                                                        second_peer);
@@ -330,12 +334,16 @@ static void test_rx_offers_are_receiver_scoped(RfMediumFixture *fixture,
     g_assert_true(efr32_rf_rx_delivery_request_get_receiver(request) ==
                   second_peer);
     efr32_rf_rx_delivery_request_free(request);
+    g_assert_false(efr32_rf_medium_has_rx_offer_for_radio(fixture->medium,
+                                                           second_peer));
     request = efr32_rf_medium_take_rx_offer_for_radio(fixture->medium,
                                                        first_peer);
     g_assert_nonnull(request);
     g_assert_true(efr32_rf_rx_delivery_request_get_receiver(request) ==
                   first_peer);
     efr32_rf_rx_delivery_request_free(request);
+    g_assert_false(efr32_rf_medium_has_rx_offer_for_radio(fixture->medium,
+                                                           first_peer));
     g_assert_null(efr32_rf_medium_take_rx_offer_for_radio(fixture->medium,
                                                            first_peer));
 

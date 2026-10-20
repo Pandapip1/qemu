@@ -144,6 +144,8 @@ Efr32RfRxDeliveryRequest *efr32_rf_medium_take_rx_offer(
 /* Transfer the oldest offer addressed to @receiver, preserving other offers. */
 Efr32RfRxDeliveryRequest *efr32_rf_medium_take_rx_offer_for_radio(
     Efr32RfMedium *medium, Efr32RfRadio *receiver);
+bool efr32_rf_medium_has_rx_offer_for_radio(const Efr32RfMedium *medium,
+                                            const Efr32RfRadio *receiver);
 void efr32_rf_medium_clear_rx_offers(Efr32RfMedium *medium);
 
 void efr32_rf_medium_register_types(void);

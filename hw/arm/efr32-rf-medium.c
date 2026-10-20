@@ -304,6 +304,20 @@ Efr32RfRxDeliveryRequest *efr32_rf_medium_take_rx_offer_for_radio(
     return NULL;
 }
 
+bool efr32_rf_medium_has_rx_offer_for_radio(const Efr32RfMedium *medium,
+                                            const Efr32RfRadio *receiver)
+{
+    for (GList *link = medium->rx_offers.head; link; link = link->next) {
+        Efr32RfRxDeliveryRequest *request = link->data;
+
+        if (efr32_rf_rx_delivery_request_get_receiver(request) == receiver) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 void efr32_rf_medium_clear_rx_offers(Efr32RfMedium *medium)
 {
     Efr32RfRxDeliveryRequest *request;
