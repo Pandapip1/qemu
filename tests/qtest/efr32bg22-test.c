@@ -30,6 +30,9 @@
 #define MODEM_BASE           0xa8014000
 #define MODEM_SHAPING1       0x098
 #define MODEM_LONGRANGE5     0x14c
+#define MODEM_IF             0x208
+#define MODEM_IEN            0x20c
+#define MODEM_IRCAL          0x228
 #define RFCRC_BASE           0xa8010000
 #define RFCRC_EN             0x004
 #define RFCRC_CTRL           0x008
@@ -122,7 +125,14 @@ static void test_modem_masks(void)
     g_assert_cmphex(readl(MODEM_BASE + MODEM_SHAPING1), ==, 0xdeadbeef);
 
     writel(MODEM_BASE + MODEM_LONGRANGE5, UINT32_MAX);
+    writel(MODEM_BASE + MODEM_IF, UINT32_MAX);
+    writel(MODEM_BASE + MODEM_IEN, UINT32_MAX);
+    writel(MODEM_BASE + MODEM_IRCAL, UINT32_MAX);
+
     g_assert_cmphex(readl(MODEM_BASE + MODEM_LONGRANGE5), ==, 0x0fffffff);
+    g_assert_cmphex(readl(MODEM_BASE + MODEM_IF), ==, 0x0007ffff);
+    g_assert_cmphex(readl(MODEM_BASE + MODEM_IEN), ==, 0x0007ffff);
+    g_assert_cmphex(readl(MODEM_BASE + MODEM_IRCAL), ==, 0x0000ffbf);
 }
 
 static void test_rfcrc_masks(void)
