@@ -26,6 +26,13 @@ struct Efr32RfRxDeliveryRequest {
     Efr32RfRadio *receiver;
     Efr32RfRxMetadata metadata;
     GBytes *data;
+    /*
+     * Mailbox bookkeeping only.  It lets a source cancel precisely the
+     * offers made from its still-retained TXEN snapshot without disturbing a
+     * newer transmission or traffic addressed to that source.
+     */
+    Efr32RfRadio *source;
+    uint64_t tx_sequence;
 };
 
 bool efr32_rf_radio_is_rx_ready(Efr32RfRadio *radio)
@@ -212,6 +219,9 @@ void efr32_rf_rx_delivery_request_free(Efr32RfRxDeliveryRequest *request)
     }
 
     object_unref(OBJECT(request->receiver));
+    if (request->source) {
+        object_unref(OBJECT(request->source));
+    }
     g_bytes_unref(request->data);
     g_free(request);
 }
@@ -270,12 +280,43 @@ unsigned efr32_rf_medium_offer_latest_tx(Efr32RfMedium *medium,
         if (!request) {
             return offers;
         }
+        request->source = EFR32_RF_RADIO(object_ref(OBJECT(
+            efr32_rf_tx_snapshot_get_radio(snapshot))));
+        request->tx_sequence = efr32_rf_tx_snapshot_get_sequence(snapshot);
         g_queue_push_tail(&medium->rx_offers, request);
         efr32_rf_radio_rx_offer_available(receiver);
         offers++;
     }
 
     return offers;
+}
+
+unsigned efr32_rf_medium_withdraw_latest_tx(Efr32RfMedium *medium,
+                                             Efr32RfRadio *source)
+{
+    const Efr32RfTxSnapshot *snapshot = medium->latest_tx_snapshot;
+    uint64_t sequence;
+    unsigned withdrawn = 0;
+    GList *link;
+
+    if (!snapshot || efr32_rf_tx_snapshot_get_radio(snapshot) != source) {
+        return 0;
+    }
+
+    sequence = efr32_rf_tx_snapshot_get_sequence(snapshot);
+    efr32_rf_medium_clear_latest_tx_snapshot(medium);
+    for (link = medium->rx_offers.head; link;) {
+        Efr32RfRxDeliveryRequest *request = link->data;
+        GList *next = link->next;
+
+        if (request->source == source && request->tx_sequence == sequence) {
+            g_queue_delete_link(&medium->rx_offers, link);
+            efr32_rf_rx_delivery_request_free(request);
+            withdrawn++;
+        }
+        link = next;
+    }
+    return withdrawn;
 }
 
 unsigned efr32_rf_medium_get_rx_offer_count(const Efr32RfMedium *medium)

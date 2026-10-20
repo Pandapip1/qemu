@@ -1194,6 +1194,15 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         {
             efr32_rac_cancel_tx_completion(s);
             timer_del(s->rac_rx_timer);
+            /*
+             * TXDIS aborts the in-flight model transaction as well as its
+             * synthetic completion timer.  Do not let a TXEN mailbox offer
+             * survive an explicit source abort and turn into a later RXDONE.
+             */
+            if (next & EFR32_RAC_CMD_TXDIS) {
+                efr32_rf_medium_withdraw_latest_tx(
+                    s->rf_medium, EFR32_RF_RADIO(s));
+            }
             efr32_rac_set_state(s, EFR32_RAC_STATE_OFF);
         }
         else if (next & EFR32_RAC_CMD_TXEN)

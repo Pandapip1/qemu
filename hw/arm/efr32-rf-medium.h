@@ -106,6 +106,13 @@ const Efr32RfTxSnapshot *efr32_rf_medium_get_latest_tx_snapshot(
 void efr32_rf_medium_clear_latest_tx_snapshot(Efr32RfMedium *medium);
 
 /*
+ * Withdraw the retained TXEN snapshot and only the undelivered offers made
+ * from it when @source aborts that transmission.  Returns offers removed.
+ */
+unsigned efr32_rf_medium_withdraw_latest_tx(Efr32RfMedium *medium,
+                                             Efr32RfRadio *source);
+
+/*
  * Discard medium state owned by, or addressed to, one radio. A reset of a
  * receiver must not discard offers for other attached receivers. A reset of
  * the source of the retained TX snapshot discards that snapshot and its
