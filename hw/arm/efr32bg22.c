@@ -162,6 +162,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_USART_STATUS_TXC (1u << 5)
 #define EFR32_USART_STATUS_TXBL (1u << 6)
 
+/* EFR32BG22 BURTC, as declared by efr32bg22_burtc.h. */
+#define EFR32_BURTC_BASE 0x40064000u
+#define EFR32_BURTC_EN 0x004u
+#define EFR32_BURTC_CFG 0x008u
+#define EFR32_BURTC_CMD 0x00cu
+#define EFR32_BURTC_STATUS 0x010u
+#define EFR32_BURTC_IF 0x014u
+#define EFR32_BURTC_IEN 0x018u
+#define EFR32_BURTC_PRECNT 0x01cu
+#define EFR32_BURTC_CNT 0x020u
+#define EFR32_BURTC_COMP 0x030u
+#define EFR32_BURTC_EN_EN (1u << 0)
+#define EFR32_BURTC_CMD_START (1u << 0)
+#define EFR32_BURTC_CMD_STOP (1u << 1)
+#define EFR32_BURTC_STATUS_RUNNING (1u << 0)
+
 #define EFR32_BUFC_BASE 0xaa000000u
 #define EFR32_BUFC_FIRST 0x00cu
 #define EFR32_BUFC_STRIDE 0x040u
@@ -191,6 +207,9 @@ struct Efr32Periph
     bool usart_tx_complete[2];
     Clock *protimer_clk;
     ptimer_state *protimer_counter;
+    Clock *burtc_clk;
+    ptimer_state *burtc_counter;
+    bool burtc_running;
     QEMUTimer *rac_tx_timer;
     QEMUTimer *rac_rx_timer;
     GByteArray *bufc_data[4];
@@ -827,7 +846,7 @@ static uint32_t efr32_rac_status(Efr32Periph *s)
            (state == EFR32_RAC_STATE_RXSEARCH) << 31;
 }
 
-static void efr32_protimer_counter_expired(void *opaque)
+static void efr32_free_running_counter_expired(void *opaque)
 {
     /* Free-running counter rollover has no observed side effects. */
 }
@@ -839,6 +858,15 @@ static void efr32_protimer_clock_update(void *opaque, ClockEvent event)
     ptimer_transaction_begin(s->protimer_counter);
     ptimer_set_period_from_clock(s->protimer_counter, s->protimer_clk, 1);
     ptimer_transaction_commit(s->protimer_counter);
+}
+
+static void efr32_burtc_clock_update(void *opaque, ClockEvent event)
+{
+    Efr32Periph *s = EFR32_PERIPH(opaque);
+
+    ptimer_transaction_begin(s->burtc_counter);
+    ptimer_set_period_from_clock(s->burtc_counter, s->burtc_clk, 1);
+    ptimer_transaction_commit(s->burtc_counter);
 }
 
 /*
@@ -858,6 +886,41 @@ static void efr32_protimer_clock_update(void *opaque, ClockEvent event)
 static uint32_t efr32_protimer_counter(Efr32Periph *s)
 {
     return UINT32_MAX - ptimer_get_count(s->protimer_counter);
+}
+
+static bool efr32_burtc_enabled(Efr32Periph *s)
+{
+    return efr32_register_get(s, EFR32_BURTC_BASE + EFR32_BURTC_EN) &
+           EFR32_BURTC_EN_EN;
+}
+
+static uint32_t efr32_burtc_counter(Efr32Periph *s)
+{
+    return UINT32_MAX - ptimer_get_count(s->burtc_counter);
+}
+
+static void efr32_burtc_update_running(Efr32Periph *s)
+{
+    ptimer_transaction_begin(s->burtc_counter);
+    if (s->burtc_running && efr32_burtc_enabled(s)) {
+        ptimer_run(s->burtc_counter, 0);
+    } else {
+        ptimer_stop(s->burtc_counter);
+    }
+    ptimer_transaction_commit(s->burtc_counter);
+}
+
+static void efr32_burtc_set_counter(Efr32Periph *s, uint32_t value)
+{
+    bool run = s->burtc_running && efr32_burtc_enabled(s);
+
+    ptimer_transaction_begin(s->burtc_counter);
+    ptimer_stop(s->burtc_counter);
+    ptimer_set_count(s->burtc_counter, UINT32_MAX - value);
+    if (run) {
+        ptimer_run(s->burtc_counter, 0);
+    }
+    ptimer_transaction_commit(s->burtc_counter);
 }
 
 static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
@@ -935,6 +998,11 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
                    : EFR32_DCDC_STATUS_WARM;
     if (address == 0x4a018004 || address == 0x4a018024)
         return 0;
+    if (address == EFR32_BURTC_BASE + EFR32_BURTC_CNT)
+        return efr32_burtc_counter(s);
+    if (address == EFR32_BURTC_BASE + EFR32_BURTC_STATUS)
+        return s->burtc_running && efr32_burtc_enabled(s) ?
+                   EFR32_BURTC_STATUS_RUNNING : 0;
     if (address == EFR32_RAC_BASE + EFR32_RAC_STATUS)
         return efr32_rac_status(s);
     if (((address & ~0x3fffu) == EFR32_PROTIMER_BASE ||
@@ -1011,6 +1079,41 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         return;
     }
 
+    if ((register_address & ~0x3fffu) == EFR32_BURTC_BASE) {
+        uint32_t burtc_offset = register_address & 0xfff;
+
+        switch (burtc_offset) {
+        case EFR32_BURTC_CMD:
+            if (next & EFR32_BURTC_CMD_STOP) {
+                s->burtc_running = false;
+            } else if (next & EFR32_BURTC_CMD_START) {
+                s->burtc_running = true;
+            }
+            efr32_burtc_update_running(s);
+            return;
+        case EFR32_BURTC_CNT:
+            efr32_burtc_set_counter(s, next);
+            return;
+        case EFR32_BURTC_STATUS:
+            return; /* status is generated from EN and CMD state. */
+        case EFR32_BURTC_EN:
+            next &= EFR32_BURTC_EN_EN;
+            break;
+        case EFR32_BURTC_CFG:
+            next &= 0xf3;
+            break;
+        case EFR32_BURTC_IF:
+        case EFR32_BURTC_IEN:
+            next &= 0x3;
+            break;
+        case EFR32_BURTC_PRECNT:
+            next &= 0x7fff;
+            break;
+        default:
+            break;
+        }
+    }
+
     if (register_address == EFR32_RAC_BASE + EFR32_RAC_CMD)
     {
         next &= 0xc000fdff;
@@ -1075,6 +1178,10 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
 
     efr32_register_put(s, register_address,
                        efr32_radio_mask_write(register_address, next));
+
+    if (register_address == EFR32_BURTC_BASE + EFR32_BURTC_EN) {
+        efr32_burtc_update_running(s);
+    }
 
     /*
      * The public CMU_DPLLLock() path clears DPLL.IF then enables DPLL0 and
@@ -1216,10 +1323,17 @@ static void efr32_periph_init(Object *o)
     s->protimer_clk = qdev_init_clock_in(DEVICE(o), "protimerclk",
                                          efr32_protimer_clock_update, s,
                                          ClockUpdate);
-    s->protimer_counter = ptimer_init(efr32_protimer_counter_expired, s,
+    s->protimer_counter = ptimer_init(efr32_free_running_counter_expired, s,
                                       PTIMER_POLICY_NO_IMMEDIATE_RELOAD |
                                       PTIMER_POLICY_NO_COUNTER_ROUND_DOWN |
                                       PTIMER_POLICY_TRIGGER_ONLY_ON_DECREMENT);
+    s->burtc_clk = qdev_init_clock_in(DEVICE(o), "burtcclk",
+                                      efr32_burtc_clock_update, s,
+                                      ClockUpdate);
+    s->burtc_counter = ptimer_init(efr32_free_running_counter_expired, s,
+                                   PTIMER_POLICY_NO_IMMEDIATE_RELOAD |
+                                   PTIMER_POLICY_NO_COUNTER_ROUND_DOWN |
+                                   PTIMER_POLICY_TRIGGER_ONLY_ON_DECREMENT);
     s->rac_tx_timer =
         timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_rac_tx_complete, s);
     s->rac_rx_timer =
@@ -1250,12 +1364,19 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     s->usart_tx_enabled[1] = false;
     s->usart_tx_complete[0] = false;
     s->usart_tx_complete[1] = false;
+    s->burtc_running = false;
     ptimer_transaction_begin(s->protimer_counter);
     ptimer_stop(s->protimer_counter);
     ptimer_set_period_from_clock(s->protimer_counter, s->protimer_clk, 1);
     ptimer_set_limit(s->protimer_counter, UINT32_MAX, 1);
     ptimer_run(s->protimer_counter, 0);
     ptimer_transaction_commit(s->protimer_counter);
+    ptimer_transaction_begin(s->burtc_counter);
+    ptimer_stop(s->burtc_counter);
+    ptimer_set_period_from_clock(s->burtc_counter, s->burtc_clk, 1);
+    ptimer_set_limit(s->burtc_counter, UINT32_MAX, 1);
+    ptimer_set_count(s->burtc_counter, UINT32_MAX);
+    ptimer_transaction_commit(s->burtc_counter);
     efr32_rac_cancel_tx_completion(s);
     timer_del(s->rac_rx_timer);
     s->rx_offer_pending = false;
@@ -1268,6 +1389,12 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
                        EFR32_EMU_STATUS_RESET);
     efr32_register_put(s, EFR32_MSC_BASE + EFR32_MSC_STATUS,
                        EFR32_MSC_STATUS_RESET);
+    /*
+     * Zephyr's alarm-mode counter driver reports COMP as its top value.
+     * The LL ticker requires a free-running 32-bit top, so this machine
+     * integration default is UINT32_MAX until guest software programs COMP.
+     */
+    efr32_register_put(s, EFR32_BURTC_BASE + EFR32_BURTC_COMP, UINT32_MAX);
     efr32_register_put(s, EFR32_AGC_BASE + EFR32_AGC_RSSI, 0x8000);
     efr32_register_put(s, EFR32_AGC_BASE + EFR32_AGC_FRAMERSSI, 0x8000);
     for (unsigned irq = 0; irq < G_N_ELEMENTS(s->irq); irq++)
@@ -1287,6 +1414,7 @@ static void efr32_periph_finalize(Object *obj)
     timer_free(s->rac_rx_timer);
     timer_free(s->rac_tx_timer);
     ptimer_free(s->protimer_counter);
+    ptimer_free(s->burtc_counter);
     for (unsigned channel = 0; channel < G_N_ELEMENTS(s->bufc_data); channel++) {
         g_byte_array_unref(s->bufc_data[channel]);
     }
@@ -1350,6 +1478,7 @@ struct Efr32Bg22SoCState {
     MemoryRegion devinfo;
     Clock *clk;
     Clock *protimer_clk;
+    Clock *burtc_clk;
 
     MemoryRegion *memory;
     Efr32RfMedium *rf_medium;
@@ -1456,6 +1585,8 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
     clock_set_hz(s->clk, 38400000);
     s->protimer_clk = clock_new(OBJECT(s), "PROTIMERCLK");
     clock_set_hz(s->protimer_clk, 2000000);
+    s->burtc_clk = clock_new(OBJECT(s), "BURTCCLK");
+    clock_set_hz(s->burtc_clk, 32768);
 
     memory_region_init_ram(&s->flash, OBJECT(s), flash_name, FLASH_SIZE,
                            &error_fatal);
@@ -1477,6 +1608,7 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
 
     s->periph.rf_medium = s->rf_medium;
     qdev_connect_clock_in(DEVICE(&s->periph), "protimerclk", s->protimer_clk);
+    qdev_connect_clock_in(DEVICE(&s->periph), "burtcclk", s->burtc_clk);
     if (!sysbus_realize(periph, errp)) {
         return;
     }

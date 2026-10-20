@@ -112,6 +112,17 @@ static char *tx_snapshot_trace_path;
 #define USART_STATUS_TXENS    (1u << 1)
 #define USART_STATUS_TXC      (1u << 5)
 #define USART_STATUS_TXBL     (1u << 6)
+#define BURTC_BASE             0x40064000
+#define BURTC_EN               0x004
+#define BURTC_CFG              0x008
+#define BURTC_CMD              0x00c
+#define BURTC_STATUS           0x010
+#define BURTC_CNT              0x020
+#define BURTC_COMP             0x030
+#define BURTC_EN_EN            (1u << 0)
+#define BURTC_CMD_START        (1u << 0)
+#define BURTC_CMD_STOP         (1u << 1)
+#define BURTC_STATUS_RUNNING   (1u << 0)
 #define RADIO_RAM_NS_BASE     0xb0000000
 #define RADIO_RAM_RHCLKPRESC  0x4fe0
 #define BUFC_BASE            0xaa000000
@@ -151,6 +162,39 @@ static void test_register_aliases(void)
 
     writel(address + REGISTER_TOGGLE_WINDOW, 0x01);
     g_assert_cmphex(readl(address), ==, 0x11);
+}
+
+static void test_burtc_counter_contract(void)
+{
+    uint32_t stopped;
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    /* The LL ticker uses the driver's COMP-backed top-value API. */
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_COMP), ==, UINT32_MAX);
+
+    writel(BURTC_BASE + BURTC_CFG, UINT32_MAX);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_CFG), ==, 0xf3);
+    writel(BURTC_BASE + BURTC_CFG + REGISTER_CLEAR_WINDOW, 0xf0);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_CFG), ==, 0x03);
+
+    writel(BURTC_BASE + BURTC_EN + REGISTER_SET_WINDOW, BURTC_EN_EN);
+    writel(BURTC_BASE + BURTC_CNT, 0x11223344);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_CNT), ==, 0x11223344);
+    writel(BURTC_BASE + BURTC_CMD, BURTC_CMD_START);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_STATUS), ==,
+                    BURTC_STATUS_RUNNING);
+    qtest_clock_step(global_qtest, 1000000);
+    g_assert_cmpuint(readl(BURTC_BASE + BURTC_CNT), >, 0x11223344);
+
+    writel(BURTC_BASE + BURTC_CMD + REGISTER_SET_WINDOW, BURTC_CMD_STOP);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_STATUS), ==, 0);
+    stopped = readl(BURTC_BASE + BURTC_CNT);
+    qtest_clock_step(global_qtest, 1000000);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_CNT), ==, stopped);
+
+    writel(BURTC_BASE + BURTC_EN + REGISTER_CLEAR_WINDOW, BURTC_EN_EN);
+    writel(BURTC_BASE + BURTC_CMD, BURTC_CMD_START);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_STATUS), ==, 0);
 }
 
 static void test_cmu_nonsecure_alias(void)
@@ -938,6 +982,8 @@ int main(int argc, char **argv)
     g_free(qemu_args);
 
     qtest_add_func("/efr32bg22/register-aliases", test_register_aliases);
+    qtest_add_func("/efr32bg22/burtc-counter-contract",
+                   test_burtc_counter_contract);
     qtest_add_func("/efr32bg22/cmu-nonsecure-alias", test_cmu_nonsecure_alias);
     qtest_add_func("/efr32bg22/dpll-lock", test_dpll_lock);
     qtest_add_func("/efr32bg22/usart-tx-polling", test_usart_tx_polling);
