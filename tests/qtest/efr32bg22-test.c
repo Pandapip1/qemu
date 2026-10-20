@@ -71,7 +71,7 @@ static char *tx_snapshot_trace_path;
 #define RAC_SEQIF_STATERXSEARCH (1u << 18)
 #define RAC_SEQIF_STATETX     (1u << 25)
 #define DCDC_BASE             0x40094000
-#define DCDC_SECURE_BASE      0x50094000
+#define DCDC_NONSECURE_BASE   0x50094000
 #define DCDC_CTRL             0x008
 #define DCDC_IF               0x024
 #define DCDC_STATUS           0x02c
@@ -81,7 +81,7 @@ static char *tx_snapshot_trace_path;
 #define MSC_BASE              0x40030000
 #define MSC_STATUS            0x01c
 #define HFXO_BASE             0x4000c000
-#define HFXO_SECURE_BASE      0x5000c000
+#define HFXO_NONSECURE_BASE   0x5000c000
 #define HFXO_CTRL             0x028
 #define HFXO_CMD              0x050
 #define HFXO_STATUS           0x058
@@ -89,6 +89,7 @@ static char *tx_snapshot_trace_path;
 #define HFXO_STATUS_FSMLOCK   (1u << 30)
 #define HFXO_CTRL_DISONDEMAND (1u << 1)
 #define CMU_BASE              0x40008000
+#define CMU_NONSECURE_BASE    0x50008000
 #define CMU_SYSCLKCTRL        0x070
 #define RADIO_RAM_NS_BASE     0xb0000000
 #define RADIO_RAM_RHCLKPRESC  0x4fe0
@@ -129,6 +130,19 @@ static void test_register_aliases(void)
 
     writel(address + REGISTER_TOGGLE_WINDOW, 0x01);
     g_assert_cmphex(readl(address), ==, 0x11);
+}
+
+static void test_cmu_nonsecure_alias(void)
+{
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    g_assert_cmphex(readl(CMU_BASE + CMU_SYSCLKCTRL) & 7, ==, 1);
+    g_assert_cmphex(readl(CMU_NONSECURE_BASE + CMU_SYSCLKCTRL) & 7, ==, 1);
+
+    writel(CMU_NONSECURE_BASE + CMU_SYSCLKCTRL, 3);
+    g_assert_cmphex(readl(CMU_BASE + CMU_SYSCLKCTRL) & 7, ==, 3);
+
+    writel(CMU_BASE + CMU_SYSCLKCTRL, 1);
+    g_assert_cmphex(readl(CMU_NONSECURE_BASE + CMU_SYSCLKCTRL) & 7, ==, 1);
 }
 
 static void test_modem_masks(void)
@@ -308,12 +322,12 @@ static void test_stock_setup_aliases(void)
 static void test_dcdc_regulation(void)
 {
     qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
-    g_assert_cmphex(readl(DCDC_SECURE_BASE + DCDC_IF) & DCDC_IF_REGULATION,
+    g_assert_cmphex(readl(DCDC_NONSECURE_BASE + DCDC_IF) & DCDC_IF_REGULATION,
                     ==, 0);
 
-    writel(DCDC_SECURE_BASE + DCDC_CTRL + REGISTER_SET_WINDOW, 1);
+    writel(DCDC_NONSECURE_BASE + DCDC_CTRL + REGISTER_SET_WINDOW, 1);
 
-    g_assert_cmphex(readl(DCDC_SECURE_BASE + DCDC_IF) & DCDC_IF_REGULATION,
+    g_assert_cmphex(readl(DCDC_NONSECURE_BASE + DCDC_IF) & DCDC_IF_REGULATION,
                     ==,
                     DCDC_IF_REGULATION);
     g_assert_cmphex(readl(DCDC_BASE + DCDC_IF) & DCDC_IF_REGULATION, ==,
@@ -336,20 +350,20 @@ static void test_hfxo_ready_status(void)
     qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
     g_assert_cmphex(readl(CMU_BASE + CMU_SYSCLKCTRL) & 7, ==, 1);
     g_assert_cmphex(readl(HFXO_BASE + HFXO_CTRL), ==, HFXO_CTRL_DISONDEMAND);
-    g_assert_cmphex(readl(HFXO_SECURE_BASE + HFXO_STATUS), ==, 0);
+    g_assert_cmphex(readl(HFXO_NONSECURE_BASE + HFXO_STATUS), ==, 0);
 
-    writel(HFXO_SECURE_BASE + HFXO_CTRL + REGISTER_SET_WINDOW, 1);
-    g_assert_cmphex(readl(HFXO_SECURE_BASE + HFXO_STATUS), ==,
+    writel(HFXO_NONSECURE_BASE + HFXO_CTRL + REGISTER_SET_WINDOW, 1);
+    g_assert_cmphex(readl(HFXO_NONSECURE_BASE + HFXO_STATUS), ==,
                     HFXO_STATUS_READY | HFXO_STATUS_FSMLOCK);
     g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==,
                     HFXO_STATUS_READY | HFXO_STATUS_FSMLOCK);
 
-    writel(HFXO_SECURE_BASE + HFXO_CMD, 1u << 1);
+    writel(HFXO_NONSECURE_BASE + HFXO_CMD, 1u << 1);
     g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==, HFXO_STATUS_READY);
 
     /* Re-enable without reading disabled STATUS: a fresh lock must start. */
-    writel(HFXO_SECURE_BASE + HFXO_CTRL + REGISTER_CLEAR_WINDOW, 1);
-    writel(HFXO_SECURE_BASE + HFXO_CTRL + REGISTER_SET_WINDOW, 1);
+    writel(HFXO_NONSECURE_BASE + HFXO_CTRL + REGISTER_CLEAR_WINDOW, 1);
+    writel(HFXO_NONSECURE_BASE + HFXO_CTRL + REGISTER_SET_WINDOW, 1);
     g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==,
                     HFXO_STATUS_READY | HFXO_STATUS_FSMLOCK);
 
@@ -855,6 +869,7 @@ int main(int argc, char **argv)
     g_free(qemu_args);
 
     qtest_add_func("/efr32bg22/register-aliases", test_register_aliases);
+    qtest_add_func("/efr32bg22/cmu-nonsecure-alias", test_cmu_nonsecure_alias);
     qtest_add_func("/efr32bg22/modem-masks", test_modem_masks);
     qtest_add_func("/efr32bg22/rfcrc-masks", test_rfcrc_masks);
     qtest_add_func("/efr32bg22/agc-rssi-status-registers",

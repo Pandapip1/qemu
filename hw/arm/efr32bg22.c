@@ -26,6 +26,9 @@
 OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define PERIPH_BASE 0x40000000u
 #define PERIPH_SIZE 0x20000000u
+#define PERIPH_NONSECURE_BASE 0x50000000u
+#define PERIPH_NONSECURE_END 0x60000000u
+#define PERIPH_NONSECURE_OFFSET (PERIPH_NONSECURE_BASE - PERIPH_BASE)
 #define RADIO_BASE 0xa8000000u
 #define RADIO_SIZE 0x04000000u
 #define FLASH_SIZE (512 * 1024)
@@ -97,7 +100,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_FSRCO 1u
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_HFXO 3u
 #define EFR32_HFXO_BASE 0x4000c000u
-#define EFR32_HFXO_SECURE_BASE 0x5000c000u
 #define EFR32_HFXO_CTRL 0x028u
 #define EFR32_HFXO_CMD 0x050u
 #define EFR32_HFXO_STATUS 0x058u
@@ -115,7 +117,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
      EFR32_HFXO_STATUS_ENS | EFR32_HFXO_STATUS_HWREQ | EFR32_HFXO_STATUS_ISWARM)
 
 #define EFR32_DCDC_BASE 0x40094000u
-#define EFR32_DCDC_SECURE_BASE 0x50094000u
 #define EFR32_DCDC_CTRL 0x008u
 #define EFR32_DCDC_IF 0x024u
 #define EFR32_DCDC_STATUS 0x02cu
@@ -468,14 +469,14 @@ static uint32_t efr32_peripheral_canonical_address(uint32_t address)
         address = EFR32_PROTIMER_BASE + (address & 0x3fffu);
     }
 
-    /* HFXO0 is visible through both the secure and non-secure peripheral map. */
-    if ((address & ~0x3fffu) == EFR32_HFXO_SECURE_BASE) {
-        address = EFR32_HFXO_BASE + (address & 0x3fffu);
-    }
-
-    /* DCDC0 has the same secure/non-secure peripheral-map arrangement. */
-    if ((address & ~0x3fffu) == EFR32_DCDC_SECURE_BASE) {
-        address = EFR32_DCDC_BASE + (address & 0x3fffu);
+    /*
+     * Series-2 exposes non-secure peripherals at 0x50000000..0x5fffffff;
+     * these mirror the secure 0x40000000..0x4fffffff view.  Preserve the
+     * 16 KiB normal/SET/CLR/TGL subwindows for the common register handler.
+     */
+    if (address >= PERIPH_NONSECURE_BASE &&
+        address < PERIPH_NONSECURE_END) {
+        address -= PERIPH_NONSECURE_OFFSET;
     }
 
     return address;
