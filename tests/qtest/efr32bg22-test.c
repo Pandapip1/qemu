@@ -87,6 +87,8 @@ static char *tx_snapshot_trace_path;
 #define HFXO_STATUS_FSMLOCK   (1u << 30)
 #define CMU_BASE              0x40008000
 #define CMU_SYSCLKCTRL        0x070
+#define RADIO_RAM_NS_BASE     0xb0000000
+#define RADIO_RAM_RHCLKPRESC  0x4fe0
 #define BUFC_BASE            0xaa000000
 #define BUFC_EN              0x004
 #define BUFC_CH0             0x00c
@@ -560,6 +562,25 @@ static void test_protimer_counter(void)
     g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_COUNTER), ==, 0);
 }
 
+static void test_protimer_counter_is_independent_from_radio_setup(void)
+{
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+
+    /*
+     * Stock setup derives state from these inputs, but does not establish
+     * them as the RAIL_GetTime counter's source or divisor. Keep the model's
+     * documented 2 MHz clock independent until that relationship is known.
+     */
+    writel(CMU_BASE + CMU_SYSCLKCTRL, 3);
+    writel(RADIO_RAM_NS_BASE + RADIO_RAM_RHCLKPRESC, 1u << 16);
+    writel(PROTIMER_BASE + PROTIMER_CTRL, 0x00011102);
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(1001);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_COUNTER), ==, 2);
+}
+
 static void test_rac_tx_commands(void)
 {
     writel(RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
@@ -862,6 +883,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/protimer-secure-nonsecure-alias",
                    test_protimer_secure_nonsecure_alias);
     qtest_add_func("/efr32bg22/protimer-counter", test_protimer_counter);
+    qtest_add_func("/efr32bg22/protimer-counter-is-independent-from-radio-setup",
+                   test_protimer_counter_is_independent_from_radio_setup);
     qtest_add_func("/efr32bg22/rac-tx-commands", test_rac_tx_commands);
     qtest_add_func("/efr32bg22/rac-tx-completion", test_rac_tx_completion);
     qtest_add_func("/efr32bg22/rac-tx-disable-cancels-completion",

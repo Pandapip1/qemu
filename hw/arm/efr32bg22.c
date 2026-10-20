@@ -742,8 +742,16 @@ static void efr32_protimer_clock_update(void *opaque, ClockEvent event)
 /*
  * RAIL_GetTime reads PROTIMER +0x020. The public RAIL API documents its
  * timer tick as roughly 0.5 microseconds, so the machine provides a dedicated
- * 2 MHz input clock. The ptimer owns scheduling and the wrapping counter;
- * compare/capture, commands, and interrupt behavior remain unmodeled.
+ * 2 MHz input clock. This deliberately remains independent of SYSCLKCTRL.
+ *
+ * The stock helper at flash +0x26e0c does derive a setup value from the
+ * SYSCLKCTRL-selected rate and RADIO RAM +0x4fe0 bit 16, then the PROTIMER
+ * setup at +0x29974 writes that derived state after CTRL. That establishes
+ * setup arithmetic, not the source or divisor of the public free-running
+ * counter. Do not couple this clock to those inputs without that missing
+ * hardware-level evidence. The ptimer owns scheduling and the wrapping
+ * counter; compare/capture, commands, and interrupt behavior remain
+ * unmodeled.
  */
 static uint32_t efr32_protimer_counter(Efr32Periph *s)
 {
