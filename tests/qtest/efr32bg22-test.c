@@ -465,6 +465,7 @@ static void test_rac_sr0_clear_alias(void)
 
 static void test_rac_force_disable(void)
 {
+    writel(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW, FRC_IF_TXDONE);
     writel(RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
     g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK,
                     ==, RAC_STATUS_STATE_TX);
@@ -473,6 +474,11 @@ static void test_rac_force_disable(void)
     g_assert_cmphex(readl(RAC_BASE + RAC_CTRL), ==, RAC_CTRL_FORCEDISABLE);
     g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK,
                     ==, 0);
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(150001);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+    g_assert_cmphex(readl(FRC_BASE + FRC_IF) & FRC_IF_TXDONE, ==, 0);
 
     writel(RAC_BASE + RAC_CTRL, 0);
     g_assert_cmphex(readl(RAC_BASE + RAC_CTRL), ==, 0);
