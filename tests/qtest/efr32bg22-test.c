@@ -22,6 +22,7 @@
 #define FRC_WHITEPOLY        0x034
 #define FRC_BUFFERMODE       0x078
 #define FRC_TRAILRXDATA       0x054
+#define FRC_RXCTRL            0x04c
 #define FRC_SEQIF            0x0b4
 #define FRC_SEQIEN           0x0b8
 #define MODEM_BASE           0xa8014000
@@ -158,6 +159,17 @@ static void test_frc_buffer_register_masks(void)
     g_assert_cmphex(readl(FRC_BASE + FRC_BUFFERMODE), ==, 0xf);
     g_assert_cmphex(readl(FRC_BASE + FRC_TRAILRXDATA), ==, 0x3f);
     g_assert_cmphex(readl(FRC_BASE + FRC_RXRAWDATA), ==, 0);
+}
+
+static void test_rail_initialization_latches(void)
+{
+    /* RAIL's RF initializer writes RXCTRL=0x60 and clears RAC.SR0 bit 6. */
+    writel(FRC_BASE + FRC_RXCTRL, 0x60);
+    writel(RAC_BASE + RAC_SR0, UINT32_MAX);
+    writel(RAC_BASE + RAC_SR0 + REGISTER_CLEAR_WINDOW, 1u << 6);
+
+    g_assert_cmphex(readl(FRC_BASE + FRC_RXCTRL), ==, 0x60);
+    g_assert_cmphex(readl(RAC_BASE + RAC_SR0) & (1u << 6), ==, 0);
 }
 
 static void test_frc_interrupt_register_masks(void)
@@ -467,6 +479,8 @@ int main(int argc, char **argv)
                    test_agc_rssi_start_command);
     qtest_add_func("/efr32bg22/frc-buffer-register-masks",
                    test_frc_buffer_register_masks);
+    qtest_add_func("/efr32bg22/rail-initialization-latches",
+                   test_rail_initialization_latches);
     qtest_add_func("/efr32bg22/frc-interrupt-register-masks",
                    test_frc_interrupt_register_masks);
     qtest_add_func("/efr32bg22/frc-completion-interrupt-enable",
