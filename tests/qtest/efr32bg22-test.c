@@ -525,10 +525,14 @@ static void test_protimer_counter(void)
     g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_COUNTER), ==, before);
 
     qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
-    clock_step(1000);
+    /* Step past the second 500 ns edge so QEMU dispatches both ptimer ticks. */
+    clock_step(1001);
     qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
     g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_COUNTER), ==, before + 2);
     g_assert_cmphex(readl(PROTIMER_NS_BASE + PROTIMER_COUNTER), ==, before + 2);
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_COUNTER), ==, 0);
 }
 
 static void test_rac_tx_commands(void)

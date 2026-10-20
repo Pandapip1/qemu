@@ -10,6 +10,8 @@
 #include "exec/address-spaces.h"
 #include "qemu/timer.h"
 #include "hw/boards.h"
+#include "hw/arm/efr32-rf-medium.h"
+#include "hw/ptimer.h"
 #include "hw/qdev-clock.h"
 #include "hw/qdev-properties.h"
 #include "hw/irq.h"
@@ -146,7 +148,8 @@ struct Efr32Periph
     uint32_t trng_state;
     uint32_t rac_state;
     bool hfxo_fsm_locked;
-    uint64_t protimer_counter_epoch_ns;
+    Clock *protimer_clk;
+    ptimer_state *protimer_counter;
     QEMUTimer *rac_tx_timer;
     GByteArray *bufc_data[4];
     qemu_irq irq[64];
@@ -576,17 +579,29 @@ static uint32_t efr32_rac_status(Efr32Periph *s)
            (state == EFR32_RAC_STATE_RXSEARCH) << 31;
 }
 
+static void efr32_protimer_counter_expired(void *opaque)
+{
+    /* Free-running counter rollover has no observed side effects. */
+}
+
+static void efr32_protimer_clock_update(void *opaque, ClockEvent event)
+{
+    Efr32Periph *s = EFR32_PERIPH(opaque);
+
+    ptimer_transaction_begin(s->protimer_counter);
+    ptimer_set_period_from_clock(s->protimer_counter, s->protimer_clk, 1);
+    ptimer_transaction_commit(s->protimer_counter);
+}
+
 /*
- * RAIL_GetTime reads PROTIMER +0x020.  The public RAIL API documents its
- * timer tick as roughly 0.5 microseconds, so expose a deterministic virtual
- * counter at approximately 2 MHz.  Compare/capture and command behavior are
- * intentionally separate, unmodeled concerns.
+ * RAIL_GetTime reads PROTIMER +0x020. The public RAIL API documents its
+ * timer tick as roughly 0.5 microseconds, so the machine provides a dedicated
+ * 2 MHz input clock. The ptimer owns scheduling and the wrapping counter;
+ * compare/capture, commands, and interrupt behavior remain unmodeled.
  */
 static uint32_t efr32_protimer_counter(Efr32Periph *s)
 {
-    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-
-    return (uint32_t)((now - s->protimer_counter_epoch_ns) / 500);
+    return UINT32_MAX - ptimer_get_count(s->protimer_counter);
 }
 
 static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
@@ -869,7 +884,13 @@ static void efr32_periph_init(Object *o)
     s->trng_state = 0x2545f491;
     s->rac_state = EFR32_RAC_STATE_OFF;
     s->hfxo_fsm_locked = true;
-    s->protimer_counter_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->protimer_clk = qdev_init_clock_in(DEVICE(o), "protimerclk",
+                                         efr32_protimer_clock_update, s,
+                                         ClockUpdate);
+    s->protimer_counter = ptimer_init(efr32_protimer_counter_expired, s,
+                                      PTIMER_POLICY_NO_IMMEDIATE_RELOAD |
+                                      PTIMER_POLICY_NO_COUNTER_ROUND_DOWN |
+                                      PTIMER_POLICY_TRIGGER_ONLY_ON_DECREMENT);
     s->rac_tx_timer =
         timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_rac_tx_complete, s);
     for (unsigned channel = 0; channel < G_N_ELEMENTS(s->bufc_data); channel++)
@@ -894,7 +915,12 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     s->trng_state = 0x2545f491;
     s->rac_state = EFR32_RAC_STATE_OFF;
     s->hfxo_fsm_locked = true;
-    s->protimer_counter_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    ptimer_transaction_begin(s->protimer_counter);
+    ptimer_stop(s->protimer_counter);
+    ptimer_set_period_from_clock(s->protimer_counter, s->protimer_clk, 1);
+    ptimer_set_limit(s->protimer_counter, UINT32_MAX, 1);
+    ptimer_run(s->protimer_counter, 0);
+    ptimer_transaction_commit(s->protimer_counter);
     timer_del(s->rac_tx_timer);
     efr32_register_put(s, EFR32_CMU_BASE + EFR32_CMU_SYSCLKCTRL,
                        EFR32_CMU_SYSCLKCTRL_CLKSEL_FSRCO);
@@ -921,7 +947,12 @@ static const TypeInfo periph_info = {.name = TYPE_EFR32_PERIPH,
                                      .parent = TYPE_SYS_BUS_DEVICE,
                                      .instance_size = sizeof(Efr32Periph),
                                      .instance_init = efr32_periph_init,
-                                     .class_init = efr32_periph_class_init};
+                                     .class_init = efr32_periph_class_init,
+                                     .interfaces =
+                                         (InterfaceInfo[]){{
+                                             TYPE_EFR32_RF_RADIO,
+                                         },
+                                                            {}}};
 
 struct Efr32State
 {
@@ -929,6 +960,8 @@ struct Efr32State
     ARMv7MState armv7m;
     MemoryRegion flash, sram;
     Clock *clk;
+    Clock *protimer_clk;
+    Efr32RfMedium *rf_medium;
     char *image;
 };
 #define TYPE_EFR32BG22_MACHINE MACHINE_TYPE_NAME("efr32bg22")
@@ -961,6 +994,8 @@ static void init(MachineState *m)
                  *di = g_new(MemoryRegion, 1);
     s->clk = clock_new(OBJECT(m), "SYSCLK");
     clock_set_hz(s->clk, 38400000);
+    s->protimer_clk = clock_new(OBJECT(m), "PROTIMERCLK");
+    clock_set_hz(s->protimer_clk, 2000000);
     memory_region_init_ram(&s->flash, NULL, "efr32.flash", FLASH_SIZE,
                            &error_fatal);
     memory_region_add_subregion(sm, 0, &s->flash);
@@ -977,8 +1012,12 @@ static void init(MachineState *m)
     object_property_set_link(OBJECT(&s->armv7m), "memory", OBJECT(sm),
                              &error_abort);
     sysbus_realize(SYS_BUS_DEVICE(&s->armv7m), &error_fatal);
+    s->rf_medium = EFR32_RF_MEDIUM(object_new(TYPE_EFR32_RF_MEDIUM));
+    object_property_add_child(OBJECT(m), "rf-medium", OBJECT(s->rf_medium));
     p = qdev_new(TYPE_EFR32_PERIPH);
+    qdev_connect_clock_in(p, "protimerclk", s->protimer_clk);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(p), &error_fatal);
+    efr32_rf_medium_attach(s->rf_medium, EFR32_RF_RADIO(p), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(p), 0, PERIPH_BASE);
     sysbus_mmio_map(SYS_BUS_DEVICE(p), 1, RADIO_BASE);
     for (unsigned irq = 0; irq < 64; irq++)
@@ -1050,6 +1089,7 @@ static const TypeInfo machine_info = {
     .interfaces = (InterfaceInfo[]){{TYPE_IDAU_INTERFACE}, {}}};
 static void register_types(void)
 {
+    efr32_rf_medium_register_types();
     type_register_static(&periph_info);
     type_register_static(&machine_info);
 }
