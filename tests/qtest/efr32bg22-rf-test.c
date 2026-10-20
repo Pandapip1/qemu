@@ -34,6 +34,7 @@
 #define BUFC_READOFFSET          0x00c
 #define BUFC_READDATA            0x014
 #define BUFC_WRITEDATA           0x018
+#define BUFC_STATUS              0x020
 #define BUFC_CMD                 0x028
 #define REGISTER_SET_WINDOW      0x1000
 #define REGISTER_CLEAR_WINDOW    0x2000
@@ -117,12 +118,24 @@ static void test_tx_offer_reaches_peer_rx_fifo(void)
                     ==, FRC_IF_RXDONE);
     g_assert_cmphex(qtest_readl(global_qtest, peer(FRC_BASE + FRC_RXRAWDATA)),
                     ==, payload[G_N_ELEMENTS(payload) - 1]);
+    /*
+     * RAIL's RX-FIFO reader consumes channel 1 using STATUS's low 13-bit
+     * count together with READOFFSET.  The medium is deliberately a
+     * synthetic producer, but its byte transport must retain that FIFO
+     * consumer contract rather than presenting a fabricated PDU record.
+     */
+    g_assert_cmphex(qtest_readl(global_qtest, peer_rx_channel + BUFC_STATUS) &
+                        0x1fff,
+                    ==, G_N_ELEMENTS(payload));
     qtest_writel(global_qtest, peer_rx_channel + BUFC_READOFFSET, 0);
     for (size_t index = 0; index < G_N_ELEMENTS(payload); index++) {
         g_assert_cmphex(qtest_readl(global_qtest,
                                     peer_rx_channel + BUFC_READDATA),
                         ==, payload[index]);
     }
+    g_assert_cmphex(qtest_readl(global_qtest, peer_rx_channel + BUFC_STATUS) &
+                        0x1fff,
+                    ==, 0);
 }
 
 /*
