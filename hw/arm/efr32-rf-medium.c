@@ -10,6 +10,14 @@ struct Efr32RfMedium {
     Object parent_obj;
 
     GList *radios;
+    uint64_t next_tx_sequence;
+};
+
+struct Efr32RfTxSnapshot {
+    Efr32RfRadio *radio;
+    Efr32RfTxMetadata metadata;
+    uint64_t sequence;
+    GBytes *data;
 };
 
 void efr32_rf_medium_attach(Efr32RfMedium *medium, Efr32RfRadio *radio,
@@ -43,6 +51,78 @@ bool efr32_rf_medium_has_radio(const Efr32RfMedium *medium,
                                 const Efr32RfRadio *radio)
 {
     return g_list_find(medium->radios, radio) != NULL;
+}
+
+Efr32RfTxSnapshot *efr32_rf_medium_snapshot_tx(
+    Efr32RfMedium *medium, Efr32RfRadio *radio,
+    const Efr32RfTxMetadata *metadata, const uint8_t *data, size_t length,
+    Error **errp)
+{
+    Efr32RfTxSnapshot *snapshot;
+
+    if (!efr32_rf_medium_has_radio(medium, radio)) {
+        error_setg(errp, "%s is not attached to this RF medium",
+                   object_get_typename(OBJECT(radio)));
+        return NULL;
+    }
+    if (!metadata) {
+        error_setg(errp, "RF TX snapshot requires metadata");
+        return NULL;
+    }
+    if (metadata->trigger != EFR32_RF_TX_TRIGGER_RAC_CMD_TXEN) {
+        error_setg(errp, "RF TX snapshot has an unsupported trigger");
+        return NULL;
+    }
+    if (metadata->buffer_channel != EFR32_RF_TX_BUFC_CHANNEL) {
+        error_setg(errp, "RF TX snapshot must use BUFC channel %u",
+                   EFR32_RF_TX_BUFC_CHANNEL);
+        return NULL;
+    }
+    if (!data && length) {
+        error_setg(errp, "RF TX snapshot has data length but no data");
+        return NULL;
+    }
+
+    snapshot = g_new0(Efr32RfTxSnapshot, 1);
+    snapshot->radio = EFR32_RF_RADIO(object_ref(OBJECT(radio)));
+    snapshot->metadata = *metadata;
+    snapshot->sequence = medium->next_tx_sequence++;
+    snapshot->data = g_bytes_new(data, length);
+    return snapshot;
+}
+
+void efr32_rf_tx_snapshot_free(Efr32RfTxSnapshot *snapshot)
+{
+    if (!snapshot) {
+        return;
+    }
+
+    object_unref(OBJECT(snapshot->radio));
+    g_bytes_unref(snapshot->data);
+    g_free(snapshot);
+}
+
+Efr32RfRadio *efr32_rf_tx_snapshot_get_radio(
+    const Efr32RfTxSnapshot *snapshot)
+{
+    return snapshot->radio;
+}
+
+const Efr32RfTxMetadata *efr32_rf_tx_snapshot_get_metadata(
+    const Efr32RfTxSnapshot *snapshot)
+{
+    return &snapshot->metadata;
+}
+
+uint64_t efr32_rf_tx_snapshot_get_sequence(
+    const Efr32RfTxSnapshot *snapshot)
+{
+    return snapshot->sequence;
+}
+
+GBytes *efr32_rf_tx_snapshot_get_data(const Efr32RfTxSnapshot *snapshot)
+{
+    return snapshot->data;
 }
 
 static void efr32_rf_medium_finalize(Object *obj)
