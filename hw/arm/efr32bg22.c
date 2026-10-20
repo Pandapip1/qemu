@@ -1194,6 +1194,25 @@ struct Efr32State
 #define TYPE_EFR32BG22_MACHINE MACHINE_TYPE_NAME("efr32bg22")
 OBJECT_DECLARE_SIMPLE_TYPE(Efr32State, EFR32BG22_MACHINE)
 
+/*
+ * Test-only topology: two complete EFR32 address spaces joined by one
+ * in-process RF medium.  The peer map starts above the 32-bit address range,
+ * so qtest can drive both MCUs without inventing a host packet ingress.
+ */
+#define TYPE_EFR32BG22_DUAL_MACHINE MACHINE_TYPE_NAME("efr32bg22-dual")
+#define EFR32BG22_PEER_PERIPH_BASE 0x60000000u
+#define EFR32BG22_PEER_RADIO_BASE 0x80000000u
+OBJECT_DECLARE_SIMPLE_TYPE(Efr32DualState, EFR32BG22_DUAL_MACHINE)
+
+struct Efr32DualState {
+    MachineState parent_obj;
+    Efr32Bg22SoCState soc[2];
+    MemoryRegion memory[2];
+    MemoryRegion peer_periph;
+    MemoryRegion peer_radio;
+    Efr32RfMedium *rf_medium;
+};
+
 /* ARMv7M CPUs require an explicit board reset registration. */
 static void efr32_cpu_reset(void *opaque)
 {
@@ -1230,6 +1249,23 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
     Efr32Bg22SoCState *s = EFR32BG22_SOC(dev);
     DeviceState *nvic = DEVICE(&s->armv7m);
     SysBusDevice *periph = SYS_BUS_DEVICE(&s->periph);
+    g_autofree gchar *name = object_get_canonical_path_component(OBJECT(s));
+    g_autofree gchar *flash_name = NULL;
+    g_autofree gchar *sram_name = NULL;
+    g_autofree gchar *radio_ram_name = NULL;
+    g_autofree gchar *devinfo_name = NULL;
+
+    if (name && strcmp(name, "soc")) {
+        flash_name = g_strdup_printf("efr32.%s.flash", name);
+        sram_name = g_strdup_printf("efr32.%s.sram", name);
+        radio_ram_name = g_strdup_printf("efr32.%s.radioram", name);
+        devinfo_name = g_strdup_printf("efr32.%s.devinfo", name);
+    } else {
+        flash_name = g_strdup("efr32.flash");
+        sram_name = g_strdup("efr32.sram");
+        radio_ram_name = g_strdup("efr32.radioram");
+        devinfo_name = g_strdup("efr32.devinfo");
+    }
 
     if (!s->memory) {
         error_setg(errp, "memory property was not set");
@@ -1249,10 +1285,10 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
     s->protimer_clk = clock_new(OBJECT(s), "PROTIMERCLK");
     clock_set_hz(s->protimer_clk, 2000000);
 
-    memory_region_init_ram(&s->flash, OBJECT(s), "efr32.flash", FLASH_SIZE,
+    memory_region_init_ram(&s->flash, OBJECT(s), flash_name, FLASH_SIZE,
                            &error_fatal);
     memory_region_add_subregion(s->memory, 0, &s->flash);
-    memory_region_init_ram(&s->sram, OBJECT(s), "efr32.sram", SRAM_SIZE,
+    memory_region_init_ram(&s->sram, OBJECT(s), sram_name, SRAM_SIZE,
                            &error_fatal);
     memory_region_add_subregion(s->memory, 0x20000000, &s->sram);
 
@@ -1287,13 +1323,13 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
     memory_region_init_alias(&s->radio_ns, OBJECT(s), "radio-ns",
                              sysbus_mmio_get_region(periph, 1), 0, RADIO_SIZE);
     memory_region_add_subregion(s->memory, 0xb8000000, &s->radio_ns);
-    memory_region_init_ram(&s->radio_ram, OBJECT(s), "efr32.radioram", 0x8000,
+    memory_region_init_ram(&s->radio_ram, OBJECT(s), radio_ram_name, 0x8000,
                            &error_fatal);
     memory_region_add_subregion(s->memory, 0xa0000000, &s->radio_ram);
     memory_region_init_alias(&s->radio_ram_ns, OBJECT(s), "efr32.radioram-ns",
                              &s->radio_ram, 0, 0x8000);
     memory_region_add_subregion(s->memory, 0xb0000000, &s->radio_ram_ns);
-    memory_region_init_ram(&s->devinfo, OBJECT(s), "efr32.devinfo", 0x10000,
+    memory_region_init_ram(&s->devinfo, OBJECT(s), devinfo_name, 0x10000,
                            &error_fatal);
     memory_region_add_subregion(s->memory, 0x0fe00000, &s->devinfo);
     efr32_initialize_devinfo(&s->devinfo);
@@ -1389,11 +1425,83 @@ static const TypeInfo machine_info = {
     .instance_size = sizeof(Efr32State),
     .class_init = mc,
     .interfaces = (InterfaceInfo[]){{TYPE_IDAU_INTERFACE}, {}}};
+
+static void dual_init(MachineState *m)
+{
+    Efr32DualState *s = EFR32BG22_DUAL_MACHINE(m);
+
+    s->rf_medium = EFR32_RF_MEDIUM(object_new(TYPE_EFR32_RF_MEDIUM));
+    object_property_add_child(OBJECT(m), "rf-medium", OBJECT(s->rf_medium));
+    for (unsigned index = 0; index < G_N_ELEMENTS(s->soc); index++) {
+        gchar *name = g_strdup_printf("soc%u", index);
+        gchar *memory_name = g_strdup_printf("efr32bg22-dual.memory%u", index);
+
+        memory_region_init(&s->memory[index], OBJECT(m), memory_name,
+                           UINT64_C(1) << 32);
+        object_initialize_child(OBJECT(m), name, &s->soc[index],
+                                TYPE_EFR32BG22_SOC);
+        object_property_set_link(OBJECT(&s->soc[index]), "memory",
+                                 OBJECT(&s->memory[index]), &error_fatal);
+        object_property_set_link(OBJECT(&s->soc[index]), "rf-medium",
+                                 OBJECT(s->rf_medium), &error_fatal);
+        object_property_set_link(OBJECT(&s->soc[index]), "idau", OBJECT(m),
+                                 &error_fatal);
+        sysbus_realize(SYS_BUS_DEVICE(&s->soc[index]), &error_fatal);
+        qemu_register_reset(efr32_cpu_reset, s->soc[index].armv7m.cpu);
+        g_free(memory_name);
+        g_free(name);
+    }
+    /*
+     * The second CPU retains its complete private ARMv7M address space.  QTest
+     * needs a system-bus route to configure its radio, so expose only aliases
+     * of its native peripheral windows at non-overlapping test addresses.
+     */
+    memory_region_add_subregion(get_system_memory(), 0,
+                                &s->soc[0].armv7m.container);
+    memory_region_init_alias(&s->peer_periph, OBJECT(m), "peer-periph",
+                             sysbus_mmio_get_region(
+                                 SYS_BUS_DEVICE(&s->soc[1].periph), 0),
+                             0, PERIPH_SIZE);
+    memory_region_add_subregion(&s->soc[0].armv7m.container,
+                                EFR32BG22_PEER_PERIPH_BASE, &s->peer_periph);
+    memory_region_init_alias(&s->peer_radio, OBJECT(m), "peer-radio",
+                             sysbus_mmio_get_region(
+                                 SYS_BUS_DEVICE(&s->soc[1].periph), 1),
+                             0, RADIO_SIZE);
+    memory_region_add_subregion(&s->soc[0].armv7m.container,
+                                EFR32BG22_PEER_RADIO_BASE, &s->peer_radio);
+}
+
+static void dual_mc(ObjectClass *o, void *d)
+{
+    MachineClass *m = MACHINE_CLASS(o);
+    IDAUInterfaceClass *i = IDAU_INTERFACE_CLASS(o);
+    static const char *const cpu[] = {ARM_CPU_TYPE_NAME("cortex-m33"), NULL};
+
+    i->check = idau;
+    m->desc = "EFR32BG22 dual-MCU RF test topology";
+    m->init = dual_init;
+    m->valid_cpu_types = cpu;
+    m->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-m33");
+    m->default_ram_size = 2 * FLASH_SIZE;
+    m->min_cpus = 2;
+    m->max_cpus = 2;
+    m->default_cpus = 2;
+    m->ignore_memory_transaction_failures = true;
+}
+
+static const TypeInfo dual_machine_info = {
+    .name = TYPE_EFR32BG22_DUAL_MACHINE,
+    .parent = TYPE_MACHINE,
+    .instance_size = sizeof(Efr32DualState),
+    .class_init = dual_mc,
+    .interfaces = (InterfaceInfo[]){{TYPE_IDAU_INTERFACE}, {}}};
 static void register_types(void)
 {
     efr32_rf_medium_register_types();
     type_register_static(&periph_info);
     type_register_static(&efr32_soc_info);
     type_register_static(&machine_info);
+    type_register_static(&dual_machine_info);
 }
 type_init(register_types)
