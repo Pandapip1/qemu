@@ -129,6 +129,21 @@ static char *tx_snapshot_trace_path;
 #define BURTC_CMD_START        (1u << 0)
 #define BURTC_CMD_STOP         (1u << 1)
 #define BURTC_STATUS_RUNNING   (1u << 0)
+#define TIMER4_BASE             0x40058000
+#define TIMER4_NS_BASE          0x50058000
+#define TIMER_EN                0x030
+#define TIMER_CMD               0x00c
+#define TIMER_STATUS            0x010
+#define TIMER_IF                0x014
+#define TIMER_IEN               0x018
+#define TIMER_TOP               0x01c
+#define TIMER_CNT               0x024
+#define TIMER_CC0_OC            0x068
+#define TIMER_EN_EN             (1u << 0)
+#define TIMER_CMD_START          (1u << 0)
+#define TIMER_CMD_STOP           (1u << 1)
+#define TIMER_STATUS_RUNNING     (1u << 0)
+#define TIMER_IF_CC0             (1u << 4)
 #define RADIO_RAM_NS_BASE     0xb0000000
 #define RADIO_RAM_RHCLKPRESC  0x4fe0
 #define BUFC_BASE            0xaa000000
@@ -223,6 +238,57 @@ static void test_burtc_compare_pending(void)
                     BURTC_IF_COMP);
     writel(BURTC_BASE + BURTC_IF + REGISTER_CLEAR_WINDOW, BURTC_IF_COMP);
     g_assert_cmphex(readl(BURTC_BASE + BURTC_IF) & BURTC_IF_COMP, ==, 0);
+}
+
+/* TIMER4 is Zephyr's 16-bit 38.4 MHz scheduling counter on this part. */
+static void test_timer4_counter_and_aliases(void)
+{
+    uint32_t stopped;
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    g_assert_cmphex(readl(TIMER4_BASE + TIMER_TOP), ==, 0xffff);
+
+    writel(TIMER4_NS_BASE + TIMER_EN + REGISTER_SET_WINDOW, TIMER_EN_EN);
+    writel(TIMER4_NS_BASE + TIMER_TOP, 0xffff);
+    writel(TIMER4_NS_BASE + TIMER_CNT, 0x1200);
+    writel(TIMER4_NS_BASE + TIMER_CMD, TIMER_CMD_START);
+    g_assert_cmphex(readl(TIMER4_BASE + TIMER_STATUS), ==,
+                    TIMER_STATUS_RUNNING);
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    qtest_clock_step(global_qtest, 1000);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+    g_assert_cmpuint(readl(TIMER4_BASE + TIMER_CNT), >, 0x1200);
+
+    writel(TIMER4_BASE + TIMER_CMD + REGISTER_SET_WINDOW, TIMER_CMD_STOP);
+    g_assert_cmphex(readl(TIMER4_NS_BASE + TIMER_STATUS), ==, 0);
+    stopped = readl(TIMER4_BASE + TIMER_CNT);
+    qtest_clock_step(global_qtest, 1000);
+    g_assert_cmphex(readl(TIMER4_BASE + TIMER_CNT), ==, stopped);
+
+    writel(TIMER4_NS_BASE + TIMER_EN + REGISTER_CLEAR_WINDOW, TIMER_EN_EN);
+    g_assert_cmphex(readl(TIMER4_BASE + TIMER_STATUS), ==, 0);
+}
+
+static void test_timer4_cc0_compare_pending(void)
+{
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+
+    writel(TIMER4_NS_BASE + TIMER_EN + REGISTER_SET_WINDOW, TIMER_EN_EN);
+    writel(TIMER4_NS_BASE + TIMER_TOP, 0xffff);
+    writel(TIMER4_NS_BASE + TIMER_CNT, 10);
+    writel(TIMER4_NS_BASE + TIMER_IF + REGISTER_CLEAR_WINDOW, TIMER_IF_CC0);
+    writel(TIMER4_NS_BASE + TIMER_CC0_OC, 48);
+    writel(TIMER4_NS_BASE + TIMER_IEN + REGISTER_SET_WINDOW, TIMER_IF_CC0);
+    writel(TIMER4_NS_BASE + TIMER_CMD, TIMER_CMD_START);
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    qtest_clock_step(global_qtest, 2000);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+    g_assert_cmphex(readl(TIMER4_BASE + TIMER_IF) & TIMER_IF_CC0, ==,
+                    TIMER_IF_CC0);
+    writel(TIMER4_BASE + TIMER_IF + REGISTER_CLEAR_WINDOW, TIMER_IF_CC0);
+    g_assert_cmphex(readl(TIMER4_NS_BASE + TIMER_IF) & TIMER_IF_CC0, ==, 0);
 }
 
 static void test_cmu_nonsecure_alias(void)
@@ -1052,6 +1118,10 @@ int main(int argc, char **argv)
                    test_burtc_counter_contract);
     qtest_add_func("/efr32bg22/burtc-compare-pending",
                    test_burtc_compare_pending);
+    qtest_add_func("/efr32bg22/timer4-counter-and-aliases",
+                   test_timer4_counter_and_aliases);
+    qtest_add_func("/efr32bg22/timer4-cc0-compare-pending",
+                   test_timer4_cc0_compare_pending);
     qtest_add_func("/efr32bg22/cmu-nonsecure-alias", test_cmu_nonsecure_alias);
     qtest_add_func("/efr32bg22/dpll-lock", test_dpll_lock);
     qtest_add_func("/efr32bg22/usart-tx-polling", test_usart_tx_polling);

@@ -147,6 +147,23 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_MSC_STATUS 0x01cu
 #define EFR32_MSC_STATUS_RESET 0x08000008u
 
+/* EFR32BG22 TIMER4: public Series-2 register layout, IRQ 11. */
+#define EFR32_TIMER4_BASE 0x40058000u
+#define EFR32_TIMER_EN 0x030u
+#define EFR32_TIMER_CMD 0x00cu
+#define EFR32_TIMER_STATUS 0x010u
+#define EFR32_TIMER_IF 0x014u
+#define EFR32_TIMER_IEN 0x018u
+#define EFR32_TIMER_TOP 0x01cu
+#define EFR32_TIMER_CNT 0x024u
+#define EFR32_TIMER_CC0_OC 0x068u
+#define EFR32_TIMER_EN_EN (1u << 0)
+#define EFR32_TIMER_CMD_START (1u << 0)
+#define EFR32_TIMER_CMD_STOP (1u << 1)
+#define EFR32_TIMER_STATUS_RUNNING (1u << 0)
+#define EFR32_TIMER_IF_CC0 (1u << 4)
+#define EFR32_TIMER4_HZ 38400000ULL
+
 /*
  * EFR32BG22 USART0/1.  This intentionally stops at the register-facing
  * transmit path used by Zephyr's polling console: bytes are accepted by the
@@ -215,6 +232,10 @@ struct Efr32Periph
     ptimer_state *burtc_counter;
     bool burtc_running;
     QEMUTimer *burtc_compare_timer;
+    uint32_t timer4_count;
+    int64_t timer4_last_ns;
+    bool timer4_running;
+    QEMUTimer *timer4_compare_timer;
     QEMUTimer *rac_tx_timer;
     QEMUTimer *rac_rx_timer;
     GByteArray *bufc_data[4];
@@ -264,6 +285,14 @@ static void efr32_protimer_update_irq(Efr32Periph *s)
                                           EFR32_PROTIMER_BASE + EFR32_PROTIMER_IEN);
 
     qemu_set_irq(s->irq[36], !!(pending & enabled));
+}
+
+static void efr32_timer4_update_irq(Efr32Periph *s)
+{
+    uint32_t pending = efr32_register_get(s, EFR32_TIMER4_BASE + EFR32_TIMER_IF);
+    uint32_t enabled = efr32_register_get(s, EFR32_TIMER4_BASE + EFR32_TIMER_IEN);
+
+    qemu_set_irq(s->irq[11], !!(pending & enabled));
 }
 
 static void efr32_frc_raise(Efr32Periph *s, uint32_t flags)
@@ -990,6 +1019,95 @@ static void efr32_burtc_set_counter(Efr32Periph *s, uint32_t value)
     efr32_burtc_schedule_compare(s);
 }
 
+static bool efr32_timer4_enabled(Efr32Periph *s)
+{
+    return efr32_register_get(s, EFR32_TIMER4_BASE + EFR32_TIMER_EN) &
+           EFR32_TIMER_EN_EN;
+}
+
+/* TIMER4 is a 16-bit up-counter, clocked from a dedicated 38.4 MHz source. */
+static void efr32_timer4_update_counter(Efr32Periph *s)
+{
+    int64_t now;
+    uint64_t ticks;
+    uint32_t top;
+    uint64_t period;
+
+    if (!s->timer4_running || !efr32_timer4_enabled(s)) {
+        return;
+    }
+
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    ticks = ((uint64_t)(now - s->timer4_last_ns) * EFR32_TIMER4_HZ) /
+            NANOSECONDS_PER_SECOND;
+    if (!ticks) {
+        return;
+    }
+
+    top = efr32_register_get(s, EFR32_TIMER4_BASE + EFR32_TIMER_TOP) & 0xffff;
+    period = (uint64_t)top + 1;
+    s->timer4_count = (s->timer4_count + ticks) % period;
+    s->timer4_last_ns += (ticks * NANOSECONDS_PER_SECOND) / EFR32_TIMER4_HZ;
+}
+
+static uint32_t efr32_timer4_counter(Efr32Periph *s)
+{
+    efr32_timer4_update_counter(s);
+    return s->timer4_count;
+}
+
+static void efr32_timer4_schedule_compare(Efr32Periph *s)
+{
+    uint32_t top;
+    uint32_t compare;
+    uint64_t period;
+    uint64_t ticks;
+    int64_t delay_ns;
+
+    timer_del(s->timer4_compare_timer);
+    if (!s->timer4_running || !efr32_timer4_enabled(s)) {
+        return;
+    }
+
+    efr32_timer4_update_counter(s);
+    top = efr32_register_get(s, EFR32_TIMER4_BASE + EFR32_TIMER_TOP) & 0xffff;
+    compare = efr32_register_get(s, EFR32_TIMER4_BASE + EFR32_TIMER_CC0_OC) & 0xffff;
+    period = (uint64_t)top + 1;
+    compare %= period;
+    ticks = (compare + period - s->timer4_count) % period;
+    if (!ticks) {
+        ticks = period;
+    }
+    delay_ns = (ticks * NANOSECONDS_PER_SECOND + EFR32_TIMER4_HZ - 1) /
+               EFR32_TIMER4_HZ;
+    timer_mod(s->timer4_compare_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay_ns);
+}
+
+static void efr32_timer4_compare_expired(void *opaque)
+{
+    Efr32Periph *s = EFR32_PERIPH(opaque);
+
+    if (!s->timer4_running || !efr32_timer4_enabled(s)) {
+        return;
+    }
+    efr32_timer4_update_counter(s);
+    efr32_register_put(s, EFR32_TIMER4_BASE + EFR32_TIMER_IF,
+                       efr32_register_get(s, EFR32_TIMER4_BASE + EFR32_TIMER_IF) |
+                           EFR32_TIMER_IF_CC0);
+    efr32_timer4_update_irq(s);
+    efr32_timer4_schedule_compare(s);
+}
+
+static void efr32_timer4_set_counter(Efr32Periph *s, uint32_t value)
+{
+    uint32_t top = efr32_register_get(s, EFR32_TIMER4_BASE + EFR32_TIMER_TOP) & 0xffff;
+
+    s->timer4_count = value % ((uint64_t)top + 1);
+    s->timer4_last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    efr32_timer4_schedule_compare(s);
+}
+
 static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
 {
     address = efr32_peripheral_canonical_address(address);
@@ -1070,6 +1188,11 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
     if (address == EFR32_BURTC_BASE + EFR32_BURTC_STATUS)
         return s->burtc_running && efr32_burtc_enabled(s) ?
                    EFR32_BURTC_STATUS_RUNNING : 0;
+    if (address == EFR32_TIMER4_BASE + EFR32_TIMER_CNT)
+        return efr32_timer4_counter(s);
+    if (address == EFR32_TIMER4_BASE + EFR32_TIMER_STATUS)
+        return s->timer4_running && efr32_timer4_enabled(s) ?
+                   EFR32_TIMER_STATUS_RUNNING : 0;
     if (address == EFR32_RAC_BASE + EFR32_RAC_STATUS)
         return efr32_rac_status(s);
     if (((address & ~0x3fffu) == EFR32_PROTIMER_BASE ||
@@ -1187,6 +1310,42 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         }
     }
 
+    if ((register_address & ~0x3fffu) == EFR32_TIMER4_BASE) {
+        uint32_t timer_offset = register_address & 0xfff;
+
+        efr32_timer4_update_counter(s);
+        switch (timer_offset) {
+        case EFR32_TIMER_CMD:
+            if (next & EFR32_TIMER_CMD_STOP) {
+                s->timer4_running = false;
+                timer_del(s->timer4_compare_timer);
+            } else if (next & EFR32_TIMER_CMD_START) {
+                s->timer4_running = true;
+                s->timer4_last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+                efr32_timer4_schedule_compare(s);
+            }
+            return; /* CMD is write-only strobes. */
+        case EFR32_TIMER_CNT:
+            efr32_timer4_set_counter(s, next & 0xffff);
+            return;
+        case EFR32_TIMER_STATUS:
+            return; /* status is generated from EN and CMD state. */
+        case EFR32_TIMER_EN:
+            next &= EFR32_TIMER_EN_EN;
+            break;
+        case EFR32_TIMER_TOP:
+        case EFR32_TIMER_CC0_OC:
+            next &= 0xffff;
+            break;
+        case EFR32_TIMER_IF:
+        case EFR32_TIMER_IEN:
+            next &= EFR32_TIMER_IF_CC0;
+            break;
+        default:
+            break;
+        }
+    }
+
     if (register_address == EFR32_RAC_BASE + EFR32_RAC_CMD)
     {
         next &= 0xc000fdff;
@@ -1270,6 +1429,20 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
     if (register_address == EFR32_BURTC_BASE + EFR32_BURTC_IF ||
         register_address == EFR32_BURTC_BASE + EFR32_BURTC_IEN) {
         efr32_burtc_update_irq(s);
+    }
+    if (register_address == EFR32_TIMER4_BASE + EFR32_TIMER_EN) {
+        if (efr32_timer4_enabled(s)) {
+            s->timer4_last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        }
+        efr32_timer4_schedule_compare(s);
+    }
+    if (register_address == EFR32_TIMER4_BASE + EFR32_TIMER_TOP ||
+        register_address == EFR32_TIMER4_BASE + EFR32_TIMER_CC0_OC) {
+        efr32_timer4_schedule_compare(s);
+    }
+    if (register_address == EFR32_TIMER4_BASE + EFR32_TIMER_IF ||
+        register_address == EFR32_TIMER4_BASE + EFR32_TIMER_IEN) {
+        efr32_timer4_update_irq(s);
     }
 
     /*
@@ -1445,6 +1618,8 @@ static void efr32_periph_init(Object *o)
                                    PTIMER_POLICY_TRIGGER_ONLY_ON_DECREMENT);
     s->burtc_compare_timer =
         timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_burtc_compare_expired, s);
+    s->timer4_compare_timer =
+        timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_timer4_compare_expired, s);
     s->rac_tx_timer =
         timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_rac_tx_complete, s);
     s->rac_rx_timer =
@@ -1478,6 +1653,10 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     s->usart_tx_complete[1] = false;
     s->burtc_running = false;
     timer_del(s->burtc_compare_timer);
+    s->timer4_running = false;
+    s->timer4_count = 0;
+    s->timer4_last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    timer_del(s->timer4_compare_timer);
     ptimer_transaction_begin(s->protimer_counter);
     ptimer_stop(s->protimer_counter);
     ptimer_set_period_from_clock(s->protimer_counter, s->protimer_clk, 1);
@@ -1508,6 +1687,7 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
      * integration default is UINT32_MAX until guest software programs COMP.
      */
     efr32_register_put(s, EFR32_BURTC_BASE + EFR32_BURTC_COMP, UINT32_MAX);
+    efr32_register_put(s, EFR32_TIMER4_BASE + EFR32_TIMER_TOP, 0xffff);
     efr32_register_put(s, EFR32_AGC_BASE + EFR32_AGC_RSSI, 0x8000);
     efr32_register_put(s, EFR32_AGC_BASE + EFR32_AGC_FRAMERSSI, 0x8000);
     for (unsigned irq = 0; irq < G_N_ELEMENTS(s->irq); irq++)
@@ -1530,6 +1710,7 @@ static void efr32_periph_finalize(Object *obj)
     timer_free(s->rac_rx_timer);
     timer_free(s->rac_tx_timer);
     timer_free(s->burtc_compare_timer);
+    timer_free(s->timer4_compare_timer);
     ptimer_free(s->protimer_counter);
     ptimer_free(s->burtc_counter);
     for (unsigned channel = 0; channel < G_N_ELEMENTS(s->bufc_data); channel++) {
