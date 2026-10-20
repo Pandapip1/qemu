@@ -1367,6 +1367,16 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         else if (next & EFR32_RAC_CMD_TXEN)
         {
             timer_del(s->rac_rx_timer);
+            /*
+             * This bounded model represents at most one active TXEN
+             * transaction per radio.  A second TXEN replaces the existing
+             * transaction, so withdraw its still-deferred mailbox offers
+             * before publishing the new BUFC snapshot.  Otherwise the old
+             * snapshot is freed below but its queued RXDONE can survive and
+             * be delivered after the replacement transmission.
+             */
+            efr32_rf_medium_withdraw_latest_tx(s->rf_medium,
+                                                EFR32_RF_RADIO(s));
             efr32_rac_capture_tx_snapshot(s);
             efr32_rac_set_state(s, EFR32_RAC_STATE_TX);
             efr32_rac_schedule_tx_completion(s);

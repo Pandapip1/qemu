@@ -291,6 +291,45 @@ static void test_timer4_cc0_compare_pending(void)
     g_assert_cmphex(readl(TIMER4_NS_BASE + TIMER_IF) & TIMER_IF_CC0, ==, 0);
 }
 
+/*
+ * A board reset is also the safe startup baseline for the radio port.  In
+ * particular, it must discard both pending timer events and register-latched
+ * interrupt enables before firmware begins a new LL schedule.
+ */
+static void test_system_reset_clears_radio_timer_state(void)
+{
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+
+    writel(BURTC_BASE + BURTC_EN, BURTC_EN_EN);
+    writel(BURTC_BASE + BURTC_CNT, 10);
+    writel(BURTC_BASE + BURTC_COMP, 42);
+    writel(BURTC_BASE + BURTC_IEN, BURTC_IF_COMP);
+    writel(BURTC_BASE + BURTC_CMD, BURTC_CMD_START);
+
+    writel(TIMER4_BASE + TIMER_EN, TIMER_EN_EN);
+    writel(TIMER4_BASE + TIMER_CNT, 10);
+    writel(TIMER4_BASE + TIMER_CC0_OC, 48);
+    writel(TIMER4_BASE + TIMER_IEN, TIMER_IF_CC0);
+    writel(TIMER4_BASE + TIMER_CMD, TIMER_CMD_START);
+
+    writel(PROTIMER_NS_BASE + PROTIMER_IF, 0x02000010);
+    writel(PROTIMER_NS_BASE + PROTIMER_IEN, 0x00000010);
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    qtest_clock_step(global_qtest, 2 * 1000 * 1000);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_STATUS), ==, 0);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_IF), ==, 0);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_IEN), ==, 0);
+    g_assert_cmphex(readl(TIMER4_BASE + TIMER_STATUS), ==, 0);
+    g_assert_cmphex(readl(TIMER4_BASE + TIMER_IF), ==, 0);
+    g_assert_cmphex(readl(TIMER4_BASE + TIMER_IEN), ==, 0);
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_IF), ==, 0);
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_IEN), ==, 0);
+}
+
 static void test_cmu_nonsecure_alias(void)
 {
     qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
@@ -1122,6 +1161,8 @@ int main(int argc, char **argv)
                    test_timer4_counter_and_aliases);
     qtest_add_func("/efr32bg22/timer4-cc0-compare-pending",
                    test_timer4_cc0_compare_pending);
+    qtest_add_func("/efr32bg22/system-reset-clears-radio-timer-state",
+                   test_system_reset_clears_radio_timer_state);
     qtest_add_func("/efr32bg22/cmu-nonsecure-alias", test_cmu_nonsecure_alias);
     qtest_add_func("/efr32bg22/dpll-lock", test_dpll_lock);
     qtest_add_func("/efr32bg22/usart-tx-polling", test_usart_tx_polling);

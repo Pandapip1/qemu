@@ -322,6 +322,59 @@ static void test_rx_enable_withdraws_deferred_offer(void)
                                 peer_rx_channel + BUFC_READDATA), ==, 0);
 }
 
+/*
+ * The native model defines TXEN as replacing its one active synthetic TX
+ * transaction.  A second TXEN must therefore discard an undelivered offer
+ * from the first snapshot rather than write both packets into the peer FIFO.
+ */
+static void test_tx_enable_replaces_deferred_offer(void)
+{
+    const uint8_t first_payload[] = { 0x19, 0x82 };
+    const uint8_t replacement_payload[] = { 0xa4, 0x3d };
+    const uint32_t fifo_guest_address = 0x20000400;
+    const uint64_t peer_rx_channel = peer(BUFC_BASE + BUFC_CH1);
+    const uint32_t source_tx_channel = BUFC_BASE + BUFC_CH0;
+
+    qtest_writel(global_qtest, peer(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW),
+                 FRC_IF_RXDONE);
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_CMD, 1);
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_ADDR, fifo_guest_address);
+    qtest_writel(global_qtest, peer_rx_channel, 0);
+    qtest_writel(global_qtest,
+                 peer(RAC_BASE + RAC_RXENSRCEN + REGISTER_SET_WINDOW),
+                 RAC_RXENSRCEN_SWRXEN);
+
+    qtest_writel(global_qtest, source_tx_channel + BUFC_CMD, 1);
+    for (size_t index = 0; index < G_N_ELEMENTS(first_payload); index++) {
+        qtest_writel(global_qtest, source_tx_channel + BUFC_WRITEDATA,
+                     first_payload[index]);
+    }
+    qtest_writel(global_qtest, RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+
+    qtest_writel(global_qtest, source_tx_channel + BUFC_CMD, 1);
+    for (size_t index = 0; index < G_N_ELEMENTS(replacement_payload); index++) {
+        qtest_writel(global_qtest, source_tx_channel + BUFC_WRITEDATA,
+                     replacement_payload[index]);
+    }
+    qtest_writel(global_qtest, RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(1);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+
+    g_assert_cmphex(qtest_readl(global_qtest, peer(FRC_BASE + FRC_IF)) &
+                        FRC_IF_RXDONE,
+                    ==, FRC_IF_RXDONE);
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_READOFFSET, 0);
+    for (size_t index = 0; index < G_N_ELEMENTS(replacement_payload); index++) {
+        g_assert_cmphex(qtest_readl(global_qtest,
+                                    peer_rx_channel + BUFC_READDATA),
+                        ==, replacement_payload[index]);
+    }
+    g_assert_cmphex(qtest_readl(global_qtest,
+                                peer_rx_channel + BUFC_READDATA), ==, 0);
+}
+
 int main(int argc, char **argv)
 {
     int result;
@@ -340,6 +393,8 @@ int main(int argc, char **argv)
                    test_force_disable_withdraws_deferred_offer);
     qtest_add_func("/efr32bg22/rf/rx-enable-withdraws-deferred-offer",
                    test_rx_enable_withdraws_deferred_offer);
+    qtest_add_func("/efr32bg22/rf/tx-enable-replaces-deferred-offer",
+                   test_tx_enable_replaces_deferred_offer);
     result = g_test_run();
     qtest_end();
     return result;
