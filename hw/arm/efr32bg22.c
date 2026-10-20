@@ -152,6 +152,7 @@ struct Efr32Periph
     ptimer_state *protimer_counter;
     QEMUTimer *rac_tx_timer;
     GByteArray *bufc_data[4];
+    Efr32RfMedium *rf_medium;
     qemu_irq irq[64];
 };
 
@@ -504,6 +505,35 @@ static void efr32_rac_tx_complete(void *opaque)
     efr32_frc_raise(s, EFR32_FRC_IF_TXDONE);
 }
 
+static void efr32_rac_capture_tx_snapshot(Efr32Periph *s)
+{
+    Efr32RfTxMetadata metadata = {
+        .trigger = EFR32_RF_TX_TRIGGER_RAC_CMD_TXEN,
+        .buffer_channel = EFR32_RF_TX_BUFC_CHANNEL,
+    };
+    GByteArray *data = s->bufc_data[EFR32_RF_TX_BUFC_CHANNEL];
+    Efr32RfTxSnapshot *snapshot;
+    const uint8_t *bytes;
+    gsize length;
+    uint32_t first_word = 0;
+
+    /*
+     * The retained blob evidence places the TX handoff at RAC.CMD.TXEN.
+     * BUFC channel 0 is copied here, before the synthetic RAC completion
+     * timer is armed. This does not initiate RF delivery.
+     */
+    snapshot = efr32_rf_medium_snapshot_tx(
+        s->rf_medium, EFR32_RF_RADIO(s), &metadata, data->data, data->len,
+        &error_abort);
+    bytes = g_bytes_get_data(efr32_rf_tx_snapshot_get_data(snapshot), &length);
+    for (unsigned index = 0; index < MIN(length, sizeof(first_word)); index++) {
+        first_word |= (uint32_t)bytes[index] << (index * 8);
+    }
+    trace_efr32bg22_tx_snapshot(efr32_rf_tx_snapshot_get_sequence(snapshot),
+                                 length, first_word);
+    efr32_rf_medium_set_latest_tx_snapshot(s->rf_medium, snapshot);
+}
+
 static uint32_t efr32_radio_mask_write(uint32_t address, uint32_t value)
 {
     uint32_t offset = address & 0xfff;
@@ -728,6 +758,7 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         }
         else if (next & EFR32_RAC_CMD_TXEN)
         {
+            efr32_rac_capture_tx_snapshot(s);
             efr32_rac_set_state(s, EFR32_RAC_STATE_TX);
             timer_mod(s->rac_tx_timer,
                       qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 150000);
@@ -922,6 +953,7 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     ptimer_run(s->protimer_counter, 0);
     ptimer_transaction_commit(s->protimer_counter);
     timer_del(s->rac_tx_timer);
+    efr32_rf_medium_clear_latest_tx_snapshot(s->rf_medium);
     efr32_register_put(s, EFR32_CMU_BASE + EFR32_CMU_SYSCLKCTRL,
                        EFR32_CMU_SYSCLKCTRL_CLKSEL_FSRCO);
     efr32_register_put(s, EFR32_EMU_BASE + EFR32_EMU_STATUS,
@@ -1015,6 +1047,7 @@ static void init(MachineState *m)
     s->rf_medium = EFR32_RF_MEDIUM(object_new(TYPE_EFR32_RF_MEDIUM));
     object_property_add_child(OBJECT(m), "rf-medium", OBJECT(s->rf_medium));
     p = qdev_new(TYPE_EFR32_PERIPH);
+    EFR32_PERIPH(p)->rf_medium = s->rf_medium;
     qdev_connect_clock_in(p, "protimerclk", s->protimer_clk);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(p), &error_fatal);
     efr32_rf_medium_attach(s->rf_medium, EFR32_RF_RADIO(p), &error_fatal);

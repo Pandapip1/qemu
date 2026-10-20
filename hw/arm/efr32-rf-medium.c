@@ -11,6 +11,7 @@ struct Efr32RfMedium {
 
     GList *radios;
     uint64_t next_tx_sequence;
+    Efr32RfTxSnapshot *latest_tx_snapshot;
 };
 
 struct Efr32RfTxSnapshot {
@@ -125,10 +126,29 @@ GBytes *efr32_rf_tx_snapshot_get_data(const Efr32RfTxSnapshot *snapshot)
     return snapshot->data;
 }
 
+void efr32_rf_medium_set_latest_tx_snapshot(Efr32RfMedium *medium,
+                                             Efr32RfTxSnapshot *snapshot)
+{
+    efr32_rf_tx_snapshot_free(medium->latest_tx_snapshot);
+    medium->latest_tx_snapshot = snapshot;
+}
+
+const Efr32RfTxSnapshot *efr32_rf_medium_get_latest_tx_snapshot(
+    const Efr32RfMedium *medium)
+{
+    return medium->latest_tx_snapshot;
+}
+
+void efr32_rf_medium_clear_latest_tx_snapshot(Efr32RfMedium *medium)
+{
+    efr32_rf_medium_set_latest_tx_snapshot(medium, NULL);
+}
+
 static void efr32_rf_medium_finalize(Object *obj)
 {
     Efr32RfMedium *medium = EFR32_RF_MEDIUM(obj);
 
+    efr32_rf_medium_clear_latest_tx_snapshot(medium);
     g_list_free(medium->radios);
 }
 

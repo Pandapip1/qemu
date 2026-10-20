@@ -6,6 +6,8 @@
 #include "qemu/osdep.h"
 #include "libqtest-single.h"
 
+static char *tx_snapshot_trace_path;
+
 #define FRC_BASE             0xa8004000
 #define FRC_DATABUFFER       0x018
 #define FRC_RXRAWDATA        0x090
@@ -567,6 +569,29 @@ static void test_rac_tx_completion(void)
                     FRC_IF_TXDONE);
 }
 
+static void test_rac_tx_snapshot_captures_staged_bufc(void)
+{
+    const uint32_t tx_channel = BUFC_BASE + BUFC_CH0;
+    gchar *trace;
+
+    writel(tx_channel + BUFC_CMD, 1);
+    writel(tx_channel + BUFC_WRITEDATA, 0x91);
+    writel(tx_channel + BUFC_WRITEDATA, 0x72);
+    writel(RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+
+    /* This later staging write must not change the first TXEN snapshot. */
+    writel(tx_channel + BUFC_WRITEDATA, 0xe3);
+    writel(RAC_BASE + RAC_CMD, RAC_CMD_TXDIS);
+    writel(RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+
+    g_assert(g_file_get_contents(tx_snapshot_trace_path, &trace, NULL, NULL));
+    g_assert_nonnull(g_strstr_len(trace, -1,
+                                  "bytes=2 first=0x00007291"));
+    g_assert_nonnull(g_strstr_len(trace, -1,
+                                  "bytes=3 first=0x00e37291"));
+    g_free(trace);
+}
+
 static void test_rac_software_rx_enable(void)
 {
     writel(RAC_BASE + RAC_RXENSRCEN + REGISTER_SET_WINDOW,
@@ -628,9 +653,16 @@ static void test_rac_force_disable(void)
 int main(int argc, char **argv)
 {
     int result;
+    gchar *qemu_args;
 
     g_test_init(&argc, &argv, NULL);
-    qtest_start("-machine efr32bg22 -S");
+    tx_snapshot_trace_path = g_strdup_printf(
+        "%s/efr32bg22-tx-snapshot-%u.trace", g_get_tmp_dir(), g_random_int());
+    qemu_args = g_strdup_printf(
+        "-machine efr32bg22 -S -trace enable=efr32bg22_tx_snapshot,file=%s",
+        tx_snapshot_trace_path);
+    qtest_start(qemu_args);
+    g_free(qemu_args);
 
     qtest_add_func("/efr32bg22/register-aliases", test_register_aliases);
     qtest_add_func("/efr32bg22/modem-masks", test_modem_masks);
@@ -685,6 +717,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/protimer-counter", test_protimer_counter);
     qtest_add_func("/efr32bg22/rac-tx-commands", test_rac_tx_commands);
     qtest_add_func("/efr32bg22/rac-tx-completion", test_rac_tx_completion);
+    qtest_add_func("/efr32bg22/rac-tx-snapshot-captures-staged-bufc",
+                   test_rac_tx_snapshot_captures_staged_bufc);
     qtest_add_func("/efr32bg22/rac-software-rx-enable",
                    test_rac_software_rx_enable);
     qtest_add_func("/efr32bg22/rac-masks", test_rac_masks);
@@ -694,5 +728,7 @@ int main(int argc, char **argv)
 
     result = g_test_run();
     qtest_end();
+    g_unlink(tx_snapshot_trace_path);
+    g_free(tx_snapshot_trace_path);
     return result;
 }

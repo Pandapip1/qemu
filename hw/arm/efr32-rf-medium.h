@@ -74,6 +74,13 @@ uint64_t efr32_rf_tx_snapshot_get_sequence(
     const Efr32RfTxSnapshot *snapshot);
 GBytes *efr32_rf_tx_snapshot_get_data(const Efr32RfTxSnapshot *snapshot);
 
+/* The medium takes ownership and retains only its newest snapshot. */
+void efr32_rf_medium_set_latest_tx_snapshot(Efr32RfMedium *medium,
+                                             Efr32RfTxSnapshot *snapshot);
+const Efr32RfTxSnapshot *efr32_rf_medium_get_latest_tx_snapshot(
+    const Efr32RfMedium *medium);
+void efr32_rf_medium_clear_latest_tx_snapshot(Efr32RfMedium *medium);
+
 void efr32_rf_medium_register_types(void);
 
 #endif /* HW_ARM_EFR32_RF_MEDIUM_H */
