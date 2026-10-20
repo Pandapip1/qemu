@@ -612,6 +612,31 @@ static void test_rac_tx_disable_cancels_completion(void)
     g_assert_cmphex(readl(FRC_BASE + FRC_IF) & FRC_IF_TXDONE, ==, 0);
 }
 
+/*
+ * RX supersedes QEMU's synthetic TX operation, so it cannot later raise
+ * TXDONE.
+ */
+static void test_rac_rx_enable_cancels_tx_completion(void)
+{
+    writel(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW, FRC_IF_TXDONE);
+    writel(RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+    g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK, ==,
+                    RAC_STATUS_STATE_TX);
+
+    writel(RAC_BASE + RAC_RXENSRCEN + REGISTER_SET_WINDOW,
+           RAC_RXENSRCEN_SWRXEN);
+    g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK, ==,
+                    RAC_STATUS_STATE_RXSEARCH);
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(150001);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+
+    g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK, ==,
+                    RAC_STATUS_STATE_RXSEARCH);
+    g_assert_cmphex(readl(FRC_BASE + FRC_IF) & FRC_IF_TXDONE, ==, 0);
+}
+
 static void test_system_reset_cancels_tx_completion(void)
 {
     writel(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW, FRC_IF_TXDONE);
@@ -841,6 +866,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/rac-tx-completion", test_rac_tx_completion);
     qtest_add_func("/efr32bg22/rac-tx-disable-cancels-completion",
                    test_rac_tx_disable_cancels_completion);
+    qtest_add_func("/efr32bg22/rac-rx-enable-cancels-tx-completion",
+                   test_rac_rx_enable_cancels_tx_completion);
     qtest_add_func("/efr32bg22/system-reset-cancels-tx-completion",
                    test_system_reset_cancels_tx_completion);
     qtest_add_func("/efr32bg22/rac-tx-snapshot-captures-staged-bufc",

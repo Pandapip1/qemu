@@ -69,6 +69,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_RAC_STATE_RXSEARCH 2u
 #define EFR32_RAC_STATE_TX 9u
 
+/* Synthetic model delay, not a measured on-air transmission duration. */
+#define EFR32_RAC_TX_COMPLETION_DELAY_NS 150000
+
 /* Observed in rfhal_protimer.o and the retained stock trace; latch only. */
 #define EFR32_PROTIMER_EN 0x004u
 #define EFR32_PROTIMER_CTRL 0x008u
@@ -542,6 +545,18 @@ static void efr32_rac_tx_complete(void *opaque)
     efr32_frc_raise(s, EFR32_FRC_IF_TXDONE);
 }
 
+static void efr32_rac_cancel_tx_completion(Efr32Periph *s)
+{
+    timer_del(s->rac_tx_timer);
+}
+
+static void efr32_rac_schedule_tx_completion(Efr32Periph *s)
+{
+    timer_mod(s->rac_tx_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  EFR32_RAC_TX_COMPLETION_DELAY_NS);
+}
+
 static void efr32_rac_capture_tx_snapshot(Efr32Periph *s)
 {
     Efr32RfTxMetadata metadata = {
@@ -794,15 +809,14 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         next &= 0xc000fdff;
         if (next & (EFR32_RAC_CMD_TXDIS | EFR32_RAC_CMD_RXDIS))
         {
-            timer_del(s->rac_tx_timer);
+            efr32_rac_cancel_tx_completion(s);
             efr32_rac_set_state(s, EFR32_RAC_STATE_OFF);
         }
         else if (next & EFR32_RAC_CMD_TXEN)
         {
             efr32_rac_capture_tx_snapshot(s);
             efr32_rac_set_state(s, EFR32_RAC_STATE_TX);
-            timer_mod(s->rac_tx_timer,
-                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 150000);
+            efr32_rac_schedule_tx_completion(s);
         }
         trace_efr32bg22_rac_command(next, s->rac_state);
         return;
@@ -863,7 +877,7 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
     if (register_address == EFR32_RAC_BASE + EFR32_RAC_CTRL &&
         (next & EFR32_RAC_CTRL_FORCEDISABLE))
     {
-        timer_del(s->rac_tx_timer);
+        efr32_rac_cancel_tx_completion(s);
         efr32_rac_set_state(s, EFR32_RAC_STATE_OFF);
     }
 
@@ -876,6 +890,8 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         ((word >> 12) & 3) == 1 &&
         (next & EFR32_RAC_RXENSRCEN_SWRXEN))
     {
+        /* RX replaces this model's active synthetic TX operation. */
+        efr32_rac_cancel_tx_completion(s);
         efr32_rac_set_state(s, EFR32_RAC_STATE_RXSEARCH);
     }
 
@@ -994,7 +1010,7 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     ptimer_set_limit(s->protimer_counter, UINT32_MAX, 1);
     ptimer_run(s->protimer_counter, 0);
     ptimer_transaction_commit(s->protimer_counter);
-    timer_del(s->rac_tx_timer);
+    efr32_rac_cancel_tx_completion(s);
     s->rx_offer_pending = false;
     efr32_rf_medium_reset_radio(s->rf_medium, EFR32_RF_RADIO(s));
     efr32_register_put(s, EFR32_CMU_BASE + EFR32_CMU_SYSCLKCTRL,
