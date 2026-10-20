@@ -592,6 +592,20 @@ static void test_rac_tx_snapshot_captures_staged_bufc(void)
     g_free(trace);
 }
 
+static void test_rac_tx_snapshot_has_no_local_offers(void)
+{
+    const uint32_t tx_channel = BUFC_BASE + BUFC_CH0;
+    gchar *trace;
+
+    writel(tx_channel + BUFC_CMD, 1);
+    writel(tx_channel + BUFC_WRITEDATA, 0x4d);
+    writel(RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+
+    g_assert(g_file_get_contents(tx_snapshot_trace_path, &trace, NULL, NULL));
+    g_assert_nonnull(g_strstr_len(trace, -1, "RX mailbox offers=0"));
+    g_free(trace);
+}
+
 static void test_rac_software_rx_enable(void)
 {
     writel(RAC_BASE + RAC_RXENSRCEN + REGISTER_SET_WINDOW,
@@ -659,7 +673,7 @@ int main(int argc, char **argv)
     tx_snapshot_trace_path = g_strdup_printf(
         "%s/efr32bg22-tx-snapshot-%u.trace", g_get_tmp_dir(), g_random_int());
     qemu_args = g_strdup_printf(
-        "-machine efr32bg22 -S -trace enable=efr32bg22_tx_snapshot,file=%s",
+        "-machine efr32bg22 -S -trace enable=efr32bg22_*,file=%s",
         tx_snapshot_trace_path);
     qtest_start(qemu_args);
     g_free(qemu_args);
@@ -719,6 +733,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/rac-tx-completion", test_rac_tx_completion);
     qtest_add_func("/efr32bg22/rac-tx-snapshot-captures-staged-bufc",
                    test_rac_tx_snapshot_captures_staged_bufc);
+    qtest_add_func("/efr32bg22/rac-tx-snapshot-has-no-local-offers",
+                   test_rac_tx_snapshot_has_no_local_offers);
     qtest_add_func("/efr32bg22/rac-software-rx-enable",
                    test_rac_software_rx_enable);
     qtest_add_func("/efr32bg22/rac-masks", test_rac_masks);
