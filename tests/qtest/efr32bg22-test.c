@@ -212,7 +212,9 @@ static void test_burtc_compare_pending(void)
     writel(BURTC_BASE + BURTC_COMP, 42);
     writel(BURTC_BASE + BURTC_IEN + REGISTER_SET_WINDOW, BURTC_IF_COMP);
     writel(BURTC_BASE + BURTC_CMD, BURTC_CMD_START);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
     qtest_clock_step(global_qtest, 2 * 1000 * 1000);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
 
     g_assert_cmphex(readl(BURTC_BASE + BURTC_IF) & BURTC_IF_COMP, ==,
                     BURTC_IF_COMP);
