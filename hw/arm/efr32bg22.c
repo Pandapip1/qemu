@@ -84,13 +84,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_PROTIMER_CMP4 0x140u
 
 /* Minimal clock/power state required by the stock boot path. */
+#define EFR32_CMU_BASE 0x40008000u
+#define EFR32_CMU_SYSCLKCTRL 0x070u
+#define EFR32_CMU_SYSCLKCTRL_CLKSEL_MASK 0x7u
+#define EFR32_CMU_SYSCLKCTRL_CLKSEL_HFXO 3u
 #define EFR32_HFXO_BASE 0x4000c000u
+#define EFR32_HFXO_CTRL 0x028u
+#define EFR32_HFXO_CMD 0x050u
 #define EFR32_HFXO_STATUS 0x058u
+#define EFR32_HFXO_CTRL_FORCEEN (1u << 0)
+#define EFR32_HFXO_CMD_MANUALOVERRIDE (1u << 1)
 #define EFR32_HFXO_STATUS_RDY (1u << 0)
 #define EFR32_HFXO_STATUS_COREBIASOPTRDY (1u << 1)
 #define EFR32_HFXO_STATUS_ENS (1u << 16)
 #define EFR32_HFXO_STATUS_HWREQ (1u << 17)
 #define EFR32_HFXO_STATUS_ISWARM (1u << 19)
+#define EFR32_HFXO_STATUS_FSMLOCK (1u << 30)
 #define EFR32_HFXO_READY_STATUS \
     (EFR32_HFXO_STATUS_RDY | EFR32_HFXO_STATUS_COREBIASOPTRDY | \
      EFR32_HFXO_STATUS_ENS | EFR32_HFXO_STATUS_HWREQ | EFR32_HFXO_STATUS_ISWARM)
@@ -126,6 +135,7 @@ struct Efr32Periph
     GHashTable *registers;
     uint32_t trng_state;
     uint32_t rac_state;
+    bool hfxo_fsm_locked;
     QEMUTimer *rac_tx_timer;
     GByteArray *bufc_data[4];
     qemu_irq irq[64];
@@ -373,6 +383,18 @@ static void efr32_register_put(Efr32Periph *s, uint32_t address, uint32_t value)
                         GUINT_TO_POINTER(value));
 }
 
+static bool efr32_hfxo_enabled(Efr32Periph *s)
+{
+    uint32_t hfxo_ctrl =
+        efr32_register_get(s, EFR32_HFXO_BASE + EFR32_HFXO_CTRL);
+    uint32_t sysclk_ctrl =
+        efr32_register_get(s, EFR32_CMU_BASE + EFR32_CMU_SYSCLKCTRL);
+
+    return (hfxo_ctrl & EFR32_HFXO_CTRL_FORCEEN) ||
+           ((sysclk_ctrl & EFR32_CMU_SYSCLKCTRL_CLKSEL_MASK) ==
+            EFR32_CMU_SYSCLKCTRL_CLKSEL_HFXO);
+}
+
 static void efr32_rac_update_irqs(Efr32Periph *s)
 {
     qemu_set_irq(s->irq[37],
@@ -565,7 +587,15 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
     if (address == 0x4001000c || address == 0x40018004 || address == 0x40028008)
         return 0x00010001;
     if (address == EFR32_HFXO_BASE + EFR32_HFXO_STATUS)
-        return EFR32_HFXO_READY_STATUS;
+    {
+        if (!efr32_hfxo_enabled(s))
+        {
+            s->hfxo_fsm_locked = true;
+            return 0;
+        }
+        return EFR32_HFXO_READY_STATUS |
+               (s->hfxo_fsm_locked ? EFR32_HFXO_STATUS_FSMLOCK : 0);
+    }
     if (address == EFR32_DCDC_BASE + EFR32_DCDC_IF)
         return efr32_register_get(s, EFR32_DCDC_BASE + EFR32_DCDC_CTRL) & 1
                    ? EFR32_DCDC_IF_REGULATION
@@ -683,6 +713,12 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
     efr32_register_put(s, register_address,
                        efr32_radio_mask_write(register_address, next));
 
+    if (register_address == EFR32_HFXO_BASE + EFR32_HFXO_CMD &&
+        (next & EFR32_HFXO_CMD_MANUALOVERRIDE))
+    {
+        s->hfxo_fsm_locked = false;
+    }
+
     /* CTRL.FORCEDISABLE cancels an active RAC operation. */
     if (register_address == EFR32_RAC_BASE + EFR32_RAC_CTRL &&
         (next & EFR32_RAC_CTRL_FORCEDISABLE))
@@ -779,6 +815,7 @@ static void efr32_periph_init(Object *o)
     s->registers = g_hash_table_new(g_direct_hash, g_direct_equal);
     s->trng_state = 0x2545f491;
     s->rac_state = EFR32_RAC_STATE_OFF;
+    s->hfxo_fsm_locked = true;
     s->rac_tx_timer =
         timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_rac_tx_complete, s);
     for (unsigned channel = 0; channel < G_N_ELEMENTS(s->bufc_data); channel++)
@@ -802,6 +839,7 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     g_hash_table_remove_all(s->registers);
     s->trng_state = 0x2545f491;
     s->rac_state = EFR32_RAC_STATE_OFF;
+    s->hfxo_fsm_locked = true;
     timer_del(s->rac_tx_timer);
     efr32_register_put(s, EFR32_AGC_BASE + EFR32_AGC_RSSI, 0x8000);
     efr32_register_put(s, EFR32_AGC_BASE + EFR32_AGC_FRAMERSSI, 0x8000);

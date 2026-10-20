@@ -64,8 +64,13 @@
 #define DCDC_STATUS           0x02c
 #define DCDC_IF_REGULATION    (1u << 5)
 #define HFXO_BASE             0x4000c000
+#define HFXO_CTRL             0x028
+#define HFXO_CMD              0x050
 #define HFXO_STATUS           0x058
 #define HFXO_STATUS_READY     0x000b0003
+#define HFXO_STATUS_FSMLOCK   (1u << 30)
+#define CMU_BASE              0x40008000
+#define CMU_SYSCLKCTRL        0x070
 #define BUFC_BASE            0xaa000000
 #define BUFC_CH0             0x00c
 #define BUFC_CH1             0x04c
@@ -241,6 +246,17 @@ static void test_dcdc_regulation(void)
 
 static void test_hfxo_ready_status(void)
 {
+    g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==, 0);
+
+    writel(HFXO_BASE + HFXO_CTRL, 1);
+    g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==,
+                    HFXO_STATUS_READY | HFXO_STATUS_FSMLOCK);
+
+    writel(HFXO_BASE + HFXO_CMD, 1u << 1);
+    g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==, HFXO_STATUS_READY);
+
+    writel(HFXO_BASE + HFXO_CTRL, 0);
+    writel(CMU_BASE + CMU_SYSCLKCTRL, 3);
     g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==, HFXO_STATUS_READY);
 }
 
