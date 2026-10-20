@@ -115,6 +115,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
      EFR32_HFXO_STATUS_ENS | EFR32_HFXO_STATUS_HWREQ | EFR32_HFXO_STATUS_ISWARM)
 
 #define EFR32_DCDC_BASE 0x40094000u
+#define EFR32_DCDC_SECURE_BASE 0x50094000u
 #define EFR32_DCDC_CTRL 0x008u
 #define EFR32_DCDC_IF 0x024u
 #define EFR32_DCDC_STATUS 0x02cu
@@ -470,6 +471,11 @@ static uint32_t efr32_peripheral_canonical_address(uint32_t address)
     /* HFXO0 is visible through both the secure and non-secure peripheral map. */
     if ((address & ~0x3fffu) == EFR32_HFXO_SECURE_BASE) {
         address = EFR32_HFXO_BASE + (address & 0x3fffu);
+    }
+
+    /* DCDC0 has the same secure/non-secure peripheral-map arrangement. */
+    if ((address & ~0x3fffu) == EFR32_DCDC_SECURE_BASE) {
+        address = EFR32_DCDC_BASE + (address & 0x3fffu);
     }
 
     return address;

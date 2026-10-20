@@ -71,6 +71,7 @@ static char *tx_snapshot_trace_path;
 #define RAC_SEQIF_STATERXSEARCH (1u << 18)
 #define RAC_SEQIF_STATETX     (1u << 25)
 #define DCDC_BASE             0x40094000
+#define DCDC_SECURE_BASE      0x50094000
 #define DCDC_CTRL             0x008
 #define DCDC_IF               0x024
 #define DCDC_STATUS           0x02c
@@ -306,10 +307,15 @@ static void test_stock_setup_aliases(void)
 
 static void test_dcdc_regulation(void)
 {
-    g_assert_cmphex(readl(DCDC_BASE + DCDC_IF) & DCDC_IF_REGULATION, ==, 0);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    g_assert_cmphex(readl(DCDC_SECURE_BASE + DCDC_IF) & DCDC_IF_REGULATION,
+                    ==, 0);
 
-    writel(DCDC_BASE + DCDC_CTRL + REGISTER_SET_WINDOW, 1);
+    writel(DCDC_SECURE_BASE + DCDC_CTRL + REGISTER_SET_WINDOW, 1);
 
+    g_assert_cmphex(readl(DCDC_SECURE_BASE + DCDC_IF) & DCDC_IF_REGULATION,
+                    ==,
+                    DCDC_IF_REGULATION);
     g_assert_cmphex(readl(DCDC_BASE + DCDC_IF) & DCDC_IF_REGULATION, ==,
                     DCDC_IF_REGULATION);
     g_assert_cmphex(readl(DCDC_BASE + DCDC_STATUS), ==, 6);
