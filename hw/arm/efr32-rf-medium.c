@@ -59,6 +59,7 @@ void efr32_rf_medium_detach(Efr32RfMedium *medium, Efr32RfRadio *radio)
         return;
     }
 
+    efr32_rf_medium_reset_radio(medium, radio);
     medium->radios = g_list_delete_link(medium->radios, member);
 }
 
@@ -284,6 +285,31 @@ void efr32_rf_medium_clear_rx_offers(Efr32RfMedium *medium)
 
     while ((request = efr32_rf_medium_take_rx_offer(medium))) {
         efr32_rf_rx_delivery_request_free(request);
+    }
+}
+
+void efr32_rf_medium_reset_radio(Efr32RfMedium *medium,
+                                 Efr32RfRadio *radio)
+{
+    bool reset_tx_source = medium->latest_tx_snapshot &&
+        efr32_rf_tx_snapshot_get_radio(medium->latest_tx_snapshot) == radio;
+    GList *link;
+
+    if (reset_tx_source) {
+        efr32_rf_medium_clear_latest_tx_snapshot(medium);
+        efr32_rf_medium_clear_rx_offers(medium);
+        return;
+    }
+
+    for (link = medium->rx_offers.head; link;) {
+        Efr32RfRxDeliveryRequest *request = link->data;
+        GList *next = link->next;
+
+        if (efr32_rf_rx_delivery_request_get_receiver(request) == radio) {
+            g_queue_delete_link(&medium->rx_offers, link);
+            efr32_rf_rx_delivery_request_free(request);
+        }
+        link = next;
     }
 }
 

@@ -290,6 +290,44 @@ static void test_tx_offers_follow_rx_ready_attachment_order(
     object_unref(OBJECT(first_peer));
 }
 
+static void test_reset_radio_keeps_other_receiver_offer(
+    RfMediumFixture *fixture, gconstpointer data)
+{
+    uint8_t staged[] = {0x31, 0x62};
+    Efr32RfTxMetadata tx_metadata = valid_tx_metadata();
+    Efr32RfTxSnapshot *snapshot;
+    Efr32RfRadio *first_peer;
+    Efr32RfRadio *second_peer;
+    Efr32RfRxDeliveryRequest *offer;
+
+    first_peer = add_rx_ready_radio(fixture);
+    second_peer = add_rx_ready_radio(fixture);
+    snapshot = efr32_rf_medium_snapshot_tx(
+        fixture->medium, fixture->radio, &tx_metadata, staged, sizeof(staged),
+        &error_abort);
+    efr32_rf_medium_set_latest_tx_snapshot(fixture->medium, snapshot);
+    g_assert_cmpuint(efr32_rf_medium_offer_latest_tx(fixture->medium,
+                                                       &error_abort), ==, 2);
+
+    efr32_rf_medium_reset_radio(fixture->medium, first_peer);
+    g_assert_nonnull(efr32_rf_medium_get_latest_tx_snapshot(fixture->medium));
+    g_assert_cmpuint(efr32_rf_medium_get_rx_offer_count(fixture->medium), ==,
+                     1);
+    offer = efr32_rf_medium_take_rx_offer(fixture->medium);
+    g_assert_true(efr32_rf_rx_delivery_request_get_receiver(offer) ==
+                  second_peer);
+    efr32_rf_rx_delivery_request_free(offer);
+
+    efr32_rf_medium_reset_radio(fixture->medium, fixture->radio);
+    g_assert_null(efr32_rf_medium_get_latest_tx_snapshot(fixture->medium));
+    g_assert_cmpuint(efr32_rf_medium_get_rx_offer_count(fixture->medium), ==,
+                     0);
+    efr32_rf_medium_detach(fixture->medium, second_peer);
+    efr32_rf_medium_detach(fixture->medium, first_peer);
+    object_unref(OBJECT(second_peer));
+    object_unref(OBJECT(first_peer));
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -319,6 +357,10 @@ int main(int argc, char **argv)
     g_test_add("/efr32-rf-medium/tx-offers-follow-rx-ready-attachment-order",
                RfMediumFixture, NULL, rf_medium_fixture_setup,
                test_tx_offers_follow_rx_ready_attachment_order,
+               rf_medium_fixture_teardown);
+    g_test_add("/efr32-rf-medium/reset-radio-keeps-other-receiver-offer",
+               RfMediumFixture, NULL, rf_medium_fixture_setup,
+               test_reset_radio_keeps_other_receiver_offer,
                rf_medium_fixture_teardown);
 
     return g_test_run();

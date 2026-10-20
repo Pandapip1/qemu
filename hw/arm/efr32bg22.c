@@ -954,8 +954,7 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     ptimer_run(s->protimer_counter, 0);
     ptimer_transaction_commit(s->protimer_counter);
     timer_del(s->rac_tx_timer);
-    efr32_rf_medium_clear_rx_offers(s->rf_medium);
-    efr32_rf_medium_clear_latest_tx_snapshot(s->rf_medium);
+    efr32_rf_medium_reset_radio(s->rf_medium, EFR32_RF_RADIO(s));
     efr32_register_put(s, EFR32_CMU_BASE + EFR32_CMU_SYSCLKCTRL,
                        EFR32_CMU_SYSCLKCTRL_CLKSEL_FSRCO);
     efr32_register_put(s, EFR32_EMU_BASE + EFR32_EMU_STATUS,

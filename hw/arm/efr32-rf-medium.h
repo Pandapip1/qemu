@@ -105,6 +105,15 @@ const Efr32RfTxSnapshot *efr32_rf_medium_get_latest_tx_snapshot(
 void efr32_rf_medium_clear_latest_tx_snapshot(Efr32RfMedium *medium);
 
 /*
+ * Discard medium state owned by, or addressed to, one radio. A reset of a
+ * receiver must not discard offers for other attached receivers. A reset of
+ * the source of the retained TX snapshot discards that snapshot and its
+ * undelivered offers.
+ */
+void efr32_rf_medium_reset_radio(Efr32RfMedium *medium,
+                                 Efr32RfRadio *radio);
+
+/*
  * Create an immutable, caller-owned request for a future RX handoff.  This
  * does not inject a packet, alter any peripheral register, or raise an IRQ.
  */
