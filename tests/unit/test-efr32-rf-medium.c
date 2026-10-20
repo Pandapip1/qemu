@@ -11,12 +11,26 @@
 
 typedef struct TestEfr32RfRadio {
     Object parent_obj;
+    bool rx_ready;
 } TestEfr32RfRadio;
+
+static bool test_efr32_rf_radio_is_rx_ready(Efr32RfRadio *radio)
+{
+    return ((TestEfr32RfRadio *)radio)->rx_ready;
+}
+
+static void test_efr32_rf_radio_class_init(ObjectClass *oc, void *data)
+{
+    Efr32RfRadioClass *radio_class = EFR32_RF_RADIO_CLASS(oc);
+
+    radio_class->is_rx_ready = test_efr32_rf_radio_is_rx_ready;
+}
 
 static const TypeInfo test_efr32_rf_radio_info = {
     .name = TYPE_TEST_EFR32_RF_RADIO,
     .parent = TYPE_OBJECT,
     .instance_size = sizeof(TestEfr32RfRadio),
+    .class_init = test_efr32_rf_radio_class_init,
     .interfaces = (InterfaceInfo[]){{TYPE_EFR32_RF_RADIO}, {}},
 };
 
@@ -29,6 +43,7 @@ static void rf_medium_fixture_setup(RfMediumFixture *fixture, gconstpointer data
 {
     fixture->medium = EFR32_RF_MEDIUM(object_new(TYPE_EFR32_RF_MEDIUM));
     fixture->radio = EFR32_RF_RADIO(object_new(TYPE_TEST_EFR32_RF_RADIO));
+    ((TestEfr32RfRadio *)fixture->radio)->rx_ready = true;
     efr32_rf_medium_attach(fixture->medium, fixture->radio, &error_abort);
 }
 
@@ -51,7 +66,6 @@ static Efr32RfTxMetadata valid_tx_metadata(void)
 static Efr32RfRxMetadata valid_rx_metadata(void)
 {
     return (Efr32RfRxMetadata){
-        .receiver_state = EFR32_RF_RX_RECEIVER_STATE_RAC_RXSEARCH,
         .buffer_channel = EFR32_RF_RX_BUFC_CHANNEL,
     };
 }
@@ -168,9 +182,6 @@ static void test_rx_delivery_request_copies_data(RfMediumFixture *fixture,
     g_assert_cmpuint(captured[0], ==, 0xc3);
     g_assert_true(efr32_rf_rx_delivery_request_get_receiver(request) ==
                   fixture->radio);
-    g_assert_cmpint(
-        efr32_rf_rx_delivery_request_get_metadata(request)->receiver_state, ==,
-        EFR32_RF_RX_RECEIVER_STATE_RAC_RXSEARCH);
     g_assert_cmpuint(
         efr32_rf_rx_delivery_request_get_metadata(request)->buffer_channel, ==,
         EFR32_RF_RX_BUFC_CHANNEL);
@@ -185,13 +196,14 @@ static void test_rx_delivery_request_validation(RfMediumFixture *fixture,
     Efr32RfRadio *other;
     Error *err = NULL;
 
-    metadata.receiver_state = 99;
+    ((TestEfr32RfRadio *)fixture->radio)->rx_ready = false;
     request = efr32_rf_medium_prepare_rx_delivery(
         fixture->medium, fixture->radio, &metadata, NULL, 0, &err);
     g_assert_null(request);
     g_assert_nonnull(err);
     error_free(err);
 
+    ((TestEfr32RfRadio *)fixture->radio)->rx_ready = true;
     metadata = valid_rx_metadata();
     metadata.buffer_channel = 0;
     err = NULL;

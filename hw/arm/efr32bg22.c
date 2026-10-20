@@ -971,9 +971,20 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
         g_byte_array_set_size(s->bufc_data[channel], 0);
     }
 }
+
+static bool efr32_periph_is_rx_ready(Efr32RfRadio *radio)
+{
+    Efr32Periph *s = EFR32_PERIPH(radio);
+
+    return s->rac_state == EFR32_RAC_STATE_RXSEARCH;
+}
+
 static void efr32_periph_class_init(ObjectClass *o, void *d)
 {
+    Efr32RfRadioClass *radio_class = EFR32_RF_RADIO_CLASS(o);
+
     RESETTABLE_CLASS(o)->phases.hold = efr32_periph_reset_hold;
+    radio_class->is_rx_ready = efr32_periph_is_rx_ready;
 }
 static const TypeInfo periph_info = {.name = TYPE_EFR32_PERIPH,
                                      .parent = TYPE_SYS_BUS_DEVICE,

@@ -27,6 +27,13 @@ struct Efr32RfRxDeliveryRequest {
     GBytes *data;
 };
 
+bool efr32_rf_radio_is_rx_ready(Efr32RfRadio *radio)
+{
+    Efr32RfRadioClass *klass = EFR32_RF_RADIO_GET_CLASS(radio);
+
+    return klass->is_rx_ready && klass->is_rx_ready(radio);
+}
+
 void efr32_rf_medium_attach(Efr32RfMedium *medium, Efr32RfRadio *radio,
                             Error **errp)
 {
@@ -166,7 +173,7 @@ Efr32RfRxDeliveryRequest *efr32_rf_medium_prepare_rx_delivery(
         error_setg(errp, "RF RX delivery request requires metadata");
         return NULL;
     }
-    if (metadata->receiver_state != EFR32_RF_RX_RECEIVER_STATE_RAC_RXSEARCH) {
+    if (!efr32_rf_radio_is_rx_ready(receiver)) {
         error_setg(errp, "RF RX delivery request requires RAC RXSEARCH");
         return NULL;
     }

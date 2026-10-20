@@ -15,8 +15,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32RfMedium, EFR32_RF_MEDIUM)
 #define TYPE_EFR32_RF_RADIO "efr32-rf-radio"
 
 typedef struct Efr32RfRadio Efr32RfRadio;
+typedef struct Efr32RfRadioClass Efr32RfRadioClass;
+DECLARE_CLASS_CHECKERS(Efr32RfRadioClass, EFR32_RF_RADIO,
+                       TYPE_EFR32_RF_RADIO)
 #define EFR32_RF_RADIO(obj) \
     INTERFACE_CHECK(Efr32RfRadio, (obj), TYPE_EFR32_RF_RADIO)
+
+struct Efr32RfRadioClass {
+    InterfaceClass parent_class;
+
+    bool (*is_rx_ready)(Efr32RfRadio *radio);
+};
+
+bool efr32_rf_radio_is_rx_ready(Efr32RfRadio *radio);
 
 typedef enum Efr32RfTxTrigger {
     /* EFR32 RAC.CMD.TXEN caused the peripheral to enter RAC->TX. */
@@ -37,19 +48,13 @@ typedef struct Efr32RfTxMetadata {
 
 typedef struct Efr32RfTxSnapshot Efr32RfTxSnapshot;
 
-typedef enum Efr32RfRxReceiverState {
-    /* RAC must already report RXSEARCH before an RX handoff can proceed. */
-    EFR32_RF_RX_RECEIVER_STATE_RAC_RXSEARCH,
-} Efr32RfRxReceiverState;
-
 #define EFR32_RF_RX_BUFC_CHANNEL 1
 
 /*
- * Preconditions for a future medium-to-radio receive handoff.  These fields
- * describe the modeled EFR32 boundary, not an over-the-air packet format.
+ * Handoff data that does not belong to receiver state. The radio interface
+ * itself supplies the RXSEARCH readiness check.
  */
 typedef struct Efr32RfRxMetadata {
-    Efr32RfRxReceiverState receiver_state;
     uint8_t buffer_channel;
 } Efr32RfRxMetadata;
 
