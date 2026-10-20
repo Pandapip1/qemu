@@ -36,6 +36,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_MODEM_BASE 0xa8014000u
 #define EFR32_SYNTH_BASE 0xa8018000u
 #define EFR32_PROTIMER_BASE 0xa801c000u
+#define EFR32_PROTIMER_NS_BASE 0xb801c000u
 #define EFR32_RAC_BASE 0xa8020000u
 
 #define EFR32_FRC_IF 0x068u
@@ -345,6 +346,15 @@ static void efr32_bufc_write_data(Efr32Periph *s, unsigned channel,
 /* Each Series-2 block has normal, SET, CLR, and TGL 4-KiB windows. */
 static uint32_t efr32_register_key(uint32_t address)
 {
+    /*
+     * RAIL accesses PROTIMER through its non-secure window at 0xb801c000,
+     * while stock setup traces also use the secure 0xa801c000 window.  They
+     * are views of the same block, including the standard SET/CLR/TGL pages.
+     */
+    if ((address & ~0x3fffu) == EFR32_PROTIMER_NS_BASE) {
+        address = EFR32_PROTIMER_BASE + (address & 0x3fffu);
+    }
+
     return (address & ~0x3fffu) | (address & 0xffcu);
 }
 

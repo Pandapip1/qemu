@@ -31,7 +31,9 @@
 #define RFCRC_EN             0x004
 #define RFCRC_CTRL           0x008
 #define PROTIMER_BASE         0xa801c000
+#define PROTIMER_NS_BASE      0xb801c000
 #define PROTIMER_CTRL         0x008
+#define PROTIMER_CMD          0x00c
 #define PROTIMER_STATE        0x030
 #define PROTIMER_PERIOD       0x038
 #define PROTIMER_CMP0         0x100
@@ -374,6 +376,16 @@ static void test_protimer_trace_latches(void)
     g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_CMP0), ==, 0x01000003);
 }
 
+static void test_protimer_secure_nonsecure_alias(void)
+{
+    /* RAIL enables PROTIMER through the non-secure 0xb801c000 window. */
+    writel(PROTIMER_NS_BASE + PROTIMER_CTRL, 0x00011102);
+    writel(PROTIMER_NS_BASE + PROTIMER_CMD, 1);
+
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_CTRL), ==, 0x00011102);
+    g_assert_cmphex(readl(PROTIMER_NS_BASE + PROTIMER_CTRL), ==, 0x00011102);
+}
+
 static void test_rac_tx_commands(void)
 {
     writel(RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
@@ -481,6 +493,8 @@ int main(int argc, char **argv)
                    test_bufc_sparse_threshold_flag);
     qtest_add_func("/efr32bg22/protimer-trace-latches",
                    test_protimer_trace_latches);
+    qtest_add_func("/efr32bg22/protimer-secure-nonsecure-alias",
+                   test_protimer_secure_nonsecure_alias);
     qtest_add_func("/efr32bg22/rac-tx-commands", test_rac_tx_commands);
     qtest_add_func("/efr32bg22/rac-tx-completion", test_rac_tx_completion);
     qtest_add_func("/efr32bg22/rac-software-rx-enable",
