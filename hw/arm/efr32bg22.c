@@ -645,7 +645,9 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
 
     if (word >= RADIO_BASE && word < RADIO_BASE + RADIO_SIZE)
     {
-        trace_efr32bg22_radio_write(word, (uint32_t)value, size);
+        uint32_t pc = current_cpu ? ARM_CPU(current_cpu)->env.regs[15] : 0;
+
+        trace_efr32bg22_radio_write(pc, word, (uint32_t)value, size);
     }
 
     switch ((address >> 12) & 3)
