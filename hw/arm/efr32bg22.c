@@ -961,7 +961,7 @@ static void efr32_burtc_update_irq(Efr32Periph *s)
 
 static void efr32_burtc_schedule_compare(Efr32Periph *s)
 {
-    uint32_t ticks;
+    uint64_t ticks;
     int64_t deadline;
 
     timer_del(s->burtc_compare_timer);
@@ -971,10 +971,19 @@ static void efr32_burtc_schedule_compare(Efr32Periph *s)
 
     /* CNT counts up modulo 2^32.  Schedule this COMP match once; IF latches
      * until the guest clears it, exactly as the one-shot Zephyr alarm uses it. */
-    ticks = efr32_register_get(s, EFR32_BURTC_BASE + EFR32_BURTC_COMP) -
-            efr32_burtc_counter(s);
+    ticks = (uint32_t)(efr32_register_get(s, EFR32_BURTC_BASE +
+                                          EFR32_BURTC_COMP) -
+                       efr32_burtc_counter(s));
     if (ticks == 0) {
-        ticks = 1;
+        /*
+         * COMP is an edge in the free-running 32-bit counter.  If software
+         * programs the current value, its next match is after a complete
+         * wrap, not on the next counter tick.  In particular, the Zephyr
+         * driver's cancel path clears IF and writes COMP = 0; treating that
+         * reset-state equality as an immediate event would relatch a stale
+         * pending bit after a successful cancellation.
+         */
+        ticks = UINT64_C(1) << 32;
     }
     deadline = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                ((int64_t)ticks * NANOSECONDS_PER_SECOND + 32768 - 1) / 32768;
@@ -1355,14 +1364,14 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
             efr32_rac_cancel_tx_completion(s);
             timer_del(s->rac_rx_timer);
             /*
-             * TXDIS aborts the in-flight model transaction as well as its
-             * synthetic completion timer.  Do not let a TXEN mailbox offer
-             * survive an explicit source abort and turn into a later RXDONE.
+             * Either disable command ends this model's active RAC operation,
+             * including a synthetic TXEN transaction.  Do not let a TXEN
+             * mailbox offer survive an explicit source abort and turn into a
+             * later peer RXDONE.  There is no active source transaction to
+             * withdraw when RXDIS merely stops receive, so this is harmless.
              */
-            if (next & EFR32_RAC_CMD_TXDIS) {
-                efr32_rf_medium_withdraw_active_tx(
-                    s->rf_medium, EFR32_RF_RADIO(s));
-            }
+            efr32_rf_medium_withdraw_active_tx(s->rf_medium,
+                                                EFR32_RF_RADIO(s));
             efr32_rac_set_state(s, EFR32_RAC_STATE_OFF);
         }
         else if (next & EFR32_RAC_CMD_TXEN)

@@ -240,6 +240,29 @@ static void test_burtc_compare_pending(void)
     g_assert_cmphex(readl(BURTC_BASE + BURTC_IF) & BURTC_IF_COMP, ==, 0);
 }
 
+/*
+ * A compare equal to the current free-running count is the next-wrap edge,
+ * rather than an immediate event.  Zephyr's counter cancel path writes
+ * COMP = 0 after clearing IF, so this also keeps cancellation from creating
+ * a spurious pending flag at reset count zero.
+ */
+static void test_burtc_current_compare_waits_for_wrap(void)
+{
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+
+    writel(BURTC_BASE + BURTC_EN + REGISTER_SET_WINDOW, BURTC_EN_EN);
+    writel(BURTC_BASE + BURTC_CNT, 10);
+    writel(BURTC_BASE + BURTC_IF + REGISTER_CLEAR_WINDOW, BURTC_IF_COMP);
+    writel(BURTC_BASE + BURTC_COMP, 10);
+    writel(BURTC_BASE + BURTC_IEN + REGISTER_SET_WINDOW, BURTC_IF_COMP);
+    writel(BURTC_BASE + BURTC_CMD, BURTC_CMD_START);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    qtest_clock_step(global_qtest, 2 * 1000 * 1000);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_IF) & BURTC_IF_COMP, ==, 0);
+}
+
 /* TIMER4 is Zephyr's 16-bit 38.4 MHz scheduling counter on this part. */
 static void test_timer4_counter_and_aliases(void)
 {
@@ -1157,6 +1180,8 @@ int main(int argc, char **argv)
                    test_burtc_counter_contract);
     qtest_add_func("/efr32bg22/burtc-compare-pending",
                    test_burtc_compare_pending);
+    qtest_add_func("/efr32bg22/burtc-current-compare-waits-for-wrap",
+                   test_burtc_current_compare_waits_for_wrap);
     qtest_add_func("/efr32bg22/timer4-counter-and-aliases",
                    test_timer4_counter_and_aliases);
     qtest_add_func("/efr32bg22/timer4-cc0-compare-pending",
