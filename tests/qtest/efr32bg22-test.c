@@ -91,6 +91,16 @@ static char *tx_snapshot_trace_path;
 #define CMU_BASE              0x40008000
 #define CMU_NONSECURE_BASE    0x50008000
 #define CMU_SYSCLKCTRL        0x070
+#define DPLL0_BASE            0x4001c000
+#define DPLL0_NONSECURE_BASE  0x5001c000
+#define DPLL_EN               0x004
+#define DPLL_CFG              0x008
+#define DPLL_CFG1             0x00c
+#define DPLL_IF               0x010
+#define DPLL_STATUS           0x018
+#define DPLL_EN_EN            (1u << 0)
+#define DPLL_IF_LOCK          (1u << 0)
+#define DPLL_STATUS_READY_LOCKED 0x80000003
 #define RADIO_RAM_NS_BASE     0xb0000000
 #define RADIO_RAM_RHCLKPRESC  0x4fe0
 #define BUFC_BASE            0xaa000000
@@ -143,6 +153,30 @@ static void test_cmu_nonsecure_alias(void)
 
     writel(CMU_BASE + CMU_SYSCLKCTRL, 1);
     g_assert_cmphex(readl(CMU_NONSECURE_BASE + CMU_SYSCLKCTRL) & 7, ==, 1);
+}
+
+/* Zephyr CMU_DPLLLock() clears IF, enables DPLL0, then polls LOCK/FAIL. */
+static void test_dpll_lock(void)
+{
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    g_assert_cmphex(readl(DPLL0_BASE + DPLL_STATUS), ==, 0);
+    g_assert_cmphex(readl(DPLL0_NONSECURE_BASE + DPLL_IF) & 7, ==, 0);
+
+    writel(DPLL0_NONSECURE_BASE + DPLL_CFG, UINT32_MAX);
+    writel(DPLL0_NONSECURE_BASE + DPLL_CFG1, UINT32_MAX);
+    g_assert_cmphex(readl(DPLL0_BASE + DPLL_CFG), ==, 0x47);
+    g_assert_cmphex(readl(DPLL0_BASE + DPLL_CFG1), ==, 0x0fff0fff);
+
+    writel(DPLL0_NONSECURE_BASE + DPLL_IF + REGISTER_CLEAR_WINDOW, 7);
+    writel(DPLL0_NONSECURE_BASE + DPLL_EN + REGISTER_SET_WINDOW,
+           DPLL_EN_EN);
+    g_assert_cmphex(readl(DPLL0_BASE + DPLL_STATUS), ==,
+                    DPLL_STATUS_READY_LOCKED);
+    g_assert_cmphex(readl(DPLL0_NONSECURE_BASE + DPLL_IF) & 7, ==,
+                    DPLL_IF_LOCK);
+
+    writel(DPLL0_BASE + DPLL_EN + REGISTER_CLEAR_WINDOW, DPLL_EN_EN);
+    g_assert_cmphex(readl(DPLL0_NONSECURE_BASE + DPLL_STATUS), ==, 0);
 }
 
 static void test_modem_masks(void)
@@ -870,6 +904,7 @@ int main(int argc, char **argv)
 
     qtest_add_func("/efr32bg22/register-aliases", test_register_aliases);
     qtest_add_func("/efr32bg22/cmu-nonsecure-alias", test_cmu_nonsecure_alias);
+    qtest_add_func("/efr32bg22/dpll-lock", test_dpll_lock);
     qtest_add_func("/efr32bg22/modem-masks", test_modem_masks);
     qtest_add_func("/efr32bg22/rfcrc-masks", test_rfcrc_masks);
     qtest_add_func("/efr32bg22/agc-rssi-status-registers",

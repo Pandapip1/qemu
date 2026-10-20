@@ -116,6 +116,20 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
     (EFR32_HFXO_STATUS_RDY | EFR32_HFXO_STATUS_COREBIASOPTRDY | \
      EFR32_HFXO_STATUS_ENS | EFR32_HFXO_STATUS_HWREQ | EFR32_HFXO_STATUS_ISWARM)
 
+/* EFR32BG22 DPLL0, used by Zephyr's CMU_DPLLLock() startup sequence. */
+#define EFR32_DPLL0_BASE 0x4001c000u
+#define EFR32_DPLL_EN 0x004u
+#define EFR32_DPLL_CFG 0x008u
+#define EFR32_DPLL_CFG1 0x00cu
+#define EFR32_DPLL_IF 0x010u
+#define EFR32_DPLL_IEN 0x014u
+#define EFR32_DPLL_STATUS 0x018u
+#define EFR32_DPLL_EN_EN (1u << 0)
+#define EFR32_DPLL_IF_LOCK (1u << 0)
+#define EFR32_DPLL_STATUS_RDY (1u << 0)
+#define EFR32_DPLL_STATUS_ENS (1u << 1)
+#define EFR32_DPLL_STATUS_LOCK (1u << 31)
+
 #define EFR32_DCDC_BASE 0x40094000u
 #define EFR32_DCDC_CTRL 0x008u
 #define EFR32_DCDC_IF 0x024u
@@ -514,6 +528,12 @@ static bool efr32_hfxo_enabled(Efr32Periph *s)
             EFR32_CMU_SYSCLKCTRL_CLKSEL_HFXO);
 }
 
+static bool efr32_dpll_enabled(Efr32Periph *s)
+{
+    return efr32_register_get(s, EFR32_DPLL0_BASE + EFR32_DPLL_EN) &
+           EFR32_DPLL_EN_EN;
+}
+
 static void efr32_rac_update_irqs(Efr32Periph *s)
 {
     qemu_set_irq(s->irq[37],
@@ -679,6 +699,23 @@ static uint32_t efr32_radio_mask_write(uint32_t address, uint32_t value)
     {
         return value & 1;
     }
+    if ((address & ~0x3fffu) == EFR32_DPLL0_BASE)
+    {
+        switch (offset)
+        {
+        case EFR32_DPLL_EN:
+            return value & EFR32_DPLL_EN_EN;
+        case EFR32_DPLL_CFG:
+            return value & 0x47;
+        case EFR32_DPLL_CFG1:
+            return value & 0x0fff0fff;
+        case EFR32_DPLL_IF:
+        case EFR32_DPLL_IEN:
+            return value & 0x7;
+        default:
+            return value;
+        }
+    }
     if ((address & ~0x3fffu) == EFR32_SYNTH_BASE && offset >= 0x34 &&
         offset <= 0x44 && !(offset & 3))
     {
@@ -830,6 +867,12 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
         return EFR32_HFXO_READY_STATUS |
                (s->hfxo_fsm_locked ? EFR32_HFXO_STATUS_FSMLOCK : 0);
     }
+    if (address == EFR32_DPLL0_BASE + EFR32_DPLL_STATUS)
+    {
+        return efr32_dpll_enabled(s) ? EFR32_DPLL_STATUS_RDY |
+                                       EFR32_DPLL_STATUS_ENS |
+                                       EFR32_DPLL_STATUS_LOCK : 0;
+    }
     if (address == EFR32_DCDC_BASE + EFR32_DCDC_IF)
         return efr32_register_get(s, EFR32_DCDC_BASE + EFR32_DCDC_CTRL) & 1
                    ? EFR32_DCDC_IF_REGULATION
@@ -874,6 +917,7 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
              mask = size == 4 ? UINT32_MAX : ((1u << (size * 8)) - 1) << shift,
              next = (old & ~mask) | (((uint32_t)value << shift) & mask);
     bool hfxo_was_enabled = efr32_hfxo_enabled(s);
+    bool dpll_was_enabled = efr32_dpll_enabled(s);
 
     if (word >= RADIO_BASE && word < RADIO_BASE + RADIO_SIZE)
     {
@@ -958,6 +1002,21 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
 
     efr32_register_put(s, register_address,
                        efr32_radio_mask_write(register_address, next));
+
+    /*
+     * The public CMU_DPLLLock() path clears DPLL.IF then enables DPLL0 and
+     * polls for LOCK or a LOCKFAIL flag.  This model has no analog loop or
+     * reference-clock timing, so an enable transition completes immediately
+     * and deterministically with the documented successful-lock state.
+     */
+    if (register_address == EFR32_DPLL0_BASE + EFR32_DPLL_EN &&
+        !dpll_was_enabled && efr32_dpll_enabled(s))
+    {
+        efr32_register_put(s, EFR32_DPLL0_BASE + EFR32_DPLL_IF,
+                           efr32_register_get(s, EFR32_DPLL0_BASE +
+                                              EFR32_DPLL_IF) |
+                               EFR32_DPLL_IF_LOCK);
+    }
 
     /* A new HFXO request starts a fresh lock sequence. */
     if ((register_address == EFR32_HFXO_BASE + EFR32_HFXO_CTRL ||
