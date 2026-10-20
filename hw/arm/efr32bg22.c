@@ -1000,13 +1000,37 @@ static const TypeInfo periph_info = {.name = TYPE_EFR32_PERIPH,
                                          },
                                                             {}}};
 
+/*
+ * The SoC owns the guest-visible address map.  The board supplies its root
+ * MemoryRegion.  This lets a future test board give two EFR32 instances
+ * independent same-address maps while sharing an in-process RF medium.
+ */
+#define TYPE_EFR32BG22_SOC "efr32bg22-soc"
+OBJECT_DECLARE_SIMPLE_TYPE(Efr32Bg22SoCState, EFR32BG22_SOC)
+
+struct Efr32Bg22SoCState {
+    SysBusDevice parent_obj;
+
+    ARMv7MState armv7m;
+    Efr32Periph periph;
+    MemoryRegion flash;
+    MemoryRegion sram;
+    MemoryRegion radio_ns;
+    MemoryRegion radio_ram;
+    MemoryRegion radio_ram_ns;
+    MemoryRegion devinfo;
+    Clock *clk;
+    Clock *protimer_clk;
+
+    MemoryRegion *memory;
+    Efr32RfMedium *rf_medium;
+    Object *idau;
+};
+
 struct Efr32State
 {
     MachineState parent_obj;
-    ARMv7MState armv7m;
-    MemoryRegion flash, sram;
-    Clock *clk;
-    Clock *protimer_clk;
+    Efr32Bg22SoCState soc;
     Efr32RfMedium *rf_medium;
     char *image;
 };
@@ -1031,57 +1055,126 @@ static void efr32_initialize_devinfo(MemoryRegion *devinfo)
     memcpy(contents + 0x804c, &value, sizeof(value));
 }
 
+static void efr32_soc_init(Object *obj)
+{
+    Efr32Bg22SoCState *s = EFR32BG22_SOC(obj);
+
+    object_initialize_child(obj, "armv7m", &s->armv7m, TYPE_ARMV7M);
+    object_initialize_child(obj, "periph", &s->periph, TYPE_EFR32_PERIPH);
+}
+
+static void efr32_soc_realize(DeviceState *dev, Error **errp)
+{
+    Efr32Bg22SoCState *s = EFR32BG22_SOC(dev);
+    DeviceState *nvic = DEVICE(&s->armv7m);
+    SysBusDevice *periph = SYS_BUS_DEVICE(&s->periph);
+
+    if (!s->memory) {
+        error_setg(errp, "memory property was not set");
+        return;
+    }
+    if (!s->rf_medium) {
+        error_setg(errp, "rf-medium property was not set");
+        return;
+    }
+    if (!s->idau) {
+        error_setg(errp, "idau property was not set");
+        return;
+    }
+
+    s->clk = clock_new(OBJECT(s), "SYSCLK");
+    clock_set_hz(s->clk, 38400000);
+    s->protimer_clk = clock_new(OBJECT(s), "PROTIMERCLK");
+    clock_set_hz(s->protimer_clk, 2000000);
+
+    memory_region_init_ram(&s->flash, OBJECT(s), "efr32.flash", FLASH_SIZE,
+                           &error_fatal);
+    memory_region_add_subregion(s->memory, 0, &s->flash);
+    memory_region_init_ram(&s->sram, OBJECT(s), "efr32.sram", SRAM_SIZE,
+                           &error_fatal);
+    memory_region_add_subregion(s->memory, 0x20000000, &s->sram);
+
+    qdev_prop_set_uint32(nvic, "num-irq", 64);
+    qdev_connect_clock_in(nvic, "cpuclk", s->clk);
+    qdev_prop_set_string(nvic, "cpu-type", ARM_CPU_TYPE_NAME("cortex-m33"));
+    object_property_set_link(OBJECT(&s->armv7m), "idau", s->idau,
+                             &error_abort);
+    object_property_set_link(OBJECT(&s->armv7m), "memory", OBJECT(s->memory),
+                             &error_abort);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->armv7m), errp)) {
+        return;
+    }
+
+    s->periph.rf_medium = s->rf_medium;
+    qdev_connect_clock_in(DEVICE(&s->periph), "protimerclk", s->protimer_clk);
+    if (!sysbus_realize(periph, errp)) {
+        return;
+    }
+    efr32_rf_medium_attach(s->rf_medium, EFR32_RF_RADIO(&s->periph), errp);
+    if (*errp) {
+        return;
+    }
+    memory_region_add_subregion(s->memory, PERIPH_BASE,
+                                sysbus_mmio_get_region(periph, 0));
+    memory_region_add_subregion(s->memory, RADIO_BASE,
+                                sysbus_mmio_get_region(periph, 1));
+    for (unsigned irq = 0; irq < 64; irq++) {
+        sysbus_connect_irq(periph, irq, qdev_get_gpio_in(nvic, irq));
+    }
+
+    memory_region_init_alias(&s->radio_ns, OBJECT(s), "radio-ns",
+                             sysbus_mmio_get_region(periph, 1), 0, RADIO_SIZE);
+    memory_region_add_subregion(s->memory, 0xb8000000, &s->radio_ns);
+    memory_region_init_ram(&s->radio_ram, OBJECT(s), "efr32.radioram", 0x8000,
+                           &error_fatal);
+    memory_region_add_subregion(s->memory, 0xa0000000, &s->radio_ram);
+    memory_region_init_alias(&s->radio_ram_ns, OBJECT(s), "efr32.radioram-ns",
+                             &s->radio_ram, 0, 0x8000);
+    memory_region_add_subregion(s->memory, 0xb0000000, &s->radio_ram_ns);
+    memory_region_init_ram(&s->devinfo, OBJECT(s), "efr32.devinfo", 0x10000,
+                           &error_fatal);
+    memory_region_add_subregion(s->memory, 0x0fe00000, &s->devinfo);
+    efr32_initialize_devinfo(&s->devinfo);
+}
+
+static Property efr32_soc_properties[] = {
+    DEFINE_PROP_LINK("memory", Efr32Bg22SoCState, memory, TYPE_MEMORY_REGION,
+                     MemoryRegion *),
+    DEFINE_PROP_LINK("rf-medium", Efr32Bg22SoCState, rf_medium,
+                     TYPE_EFR32_RF_MEDIUM, Efr32RfMedium *),
+    DEFINE_PROP_LINK("idau", Efr32Bg22SoCState, idau, TYPE_IDAU_INTERFACE,
+                     Object *),
+    DEFINE_PROP_END_OF_LIST(),
+};
+
+static void efr32_soc_class_init(ObjectClass *oc, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(oc);
+
+    dc->realize = efr32_soc_realize;
+    device_class_set_props(dc, efr32_soc_properties);
+}
+
+static const TypeInfo efr32_soc_info = {
+    .name = TYPE_EFR32BG22_SOC,
+    .parent = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(Efr32Bg22SoCState),
+    .instance_init = efr32_soc_init,
+    .class_init = efr32_soc_class_init,
+};
+
 static void init(MachineState *m)
 {
     Efr32State *s = EFR32BG22_MACHINE(m);
-    DeviceState *nvic, *p;
-    MemoryRegion *sm = get_system_memory(), *alias = g_new(MemoryRegion, 1),
-                 *ram = g_new(MemoryRegion, 1), *ns = g_new(MemoryRegion, 1),
-                 *di = g_new(MemoryRegion, 1);
-    s->clk = clock_new(OBJECT(m), "SYSCLK");
-    clock_set_hz(s->clk, 38400000);
-    s->protimer_clk = clock_new(OBJECT(m), "PROTIMERCLK");
-    clock_set_hz(s->protimer_clk, 2000000);
-    memory_region_init_ram(&s->flash, NULL, "efr32.flash", FLASH_SIZE,
-                           &error_fatal);
-    memory_region_add_subregion(sm, 0, &s->flash);
-    memory_region_init_ram(&s->sram, NULL, "efr32.sram", SRAM_SIZE,
-                           &error_fatal);
-    memory_region_add_subregion(sm, 0x20000000, &s->sram);
-    object_initialize_child(OBJECT(m), "armv7m", &s->armv7m, TYPE_ARMV7M);
-    nvic = DEVICE(&s->armv7m);
-    qdev_prop_set_uint32(nvic, "num-irq", 64);
-    qdev_connect_clock_in(nvic, "cpuclk", s->clk);
-    qdev_prop_set_string(nvic, "cpu-type", m->cpu_type);
-    object_property_set_link(OBJECT(&s->armv7m), "idau", OBJECT(m),
-                             &error_abort);
-    object_property_set_link(OBJECT(&s->armv7m), "memory", OBJECT(sm),
-                             &error_abort);
-    sysbus_realize(SYS_BUS_DEVICE(&s->armv7m), &error_fatal);
     s->rf_medium = EFR32_RF_MEDIUM(object_new(TYPE_EFR32_RF_MEDIUM));
     object_property_add_child(OBJECT(m), "rf-medium", OBJECT(s->rf_medium));
-    p = qdev_new(TYPE_EFR32_PERIPH);
-    EFR32_PERIPH(p)->rf_medium = s->rf_medium;
-    qdev_connect_clock_in(p, "protimerclk", s->protimer_clk);
-    sysbus_realize_and_unref(SYS_BUS_DEVICE(p), &error_fatal);
-    efr32_rf_medium_attach(s->rf_medium, EFR32_RF_RADIO(p), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(p), 0, PERIPH_BASE);
-    sysbus_mmio_map(SYS_BUS_DEVICE(p), 1, RADIO_BASE);
-    for (unsigned irq = 0; irq < 64; irq++)
-    {
-        sysbus_connect_irq(SYS_BUS_DEVICE(p), irq, qdev_get_gpio_in(nvic, irq));
-    }
-    memory_region_init_alias(alias, NULL, "radio-ns",
-                             sysbus_mmio_get_region(SYS_BUS_DEVICE(p), 1), 0,
-                             RADIO_SIZE);
-    memory_region_add_subregion(sm, 0xb8000000, alias);
-    memory_region_init_ram(ram, NULL, "efr32.radioram", 0x8000, &error_fatal);
-    memory_region_add_subregion(sm, 0xa0000000, ram);
-    memory_region_init_alias(ns, NULL, "efr32.radioram-ns", ram, 0, 0x8000);
-    memory_region_add_subregion(sm, 0xb0000000, ns);
-    memory_region_init_ram(di, NULL, "efr32.devinfo", 0x10000, &error_fatal);
-    memory_region_add_subregion(sm, 0x0fe00000, di);
-    efr32_initialize_devinfo(di);
+    object_initialize_child(OBJECT(m), "soc", &s->soc, TYPE_EFR32BG22_SOC);
+    object_property_set_link(OBJECT(&s->soc), "memory",
+                             OBJECT(get_system_memory()), &error_fatal);
+    object_property_set_link(OBJECT(&s->soc), "rf-medium", OBJECT(s->rf_medium),
+                             &error_fatal);
+    object_property_set_link(OBJECT(&s->soc), "idau", OBJECT(m), &error_fatal);
+    sysbus_realize(SYS_BUS_DEVICE(&s->soc), &error_fatal);
     if (s->image)
     {
         gchar *d;
@@ -1091,7 +1184,7 @@ static void init(MachineState *m)
             error_report("efr32bg22: cannot load flash image %s", s->image);
             exit(EXIT_FAILURE);
         }
-        memcpy(memory_region_get_ram_ptr(&s->flash), d, n);
+        memcpy(memory_region_get_ram_ptr(&s->soc.flash), d, n);
         g_free(d);
     }
     qemu_register_reset(cpu_reset_cb, ARM_CPU(first_cpu));
@@ -1138,6 +1231,7 @@ static void register_types(void)
 {
     efr32_rf_medium_register_types();
     type_register_static(&periph_info);
+    type_register_static(&efr32_soc_info);
     type_register_static(&machine_info);
 }
 type_init(register_types)
