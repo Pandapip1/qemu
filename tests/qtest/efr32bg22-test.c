@@ -194,10 +194,10 @@ static void test_frc_sniffctrl_mask(void)
     writel(address, UINT32_MAX);
     g_assert_cmphex(readl(address), ==, 0x0003ffff);
 
-    /* Stock clears this register then sets 0xf8 through alias windows. */
+    /* Stock clears this register then sets 0x17f8 through alias windows. */
     writel(address + REGISTER_CLEAR_WINDOW, UINT32_MAX);
-    writel(address + REGISTER_SET_WINDOW, 0xf8);
-    g_assert_cmphex(readl(address), ==, 0xf8);
+    writel(address + REGISTER_SET_WINDOW, 0x17f8);
+    g_assert_cmphex(readl(address), ==, 0x17f8);
 }
 
 static void test_frc_rawctrl_mask(void)
