@@ -48,6 +48,8 @@ tests = {
   'test-qapi-util': [],
   'test-interval-tree': [],
   'test-fifo': [],
+  'test-efr32-rf-medium': [qom,
+                            meson.project_source_root() / 'hw/arm/efr32-rf-medium.c'],
 }
 
 if have_system or have_tools
