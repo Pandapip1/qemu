@@ -56,6 +56,9 @@
 #define DCDC_IF               0x024
 #define DCDC_STATUS           0x02c
 #define DCDC_IF_REGULATION    (1u << 5)
+#define HFXO_BASE             0x4000c000
+#define HFXO_STATUS           0x058
+#define HFXO_STATUS_READY     0x000b0003
 #define BUFC_BASE            0xaa000000
 #define BUFC_CH0             0x00c
 #define BUFC_CH1             0x04c
@@ -207,6 +210,11 @@ static void test_dcdc_regulation(void)
     g_assert_cmphex(readl(DCDC_BASE + DCDC_IF) & DCDC_IF_REGULATION, ==,
                     DCDC_IF_REGULATION);
     g_assert_cmphex(readl(DCDC_BASE + DCDC_STATUS), ==, 6);
+}
+
+static void test_hfxo_ready_status(void)
+{
+    g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==, HFXO_STATUS_READY);
 }
 
 static void test_bufc_data_port(void)
@@ -433,6 +441,7 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/radio-nonsecure-alias",
                    test_radio_nonsecure_alias);
     qtest_add_func("/efr32bg22/dcdc-regulation", test_dcdc_regulation);
+    qtest_add_func("/efr32bg22/hfxo-ready-status", test_hfxo_ready_status);
     qtest_add_func("/efr32bg22/bufc-data-port", test_bufc_data_port);
     qtest_add_func("/efr32bg22/bufc-tx-fifo-setup-latches",
                    test_bufc_tx_fifo_setup_latches);

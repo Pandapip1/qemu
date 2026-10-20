@@ -79,6 +79,26 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_PROTIMER_CMP3 0x130u
 #define EFR32_PROTIMER_CMP4 0x140u
 
+/* Minimal clock/power state required by the stock boot path. */
+#define EFR32_HFXO_BASE 0x4000c000u
+#define EFR32_HFXO_STATUS 0x058u
+#define EFR32_HFXO_STATUS_RDY (1u << 0)
+#define EFR32_HFXO_STATUS_COREBIASOPTRDY (1u << 1)
+#define EFR32_HFXO_STATUS_ENS (1u << 16)
+#define EFR32_HFXO_STATUS_HWREQ (1u << 17)
+#define EFR32_HFXO_STATUS_ISWARM (1u << 19)
+#define EFR32_HFXO_READY_STATUS \
+    (EFR32_HFXO_STATUS_RDY | EFR32_HFXO_STATUS_COREBIASOPTRDY | \
+     EFR32_HFXO_STATUS_ENS | EFR32_HFXO_STATUS_HWREQ | EFR32_HFXO_STATUS_ISWARM)
+
+#define EFR32_DCDC_BASE 0x40094000u
+#define EFR32_DCDC_CTRL 0x008u
+#define EFR32_DCDC_IF 0x024u
+#define EFR32_DCDC_STATUS 0x02cu
+#define EFR32_DCDC_IF_REGULATION (1u << 5)
+#define EFR32_DCDC_STATUS_WARM (1u << 1)
+#define EFR32_DCDC_STATUS_RUNNING (1u << 2)
+
 #define EFR32_BUFC_BASE 0xaa000000u
 #define EFR32_BUFC_FIRST 0x00cu
 #define EFR32_BUFC_STRIDE 0x040u
@@ -531,12 +551,16 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
         return UINT32_MAX; /* CMU.STATUS */
     if (address == 0x4001000c || address == 0x40018004 || address == 0x40028008)
         return 0x00010001;
-    if (address == 0x4000c058)
-        return 0x000b0003;
-    if (address == 0x40094024)
-        return efr32_register_get(s, 0x40094008) & 1 ? 0x20 : 0;
-    if (address == 0x4009402c)
-        return efr32_register_get(s, 0x40094008) & 1 ? 6 : 1;
+    if (address == EFR32_HFXO_BASE + EFR32_HFXO_STATUS)
+        return EFR32_HFXO_READY_STATUS;
+    if (address == EFR32_DCDC_BASE + EFR32_DCDC_IF)
+        return efr32_register_get(s, EFR32_DCDC_BASE + EFR32_DCDC_CTRL) & 1
+                   ? EFR32_DCDC_IF_REGULATION
+                   : 0;
+    if (address == EFR32_DCDC_BASE + EFR32_DCDC_STATUS)
+        return efr32_register_get(s, EFR32_DCDC_BASE + EFR32_DCDC_CTRL) & 1
+                   ? EFR32_DCDC_STATUS_WARM | EFR32_DCDC_STATUS_RUNNING
+                   : EFR32_DCDC_STATUS_WARM;
     if (address == 0x4a018004 || address == 0x4a018024)
         return 0;
     if (address == EFR32_RAC_BASE + EFR32_RAC_STATUS)
