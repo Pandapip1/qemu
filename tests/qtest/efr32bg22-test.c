@@ -62,6 +62,8 @@
 #define RAC_STATUS_STATE_MASK 0x0f000000
 #define RAC_STATUS_STATE_RXSEARCH (2u << 24)
 #define RAC_STATUS_STATE_TX   (9u << 24)
+#define RAC_STATUS_TXENS      (1u << 30)
+#define RAC_STATUS_RXENS      (1u << 31)
 #define RAC_SEQIF_STATEOFF    (1u << 16)
 #define RAC_SEQIF_STATERXSEARCH (1u << 18)
 #define RAC_SEQIF_STATETX     (1u << 25)
@@ -492,6 +494,9 @@ static void test_rac_tx_commands(void)
     writel(RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
     g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK, ==,
                     RAC_STATUS_STATE_TX);
+    g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) &
+                        (RAC_STATUS_TXENS | RAC_STATUS_RXENS),
+                    ==, RAC_STATUS_TXENS);
     g_assert_cmphex(readl(RAC_BASE + RAC_SEQIF) & RAC_SEQIF_STATETX, ==,
                     RAC_SEQIF_STATETX);
 
@@ -522,6 +527,9 @@ static void test_rac_software_rx_enable(void)
            RAC_RXENSRCEN_SWRXEN);
     g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK, ==,
                     RAC_STATUS_STATE_RXSEARCH);
+    g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) &
+                        (RAC_STATUS_TXENS | RAC_STATUS_RXENS),
+                    ==, RAC_STATUS_RXENS);
     g_assert_cmphex(readl(RAC_BASE + RAC_SEQIF) & RAC_SEQIF_STATERXSEARCH, ==,
                     RAC_SEQIF_STATERXSEARCH);
 
