@@ -17,7 +17,6 @@
 #include "hw/irq.h"
 #include "hw/sysbus.h"
 #include "hw/arm/armv7m.h"
-#include "sysemu/reset.h"
 #include "target/arm/cpu.h"
 #include "target/arm/idau.h"
 #include "trace.h"
@@ -1036,8 +1035,6 @@ struct Efr32State
 };
 #define TYPE_EFR32BG22_MACHINE MACHINE_TYPE_NAME("efr32bg22")
 OBJECT_DECLARE_SIMPLE_TYPE(Efr32State, EFR32BG22_MACHINE)
-static void cpu_reset_cb(void *o) { cpu_reset(CPU(o)); }
-
 static void efr32_initialize_devinfo(MemoryRegion *devinfo)
 {
     uint8_t *contents = memory_region_get_ram_ptr(devinfo);
@@ -1187,7 +1184,6 @@ static void init(MachineState *m)
         memcpy(memory_region_get_ram_ptr(&s->soc.flash), d, n);
         g_free(d);
     }
-    qemu_register_reset(cpu_reset_cb, ARM_CPU(first_cpu));
 }
 static void idau(IDAUInterface *i, uint32_t a, int *r, bool *e, bool *n,
                  bool *c)
