@@ -1921,6 +1921,7 @@ struct Efr32Bg22SoCState {
     MemoryRegion *memory;
     Efr32RfMedium *rf_medium;
     Object *idau;
+    uint32_t boot_offset;
 };
 
 struct Efr32State
@@ -1929,6 +1930,8 @@ struct Efr32State
     Efr32Bg22SoCState soc;
     Efr32RfMedium *rf_medium;
     char *image;
+    uint32_t flash_offset;
+    uint32_t boot_offset;
 };
 #define TYPE_EFR32BG22_MACHINE MACHINE_TYPE_NAME("efr32bg22")
 OBJECT_DECLARE_SIMPLE_TYPE(Efr32State, EFR32BG22_MACHINE)
@@ -2036,6 +2039,20 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
     qdev_prop_set_uint32(nvic, "num-irq", 64);
     qdev_connect_clock_in(nvic, "cpuclk", s->clk);
     qdev_prop_set_string(nvic, "cpu-type", ARM_CPU_TYPE_NAME("cortex-m33"));
+    /*
+     * EFR32 Series 2 implements the Armv8-M MPU with 16 regions in each
+     * security state.  The generic Cortex-M33 default does not describe that
+     * part accurately, and Zephyr programs its MPU during early boot.
+     */
+    qdev_prop_set_uint32(nvic, "mpu-ns-regions", 16);
+    qdev_prop_set_uint32(nvic, "mpu-s-regions", 16);
+    /*
+     * Direct application-slot boot is a model convenience, not a bootloader
+     * emulation.  Keep both reset VTORs at the selected slot so that a secure
+     * or non-secure image begins from its own vector table.
+     */
+    qdev_prop_set_uint32(nvic, "init-svtor", s->boot_offset);
+    qdev_prop_set_uint32(nvic, "init-nsvtor", s->boot_offset);
     object_property_set_link(OBJECT(&s->armv7m), "idau", s->idau,
                              &error_abort);
     object_property_set_link(OBJECT(&s->armv7m), "memory", OBJECT(s->memory),
@@ -2111,6 +2128,7 @@ static void init(MachineState *m)
     s->rf_medium = EFR32_RF_MEDIUM(object_new(TYPE_EFR32_RF_MEDIUM));
     object_property_add_child(OBJECT(m), "rf-medium", OBJECT(s->rf_medium));
     object_initialize_child(OBJECT(m), "soc", &s->soc, TYPE_EFR32BG22_SOC);
+    s->soc.boot_offset = s->boot_offset;
     object_property_set_link(OBJECT(&s->soc), "memory",
                              OBJECT(get_system_memory()), &error_fatal);
     object_property_set_link(OBJECT(&s->soc), "rf-medium", OBJECT(s->rf_medium),
@@ -2121,12 +2139,14 @@ static void init(MachineState *m)
     {
         gchar *d;
         gsize n;
-        if (!g_file_get_contents(s->image, &d, &n, NULL) || n > FLASH_SIZE)
+        if (!g_file_get_contents(s->image, &d, &n, NULL) ||
+            n > FLASH_SIZE - s->flash_offset)
         {
             error_report("efr32bg22: cannot load flash image %s", s->image);
             exit(EXIT_FAILURE);
         }
-        memcpy(memory_region_get_ram_ptr(&s->soc.flash), d, n);
+        memcpy(memory_region_get_ram_ptr(&s->soc.flash) + s->flash_offset,
+               d, n);
         g_free(d);
     }
     qemu_register_reset(efr32_cpu_reset, s->soc.armv7m.cpu);
@@ -2149,6 +2169,22 @@ static void image_set(Object *o, const char *v, Error **e)
     g_free(s->image);
     s->image = g_strdup(v);
 }
+
+static void efr32_machine_instance_init(Object *obj)
+{
+    Efr32State *s = EFR32BG22_MACHINE(obj);
+
+    /*
+     * `flash` deliberately remains a raw-image property.  Slot images need
+     * both offsets: one for their physical storage, one for the reset vector
+     * table that a real bootloader would select before handing them control.
+     */
+    object_property_add_uint32_ptr(obj, "flash-offset", &s->flash_offset,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_add_uint32_ptr(obj, "boot-offset", &s->boot_offset,
+                                   OBJ_PROP_FLAG_READWRITE);
+}
+
 static void mc(ObjectClass *o, void *d)
 {
     MachineClass *m = MACHINE_CLASS(o);
@@ -2167,6 +2203,7 @@ static const TypeInfo machine_info = {
     .name = TYPE_EFR32BG22_MACHINE,
     .parent = TYPE_MACHINE,
     .instance_size = sizeof(Efr32State),
+    .instance_init = efr32_machine_instance_init,
     .class_init = mc,
     .interfaces = (InterfaceInfo[]){{TYPE_IDAU_INTERFACE}, {}}};
 
