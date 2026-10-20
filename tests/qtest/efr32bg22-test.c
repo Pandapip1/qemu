@@ -22,6 +22,7 @@
 #define FRC_WHITEPOLY        0x034
 #define FRC_BUFFERMODE       0x078
 #define FRC_SNIFFCTRL        0x084
+#define FRC_RAWCTRL          0x08c
 #define FRC_TRAILRXDATA       0x054
 #define FRC_RXCTRL            0x04c
 #define FRC_SEQIF            0x0b4
@@ -187,6 +188,13 @@ static void test_frc_sniffctrl_mask(void)
     writel(address + REGISTER_CLEAR_WINDOW, UINT32_MAX);
     writel(address + REGISTER_SET_WINDOW, 0xf8);
     g_assert_cmphex(readl(address), ==, 0xf8);
+}
+
+static void test_frc_rawctrl_mask(void)
+{
+    writel(FRC_BASE + FRC_RAWCTRL, UINT32_MAX);
+
+    g_assert_cmphex(readl(FRC_BASE + FRC_RAWCTRL), ==, 0x000021bf);
 }
 
 static void test_rail_initialization_latches(void)
@@ -572,6 +580,7 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/frc-buffer-register-masks",
                    test_frc_buffer_register_masks);
     qtest_add_func("/efr32bg22/frc-sniffctrl-mask", test_frc_sniffctrl_mask);
+    qtest_add_func("/efr32bg22/frc-rawctrl-mask", test_frc_rawctrl_mask);
     qtest_add_func("/efr32bg22/rail-initialization-latches",
                    test_rail_initialization_latches);
     qtest_add_func("/efr32bg22/rac-sr3-clear-alias", test_rac_sr3_clear_alias);
