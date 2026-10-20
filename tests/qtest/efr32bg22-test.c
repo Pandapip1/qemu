@@ -46,6 +46,8 @@ static char *tx_snapshot_trace_path;
 #define PROTIMER_COUNTER      0x020
 #define PROTIMER_STATE        0x030
 #define PROTIMER_PERIOD       0x038
+#define PROTIMER_IF           0x064
+#define PROTIMER_IEN          0x070
 #define PROTIMER_CMP0         0x100
 #define PROTIMER_CMP0_TIME    0x10c
 #define SYNTH_BASE            0xa8018000
@@ -721,6 +723,26 @@ static void test_protimer_secure_nonsecure_alias(void)
 }
 
 /*
+ * generic_phy.o:FRC_IRQHandler reads PROTIMER.IF (+0x064) and IEN (+0x070)
+ * through the non-secure window.  Keep those banks as aliasable latches; a
+ * counter or compare match deliberately does not manufacture a pending bit.
+ */
+static void test_protimer_interrupt_banks_are_aliasable(void)
+{
+    writel(PROTIMER_NS_BASE + PROTIMER_IF, 0x02000010);
+    writel(PROTIMER_BASE + PROTIMER_IEN + REGISTER_SET_WINDOW, 0x00000010);
+
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_IF), ==, 0x02000010);
+    g_assert_cmphex(readl(PROTIMER_NS_BASE + PROTIMER_IEN), ==, 0x00000010);
+
+    writel(PROTIMER_NS_BASE + PROTIMER_IF + REGISTER_CLEAR_WINDOW, 0x10);
+    writel(PROTIMER_BASE + PROTIMER_IEN + REGISTER_TOGGLE_WINDOW, 0x10);
+
+    g_assert_cmphex(readl(PROTIMER_NS_BASE + PROTIMER_IF), ==, 0x02000000);
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_IEN), ==, 0);
+}
+
+/*
  * rfhal_protimer.o:0x3c140 writes 0x11 to the first indexed slot and, on
  * one branch, clears a bit through 0xb801e100. This only preserves the
  * observed normal/CLR alias access; it does not assign compare semantics.
@@ -1084,6 +1106,8 @@ int main(int argc, char **argv)
                    test_protimer_trace_latches);
     qtest_add_func("/efr32bg22/protimer-secure-nonsecure-alias",
                    test_protimer_secure_nonsecure_alias);
+    qtest_add_func("/efr32bg22/protimer-interrupt-banks-are-aliasable",
+                   test_protimer_interrupt_banks_are_aliasable);
     qtest_add_func("/efr32bg22/protimer-compare-slot-clear-alias",
                    test_protimer_compare_slot_clear_alias);
     qtest_add_func("/efr32bg22/protimer-counter", test_protimer_counter);

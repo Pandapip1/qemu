@@ -84,7 +84,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_PROTIMER_STATE 0x030u
 #define EFR32_PROTIMER_PERIOD 0x038u
 #define EFR32_PROTIMER_TRACE_60 0x060u
-#define EFR32_PROTIMER_TRACE_64 0x064u
+#define EFR32_PROTIMER_IF 0x064u
+#define EFR32_PROTIMER_IEN 0x070u
 #define EFR32_PROTIMER_TRACE_74 0x074u
 #define EFR32_PROTIMER_TRACE_78 0x078u
 #define EFR32_PROTIMER_CMP0 0x100u
@@ -247,6 +248,22 @@ static void efr32_frc_update_irq(Efr32Periph *s)
     uint32_t enabled = efr32_register_get(s, EFR32_FRC_BASE + EFR32_FRC_IEN);
 
     qemu_set_irq(s->irq[34], !!(pending & enabled));
+}
+
+/*
+ * The archived generic_phy FRC_IRQHandler reads PROTIMER IF and IEN, then
+ * dispatches their intersection from the PROTIMER vector.  The individual
+ * timer sources are not characterized yet, so this only models the observed
+ * interrupt-bank contract; no counter or compare event raises a flag here.
+ */
+static void efr32_protimer_update_irq(Efr32Periph *s)
+{
+    uint32_t pending = efr32_register_get(s,
+                                          EFR32_PROTIMER_BASE + EFR32_PROTIMER_IF);
+    uint32_t enabled = efr32_register_get(s,
+                                          EFR32_PROTIMER_BASE + EFR32_PROTIMER_IEN);
+
+    qemu_set_irq(s->irq[36], !!(pending & enabled));
 }
 
 static void efr32_frc_raise(Efr32Periph *s, uint32_t flags)
@@ -1319,6 +1336,12 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         register_address == EFR32_FRC_BASE + EFR32_FRC_IEN)
     {
         efr32_frc_update_irq(s);
+    }
+
+    if (register_address == EFR32_PROTIMER_BASE + EFR32_PROTIMER_IF ||
+        register_address == EFR32_PROTIMER_BASE + EFR32_PROTIMER_IEN)
+    {
+        efr32_protimer_update_irq(s);
     }
 
     if (register_address == EFR32_AGC_BASE + EFR32_AGC_IF ||
