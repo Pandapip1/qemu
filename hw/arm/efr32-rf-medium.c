@@ -379,6 +379,7 @@ static const TypeInfo efr32_rf_medium_info = {
 static const TypeInfo efr32_rf_radio_info = {
     .name = TYPE_EFR32_RF_RADIO,
     .parent = TYPE_INTERFACE,
+    .class_size = sizeof(Efr32RfRadioClass),
 };
 
 void efr32_rf_medium_register_types(void)
