@@ -47,6 +47,7 @@ static char *tx_snapshot_trace_path;
 #define PROTIMER_STATE        0x030
 #define PROTIMER_PERIOD       0x038
 #define PROTIMER_CMP0         0x100
+#define PROTIMER_CMP0_TIME    0x10c
 #define SYNTH_BASE            0xa8018000
 #define RAC_BASE              0xa8020000
 #define RAC_STATUS            0x00c
@@ -719,6 +720,24 @@ static void test_protimer_secure_nonsecure_alias(void)
     g_assert_cmphex(readl(PROTIMER_NS_BASE + PROTIMER_CTRL), ==, 0x00011102);
 }
 
+/*
+ * rfhal_protimer.o:0x3c140 writes 0x11 to the first indexed slot and, on
+ * one branch, clears a bit through 0xb801e100. This only preserves the
+ * observed normal/CLR alias access; it does not assign compare semantics.
+ */
+static void test_protimer_compare_slot_clear_alias(void)
+{
+    writel(PROTIMER_NS_BASE + PROTIMER_CMP0, 0x11);
+    writel(PROTIMER_NS_BASE + PROTIMER_CMP0_TIME, 0x12345678);
+    writel(PROTIMER_NS_BASE + PROTIMER_CMP0 + REGISTER_CLEAR_WINDOW, 1);
+
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_CMP0), ==, 0x10);
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_CMP0_TIME), ==, 0x12345678);
+
+    writel(PROTIMER_BASE + PROTIMER_CMP0 + REGISTER_CLEAR_WINDOW, 0x10);
+    g_assert_cmphex(readl(PROTIMER_NS_BASE + PROTIMER_CMP0), ==, 0);
+}
+
 static void test_protimer_counter(void)
 {
     uint32_t before = readl(PROTIMER_BASE + PROTIMER_COUNTER);
@@ -1065,6 +1084,8 @@ int main(int argc, char **argv)
                    test_protimer_trace_latches);
     qtest_add_func("/efr32bg22/protimer-secure-nonsecure-alias",
                    test_protimer_secure_nonsecure_alias);
+    qtest_add_func("/efr32bg22/protimer-compare-slot-clear-alias",
+                   test_protimer_compare_slot_clear_alias);
     qtest_add_func("/efr32bg22/protimer-counter", test_protimer_counter);
     qtest_add_func("/efr32bg22/protimer-counter-is-independent-from-radio-setup",
                    test_protimer_counter_is_independent_from_radio_setup);
