@@ -21,6 +21,7 @@
 #define AGC_CMD              0x04c
 #define FRC_WHITEPOLY        0x034
 #define FRC_BUFFERMODE       0x078
+#define FRC_SNIFFCTRL        0x084
 #define FRC_TRAILRXDATA       0x054
 #define FRC_RXCTRL            0x04c
 #define FRC_SEQIF            0x0b4
@@ -170,6 +171,19 @@ static void test_frc_buffer_register_masks(void)
     g_assert_cmphex(readl(FRC_BASE + FRC_BUFFERMODE), ==, 0xf);
     g_assert_cmphex(readl(FRC_BASE + FRC_TRAILRXDATA), ==, 0x3f);
     g_assert_cmphex(readl(FRC_BASE + FRC_RXRAWDATA), ==, 0);
+}
+
+static void test_frc_sniffctrl_mask(void)
+{
+    uint32_t address = FRC_BASE + FRC_SNIFFCTRL;
+
+    writel(address, UINT32_MAX);
+    g_assert_cmphex(readl(address), ==, 0x0003ffff);
+
+    /* Stock clears this register then sets 0xf8 through alias windows. */
+    writel(address + REGISTER_CLEAR_WINDOW, UINT32_MAX);
+    writel(address + REGISTER_SET_WINDOW, 0xf8);
+    g_assert_cmphex(readl(address), ==, 0xf8);
 }
 
 static void test_rail_initialization_latches(void)
@@ -533,6 +547,7 @@ int main(int argc, char **argv)
                    test_agc_rssi_start_command);
     qtest_add_func("/efr32bg22/frc-buffer-register-masks",
                    test_frc_buffer_register_masks);
+    qtest_add_func("/efr32bg22/frc-sniffctrl-mask", test_frc_sniffctrl_mask);
     qtest_add_func("/efr32bg22/rail-initialization-latches",
                    test_rail_initialization_latches);
     qtest_add_func("/efr32bg22/frc-interrupt-register-masks",
