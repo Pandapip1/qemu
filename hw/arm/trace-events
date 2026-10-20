@@ -74,3 +74,4 @@ bcm2838_gic_set_irq(int irq, int level) "gic irq:%d lvl:%d"
 # efr32bg22.c
 efr32bg22_rac_command(uint32_t command, uint32_t state) "RAC.CMD=0x%08x state=%u"
 efr32bg22_rac_state(uint32_t previous, uint32_t state) "RAC state %u -> %u"
+efr32bg22_radio_write(uint32_t address, uint32_t value, unsigned size) "addr=0x%08x value=0x%08x size=%u"

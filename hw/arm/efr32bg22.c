@@ -642,6 +642,12 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
              shift = (address & 3) * 8,
              mask = size == 4 ? UINT32_MAX : ((1u << (size * 8)) - 1) << shift,
              next = (old & ~mask) | (((uint32_t)value << shift) & mask);
+
+    if (word >= RADIO_BASE && word < RADIO_BASE + RADIO_SIZE)
+    {
+        trace_efr32bg22_radio_write(word, (uint32_t)value, size);
+    }
+
     switch ((address >> 12) & 3)
     {
     case 1:
