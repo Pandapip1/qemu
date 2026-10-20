@@ -38,6 +38,7 @@
 #define RAC_BASE              0xa8020000
 #define RAC_STATUS            0x00c
 #define RAC_CMD               0x010
+#define RAC_SR0               0x040
 #define RAC_RXENSRCEN         0x008
 #define RAC_IEN               0x020
 #define RAC_SEQIF             0x028
@@ -417,6 +418,15 @@ static void test_rac_masks(void)
     g_assert_cmphex(readl(RAC_BASE + RAC_IEN), ==, 0x00ff000f);
 }
 
+/* RAIL_StartTx clears RAC.SR0 bit 5 through the Series-2 CLR alias. */
+static void test_rac_sr0_clear_alias(void)
+{
+    writel(RAC_BASE + RAC_SR0, UINT32_MAX);
+    writel(RAC_BASE + RAC_SR0 + REGISTER_CLEAR_WINDOW, 1u << 5);
+
+    g_assert_cmphex(readl(RAC_BASE + RAC_SR0), ==, UINT32_MAX & ~(1u << 5));
+}
+
 int main(int argc, char **argv)
 {
     int result;
@@ -464,6 +474,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/rac-software-rx-enable",
                    test_rac_software_rx_enable);
     qtest_add_func("/efr32bg22/rac-masks", test_rac_masks);
+    qtest_add_func("/efr32bg22/rac-sr0-clear-alias",
+                   test_rac_sr0_clear_alias);
 
     result = g_test_run();
     qtest_end();
