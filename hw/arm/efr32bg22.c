@@ -146,6 +146,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_MSC_STATUS 0x01cu
 #define EFR32_MSC_STATUS_RESET 0x08000008u
 
+/*
+ * EFR32BG22 USART0/1.  This intentionally stops at the register-facing
+ * transmit path used by Zephyr's polling console: bytes are accepted by the
+ * peripheral, but are not forwarded to a host character device.
+ */
+#define EFR32_USART0_BASE 0x4005c000u
+#define EFR32_USART1_BASE 0x40060000u
+#define EFR32_USART_CMD 0x014u
+#define EFR32_USART_STATUS 0x018u
+#define EFR32_USART_TXDATA 0x03cu
+#define EFR32_USART_CMD_TXEN (1u << 2)
+#define EFR32_USART_CMD_TXDIS (1u << 3)
+#define EFR32_USART_STATUS_TXENS (1u << 1)
+#define EFR32_USART_STATUS_TXC (1u << 5)
+#define EFR32_USART_STATUS_TXBL (1u << 6)
+
 #define EFR32_BUFC_BASE 0xaa000000u
 #define EFR32_BUFC_FIRST 0x00cu
 #define EFR32_BUFC_STRIDE 0x040u
@@ -171,6 +187,8 @@ struct Efr32Periph
     uint32_t rac_state;
     bool hfxo_fsm_locked;
     bool rx_offer_pending;
+    bool usart_tx_enabled[2];
+    bool usart_tx_complete[2];
     Clock *protimer_clk;
     ptimer_state *protimer_counter;
     QEMUTimer *rac_tx_timer;
@@ -534,6 +552,32 @@ static bool efr32_dpll_enabled(Efr32Periph *s)
            EFR32_DPLL_EN_EN;
 }
 
+static int efr32_usart_index(uint32_t address)
+{
+    uint32_t block = address & ~0x3fffu;
+
+    if (block == EFR32_USART0_BASE) {
+        return 0;
+    }
+    if (block == EFR32_USART1_BASE) {
+        return 1;
+    }
+    return -1;
+}
+
+static uint32_t efr32_usart_status(Efr32Periph *s, unsigned index)
+{
+    /*
+     * The public register description resets TXBL high.  With no serial
+     * timing or host endpoint in this model, accepted TXDATA completes at
+     * the MMIO boundary, keeping the public TXC polling primitive
+     * deterministic too.
+     */
+    return EFR32_USART_STATUS_TXBL |
+           (s->usart_tx_complete[index] ? EFR32_USART_STATUS_TXC : 0) |
+           (s->usart_tx_enabled[index] ? EFR32_USART_STATUS_TXENS : 0);
+}
+
 static void efr32_rac_update_irqs(Efr32Periph *s)
 {
     qemu_set_irq(s->irq[37],
@@ -822,6 +866,14 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
     uint32_t offset = address & 0xfff;
     unsigned channel;
     uint32_t register_offset;
+    int usart_index = efr32_usart_index(address);
+
+    if (usart_index >= 0 && offset == EFR32_USART_STATUS) {
+        return efr32_usart_status(s, usart_index);
+    }
+    if (usart_index >= 0 && offset == EFR32_USART_CMD) {
+        return 0; /* CMD is command strobes, not retained state. */
+    }
 
     if ((address & ~0x3fffu) == EFR32_BUFC_BASE &&
         efr32_bufc_decode(offset, &channel, &register_offset))
@@ -918,6 +970,7 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
              next = (old & ~mask) | (((uint32_t)value << shift) & mask);
     bool hfxo_was_enabled = efr32_hfxo_enabled(s);
     bool dpll_was_enabled = efr32_dpll_enabled(s);
+    int usart_index = efr32_usart_index(register_address);
 
     if (word >= RADIO_BASE && word < RADIO_BASE + RADIO_SIZE)
     {
@@ -936,6 +989,26 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         break;
     case 3:
         next = old ^ next;
+    }
+
+    if (usart_index >= 0 && (register_address & 0xfff) == EFR32_USART_CMD)
+    {
+        /* CMD_SET is the form used by the public Zephyr/Silabs helpers. */
+        if (next & EFR32_USART_CMD_TXEN) {
+            s->usart_tx_enabled[usart_index] = true;
+        }
+        if (next & EFR32_USART_CMD_TXDIS) {
+            s->usart_tx_enabled[usart_index] = false;
+        }
+        return;
+    }
+
+    if (usart_index >= 0 && (register_address & 0xfff) == EFR32_USART_TXDATA)
+    {
+        /* Retain the public eight-bit data field; do not create host I/O. */
+        efr32_register_put(s, register_address, next & 0xff);
+        s->usart_tx_complete[usart_index] = true;
+        return;
     }
 
     if (register_address == EFR32_RAC_BASE + EFR32_RAC_CMD)
@@ -1136,6 +1209,10 @@ static void efr32_periph_init(Object *o)
     s->rac_state = EFR32_RAC_STATE_OFF;
     s->hfxo_fsm_locked = true;
     s->rx_offer_pending = false;
+    s->usart_tx_enabled[0] = false;
+    s->usart_tx_enabled[1] = false;
+    s->usart_tx_complete[0] = false;
+    s->usart_tx_complete[1] = false;
     s->protimer_clk = qdev_init_clock_in(DEVICE(o), "protimerclk",
                                          efr32_protimer_clock_update, s,
                                          ClockUpdate);
@@ -1169,6 +1246,10 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     s->trng_state = 0x2545f491;
     s->rac_state = EFR32_RAC_STATE_OFF;
     s->hfxo_fsm_locked = true;
+    s->usart_tx_enabled[0] = false;
+    s->usart_tx_enabled[1] = false;
+    s->usart_tx_complete[0] = false;
+    s->usart_tx_complete[1] = false;
     ptimer_transaction_begin(s->protimer_counter);
     ptimer_stop(s->protimer_counter);
     ptimer_set_period_from_clock(s->protimer_counter, s->protimer_clk, 1);

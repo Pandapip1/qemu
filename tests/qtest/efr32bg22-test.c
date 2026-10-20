@@ -101,6 +101,17 @@ static char *tx_snapshot_trace_path;
 #define DPLL_EN_EN            (1u << 0)
 #define DPLL_IF_LOCK          (1u << 0)
 #define DPLL_STATUS_READY_LOCKED 0x80000003
+#define USART0_BASE           0x4005c000
+#define USART0_NONSECURE_BASE 0x5005c000
+#define USART1_BASE           0x40060000
+#define USART_CMD             0x014
+#define USART_STATUS          0x018
+#define USART_TXDATA          0x03c
+#define USART_CMD_TXEN        (1u << 2)
+#define USART_CMD_TXDIS       (1u << 3)
+#define USART_STATUS_TXENS    (1u << 1)
+#define USART_STATUS_TXC      (1u << 5)
+#define USART_STATUS_TXBL     (1u << 6)
 #define RADIO_RAM_NS_BASE     0xb0000000
 #define RADIO_RAM_RHCLKPRESC  0x4fe0
 #define BUFC_BASE            0xaa000000
@@ -177,6 +188,30 @@ static void test_dpll_lock(void)
 
     writel(DPLL0_BASE + DPLL_EN + REGISTER_CLEAR_WINDOW, DPLL_EN_EN);
     g_assert_cmphex(readl(DPLL0_NONSECURE_BASE + DPLL_STATUS), ==, 0);
+}
+
+/* Zephyr's USART_Tx() polls TXBL, then writes TXDATA through this sequence. */
+static void test_usart_tx_polling(void)
+{
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+
+    g_assert_cmphex(readl(USART0_BASE + USART_STATUS), ==,
+                    USART_STATUS_TXBL);
+    writel(USART0_NONSECURE_BASE + USART_CMD + REGISTER_SET_WINDOW,
+           USART_CMD_TXEN);
+    g_assert_cmphex(readl(USART0_BASE + USART_STATUS), ==,
+                    USART_STATUS_TXENS | USART_STATUS_TXBL);
+
+    writel(USART0_NONSECURE_BASE + USART_TXDATA, 0x1a5);
+    g_assert_cmphex(readl(USART0_BASE + USART_TXDATA), ==, 0xa5);
+    g_assert_cmphex(readl(USART0_BASE + USART_STATUS), ==,
+                    USART_STATUS_TXENS | USART_STATUS_TXBL | USART_STATUS_TXC);
+
+    writel(USART0_BASE + USART_CMD, USART_CMD_TXDIS);
+    g_assert_cmphex(readl(USART0_NONSECURE_BASE + USART_STATUS), ==,
+                    USART_STATUS_TXBL | USART_STATUS_TXC);
+    g_assert_cmphex(readl(USART1_BASE + USART_STATUS), ==,
+                    USART_STATUS_TXBL);
 }
 
 static void test_modem_masks(void)
@@ -905,6 +940,7 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/register-aliases", test_register_aliases);
     qtest_add_func("/efr32bg22/cmu-nonsecure-alias", test_cmu_nonsecure_alias);
     qtest_add_func("/efr32bg22/dpll-lock", test_dpll_lock);
+    qtest_add_func("/efr32bg22/usart-tx-polling", test_usart_tx_polling);
     qtest_add_func("/efr32bg22/modem-masks", test_modem_masks);
     qtest_add_func("/efr32bg22/rfcrc-masks", test_rfcrc_masks);
     qtest_add_func("/efr32bg22/agc-rssi-status-registers",
