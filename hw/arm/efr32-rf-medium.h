@@ -25,9 +25,11 @@ struct Efr32RfRadioClass {
     InterfaceClass parent_class;
 
     bool (*is_rx_ready)(Efr32RfRadio *radio);
+    void (*rx_offer_available)(Efr32RfRadio *radio);
 };
 
 bool efr32_rf_radio_is_rx_ready(Efr32RfRadio *radio);
+void efr32_rf_radio_rx_offer_available(Efr32RfRadio *radio);
 
 typedef enum Efr32RfTxTrigger {
     /* EFR32 RAC.CMD.TXEN caused the peripheral to enter RAC->TX. */
@@ -64,8 +66,7 @@ typedef struct Efr32RfRxDeliveryRequest Efr32RfRxDeliveryRequest;
  * This interface deliberately models only membership in an in-process RF
  * medium.  It does not define an air-frame format or a host HCI transport.
  * The intended EFR32 abstraction boundary is a snapshot of staged BUFC
- * channel 0 at RAC.CMD.TXEN/RAC->TX; no peripheral call site exists yet.
- * Receive delivery remains deferred until a
+ * channel 0 at RAC.CMD.TXEN/RAC->TX. Receive delivery remains deferred until a
  * receiver is in RXSEARCH and the RXRAWDATA-to-BUFC channel 1 path can produce
  * a source-backed RXDONE.  The controller firmware remains responsible for
  * exposing standard HCI through its own transport when that exists.
@@ -140,6 +141,9 @@ unsigned efr32_rf_medium_offer_latest_tx(Efr32RfMedium *medium,
 unsigned efr32_rf_medium_get_rx_offer_count(const Efr32RfMedium *medium);
 Efr32RfRxDeliveryRequest *efr32_rf_medium_take_rx_offer(
     Efr32RfMedium *medium);
+/* Transfer the oldest offer addressed to @receiver, preserving other offers. */
+Efr32RfRxDeliveryRequest *efr32_rf_medium_take_rx_offer_for_radio(
+    Efr32RfMedium *medium, Efr32RfRadio *receiver);
 void efr32_rf_medium_clear_rx_offers(Efr32RfMedium *medium);
 
 void efr32_rf_medium_register_types(void);

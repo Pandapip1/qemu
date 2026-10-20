@@ -35,6 +35,15 @@ bool efr32_rf_radio_is_rx_ready(Efr32RfRadio *radio)
     return klass->is_rx_ready && klass->is_rx_ready(radio);
 }
 
+void efr32_rf_radio_rx_offer_available(Efr32RfRadio *radio)
+{
+    Efr32RfRadioClass *klass = EFR32_RF_RADIO_GET_CLASS(radio);
+
+    if (klass->rx_offer_available) {
+        klass->rx_offer_available(radio);
+    }
+}
+
 void efr32_rf_medium_attach(Efr32RfMedium *medium, Efr32RfRadio *radio,
                             Error **errp)
 {
@@ -262,6 +271,7 @@ unsigned efr32_rf_medium_offer_latest_tx(Efr32RfMedium *medium,
             return offers;
         }
         g_queue_push_tail(&medium->rx_offers, request);
+        efr32_rf_radio_rx_offer_available(receiver);
         offers++;
     }
 
@@ -277,6 +287,21 @@ Efr32RfRxDeliveryRequest *efr32_rf_medium_take_rx_offer(
     Efr32RfMedium *medium)
 {
     return g_queue_pop_head(&medium->rx_offers);
+}
+
+Efr32RfRxDeliveryRequest *efr32_rf_medium_take_rx_offer_for_radio(
+    Efr32RfMedium *medium, Efr32RfRadio *receiver)
+{
+    for (GList *link = medium->rx_offers.head; link; link = link->next) {
+        Efr32RfRxDeliveryRequest *request = link->data;
+
+        if (efr32_rf_rx_delivery_request_get_receiver(request) == receiver) {
+            g_queue_delete_link(&medium->rx_offers, link);
+            return request;
+        }
+    }
+
+    return NULL;
 }
 
 void efr32_rf_medium_clear_rx_offers(Efr32RfMedium *medium)

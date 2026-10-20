@@ -147,6 +147,7 @@ struct Efr32Periph
     uint32_t trng_state;
     uint32_t rac_state;
     bool hfxo_fsm_locked;
+    bool rx_offer_pending;
     Clock *protimer_clk;
     ptimer_state *protimer_counter;
     QEMUTimer *rac_tx_timer;
@@ -916,6 +917,7 @@ static void efr32_periph_init(Object *o)
     s->trng_state = 0x2545f491;
     s->rac_state = EFR32_RAC_STATE_OFF;
     s->hfxo_fsm_locked = true;
+    s->rx_offer_pending = false;
     s->protimer_clk = qdev_init_clock_in(DEVICE(o), "protimerclk",
                                          efr32_protimer_clock_update, s,
                                          ClockUpdate);
@@ -980,12 +982,21 @@ static bool efr32_periph_is_rx_ready(Efr32RfRadio *radio)
     return s->rac_state == EFR32_RAC_STATE_RXSEARCH;
 }
 
+static void efr32_periph_rx_offer_available(Efr32RfRadio *radio)
+{
+    Efr32Periph *s = EFR32_PERIPH(radio);
+
+    /* A mailbox notification only; FRC/BUFC/CRC/IRQ delivery is unmodelled. */
+    s->rx_offer_pending = true;
+}
+
 static void efr32_periph_class_init(ObjectClass *o, void *d)
 {
     Efr32RfRadioClass *radio_class = EFR32_RF_RADIO_CLASS(o);
 
     RESETTABLE_CLASS(o)->phases.hold = efr32_periph_reset_hold;
     radio_class->is_rx_ready = efr32_periph_is_rx_ready;
+    radio_class->rx_offer_available = efr32_periph_rx_offer_available;
 }
 static const TypeInfo periph_info = {.name = TYPE_EFR32_PERIPH,
                                      .parent = TYPE_SYS_BUS_DEVICE,
