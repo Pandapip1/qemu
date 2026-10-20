@@ -12,6 +12,7 @@ struct Efr32RfMedium {
     GList *radios;
     uint64_t next_tx_sequence;
     Efr32RfTxSnapshot *latest_tx_snapshot;
+    GQueue rx_offers;
 };
 
 struct Efr32RfTxSnapshot {
@@ -223,10 +224,81 @@ GBytes *efr32_rf_rx_delivery_request_get_data(
     return request->data;
 }
 
+unsigned efr32_rf_medium_offer_latest_tx(Efr32RfMedium *medium,
+                                         Error **errp)
+{
+    const Efr32RfTxSnapshot *snapshot = medium->latest_tx_snapshot;
+    Efr32RfRxMetadata metadata = {
+        .buffer_channel = EFR32_RF_RX_BUFC_CHANNEL,
+    };
+    unsigned offers = 0;
+
+    if (!snapshot) {
+        return 0;
+    }
+
+    /*
+     * This is deliberately a mailbox, not an RF channel model: it has no
+     * propagation delay, collision, PHY, or receiver-side side effects.
+     * GList preserves the board's attachment order for deterministic tests.
+     */
+    for (GList *member = medium->radios; member; member = member->next) {
+        Efr32RfRadio *receiver = member->data;
+        Efr32RfRxDeliveryRequest *request;
+        gsize length;
+        const uint8_t *data;
+
+        if (receiver == efr32_rf_tx_snapshot_get_radio(snapshot) ||
+            !efr32_rf_radio_is_rx_ready(receiver)) {
+            continue;
+        }
+
+        data = g_bytes_get_data(efr32_rf_tx_snapshot_get_data(snapshot),
+                                &length);
+        request = efr32_rf_medium_prepare_rx_delivery(
+            medium, receiver, &metadata, data, length, errp);
+        if (!request) {
+            return offers;
+        }
+        g_queue_push_tail(&medium->rx_offers, request);
+        offers++;
+    }
+
+    return offers;
+}
+
+unsigned efr32_rf_medium_get_rx_offer_count(const Efr32RfMedium *medium)
+{
+    return medium->rx_offers.length;
+}
+
+Efr32RfRxDeliveryRequest *efr32_rf_medium_take_rx_offer(
+    Efr32RfMedium *medium)
+{
+    return g_queue_pop_head(&medium->rx_offers);
+}
+
+void efr32_rf_medium_clear_rx_offers(Efr32RfMedium *medium)
+{
+    Efr32RfRxDeliveryRequest *request;
+
+    while ((request = efr32_rf_medium_take_rx_offer(medium))) {
+        efr32_rf_rx_delivery_request_free(request);
+    }
+}
+
+static void efr32_rf_medium_init(Object *obj)
+{
+    Efr32RfMedium *medium = EFR32_RF_MEDIUM(obj);
+
+    g_queue_init(&medium->rx_offers);
+}
+
 static void efr32_rf_medium_finalize(Object *obj)
 {
     Efr32RfMedium *medium = EFR32_RF_MEDIUM(obj);
 
+    efr32_rf_medium_clear_rx_offers(medium);
     efr32_rf_medium_clear_latest_tx_snapshot(medium);
     g_list_free(medium->radios);
 }
@@ -235,6 +307,7 @@ static const TypeInfo efr32_rf_medium_info = {
     .name = TYPE_EFR32_RF_MEDIUM,
     .parent = TYPE_OBJECT,
     .instance_size = sizeof(Efr32RfMedium),
+    .instance_init = efr32_rf_medium_init,
     .instance_finalize = efr32_rf_medium_finalize,
 };
 

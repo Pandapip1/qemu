@@ -231,6 +231,65 @@ static void test_rx_delivery_request_validation(RfMediumFixture *fixture,
     object_unref(OBJECT(other));
 }
 
+static Efr32RfRadio *add_rx_ready_radio(RfMediumFixture *fixture)
+{
+    Efr32RfRadio *radio =
+        EFR32_RF_RADIO(object_new(TYPE_TEST_EFR32_RF_RADIO));
+
+    ((TestEfr32RfRadio *)radio)->rx_ready = true;
+    efr32_rf_medium_attach(fixture->medium, radio, &error_abort);
+    return radio;
+}
+
+static void test_tx_offers_follow_rx_ready_attachment_order(
+    RfMediumFixture *fixture, gconstpointer data)
+{
+    uint8_t staged[] = {0x31, 0x62};
+    Efr32RfTxMetadata tx_metadata = valid_tx_metadata();
+    Efr32RfTxSnapshot *snapshot;
+    Efr32RfRadio *first_peer;
+    Efr32RfRadio *second_peer;
+    Efr32RfRadio *not_ready_peer;
+    Efr32RfRxDeliveryRequest *first_offer;
+    Efr32RfRxDeliveryRequest *second_offer;
+    const uint8_t *payload;
+    gsize length;
+
+    first_peer = add_rx_ready_radio(fixture);
+    not_ready_peer = EFR32_RF_RADIO(object_new(TYPE_TEST_EFR32_RF_RADIO));
+    efr32_rf_medium_attach(fixture->medium, not_ready_peer, &error_abort);
+    second_peer = add_rx_ready_radio(fixture);
+    snapshot = efr32_rf_medium_snapshot_tx(
+        fixture->medium, fixture->radio, &tx_metadata, staged, sizeof(staged),
+        &error_abort);
+    efr32_rf_medium_set_latest_tx_snapshot(fixture->medium, snapshot);
+    staged[0] = 0;
+
+    g_assert_cmpuint(efr32_rf_medium_offer_latest_tx(fixture->medium,
+                                                       &error_abort), ==, 2);
+    g_assert_cmpuint(efr32_rf_medium_get_rx_offer_count(fixture->medium), ==,
+                     2);
+    first_offer = efr32_rf_medium_take_rx_offer(fixture->medium);
+    second_offer = efr32_rf_medium_take_rx_offer(fixture->medium);
+    g_assert_true(efr32_rf_rx_delivery_request_get_receiver(first_offer) ==
+                  first_peer);
+    g_assert_true(efr32_rf_rx_delivery_request_get_receiver(second_offer) ==
+                  second_peer);
+    payload = g_bytes_get_data(
+        efr32_rf_rx_delivery_request_get_data(first_offer), &length);
+    g_assert_cmpuint(length, ==, sizeof(staged));
+    g_assert_cmpuint(payload[0], ==, 0x31);
+    g_assert_null(efr32_rf_medium_take_rx_offer(fixture->medium));
+    efr32_rf_rx_delivery_request_free(first_offer);
+    efr32_rf_rx_delivery_request_free(second_offer);
+    efr32_rf_medium_detach(fixture->medium, second_peer);
+    efr32_rf_medium_detach(fixture->medium, not_ready_peer);
+    efr32_rf_medium_detach(fixture->medium, first_peer);
+    object_unref(OBJECT(second_peer));
+    object_unref(OBJECT(not_ready_peer));
+    object_unref(OBJECT(first_peer));
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -257,6 +316,10 @@ int main(int argc, char **argv)
     g_test_add("/efr32-rf-medium/rx-delivery-request-validation",
                RfMediumFixture, NULL, rf_medium_fixture_setup,
                test_rx_delivery_request_validation, rf_medium_fixture_teardown);
+    g_test_add("/efr32-rf-medium/tx-offers-follow-rx-ready-attachment-order",
+               RfMediumFixture, NULL, rf_medium_fixture_setup,
+               test_tx_offers_follow_rx_ready_attachment_order,
+               rf_medium_fixture_teardown);
 
     return g_test_run();
 }

@@ -122,6 +122,17 @@ const Efr32RfRxMetadata *efr32_rf_rx_delivery_request_get_metadata(
 GBytes *efr32_rf_rx_delivery_request_get_data(
     const Efr32RfRxDeliveryRequest *request);
 
+/*
+ * Create mailbox offers from the newest TX snapshot for RX-ready attached
+ * peers, in attachment order. This is not RF delivery or a timing model.
+ */
+unsigned efr32_rf_medium_offer_latest_tx(Efr32RfMedium *medium,
+                                         Error **errp);
+unsigned efr32_rf_medium_get_rx_offer_count(const Efr32RfMedium *medium);
+Efr32RfRxDeliveryRequest *efr32_rf_medium_take_rx_offer(
+    Efr32RfMedium *medium);
+void efr32_rf_medium_clear_rx_offers(Efr32RfMedium *medium);
+
 void efr32_rf_medium_register_types(void);
 
 #endif /* HW_ARM_EFR32_RF_MEDIUM_H */
