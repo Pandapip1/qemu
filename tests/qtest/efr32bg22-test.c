@@ -45,6 +45,7 @@
 #define RAC_CMD               0x010
 #define RAC_CTRL              0x014
 #define RAC_SR0               0x040
+#define RAC_SR3               0x04c
 #define RAC_RXENSRCEN         0x008
 #define RAC_IEN               0x020
 #define RAC_SEQIF             0x028
@@ -195,6 +196,17 @@ static void test_rail_initialization_latches(void)
 
     g_assert_cmphex(readl(FRC_BASE + FRC_RXCTRL), ==, 0x60);
     g_assert_cmphex(readl(RAC_BASE + RAC_SR0) & (1u << 6), ==, 0);
+}
+
+static void test_rac_sr3_clear_alias(void)
+{
+    uint32_t address = RAC_BASE + RAC_SR3;
+
+    writel(address, UINT32_MAX);
+    writel(address + REGISTER_CLEAR_WINDOW, 0x40000000);
+
+    /* Stock clears this exact bit through RAC.SR3's CLR window. */
+    g_assert_cmphex(readl(address), ==, 0xbfffffff);
 }
 
 static void test_frc_interrupt_register_masks(void)
@@ -550,6 +562,7 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/frc-sniffctrl-mask", test_frc_sniffctrl_mask);
     qtest_add_func("/efr32bg22/rail-initialization-latches",
                    test_rail_initialization_latches);
+    qtest_add_func("/efr32bg22/rac-sr3-clear-alias", test_rac_sr3_clear_alias);
     qtest_add_func("/efr32bg22/frc-interrupt-register-masks",
                    test_frc_interrupt_register_masks);
     qtest_add_func("/efr32bg22/frc-completion-interrupt-enable",
