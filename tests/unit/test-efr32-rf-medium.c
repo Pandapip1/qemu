@@ -446,6 +446,69 @@ static void test_reset_latest_source_keeps_other_source_offer(
     object_unref(OBJECT(first_receiver));
 }
 
+/*
+ * The retained newest snapshot is a convenience for offer creation, not a
+ * global ownership token. If source A aborts while source B has since begun
+ * TX, only A's active mailbox offers may be withdrawn.
+ */
+static void test_abort_earlier_source_keeps_later_source_offer(
+    RfMediumFixture *fixture, gconstpointer data)
+{
+    const uint8_t first_payload[] = {0x31};
+    const uint8_t second_payload[] = {0x62};
+    Efr32RfTxMetadata tx_metadata = valid_tx_metadata();
+    Efr32RfRadio *first_receiver;
+    Efr32RfRadio *later_source;
+    Efr32RfTxSnapshot *snapshot;
+    Efr32RfRxDeliveryRequest *offer;
+    const uint8_t *payload;
+    gsize length;
+
+    first_receiver = add_rx_ready_radio(fixture);
+    later_source = add_rx_ready_radio(fixture);
+
+    snapshot = efr32_rf_medium_snapshot_tx(
+        fixture->medium, fixture->radio, &tx_metadata, first_payload,
+        sizeof(first_payload), &error_abort);
+    efr32_rf_medium_set_latest_tx_snapshot(fixture->medium, snapshot);
+    g_assert_cmpuint(efr32_rf_medium_offer_latest_tx(fixture->medium,
+                                                       &error_abort), ==, 2);
+
+    snapshot = efr32_rf_medium_snapshot_tx(
+        fixture->medium, later_source, &tx_metadata, second_payload,
+        sizeof(second_payload), &error_abort);
+    efr32_rf_medium_set_latest_tx_snapshot(fixture->medium, snapshot);
+    g_assert_cmpuint(efr32_rf_medium_offer_latest_tx(fixture->medium,
+                                                       &error_abort), ==, 2);
+
+    g_assert_cmpuint(efr32_rf_medium_withdraw_active_tx(fixture->medium,
+                                                          fixture->radio),
+                     ==, 2);
+    g_assert_cmpuint(efr32_rf_medium_get_rx_offer_count(fixture->medium), ==,
+                     2);
+    offer = efr32_rf_medium_take_rx_offer(fixture->medium);
+    g_assert_true(efr32_rf_rx_delivery_request_get_receiver(offer) ==
+                  fixture->radio);
+    payload = g_bytes_get_data(efr32_rf_rx_delivery_request_get_data(offer),
+                               &length);
+    g_assert_cmpuint(length, ==, sizeof(second_payload));
+    g_assert_cmpuint(payload[0], ==, second_payload[0]);
+    efr32_rf_rx_delivery_request_free(offer);
+    offer = efr32_rf_medium_take_rx_offer(fixture->medium);
+    g_assert_true(efr32_rf_rx_delivery_request_get_receiver(offer) ==
+                  first_receiver);
+    payload = g_bytes_get_data(efr32_rf_rx_delivery_request_get_data(offer),
+                               &length);
+    g_assert_cmpuint(length, ==, sizeof(second_payload));
+    g_assert_cmpuint(payload[0], ==, second_payload[0]);
+    efr32_rf_rx_delivery_request_free(offer);
+
+    efr32_rf_medium_detach(fixture->medium, later_source);
+    efr32_rf_medium_detach(fixture->medium, first_receiver);
+    object_unref(OBJECT(later_source));
+    object_unref(OBJECT(first_receiver));
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -483,6 +546,10 @@ int main(int argc, char **argv)
     g_test_add("/efr32-rf-medium/reset-latest-source-keeps-other-source-offer",
                RfMediumFixture, NULL, rf_medium_fixture_setup,
                test_reset_latest_source_keeps_other_source_offer,
+               rf_medium_fixture_teardown);
+    g_test_add("/efr32-rf-medium/abort-earlier-source-keeps-later-source-offer",
+               RfMediumFixture, NULL, rf_medium_fixture_setup,
+               test_abort_earlier_source_keeps_later_source_offer,
                rf_medium_fixture_teardown);
     g_test_add("/efr32-rf-medium/rx-offers-are-receiver-scoped",
                RfMediumFixture, NULL, rf_medium_fixture_setup,

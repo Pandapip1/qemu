@@ -106,11 +106,16 @@ const Efr32RfTxSnapshot *efr32_rf_medium_get_latest_tx_snapshot(
 void efr32_rf_medium_clear_latest_tx_snapshot(Efr32RfMedium *medium);
 
 /*
- * Withdraw the retained TXEN snapshot and only the undelivered offers made
- * from it when @source aborts that transmission.  Returns offers removed.
+ * Withdraw @source's active TXEN transaction and only the undelivered offers
+ * made from it when that source aborts. The retained newest snapshot can
+ * belong to another radio, so cancellation is source-scoped.
  */
-unsigned efr32_rf_medium_withdraw_latest_tx(Efr32RfMedium *medium,
+unsigned efr32_rf_medium_withdraw_active_tx(Efr32RfMedium *medium,
                                              Efr32RfRadio *source);
+
+/* Mark @source's active synthetic TX transaction complete. */
+void efr32_rf_medium_complete_tx(Efr32RfMedium *medium,
+                                  Efr32RfRadio *source);
 
 /*
  * Discard medium state owned by, or addressed to, one radio. A reset of a

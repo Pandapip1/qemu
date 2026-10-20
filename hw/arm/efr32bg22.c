@@ -697,6 +697,7 @@ static void efr32_rac_tx_complete(void *opaque)
 {
     Efr32Periph *s = EFR32_PERIPH(opaque);
 
+    efr32_rf_medium_complete_tx(s->rf_medium, EFR32_RF_RADIO(s));
     efr32_rac_set_state(s, EFR32_RAC_STATE_OFF);
     efr32_frc_raise(s, EFR32_FRC_IF_TXDONE);
 }
@@ -1359,7 +1360,7 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
              * survive an explicit source abort and turn into a later RXDONE.
              */
             if (next & EFR32_RAC_CMD_TXDIS) {
-                efr32_rf_medium_withdraw_latest_tx(
+                efr32_rf_medium_withdraw_active_tx(
                     s->rf_medium, EFR32_RF_RADIO(s));
             }
             efr32_rac_set_state(s, EFR32_RAC_STATE_OFF);
@@ -1375,7 +1376,7 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
              * snapshot is freed below but its queued RXDONE can survive and
              * be delivered after the replacement transmission.
              */
-            efr32_rf_medium_withdraw_latest_tx(s->rf_medium,
+            efr32_rf_medium_withdraw_active_tx(s->rf_medium,
                                                 EFR32_RF_RADIO(s));
             efr32_rac_capture_tx_snapshot(s);
             efr32_rac_set_state(s, EFR32_RAC_STATE_TX);
@@ -1495,7 +1496,7 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
          * in-flight model transaction so a deferred peer handoff cannot turn
          * a cancelled transmission into RXDONE.
          */
-        efr32_rf_medium_withdraw_latest_tx(s->rf_medium, EFR32_RF_RADIO(s));
+        efr32_rf_medium_withdraw_active_tx(s->rf_medium, EFR32_RF_RADIO(s));
         efr32_rac_set_state(s, EFR32_RAC_STATE_OFF);
     }
 
@@ -1516,7 +1517,7 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
          * TXEN snapshot.  Do not let its deferred peer offer escape after
          * this radio has stopped transmitting.
          */
-        efr32_rf_medium_withdraw_latest_tx(s->rf_medium, EFR32_RF_RADIO(s));
+        efr32_rf_medium_withdraw_active_tx(s->rf_medium, EFR32_RF_RADIO(s));
         efr32_rac_set_state(s, EFR32_RAC_STATE_RXSEARCH);
         if (s->rx_offer_pending) {
             efr32_rac_schedule_rx_handoff(s);

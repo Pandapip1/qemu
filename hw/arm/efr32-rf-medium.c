@@ -12,6 +12,8 @@ struct Efr32RfMedium {
     GList *radios;
     uint64_t next_tx_sequence;
     Efr32RfTxSnapshot *latest_tx_snapshot;
+    /* Source radio -> active TXEN sequence, owned by the medium. */
+    GHashTable *active_tx_sequences;
     GQueue rx_offers;
 };
 
@@ -160,8 +162,18 @@ GBytes *efr32_rf_tx_snapshot_get_data(const Efr32RfTxSnapshot *snapshot)
 void efr32_rf_medium_set_latest_tx_snapshot(Efr32RfMedium *medium,
                                              Efr32RfTxSnapshot *snapshot)
 {
+    uint64_t *sequence;
+
     efr32_rf_tx_snapshot_free(medium->latest_tx_snapshot);
     medium->latest_tx_snapshot = snapshot;
+    if (!snapshot) {
+        return;
+    }
+
+    sequence = g_new(uint64_t, 1);
+    *sequence = efr32_rf_tx_snapshot_get_sequence(snapshot);
+    g_hash_table_replace(medium->active_tx_sequences,
+                         efr32_rf_tx_snapshot_get_radio(snapshot), sequence);
 }
 
 const Efr32RfTxSnapshot *efr32_rf_medium_get_latest_tx_snapshot(
@@ -291,32 +303,42 @@ unsigned efr32_rf_medium_offer_latest_tx(Efr32RfMedium *medium,
     return offers;
 }
 
-unsigned efr32_rf_medium_withdraw_latest_tx(Efr32RfMedium *medium,
+unsigned efr32_rf_medium_withdraw_active_tx(Efr32RfMedium *medium,
                                              Efr32RfRadio *source)
 {
     const Efr32RfTxSnapshot *snapshot = medium->latest_tx_snapshot;
-    uint64_t sequence;
+    uint64_t *sequence;
     unsigned withdrawn = 0;
     GList *link;
 
-    if (!snapshot || efr32_rf_tx_snapshot_get_radio(snapshot) != source) {
+    sequence = g_hash_table_lookup(medium->active_tx_sequences, source);
+    if (!sequence) {
         return 0;
     }
 
-    sequence = efr32_rf_tx_snapshot_get_sequence(snapshot);
-    efr32_rf_medium_clear_latest_tx_snapshot(medium);
+    if (snapshot && efr32_rf_tx_snapshot_get_radio(snapshot) == source) {
+        efr32_rf_medium_clear_latest_tx_snapshot(medium);
+    }
+    g_hash_table_steal(medium->active_tx_sequences, source);
     for (link = medium->rx_offers.head; link;) {
         Efr32RfRxDeliveryRequest *request = link->data;
         GList *next = link->next;
 
-        if (request->source == source && request->tx_sequence == sequence) {
+        if (request->source == source && request->tx_sequence == *sequence) {
             g_queue_delete_link(&medium->rx_offers, link);
             efr32_rf_rx_delivery_request_free(request);
             withdrawn++;
         }
         link = next;
     }
+    g_free(sequence);
     return withdrawn;
+}
+
+void efr32_rf_medium_complete_tx(Efr32RfMedium *medium,
+                                  Efr32RfRadio *source)
+{
+    g_hash_table_remove(medium->active_tx_sequences, source);
 }
 
 unsigned efr32_rf_medium_get_rx_offer_count(const Efr32RfMedium *medium)
@@ -378,6 +400,7 @@ void efr32_rf_medium_reset_radio(Efr32RfMedium *medium,
     if (reset_tx_source) {
         efr32_rf_medium_clear_latest_tx_snapshot(medium);
     }
+    g_hash_table_remove(medium->active_tx_sequences, radio);
 
     for (link = medium->rx_offers.head; link;) {
         Efr32RfRxDeliveryRequest *request = link->data;
@@ -403,6 +426,8 @@ static void efr32_rf_medium_init(Object *obj)
     Efr32RfMedium *medium = EFR32_RF_MEDIUM(obj);
 
     g_queue_init(&medium->rx_offers);
+    medium->active_tx_sequences = g_hash_table_new_full(
+        g_direct_hash, g_direct_equal, NULL, g_free);
 }
 
 static void efr32_rf_medium_finalize(Object *obj)
@@ -411,6 +436,7 @@ static void efr32_rf_medium_finalize(Object *obj)
 
     efr32_rf_medium_clear_rx_offers(medium);
     efr32_rf_medium_clear_latest_tx_snapshot(medium);
+    g_hash_table_destroy(medium->active_tx_sequences);
     g_list_free(medium->radios);
 }
 
