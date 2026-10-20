@@ -210,6 +210,7 @@ struct Efr32Periph
     Clock *burtc_clk;
     ptimer_state *burtc_counter;
     bool burtc_running;
+    QEMUTimer *burtc_compare_timer;
     QEMUTimer *rac_tx_timer;
     QEMUTimer *rac_rx_timer;
     GByteArray *bufc_data[4];
@@ -899,6 +900,50 @@ static uint32_t efr32_burtc_counter(Efr32Periph *s)
     return UINT32_MAX - ptimer_get_count(s->burtc_counter);
 }
 
+static void efr32_burtc_update_irq(Efr32Periph *s)
+{
+    uint32_t pending = efr32_register_get(s, EFR32_BURTC_BASE + EFR32_BURTC_IF);
+    uint32_t enabled = efr32_register_get(s, EFR32_BURTC_BASE + EFR32_BURTC_IEN);
+
+    /* xG22.dtsi and the part header both assign BURTC to external IRQ 18. */
+    qemu_set_irq(s->irq[18], !!(pending & enabled));
+}
+
+static void efr32_burtc_schedule_compare(Efr32Periph *s)
+{
+    uint32_t ticks;
+    int64_t deadline;
+
+    timer_del(s->burtc_compare_timer);
+    if (!s->burtc_running || !efr32_burtc_enabled(s)) {
+        return;
+    }
+
+    /* CNT counts up modulo 2^32.  Schedule this COMP match once; IF latches
+     * until the guest clears it, exactly as the one-shot Zephyr alarm uses it. */
+    ticks = efr32_register_get(s, EFR32_BURTC_BASE + EFR32_BURTC_COMP) -
+            efr32_burtc_counter(s);
+    if (ticks == 0) {
+        ticks = 1;
+    }
+    deadline = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+               ((int64_t)ticks * NANOSECONDS_PER_SECOND + 32768 - 1) / 32768;
+    timer_mod(s->burtc_compare_timer, deadline);
+}
+
+static void efr32_burtc_compare_expired(void *opaque)
+{
+    Efr32Periph *s = EFR32_PERIPH(opaque);
+
+    if (!s->burtc_running || !efr32_burtc_enabled(s)) {
+        return;
+    }
+    efr32_register_put(s, EFR32_BURTC_BASE + EFR32_BURTC_IF,
+                       efr32_register_get(s, EFR32_BURTC_BASE + EFR32_BURTC_IF) |
+                           (1u << 1)); /* BURTC_IF_COMP */
+    efr32_burtc_update_irq(s);
+}
+
 static void efr32_burtc_update_running(Efr32Periph *s)
 {
     ptimer_transaction_begin(s->burtc_counter);
@@ -908,6 +953,7 @@ static void efr32_burtc_update_running(Efr32Periph *s)
         ptimer_stop(s->burtc_counter);
     }
     ptimer_transaction_commit(s->burtc_counter);
+    efr32_burtc_schedule_compare(s);
 }
 
 static void efr32_burtc_set_counter(Efr32Periph *s, uint32_t value)
@@ -921,6 +967,7 @@ static void efr32_burtc_set_counter(Efr32Periph *s, uint32_t value)
         ptimer_run(s->burtc_counter, 0);
     }
     ptimer_transaction_commit(s->burtc_counter);
+    efr32_burtc_schedule_compare(s);
 }
 
 static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
@@ -1182,6 +1229,13 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
     if (register_address == EFR32_BURTC_BASE + EFR32_BURTC_EN) {
         efr32_burtc_update_running(s);
     }
+    if (register_address == EFR32_BURTC_BASE + EFR32_BURTC_COMP) {
+        efr32_burtc_schedule_compare(s);
+    }
+    if (register_address == EFR32_BURTC_BASE + EFR32_BURTC_IF ||
+        register_address == EFR32_BURTC_BASE + EFR32_BURTC_IEN) {
+        efr32_burtc_update_irq(s);
+    }
 
     /*
      * The public CMU_DPLLLock() path clears DPLL.IF then enables DPLL0 and
@@ -1334,6 +1388,8 @@ static void efr32_periph_init(Object *o)
                                    PTIMER_POLICY_NO_IMMEDIATE_RELOAD |
                                    PTIMER_POLICY_NO_COUNTER_ROUND_DOWN |
                                    PTIMER_POLICY_TRIGGER_ONLY_ON_DECREMENT);
+    s->burtc_compare_timer =
+        timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_burtc_compare_expired, s);
     s->rac_tx_timer =
         timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_rac_tx_complete, s);
     s->rac_rx_timer =
@@ -1365,6 +1421,7 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     s->usart_tx_complete[0] = false;
     s->usart_tx_complete[1] = false;
     s->burtc_running = false;
+    timer_del(s->burtc_compare_timer);
     ptimer_transaction_begin(s->protimer_counter);
     ptimer_stop(s->protimer_counter);
     ptimer_set_period_from_clock(s->protimer_counter, s->protimer_clk, 1);
@@ -1413,6 +1470,7 @@ static void efr32_periph_finalize(Object *obj)
 
     timer_free(s->rac_rx_timer);
     timer_free(s->rac_tx_timer);
+    timer_free(s->burtc_compare_timer);
     ptimer_free(s->protimer_counter);
     ptimer_free(s->burtc_counter);
     for (unsigned channel = 0; channel < G_N_ELEMENTS(s->bufc_data); channel++) {

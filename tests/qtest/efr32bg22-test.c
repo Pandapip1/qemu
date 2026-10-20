@@ -117,8 +117,11 @@ static char *tx_snapshot_trace_path;
 #define BURTC_CFG              0x008
 #define BURTC_CMD              0x00c
 #define BURTC_STATUS           0x010
+#define BURTC_IF               0x014
+#define BURTC_IEN              0x018
 #define BURTC_CNT              0x020
 #define BURTC_COMP             0x030
+#define BURTC_IF_COMP          (1u << 1)
 #define BURTC_EN_EN            (1u << 0)
 #define BURTC_CMD_START        (1u << 0)
 #define BURTC_CMD_STOP         (1u << 1)
@@ -195,6 +198,26 @@ static void test_burtc_counter_contract(void)
     writel(BURTC_BASE + BURTC_EN + REGISTER_CLEAR_WINDOW, BURTC_EN_EN);
     writel(BURTC_BASE + BURTC_CMD, BURTC_CMD_START);
     g_assert_cmphex(readl(BURTC_BASE + BURTC_STATUS), ==, 0);
+}
+
+/* The Zephyr counter driver uses COMP as a one-shot alarm and dispatches
+ * only enabled pending flags from its IRQ 18 handler. */
+static void test_burtc_compare_pending(void)
+{
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+
+    writel(BURTC_BASE + BURTC_EN + REGISTER_SET_WINDOW, BURTC_EN_EN);
+    writel(BURTC_BASE + BURTC_CNT, 10);
+    writel(BURTC_BASE + BURTC_IF + REGISTER_CLEAR_WINDOW, BURTC_IF_COMP);
+    writel(BURTC_BASE + BURTC_COMP, 42);
+    writel(BURTC_BASE + BURTC_IEN + REGISTER_SET_WINDOW, BURTC_IF_COMP);
+    writel(BURTC_BASE + BURTC_CMD, BURTC_CMD_START);
+    qtest_clock_step(global_qtest, 2 * 1000 * 1000);
+
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_IF) & BURTC_IF_COMP, ==,
+                    BURTC_IF_COMP);
+    writel(BURTC_BASE + BURTC_IF + REGISTER_CLEAR_WINDOW, BURTC_IF_COMP);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_IF) & BURTC_IF_COMP, ==, 0);
 }
 
 static void test_cmu_nonsecure_alias(void)
@@ -984,6 +1007,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/register-aliases", test_register_aliases);
     qtest_add_func("/efr32bg22/burtc-counter-contract",
                    test_burtc_counter_contract);
+    qtest_add_func("/efr32bg22/burtc-compare-pending",
+                   test_burtc_compare_pending);
     qtest_add_func("/efr32bg22/cmu-nonsecure-alias", test_cmu_nonsecure_alias);
     qtest_add_func("/efr32bg22/dpll-lock", test_dpll_lock);
     qtest_add_func("/efr32bg22/usart-tx-polling", test_usart_tx_polling);
