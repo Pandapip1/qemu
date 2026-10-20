@@ -85,6 +85,7 @@ static char *tx_snapshot_trace_path;
 #define HFXO_STATUS           0x058
 #define HFXO_STATUS_READY     0x000b0003
 #define HFXO_STATUS_FSMLOCK   (1u << 30)
+#define HFXO_CTRL_DISONDEMAND (1u << 1)
 #define CMU_BASE              0x40008000
 #define CMU_SYSCLKCTRL        0x070
 #define RADIO_RAM_NS_BASE     0xb0000000
@@ -325,19 +326,33 @@ static void test_msc_status_reset(void)
 
 static void test_hfxo_ready_status(void)
 {
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
     g_assert_cmphex(readl(CMU_BASE + CMU_SYSCLKCTRL) & 7, ==, 1);
+    g_assert_cmphex(readl(HFXO_BASE + HFXO_CTRL), ==, HFXO_CTRL_DISONDEMAND);
     g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==, 0);
 
-    writel(HFXO_BASE + HFXO_CTRL, 1);
+    writel(HFXO_BASE + HFXO_CTRL + REGISTER_SET_WINDOW, 1);
     g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==,
                     HFXO_STATUS_READY | HFXO_STATUS_FSMLOCK);
 
     writel(HFXO_BASE + HFXO_CMD, 1u << 1);
     g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==, HFXO_STATUS_READY);
 
-    writel(HFXO_BASE + HFXO_CTRL, 0);
+    /* Re-enable without reading disabled STATUS: a fresh lock must start. */
+    writel(HFXO_BASE + HFXO_CTRL + REGISTER_CLEAR_WINDOW, 1);
+    writel(HFXO_BASE + HFXO_CTRL + REGISTER_SET_WINDOW, 1);
+    g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==,
+                    HFXO_STATUS_READY | HFXO_STATUS_FSMLOCK);
+
+    writel(HFXO_BASE + HFXO_CMD, 1u << 1);
+    writel(HFXO_BASE + HFXO_CTRL + REGISTER_CLEAR_WINDOW, 1);
     writel(CMU_BASE + CMU_SYSCLKCTRL, 3);
-    g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==, HFXO_STATUS_READY);
+    g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==,
+                    HFXO_STATUS_READY | HFXO_STATUS_FSMLOCK);
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    g_assert_cmphex(readl(HFXO_BASE + HFXO_CTRL), ==, HFXO_CTRL_DISONDEMAND);
+    g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==, 0);
 }
 
 static void test_bufc_data_port(void)

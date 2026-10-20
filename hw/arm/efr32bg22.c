@@ -101,6 +101,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_HFXO_CMD 0x050u
 #define EFR32_HFXO_STATUS 0x058u
 #define EFR32_HFXO_CTRL_FORCEEN (1u << 0)
+#define EFR32_HFXO_CTRL_DISONDEMAND (1u << 1)
 #define EFR32_HFXO_CMD_MANUALOVERRIDE (1u << 1)
 #define EFR32_HFXO_STATUS_RDY (1u << 0)
 #define EFR32_HFXO_STATUS_COREBIASOPTRDY (1u << 1)
@@ -803,7 +804,6 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
     {
         if (!efr32_hfxo_enabled(s))
         {
-            s->hfxo_fsm_locked = true;
             return 0;
         }
         return EFR32_HFXO_READY_STATUS |
@@ -852,6 +852,7 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
              shift = (address & 3) * 8,
              mask = size == 4 ? UINT32_MAX : ((1u << (size * 8)) - 1) << shift,
              next = (old & ~mask) | (((uint32_t)value << shift) & mask);
+    bool hfxo_was_enabled = efr32_hfxo_enabled(s);
 
     if (word >= RADIO_BASE && word < RADIO_BASE + RADIO_SIZE)
     {
@@ -936,6 +937,14 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
 
     efr32_register_put(s, register_address,
                        efr32_radio_mask_write(register_address, next));
+
+    /* A new HFXO request starts a fresh lock sequence. */
+    if ((register_address == EFR32_HFXO_BASE + EFR32_HFXO_CTRL ||
+         register_address == EFR32_CMU_BASE + EFR32_CMU_SYSCLKCTRL) &&
+        !hfxo_was_enabled && efr32_hfxo_enabled(s))
+    {
+        s->hfxo_fsm_locked = true;
+    }
 
     if (register_address == EFR32_HFXO_BASE + EFR32_HFXO_CMD &&
         (next & EFR32_HFXO_CMD_MANUALOVERRIDE))
@@ -1092,6 +1101,8 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     efr32_rf_medium_reset_radio(s->rf_medium, EFR32_RF_RADIO(s));
     efr32_register_put(s, EFR32_CMU_BASE + EFR32_CMU_SYSCLKCTRL,
                        EFR32_CMU_SYSCLKCTRL_CLKSEL_FSRCO);
+    efr32_register_put(s, EFR32_HFXO_BASE + EFR32_HFXO_CTRL,
+                       EFR32_HFXO_CTRL_DISONDEMAND);
     efr32_register_put(s, EFR32_EMU_BASE + EFR32_EMU_STATUS,
                        EFR32_EMU_STATUS_RESET);
     efr32_register_put(s, EFR32_MSC_BASE + EFR32_MSC_STATUS,
