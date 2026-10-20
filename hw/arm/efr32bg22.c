@@ -71,6 +71,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_PROTIMER_EN 0x004u
 #define EFR32_PROTIMER_CTRL 0x008u
 #define EFR32_PROTIMER_CMD 0x00cu
+#define EFR32_PROTIMER_COUNTER 0x020u
 #define EFR32_PROTIMER_STATE 0x030u
 #define EFR32_PROTIMER_PERIOD 0x038u
 #define EFR32_PROTIMER_TRACE_60 0x060u
@@ -145,6 +146,7 @@ struct Efr32Periph
     uint32_t trng_state;
     uint32_t rac_state;
     bool hfxo_fsm_locked;
+    uint64_t protimer_counter_epoch_ns;
     QEMUTimer *rac_tx_timer;
     GByteArray *bufc_data[4];
     qemu_irq irq[64];
@@ -536,6 +538,19 @@ static uint32_t efr32_rac_status(Efr32Periph *s)
            (state == EFR32_RAC_STATE_RXSEARCH) << 31;
 }
 
+/*
+ * RAIL_GetTime reads PROTIMER +0x020.  The public RAIL API documents its
+ * timer tick as roughly 0.5 microseconds, so expose a deterministic virtual
+ * counter at approximately 2 MHz.  Compare/capture and command behavior are
+ * intentionally separate, unmodeled concerns.
+ */
+static uint32_t efr32_protimer_counter(Efr32Periph *s)
+{
+    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    return (uint32_t)((now - s->protimer_counter_epoch_ns) / 500);
+}
+
 static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
 {
     uint32_t offset = address & 0xfff;
@@ -620,6 +635,12 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
         return 0;
     if (address == EFR32_RAC_BASE + EFR32_RAC_STATUS)
         return efr32_rac_status(s);
+    if (((address & ~0x3fffu) == EFR32_PROTIMER_BASE ||
+         (address & ~0x3fffu) == EFR32_PROTIMER_NS_BASE) &&
+        offset == EFR32_PROTIMER_COUNTER)
+    {
+        return efr32_protimer_counter(s);
+    }
     if (address == EFR32_AGC_BASE + EFR32_AGC_CMD)
         return 0; /* AGC.CMD is write-only in the public register model. */
     if (((address & ~0x3fffu) == 0xa8028000 ||
@@ -836,6 +857,7 @@ static void efr32_periph_init(Object *o)
     s->trng_state = 0x2545f491;
     s->rac_state = EFR32_RAC_STATE_OFF;
     s->hfxo_fsm_locked = true;
+    s->protimer_counter_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->rac_tx_timer =
         timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_rac_tx_complete, s);
     for (unsigned channel = 0; channel < G_N_ELEMENTS(s->bufc_data); channel++)
@@ -860,6 +882,7 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     s->trng_state = 0x2545f491;
     s->rac_state = EFR32_RAC_STATE_OFF;
     s->hfxo_fsm_locked = true;
+    s->protimer_counter_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     timer_del(s->rac_tx_timer);
     efr32_register_put(s, EFR32_CMU_BASE + EFR32_CMU_SYSCLKCTRL,
                        EFR32_CMU_SYSCLKCTRL_CLKSEL_FSRCO);

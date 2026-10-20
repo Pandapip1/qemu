@@ -41,6 +41,7 @@
 #define PROTIMER_EN           0x004
 #define PROTIMER_CTRL         0x008
 #define PROTIMER_CMD          0x00c
+#define PROTIMER_COUNTER      0x020
 #define PROTIMER_STATE        0x030
 #define PROTIMER_PERIOD       0x038
 #define PROTIMER_CMP0         0x100
@@ -489,6 +490,21 @@ static void test_protimer_secure_nonsecure_alias(void)
     g_assert_cmphex(readl(PROTIMER_NS_BASE + PROTIMER_CTRL), ==, 0x00011102);
 }
 
+static void test_protimer_counter(void)
+{
+    uint32_t before = readl(PROTIMER_BASE + PROTIMER_COUNTER);
+
+    g_assert_cmphex(readl(PROTIMER_NS_BASE + PROTIMER_COUNTER), ==, before);
+    writel(PROTIMER_BASE + PROTIMER_COUNTER, UINT32_MAX);
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_COUNTER), ==, before);
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(1000);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_COUNTER), ==, before + 2);
+    g_assert_cmphex(readl(PROTIMER_NS_BASE + PROTIMER_COUNTER), ==, before + 2);
+}
+
 static void test_rac_tx_commands(void)
 {
     writel(RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
@@ -634,6 +650,7 @@ int main(int argc, char **argv)
                    test_protimer_trace_latches);
     qtest_add_func("/efr32bg22/protimer-secure-nonsecure-alias",
                    test_protimer_secure_nonsecure_alias);
+    qtest_add_func("/efr32bg22/protimer-counter", test_protimer_counter);
     qtest_add_func("/efr32bg22/rac-tx-commands", test_rac_tx_commands);
     qtest_add_func("/efr32bg22/rac-tx-completion", test_rac_tx_completion);
     qtest_add_func("/efr32bg22/rac-software-rx-enable",
