@@ -34,6 +34,7 @@
 #define RFCRC_CTRL           0x008
 #define PROTIMER_BASE         0xa801c000
 #define PROTIMER_NS_BASE      0xb801c000
+#define PROTIMER_EN           0x004
 #define PROTIMER_CTRL         0x008
 #define PROTIMER_CMD          0x00c
 #define PROTIMER_STATE        0x030
@@ -78,6 +79,7 @@
 #define CMU_BASE              0x40008000
 #define CMU_SYSCLKCTRL        0x070
 #define BUFC_BASE            0xaa000000
+#define BUFC_EN              0x004
 #define BUFC_CH0             0x00c
 #define BUFC_CH1             0x04c
 #define BUFC_CH2             0x08c
@@ -261,6 +263,16 @@ static void test_radio_nonsecure_alias(void)
 
     g_assert_cmphex(readl(secure_address), ==, 0xffff);
     g_assert_cmphex(readl(nonsecure_address), ==, 0xffff);
+}
+
+static void test_stock_setup_aliases(void)
+{
+    /* Stock writes one at +0x004 through these two radio windows. */
+    writel(BUFC_BASE + RADIO_NONSECURE_ALIAS + BUFC_EN, 1);
+    writel(PROTIMER_NS_BASE + PROTIMER_EN, 1);
+
+    g_assert_cmphex(readl(BUFC_BASE + BUFC_EN), ==, 1);
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_EN), ==, 1);
 }
 
 static void test_dcdc_regulation(void)
@@ -570,6 +582,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/radio-enable-masks", test_radio_enable_masks);
     qtest_add_func("/efr32bg22/radio-nonsecure-alias",
                    test_radio_nonsecure_alias);
+    qtest_add_func("/efr32bg22/stock-setup-aliases",
+                   test_stock_setup_aliases);
     qtest_add_func("/efr32bg22/dcdc-regulation", test_dcdc_regulation);
     qtest_add_func("/efr32bg22/emu-status-reset", test_emu_status_reset);
     qtest_add_func("/efr32bg22/msc-status-reset", test_msc_status_reset);
