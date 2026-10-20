@@ -1500,6 +1500,13 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
     {
         /* RX replaces this model's active synthetic TX operation. */
         efr32_rac_cancel_tx_completion(s);
+        /*
+         * Just like TXDIS and FORCEDISABLE, changing the sequencer from TX
+         * to RX aborts the synthetic transaction represented by the latest
+         * TXEN snapshot.  Do not let its deferred peer offer escape after
+         * this radio has stopped transmitting.
+         */
+        efr32_rf_medium_withdraw_latest_tx(s->rf_medium, EFR32_RF_RADIO(s));
         efr32_rac_set_state(s, EFR32_RAC_STATE_RXSEARCH);
         if (s->rx_offer_pending) {
             efr32_rac_schedule_rx_handoff(s);
