@@ -1120,9 +1120,15 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
 
     if (usart_index >= 0 && (register_address & 0xfff) == EFR32_USART_TXDATA)
     {
-        /* Retain the public eight-bit data field; do not create host I/O. */
+        /*
+         * Retain the public eight-bit data field; do not create host I/O.
+         * The tracepoint is deliberately inside the native USART model, so a
+         * bounded board smoke can observe its own console without a host
+         * character-device shortcut or a guest-visible behaviour change.
+         */
         efr32_register_put(s, register_address, next & 0xff);
         s->usart_tx_complete[usart_index] = true;
+        trace_efr32bg22_usart_tx(usart_index, next & 0xff);
         return;
     }
 
@@ -1409,6 +1415,7 @@ static void efr32_periph_init(Object *o)
         sysbus_init_irq(SYS_BUS_DEVICE(o), &s->irq[irq]);
     }
 }
+
 static void efr32_periph_reset_hold(Object *o, ResetType t)
 {
     Efr32Periph *s = EFR32_PERIPH(o);
