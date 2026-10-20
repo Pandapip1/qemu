@@ -25,6 +25,7 @@
 #define BUFC_BASE                0xaa000000
 #define BUFC_CH0                 0x00c
 #define BUFC_CH1                 0x04c
+#define BUFC_ADDR                0x004
 #define BUFC_READOFFSET          0x00c
 #define BUFC_READDATA            0x014
 #define BUFC_WRITEDATA           0x018
@@ -38,6 +39,29 @@ static uint64_t peer(uint32_t address)
         return EFR32BG22_PEER_RADIO_BASE + (address - RADIO_BASE);
     }
     return EFR32BG22_PEER_PERIPH_BASE + (address - 0x40000000);
+}
+
+/*
+ * The test board intentionally gives both SoCs RAM at 0x20000000.  BUFC is a
+ * bus master, so its guest backing store must resolve through the owning
+ * SoC's address space, not the global qtest map (which is SoC 0's map).
+ */
+static void test_peer_bufc_dma_uses_peer_address_space(void)
+{
+    const uint32_t shared_guest_address = 0x20000100;
+    const uint64_t peer_tx_channel = peer(BUFC_BASE + BUFC_CH0);
+
+    qtest_writeb(global_qtest, shared_guest_address, 0xa5);
+    qtest_writel(global_qtest, peer_tx_channel + BUFC_CMD, 1);
+    qtest_writel(global_qtest, peer_tx_channel + BUFC_ADDR,
+                 shared_guest_address);
+    qtest_writel(global_qtest, peer_tx_channel, 0); /* 64-byte peer FIFO */
+    qtest_writel(global_qtest, peer_tx_channel + BUFC_WRITEDATA, 0x5a);
+
+    g_assert_cmphex(qtest_readb(global_qtest, shared_guest_address), ==, 0xa5);
+    qtest_writel(global_qtest, peer_tx_channel + BUFC_READOFFSET, 0);
+    g_assert_cmphex(qtest_readl(global_qtest,
+                                peer_tx_channel + BUFC_READDATA), ==, 0x5a);
 }
 
 /*
@@ -96,6 +120,8 @@ int main(int argc, char **argv)
 
     g_test_init(&argc, &argv, NULL);
     qtest_start("-machine efr32bg22-dual -S");
+    qtest_add_func("/efr32bg22/rf/peer-bufc-dma-address-space",
+                   test_peer_bufc_dma_uses_peer_address_space);
     qtest_add_func("/efr32bg22/rf/tx-offer-reaches-peer-rx-fifo",
                    test_tx_offer_reaches_peer_rx_fifo);
     result = g_test_run();

@@ -198,6 +198,9 @@ struct Efr32Periph
     SysBusDevice parent_obj;
     MemoryRegion peripheral_mmio;
     MemoryRegion radio_mmio;
+    MemoryRegion *memory;
+    AddressSpace dma_as;
+    bool dma_as_initialized;
     GHashTable *registers;
     uint32_t trng_state;
     uint32_t rac_state;
@@ -434,7 +437,7 @@ static void efr32_bufc_write_data_port(Efr32Periph *s, unsigned channel,
     data->data[position] = xor_write ? data->data[position] ^ value : value;
     if (buffer_address)
     {
-        address_space_write(&address_space_memory, buffer_address + position,
+        address_space_write(&s->dma_as, buffer_address + position,
                             MEMTXATTRS_UNSPECIFIED, &data->data[position], 1);
     }
     efr32_register_put(s, base + EFR32_BUFC_WRITEOFFSET, write_offset + 1);
@@ -454,7 +457,7 @@ static uint8_t efr32_bufc_read_data_port(Efr32Periph *s, unsigned channel)
 
     if (buffer_address)
     {
-        address_space_read(&address_space_memory, buffer_address + position,
+        address_space_read(&s->dma_as, buffer_address + position,
                            MEMTXATTRS_UNSPECIFIED, &value, 1);
     }
 
@@ -492,7 +495,7 @@ static GByteArray *efr32_bufc_snapshot_data(Efr32Periph *s, unsigned channel)
         uint32_t offset = efr32_bufc_storage_offset(
             s, channel, read_offset + index);
 
-        address_space_read(&address_space_memory, buffer_address + offset,
+        address_space_read(&s->dma_as, buffer_address + offset,
                            MEMTXATTRS_UNSPECIFIED, &value, 1);
         snapshot->data[index] = value;
     }
@@ -1368,6 +1371,20 @@ static const MemoryRegionOps ro = {
     .write = efr32_radio_mmio_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = {.min_access_size = 1, .max_access_size = 4}};
+
+static void efr32_periph_realize(DeviceState *dev, Error **errp)
+{
+    Efr32Periph *s = EFR32_PERIPH(dev);
+
+    if (!s->memory) {
+        error_setg(errp, "memory property was not set");
+        return;
+    }
+
+    address_space_init(&s->dma_as, s->memory, "efr32-bufc-dma");
+    s->dma_as_initialized = true;
+}
+
 static void efr32_periph_init(Object *o)
 {
     Efr32Periph *s = EFR32_PERIPH(o);
@@ -1475,6 +1492,9 @@ static void efr32_periph_finalize(Object *obj)
 {
     Efr32Periph *s = EFR32_PERIPH(obj);
 
+    if (s->dma_as_initialized) {
+        address_space_destroy(&s->dma_as);
+    }
     timer_free(s->rac_rx_timer);
     timer_free(s->rac_tx_timer);
     timer_free(s->burtc_compare_timer);
@@ -1502,14 +1522,24 @@ static void efr32_periph_rx_offer_available(Efr32RfRadio *radio)
     efr32_rac_schedule_rx_handoff(s);
 }
 
+static Property efr32_periph_properties[] = {
+    DEFINE_PROP_LINK("memory", Efr32Periph, memory, TYPE_MEMORY_REGION,
+                     MemoryRegion *),
+    DEFINE_PROP_END_OF_LIST(),
+};
+
 static void efr32_periph_class_init(ObjectClass *o, void *d)
 {
+    DeviceClass *dc = DEVICE_CLASS(o);
     Efr32RfRadioClass *radio_class = EFR32_RF_RADIO_CLASS(o);
 
+    dc->realize = efr32_periph_realize;
+    device_class_set_props(dc, efr32_periph_properties);
     RESETTABLE_CLASS(o)->phases.hold = efr32_periph_reset_hold;
     radio_class->is_rx_ready = efr32_periph_is_rx_ready;
     radio_class->rx_offer_available = efr32_periph_rx_offer_available;
 }
+
 static const TypeInfo periph_info = {.name = TYPE_EFR32_PERIPH,
                                      .parent = TYPE_SYS_BUS_DEVICE,
                                      .instance_size = sizeof(Efr32Periph),
@@ -1672,6 +1702,8 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
     }
 
     s->periph.rf_medium = s->rf_medium;
+    object_property_set_link(OBJECT(&s->periph), "memory", OBJECT(s->memory),
+                             &error_abort);
     qdev_connect_clock_in(DEVICE(&s->periph), "protimerclk", s->protimer_clk);
     qdev_connect_clock_in(DEVICE(&s->periph), "burtcclk", s->burtc_clk);
     if (!sysbus_realize(periph, errp)) {
