@@ -87,6 +87,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_CMU_BASE 0x40008000u
 #define EFR32_CMU_SYSCLKCTRL 0x070u
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_MASK 0x7u
+#define EFR32_CMU_SYSCLKCTRL_CLKSEL_FSRCO 1u
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_HFXO 3u
 #define EFR32_HFXO_BASE 0x4000c000u
 #define EFR32_HFXO_CTRL 0x028u
@@ -111,6 +112,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_DCDC_IF_REGULATION (1u << 5)
 #define EFR32_DCDC_STATUS_WARM (1u << 1)
 #define EFR32_DCDC_STATUS_RUNNING (1u << 2)
+
+#define EFR32_EMU_BASE 0x40004000u
+#define EFR32_EMU_STATUS 0x084u
+#define EFR32_EMU_STATUS_RESET 0x00000080u
 
 #define EFR32_BUFC_BASE 0xaa000000u
 #define EFR32_BUFC_FIRST 0x00cu
@@ -841,6 +846,10 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     s->rac_state = EFR32_RAC_STATE_OFF;
     s->hfxo_fsm_locked = true;
     timer_del(s->rac_tx_timer);
+    efr32_register_put(s, EFR32_CMU_BASE + EFR32_CMU_SYSCLKCTRL,
+                       EFR32_CMU_SYSCLKCTRL_CLKSEL_FSRCO);
+    efr32_register_put(s, EFR32_EMU_BASE + EFR32_EMU_STATUS,
+                       EFR32_EMU_STATUS_RESET);
     efr32_register_put(s, EFR32_AGC_BASE + EFR32_AGC_RSSI, 0x8000);
     efr32_register_put(s, EFR32_AGC_BASE + EFR32_AGC_FRAMERSSI, 0x8000);
     for (unsigned irq = 0; irq < G_N_ELEMENTS(s->irq); irq++)
