@@ -377,15 +377,20 @@ void efr32_rf_medium_reset_radio(Efr32RfMedium *medium,
 
     if (reset_tx_source) {
         efr32_rf_medium_clear_latest_tx_snapshot(medium);
-        efr32_rf_medium_clear_rx_offers(medium);
-        return;
     }
 
     for (link = medium->rx_offers.head; link;) {
         Efr32RfRxDeliveryRequest *request = link->data;
         GList *next = link->next;
 
-        if (efr32_rf_rx_delivery_request_get_receiver(request) == radio) {
+        /*
+         * A reset only invalidates medium state owned by, or addressed to,
+         * this radio.  In particular, another source's already queued offer
+         * must not disappear merely because the current latest transmitter
+         * reset before its receiver's deferred handoff.
+         */
+        if (efr32_rf_rx_delivery_request_get_receiver(request) == radio ||
+            request->source == radio) {
             g_queue_delete_link(&medium->rx_offers, link);
             efr32_rf_rx_delivery_request_free(request);
         }
