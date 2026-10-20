@@ -1480,6 +1480,12 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
     {
         efr32_rac_cancel_tx_completion(s);
         timer_del(s->rac_rx_timer);
+        /*
+         * FORCEDISABLE is an explicit abort just like TXDIS.  Withdraw the
+         * in-flight model transaction so a deferred peer handoff cannot turn
+         * a cancelled transmission into RXDONE.
+         */
+        efr32_rf_medium_withdraw_latest_tx(s->rf_medium, EFR32_RF_RADIO(s));
         efr32_rac_set_state(s, EFR32_RAC_STATE_OFF);
     }
 
