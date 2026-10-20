@@ -65,6 +65,8 @@
 #define DCDC_IF_REGULATION    (1u << 5)
 #define EMU_BASE              0x40004000
 #define EMU_STATUS            0x084
+#define MSC_BASE              0x40030000
+#define MSC_STATUS            0x01c
 #define HFXO_BASE             0x4000c000
 #define HFXO_CTRL             0x028
 #define HFXO_CMD              0x050
@@ -249,6 +251,11 @@ static void test_dcdc_regulation(void)
 static void test_emu_status_reset(void)
 {
     g_assert_cmphex(readl(EMU_BASE + EMU_STATUS), ==, 0x80);
+}
+
+static void test_msc_status_reset(void)
+{
+    g_assert_cmphex(readl(MSC_BASE + MSC_STATUS), ==, 0x08000008);
 }
 
 static void test_hfxo_ready_status(void)
@@ -537,6 +544,7 @@ int main(int argc, char **argv)
                    test_radio_nonsecure_alias);
     qtest_add_func("/efr32bg22/dcdc-regulation", test_dcdc_regulation);
     qtest_add_func("/efr32bg22/emu-status-reset", test_emu_status_reset);
+    qtest_add_func("/efr32bg22/msc-status-reset", test_msc_status_reset);
     qtest_add_func("/efr32bg22/hfxo-ready-status", test_hfxo_ready_status);
     qtest_add_func("/efr32bg22/bufc-data-port", test_bufc_data_port);
     qtest_add_func("/efr32bg22/bufc-tx-fifo-setup-latches",

@@ -117,6 +117,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_EMU_STATUS 0x084u
 #define EFR32_EMU_STATUS_RESET 0x00000080u
 
+#define EFR32_MSC_BASE 0x40030000u
+#define EFR32_MSC_STATUS 0x01cu
+#define EFR32_MSC_STATUS_RESET 0x08000008u
+
 #define EFR32_BUFC_BASE 0xaa000000u
 #define EFR32_BUFC_FIRST 0x00cu
 #define EFR32_BUFC_STRIDE 0x040u
@@ -850,6 +854,8 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
                        EFR32_CMU_SYSCLKCTRL_CLKSEL_FSRCO);
     efr32_register_put(s, EFR32_EMU_BASE + EFR32_EMU_STATUS,
                        EFR32_EMU_STATUS_RESET);
+    efr32_register_put(s, EFR32_MSC_BASE + EFR32_MSC_STATUS,
+                       EFR32_MSC_STATUS_RESET);
     efr32_register_put(s, EFR32_AGC_BASE + EFR32_AGC_RSSI, 0x8000);
     efr32_register_put(s, EFR32_AGC_BASE + EFR32_AGC_FRAMERSSI, 0x8000);
     for (unsigned irq = 0; irq < G_N_ELEMENTS(s->irq); irq++)
