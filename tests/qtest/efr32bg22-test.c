@@ -859,6 +859,29 @@ static void test_bufc_sparse_threshold_flag(void)
     g_assert_cmphex(readl(channel + BUFC_STATUS), ==, (1u << 20) | 1u);
 }
 
+static void test_bufc_descriptor_threshold_flag(void)
+{
+    uint32_t channel = BUFC_BASE + BUFC_CH2;
+    uint32_t threshold_flag = 1u << 18;
+
+    /*
+     * The archived RAIL descriptor-ring setup uses buffer 2, whose global
+     * threshold source is bit 18 (not a compact third threshold bit).  This
+     * checks only BUFC's documented counter/flag presentation; it does not
+     * claim that this CPU data-port write is a hardware descriptor producer.
+     */
+    writel(BUFC_BASE + BUFC_IF + REGISTER_CLEAR_WINDOW, threshold_flag);
+    writel(BUFC_BASE + BUFC_IEN, threshold_flag);
+    writel(channel + BUFC_CMD, 1);
+    writel(channel, 3);
+    writel(channel + BUFC_THRESHOLD, 0);
+    writel(channel + BUFC_WRITEDATA, 0x5a);
+
+    g_assert_cmphex(readl(BUFC_BASE + BUFC_IF) & threshold_flag, ==,
+                    threshold_flag);
+    g_assert_cmphex(readl(channel + BUFC_STATUS), ==, (1u << 20) | 1u);
+}
+
 static void test_protimer_trace_latches(void)
 {
     writel(PROTIMER_BASE + PROTIMER_CTRL, 0x00011102);
@@ -1272,6 +1295,8 @@ int main(int argc, char **argv)
                    test_bufc_channel_register_masks);
     qtest_add_func("/efr32bg22/bufc-sparse-threshold-flag",
                    test_bufc_sparse_threshold_flag);
+    qtest_add_func("/efr32bg22/bufc-descriptor-threshold-flag",
+                   test_bufc_descriptor_threshold_flag);
     qtest_add_func("/efr32bg22/protimer-trace-latches",
                    test_protimer_trace_latches);
     qtest_add_func("/efr32bg22/protimer-secure-nonsecure-alias",
