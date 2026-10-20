@@ -42,6 +42,7 @@
 #define RAC_BASE              0xa8020000
 #define RAC_STATUS            0x00c
 #define RAC_CMD               0x010
+#define RAC_CTRL              0x014
 #define RAC_SR0               0x040
 #define RAC_RXENSRCEN         0x008
 #define RAC_IEN               0x020
@@ -49,6 +50,7 @@
 #define RAC_CMD_TXEN          (1u << 0)
 #define RAC_CMD_TXDIS         (1u << 5)
 #define RAC_CMD_RXDIS         (1u << 8)
+#define RAC_CTRL_FORCEDISABLE (1u << 0)
 #define RAC_RXENSRCEN_SWRXEN  (1u << 1)
 #define RAC_STATUS_STATE_MASK 0x0f000000
 #define RAC_STATUS_STATE_RXSEARCH (2u << 24)
@@ -461,6 +463,21 @@ static void test_rac_sr0_clear_alias(void)
     g_assert_cmphex(readl(RAC_BASE + RAC_SR0), ==, UINT32_MAX & ~(1u << 5));
 }
 
+static void test_rac_force_disable(void)
+{
+    writel(RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+    g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK,
+                    ==, RAC_STATUS_STATE_TX);
+
+    writel(RAC_BASE + RAC_CTRL, RAC_CTRL_FORCEDISABLE);
+    g_assert_cmphex(readl(RAC_BASE + RAC_CTRL), ==, RAC_CTRL_FORCEDISABLE);
+    g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK,
+                    ==, 0);
+
+    writel(RAC_BASE + RAC_CTRL, 0);
+    g_assert_cmphex(readl(RAC_BASE + RAC_CTRL), ==, 0);
+}
+
 int main(int argc, char **argv)
 {
     int result;
@@ -516,6 +533,7 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/rac-masks", test_rac_masks);
     qtest_add_func("/efr32bg22/rac-sr0-clear-alias",
                    test_rac_sr0_clear_alias);
+    qtest_add_func("/efr32bg22/rac-force-disable", test_rac_force_disable);
 
     result = g_test_run();
     qtest_end();

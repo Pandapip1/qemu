@@ -53,6 +53,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_RAC_STATUS 0x00cu
 #define EFR32_RAC_RXENSRCEN 0x008u
 #define EFR32_RAC_CMD 0x010u
+#define EFR32_RAC_CTRL 0x014u
 #define EFR32_RAC_IF 0x01cu
 #define EFR32_RAC_IEN 0x020u
 #define EFR32_RAC_SEQIF 0x028u
@@ -60,6 +61,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_RAC_CMD_TXEN (1u << 0)
 #define EFR32_RAC_CMD_TXDIS (1u << 5)
 #define EFR32_RAC_CMD_RXDIS (1u << 8)
+#define EFR32_RAC_CTRL_FORCEDISABLE (1u << 0)
 #define EFR32_RAC_RXENSRCEN_SWRXEN (1u << 1)
 #define EFR32_RAC_STATE_OFF 0u
 #define EFR32_RAC_STATE_RXSEARCH 2u
@@ -680,6 +682,14 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
 
     efr32_register_put(s, register_address,
                        efr32_radio_mask_write(register_address, next));
+
+    /* CTRL.FORCEDISABLE cancels an active RAC operation. */
+    if (register_address == EFR32_RAC_BASE + EFR32_RAC_CTRL &&
+        (next & EFR32_RAC_CTRL_FORCEDISABLE))
+    {
+        timer_del(s->rac_tx_timer);
+        efr32_rac_set_state(s, EFR32_RAC_STATE_OFF);
+    }
 
     /*
      * RAIL_StartRx writes SWRXEN through the RXENSRCEN SET alias.  The
