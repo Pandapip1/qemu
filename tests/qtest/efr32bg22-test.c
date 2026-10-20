@@ -455,6 +455,29 @@ static void test_bufc_rx_fifo_setup_latches(void)
     g_assert_cmphex(readl(channel + BUFC_CMD), ==, 1);
 }
 
+static void test_bufc_rx_descriptor_ring_setup_latches(void)
+{
+    uint32_t channel = BUFC_BASE + BUFC_CH2;
+
+    /*
+     * RAIL configures BUFC channel 2 as its eight-byte RX descriptor ring:
+     * CMD=1, capacity encoding, backing address, and threshold=7.  This is
+     * distinct from the channel-1 sequencer payload-byte FIFO.
+     */
+    writel(BUFC_BASE + BUFC_IF, 0x00050000);
+    writel(channel + BUFC_CMD, 1);
+    writel(channel, 3);
+    writel(channel + 0x004, 0x20002400);
+    writel(channel + BUFC_THRESHOLD, 7);
+    writel(BUFC_BASE + BUFC_IF + REGISTER_CLEAR_WINDOW, 0x00050000);
+
+    g_assert_cmphex(readl(channel), ==, 3);
+    g_assert_cmphex(readl(channel + 0x004), ==, 0x20002400);
+    g_assert_cmphex(readl(channel + BUFC_THRESHOLD), ==, 7);
+    g_assert_cmphex(readl(channel + BUFC_CMD), ==, 1);
+    g_assert_cmphex(readl(BUFC_BASE + BUFC_IF) & 0x00050000, ==, 0);
+}
+
 static void test_bufc_interrupt_register_masks(void)
 {
     writel(BUFC_BASE + BUFC_IF, UINT32_MAX);
@@ -738,6 +761,8 @@ int main(int argc, char **argv)
                    test_bufc_overflow_latch);
     qtest_add_func("/efr32bg22/bufc-rx-fifo-setup-latches",
                    test_bufc_rx_fifo_setup_latches);
+    qtest_add_func("/efr32bg22/bufc-rx-descriptor-ring-setup-latches",
+                   test_bufc_rx_descriptor_ring_setup_latches);
     qtest_add_func("/efr32bg22/bufc-interrupt-register-masks",
                    test_bufc_interrupt_register_masks);
     qtest_add_func("/efr32bg22/bufc-channel-register-masks",
