@@ -51,6 +51,11 @@
 #define RAC_SEQIF_STATEOFF    (1u << 16)
 #define RAC_SEQIF_STATERXSEARCH (1u << 18)
 #define RAC_SEQIF_STATETX     (1u << 25)
+#define DCDC_BASE             0x40094000
+#define DCDC_CTRL             0x008
+#define DCDC_IF               0x024
+#define DCDC_STATUS           0x02c
+#define DCDC_IF_REGULATION    (1u << 5)
 #define BUFC_BASE            0xaa000000
 #define BUFC_CH0             0x00c
 #define BUFC_CH1             0x04c
@@ -191,6 +196,17 @@ static void test_radio_nonsecure_alias(void)
 
     g_assert_cmphex(readl(secure_address), ==, 0xffff);
     g_assert_cmphex(readl(nonsecure_address), ==, 0xffff);
+}
+
+static void test_dcdc_regulation(void)
+{
+    g_assert_cmphex(readl(DCDC_BASE + DCDC_IF) & DCDC_IF_REGULATION, ==, 0);
+
+    writel(DCDC_BASE + DCDC_CTRL + REGISTER_SET_WINDOW, 1);
+
+    g_assert_cmphex(readl(DCDC_BASE + DCDC_IF) & DCDC_IF_REGULATION, ==,
+                    DCDC_IF_REGULATION);
+    g_assert_cmphex(readl(DCDC_BASE + DCDC_STATUS), ==, 6);
 }
 
 static void test_bufc_data_port(void)
@@ -416,6 +432,7 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/radio-enable-masks", test_radio_enable_masks);
     qtest_add_func("/efr32bg22/radio-nonsecure-alias",
                    test_radio_nonsecure_alias);
+    qtest_add_func("/efr32bg22/dcdc-regulation", test_dcdc_regulation);
     qtest_add_func("/efr32bg22/bufc-data-port", test_bufc_data_port);
     qtest_add_func("/efr32bg22/bufc-tx-fifo-setup-latches",
                    test_bufc_tx_fifo_setup_latches);

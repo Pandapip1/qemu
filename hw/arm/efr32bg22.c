@@ -533,6 +533,8 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
         return 0x00010001;
     if (address == 0x4000c058)
         return 0x000b0003;
+    if (address == 0x40094024)
+        return efr32_register_get(s, 0x40094008) & 1 ? 0x20 : 0;
     if (address == 0x4009402c)
         return efr32_register_get(s, 0x40094008) & 1 ? 6 : 1;
     if (address == 0x4a018004 || address == 0x4a018024)
