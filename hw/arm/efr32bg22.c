@@ -97,6 +97,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_FSRCO 1u
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_HFXO 3u
 #define EFR32_HFXO_BASE 0x4000c000u
+#define EFR32_HFXO_SECURE_BASE 0x5000c000u
 #define EFR32_HFXO_CTRL 0x028u
 #define EFR32_HFXO_CMD 0x050u
 #define EFR32_HFXO_STATUS 0x058u
@@ -455,7 +456,7 @@ static void efr32_bufc_clear(Efr32Periph *s, unsigned channel)
 }
 
 /* Each Series-2 block has normal, SET, CLR, and TGL 4-KiB windows. */
-static uint32_t efr32_register_key(uint32_t address)
+static uint32_t efr32_peripheral_canonical_address(uint32_t address)
 {
     /*
      * RAIL accesses PROTIMER through its non-secure window at 0xb801c000,
@@ -465,6 +466,18 @@ static uint32_t efr32_register_key(uint32_t address)
     if ((address & ~0x3fffu) == EFR32_PROTIMER_NS_BASE) {
         address = EFR32_PROTIMER_BASE + (address & 0x3fffu);
     }
+
+    /* HFXO0 is visible through both the secure and non-secure peripheral map. */
+    if ((address & ~0x3fffu) == EFR32_HFXO_SECURE_BASE) {
+        address = EFR32_HFXO_BASE + (address & 0x3fffu);
+    }
+
+    return address;
+}
+
+static uint32_t efr32_register_key(uint32_t address)
+{
+    address = efr32_peripheral_canonical_address(address);
 
     return (address & ~0x3fffu) | (address & 0xffcu);
 }
@@ -761,6 +774,7 @@ static uint32_t efr32_protimer_counter(Efr32Periph *s)
 
 static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
 {
+    address = efr32_peripheral_canonical_address(address);
     uint32_t offset = address & 0xfff;
     unsigned channel;
     uint32_t register_offset;

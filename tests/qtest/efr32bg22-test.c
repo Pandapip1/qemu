@@ -80,6 +80,7 @@ static char *tx_snapshot_trace_path;
 #define MSC_BASE              0x40030000
 #define MSC_STATUS            0x01c
 #define HFXO_BASE             0x4000c000
+#define HFXO_SECURE_BASE      0x5000c000
 #define HFXO_CTRL             0x028
 #define HFXO_CMD              0x050
 #define HFXO_STATUS           0x058
@@ -329,18 +330,20 @@ static void test_hfxo_ready_status(void)
     qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
     g_assert_cmphex(readl(CMU_BASE + CMU_SYSCLKCTRL) & 7, ==, 1);
     g_assert_cmphex(readl(HFXO_BASE + HFXO_CTRL), ==, HFXO_CTRL_DISONDEMAND);
-    g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==, 0);
+    g_assert_cmphex(readl(HFXO_SECURE_BASE + HFXO_STATUS), ==, 0);
 
-    writel(HFXO_BASE + HFXO_CTRL + REGISTER_SET_WINDOW, 1);
+    writel(HFXO_SECURE_BASE + HFXO_CTRL + REGISTER_SET_WINDOW, 1);
+    g_assert_cmphex(readl(HFXO_SECURE_BASE + HFXO_STATUS), ==,
+                    HFXO_STATUS_READY | HFXO_STATUS_FSMLOCK);
     g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==,
                     HFXO_STATUS_READY | HFXO_STATUS_FSMLOCK);
 
-    writel(HFXO_BASE + HFXO_CMD, 1u << 1);
+    writel(HFXO_SECURE_BASE + HFXO_CMD, 1u << 1);
     g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==, HFXO_STATUS_READY);
 
     /* Re-enable without reading disabled STATUS: a fresh lock must start. */
-    writel(HFXO_BASE + HFXO_CTRL + REGISTER_CLEAR_WINDOW, 1);
-    writel(HFXO_BASE + HFXO_CTRL + REGISTER_SET_WINDOW, 1);
+    writel(HFXO_SECURE_BASE + HFXO_CTRL + REGISTER_CLEAR_WINDOW, 1);
+    writel(HFXO_SECURE_BASE + HFXO_CTRL + REGISTER_SET_WINDOW, 1);
     g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==,
                     HFXO_STATUS_READY | HFXO_STATUS_FSMLOCK);
 
