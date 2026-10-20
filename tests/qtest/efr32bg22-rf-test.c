@@ -26,6 +26,7 @@
 #define BUFC_CH0                 0x00c
 #define BUFC_CH1                 0x04c
 #define BUFC_ADDR                0x004
+#define BUFC_WRITEOFFSET         0x008
 #define BUFC_READOFFSET          0x00c
 #define BUFC_READDATA            0x014
 #define BUFC_WRITEDATA           0x018
@@ -66,20 +67,23 @@ static void test_peer_bufc_dma_uses_peer_address_space(void)
 
 /*
  * This fixture has two native EFR32 SoCs.  qtest only performs their normal
- * MMIO staging/configuration: TX bytes enter the source's BUFC channel 0 and
- * the receiver is placed in RXSEARCH.  No QMP, host Bluetooth, or packet
+ * MMIO staging/configuration: the source's guest-backed BUFC channel 0 holds
+ * the TX bytes and the receiver is placed in RXSEARCH with an independent,
+ * same-address guest-backed BUFC FIFO. No QMP, host Bluetooth, or packet
  * injection path exists in this test.
  */
 static void test_tx_offer_reaches_peer_rx_fifo(void)
 {
     const uint8_t payload[] = { 0x91, 0x72, 0xe3 };
+    const uint32_t fifo_guest_address = 0x20000180;
     const uint64_t peer_rx_channel = peer(BUFC_BASE + BUFC_CH1);
     const uint32_t source_tx_channel = BUFC_BASE + BUFC_CH0;
 
     qtest_writel(global_qtest, peer(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW),
                  FRC_IF_RXDONE);
     qtest_writel(global_qtest, peer_rx_channel + BUFC_CMD, 1);
-    qtest_writel(global_qtest, peer_rx_channel, 3); /* 512-byte peer RX FIFO */
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_ADDR, fifo_guest_address);
+    qtest_writel(global_qtest, peer_rx_channel, 0); /* 64-byte peer RX FIFO */
     qtest_writel(global_qtest,
                  peer(RAC_BASE + RAC_RXENSRCEN + REGISTER_SET_WINDOW),
                  RAC_RXENSRCEN_SWRXEN);
@@ -92,9 +96,12 @@ static void test_tx_offer_reaches_peer_rx_fifo(void)
 
     qtest_writel(global_qtest, source_tx_channel + BUFC_CMD, 1);
     for (size_t index = 0; index < G_N_ELEMENTS(payload); index++) {
-        qtest_writel(global_qtest, source_tx_channel + BUFC_WRITEDATA,
-                     payload[index]);
+        qtest_writeb(global_qtest, fifo_guest_address + index, payload[index]);
     }
+    qtest_writel(global_qtest, source_tx_channel + BUFC_ADDR, fifo_guest_address);
+    qtest_writel(global_qtest, source_tx_channel, 0); /* 64-byte source TX FIFO */
+    qtest_writel(global_qtest, source_tx_channel + BUFC_WRITEOFFSET,
+                 G_N_ELEMENTS(payload));
     qtest_writel(global_qtest, RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
 
     qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
