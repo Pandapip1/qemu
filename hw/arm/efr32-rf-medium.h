@@ -37,6 +37,24 @@ typedef struct Efr32RfTxMetadata {
 
 typedef struct Efr32RfTxSnapshot Efr32RfTxSnapshot;
 
+typedef enum Efr32RfRxReceiverState {
+    /* RAC must already report RXSEARCH before an RX handoff can proceed. */
+    EFR32_RF_RX_RECEIVER_STATE_RAC_RXSEARCH,
+} Efr32RfRxReceiverState;
+
+#define EFR32_RF_RX_BUFC_CHANNEL 1
+
+/*
+ * Preconditions for a future medium-to-radio receive handoff.  These fields
+ * describe the modeled EFR32 boundary, not an over-the-air packet format.
+ */
+typedef struct Efr32RfRxMetadata {
+    Efr32RfRxReceiverState receiver_state;
+    uint8_t buffer_channel;
+} Efr32RfRxMetadata;
+
+typedef struct Efr32RfRxDeliveryRequest Efr32RfRxDeliveryRequest;
+
 /*
  * This interface deliberately models only membership in an in-process RF
  * medium.  It does not define an air-frame format or a host HCI transport.
@@ -80,6 +98,24 @@ void efr32_rf_medium_set_latest_tx_snapshot(Efr32RfMedium *medium,
 const Efr32RfTxSnapshot *efr32_rf_medium_get_latest_tx_snapshot(
     const Efr32RfMedium *medium);
 void efr32_rf_medium_clear_latest_tx_snapshot(Efr32RfMedium *medium);
+
+/*
+ * Create an immutable, caller-owned request for a future RX handoff.  This
+ * does not inject a packet, alter any peripheral register, or raise an IRQ.
+ */
+Efr32RfRxDeliveryRequest *efr32_rf_medium_prepare_rx_delivery(
+    Efr32RfMedium *medium, Efr32RfRadio *receiver,
+    const Efr32RfRxMetadata *metadata, const uint8_t *data, size_t length,
+    Error **errp);
+void efr32_rf_rx_delivery_request_free(Efr32RfRxDeliveryRequest *request);
+
+/* These accessors return borrowed data valid until request_free(). */
+Efr32RfRadio *efr32_rf_rx_delivery_request_get_receiver(
+    const Efr32RfRxDeliveryRequest *request);
+const Efr32RfRxMetadata *efr32_rf_rx_delivery_request_get_metadata(
+    const Efr32RfRxDeliveryRequest *request);
+GBytes *efr32_rf_rx_delivery_request_get_data(
+    const Efr32RfRxDeliveryRequest *request);
 
 void efr32_rf_medium_register_types(void);
 

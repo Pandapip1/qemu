@@ -48,6 +48,14 @@ static Efr32RfTxMetadata valid_tx_metadata(void)
     };
 }
 
+static Efr32RfRxMetadata valid_rx_metadata(void)
+{
+    return (Efr32RfRxMetadata){
+        .receiver_state = EFR32_RF_RX_RECEIVER_STATE_RAC_RXSEARCH,
+        .buffer_channel = EFR32_RF_RX_BUFC_CHANNEL,
+    };
+}
+
 static void test_snapshot_copies_data(RfMediumFixture *fixture,
                                       gconstpointer data)
 {
@@ -140,6 +148,77 @@ static void test_snapshot_sequences_are_ordered(RfMediumFixture *fixture,
     efr32_rf_tx_snapshot_free(first);
 }
 
+static void test_rx_delivery_request_copies_data(RfMediumFixture *fixture,
+                                                  gconstpointer data)
+{
+    uint8_t received[] = {0xc3, 0x5a};
+    Efr32RfRxMetadata metadata = valid_rx_metadata();
+    Efr32RfRxDeliveryRequest *request;
+    const uint8_t *captured;
+    gsize length;
+
+    request = efr32_rf_medium_prepare_rx_delivery(
+        fixture->medium, fixture->radio, &metadata, received, sizeof(received),
+        &error_abort);
+    received[0] = 0;
+
+    captured = g_bytes_get_data(
+        efr32_rf_rx_delivery_request_get_data(request), &length);
+    g_assert_cmpuint(length, ==, sizeof(received));
+    g_assert_cmpuint(captured[0], ==, 0xc3);
+    g_assert_true(efr32_rf_rx_delivery_request_get_receiver(request) ==
+                  fixture->radio);
+    g_assert_cmpint(
+        efr32_rf_rx_delivery_request_get_metadata(request)->receiver_state, ==,
+        EFR32_RF_RX_RECEIVER_STATE_RAC_RXSEARCH);
+    g_assert_cmpuint(
+        efr32_rf_rx_delivery_request_get_metadata(request)->buffer_channel, ==,
+        EFR32_RF_RX_BUFC_CHANNEL);
+    efr32_rf_rx_delivery_request_free(request);
+}
+
+static void test_rx_delivery_request_validation(RfMediumFixture *fixture,
+                                                gconstpointer data)
+{
+    Efr32RfRxMetadata metadata = valid_rx_metadata();
+    Efr32RfRxDeliveryRequest *request;
+    Efr32RfRadio *other;
+    Error *err = NULL;
+
+    metadata.receiver_state = 99;
+    request = efr32_rf_medium_prepare_rx_delivery(
+        fixture->medium, fixture->radio, &metadata, NULL, 0, &err);
+    g_assert_null(request);
+    g_assert_nonnull(err);
+    error_free(err);
+
+    metadata = valid_rx_metadata();
+    metadata.buffer_channel = 0;
+    err = NULL;
+    request = efr32_rf_medium_prepare_rx_delivery(
+        fixture->medium, fixture->radio, &metadata, NULL, 0, &err);
+    g_assert_null(request);
+    g_assert_nonnull(err);
+    error_free(err);
+
+    metadata = valid_rx_metadata();
+    err = NULL;
+    request = efr32_rf_medium_prepare_rx_delivery(
+        fixture->medium, fixture->radio, &metadata, NULL, 1, &err);
+    g_assert_null(request);
+    g_assert_nonnull(err);
+    error_free(err);
+
+    other = EFR32_RF_RADIO(object_new(TYPE_TEST_EFR32_RF_RADIO));
+    err = NULL;
+    request = efr32_rf_medium_prepare_rx_delivery(
+        fixture->medium, other, &metadata, NULL, 0, &err);
+    g_assert_null(request);
+    g_assert_nonnull(err);
+    error_free(err);
+    object_unref(OBJECT(other));
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -160,6 +239,12 @@ int main(int argc, char **argv)
     g_test_add("/efr32-rf-medium/snapshot-sequences-are-ordered",
                RfMediumFixture, NULL, rf_medium_fixture_setup,
                test_snapshot_sequences_are_ordered, rf_medium_fixture_teardown);
+    g_test_add("/efr32-rf-medium/rx-delivery-request-copies-data",
+               RfMediumFixture, NULL, rf_medium_fixture_setup,
+               test_rx_delivery_request_copies_data, rf_medium_fixture_teardown);
+    g_test_add("/efr32-rf-medium/rx-delivery-request-validation",
+               RfMediumFixture, NULL, rf_medium_fixture_setup,
+               test_rx_delivery_request_validation, rf_medium_fixture_teardown);
 
     return g_test_run();
 }

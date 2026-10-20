@@ -21,6 +21,12 @@ struct Efr32RfTxSnapshot {
     GBytes *data;
 };
 
+struct Efr32RfRxDeliveryRequest {
+    Efr32RfRadio *receiver;
+    Efr32RfRxMetadata metadata;
+    GBytes *data;
+};
+
 void efr32_rf_medium_attach(Efr32RfMedium *medium, Efr32RfRadio *radio,
                             Error **errp)
 {
@@ -142,6 +148,72 @@ const Efr32RfTxSnapshot *efr32_rf_medium_get_latest_tx_snapshot(
 void efr32_rf_medium_clear_latest_tx_snapshot(Efr32RfMedium *medium)
 {
     efr32_rf_medium_set_latest_tx_snapshot(medium, NULL);
+}
+
+Efr32RfRxDeliveryRequest *efr32_rf_medium_prepare_rx_delivery(
+    Efr32RfMedium *medium, Efr32RfRadio *receiver,
+    const Efr32RfRxMetadata *metadata, const uint8_t *data, size_t length,
+    Error **errp)
+{
+    Efr32RfRxDeliveryRequest *request;
+
+    if (!efr32_rf_medium_has_radio(medium, receiver)) {
+        error_setg(errp, "%s is not attached to this RF medium",
+                   object_get_typename(OBJECT(receiver)));
+        return NULL;
+    }
+    if (!metadata) {
+        error_setg(errp, "RF RX delivery request requires metadata");
+        return NULL;
+    }
+    if (metadata->receiver_state != EFR32_RF_RX_RECEIVER_STATE_RAC_RXSEARCH) {
+        error_setg(errp, "RF RX delivery request requires RAC RXSEARCH");
+        return NULL;
+    }
+    if (metadata->buffer_channel != EFR32_RF_RX_BUFC_CHANNEL) {
+        error_setg(errp, "RF RX delivery request must use BUFC channel %u",
+                   EFR32_RF_RX_BUFC_CHANNEL);
+        return NULL;
+    }
+    if (!data && length) {
+        error_setg(errp, "RF RX delivery request has data length but no data");
+        return NULL;
+    }
+
+    request = g_new0(Efr32RfRxDeliveryRequest, 1);
+    request->receiver = EFR32_RF_RADIO(object_ref(OBJECT(receiver)));
+    request->metadata = *metadata;
+    request->data = g_bytes_new(data, length);
+    return request;
+}
+
+void efr32_rf_rx_delivery_request_free(Efr32RfRxDeliveryRequest *request)
+{
+    if (!request) {
+        return;
+    }
+
+    object_unref(OBJECT(request->receiver));
+    g_bytes_unref(request->data);
+    g_free(request);
+}
+
+Efr32RfRadio *efr32_rf_rx_delivery_request_get_receiver(
+    const Efr32RfRxDeliveryRequest *request)
+{
+    return request->receiver;
+}
+
+const Efr32RfRxMetadata *efr32_rf_rx_delivery_request_get_metadata(
+    const Efr32RfRxDeliveryRequest *request)
+{
+    return &request->metadata;
+}
+
+GBytes *efr32_rf_rx_delivery_request_get_data(
+    const Efr32RfRxDeliveryRequest *request)
+{
+    return request->data;
 }
 
 static void efr32_rf_medium_finalize(Object *obj)
