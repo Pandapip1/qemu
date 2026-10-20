@@ -303,6 +303,59 @@ unsigned efr32_rf_medium_offer_latest_tx(Efr32RfMedium *medium,
     return offers;
 }
 
+unsigned efr32_rf_medium_offer_active_tx_to_receiver(Efr32RfMedium *medium,
+                                                      Efr32RfRadio *receiver,
+                                                      Error **errp)
+{
+    const Efr32RfTxSnapshot *snapshot = medium->latest_tx_snapshot;
+    Efr32RfRxMetadata metadata = {
+        .buffer_channel = EFR32_RF_RX_BUFC_CHANNEL,
+    };
+    Efr32RfRadio *source;
+    uint64_t *active_sequence;
+    Efr32RfRxDeliveryRequest *request;
+    const uint8_t *data;
+    gsize length;
+
+    if (!efr32_rf_medium_has_radio(medium, receiver)) {
+        error_setg(errp, "%s is not attached to this RF medium",
+                   object_get_typename(OBJECT(receiver)));
+        return 0;
+    }
+    if (!snapshot || !efr32_rf_radio_is_rx_ready(receiver)) {
+        return 0;
+    }
+
+    source = efr32_rf_tx_snapshot_get_radio(snapshot);
+    active_sequence = g_hash_table_lookup(medium->active_tx_sequences, source);
+    if (source == receiver || !active_sequence ||
+        *active_sequence != efr32_rf_tx_snapshot_get_sequence(snapshot)) {
+        return 0;
+    }
+
+    /* Re-entering RXSEARCH must not duplicate the same transaction's offer. */
+    for (GList *link = medium->rx_offers.head; link; link = link->next) {
+        Efr32RfRxDeliveryRequest *queued = link->data;
+
+        if (queued->receiver == receiver && queued->source == source &&
+            queued->tx_sequence == *active_sequence) {
+            return 0;
+        }
+    }
+
+    data = g_bytes_get_data(efr32_rf_tx_snapshot_get_data(snapshot), &length);
+    request = efr32_rf_medium_prepare_rx_delivery(medium, receiver, &metadata,
+                                                   data, length, errp);
+    if (!request) {
+        return 0;
+    }
+    request->source = EFR32_RF_RADIO(object_ref(OBJECT(source)));
+    request->tx_sequence = *active_sequence;
+    g_queue_push_tail(&medium->rx_offers, request);
+    efr32_rf_radio_rx_offer_available(receiver);
+    return 1;
+}
+
 unsigned efr32_rf_medium_withdraw_active_tx(Efr32RfMedium *medium,
                                              Efr32RfRadio *source)
 {

@@ -150,6 +150,15 @@ GBytes *efr32_rf_rx_delivery_request_get_data(
  */
 unsigned efr32_rf_medium_offer_latest_tx(Efr32RfMedium *medium,
                                          Error **errp);
+/*
+ * Offer the current latest snapshot to one receiver only if that snapshot's
+ * source still has the model's synthetic TX transaction active. This lets a
+ * receiver entering RXSEARCH during that bounded window observe the same
+ * mailbox handoff as a receiver already listening at TXEN.
+ */
+unsigned efr32_rf_medium_offer_active_tx_to_receiver(Efr32RfMedium *medium,
+                                                      Efr32RfRadio *receiver,
+                                                      Error **errp);
 unsigned efr32_rf_medium_get_rx_offer_count(const Efr32RfMedium *medium);
 Efr32RfRxDeliveryRequest *efr32_rf_medium_take_rx_offer(
     Efr32RfMedium *medium);

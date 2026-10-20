@@ -694,6 +694,15 @@ static void efr32_rac_set_state(Efr32Periph *s, uint32_t state)
                        efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_SEQIF) |
                            sequence_flag);
     efr32_rac_update_irqs(s);
+    if (state == EFR32_RAC_STATE_RXSEARCH) {
+        /*
+         * RXSEARCH can begin after a peer's TXEN but before that model
+         * transaction completes. Offer that still-active snapshot now; the
+         * medium rejects completed transactions and duplicate offers.
+         */
+        efr32_rf_medium_offer_active_tx_to_receiver(
+            s->rf_medium, EFR32_RF_RADIO(s), &error_abort);
+    }
     trace_efr32bg22_rac_state(previous_state, state);
 }
 
