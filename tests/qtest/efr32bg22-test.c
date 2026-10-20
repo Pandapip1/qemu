@@ -569,6 +569,26 @@ static void test_rac_tx_completion(void)
                     FRC_IF_TXDONE);
 }
 
+/* TXDIS cancels QEMU's synthetic completion; it is not a hardware timing claim. */
+static void test_rac_tx_disable_cancels_completion(void)
+{
+    writel(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW, FRC_IF_TXDONE);
+    writel(RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+    g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK, ==,
+                    RAC_STATUS_STATE_TX);
+
+    writel(RAC_BASE + RAC_CMD, RAC_CMD_TXDIS);
+    g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK, ==,
+                    0);
+    g_assert_cmphex(readl(RAC_BASE + RAC_SEQIF) & RAC_SEQIF_STATEOFF, ==,
+                    RAC_SEQIF_STATEOFF);
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(150001);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+    g_assert_cmphex(readl(FRC_BASE + FRC_IF) & FRC_IF_TXDONE, ==, 0);
+}
+
 static void test_rac_tx_snapshot_captures_staged_bufc(void)
 {
     const uint32_t tx_channel = BUFC_BASE + BUFC_CH0;
@@ -731,6 +751,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/protimer-counter", test_protimer_counter);
     qtest_add_func("/efr32bg22/rac-tx-commands", test_rac_tx_commands);
     qtest_add_func("/efr32bg22/rac-tx-completion", test_rac_tx_completion);
+    qtest_add_func("/efr32bg22/rac-tx-disable-cancels-completion",
+                   test_rac_tx_disable_cancels_completion);
     qtest_add_func("/efr32bg22/rac-tx-snapshot-captures-staged-bufc",
                    test_rac_tx_snapshot_captures_staged_bufc);
     qtest_add_func("/efr32bg22/rac-tx-snapshot-has-no-local-offers",
