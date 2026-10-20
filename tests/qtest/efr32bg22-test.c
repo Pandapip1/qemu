@@ -635,6 +635,29 @@ static void test_rac_tx_snapshot_captures_staged_bufc(void)
     g_free(trace);
 }
 
+static void test_rac_tx_snapshot_captures_guest_backed_fifo(void)
+{
+    const uint32_t tx_channel = BUFC_BASE + BUFC_CH0;
+    const uint32_t tx_buffer = 0x20001000;
+    gchar *trace;
+
+    /* Match the RAIL SetTxFifo staging shape used by the Zephyr HAL. */
+    writel(tx_channel + BUFC_CMD, 1);
+    writel(tx_channel, 3);
+    writel(tx_channel + 0x004, tx_buffer);
+    qtest_writeb(global_qtest, tx_buffer, 0x8d);
+    qtest_writeb(global_qtest, tx_buffer + 1, 0x5b);
+    qtest_writeb(global_qtest, tx_buffer + 2, 0xe1);
+    writel(tx_channel + BUFC_WRITEOFFSET, 3);
+    writel(tx_channel + BUFC_CMD, 2);
+    writel(RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+
+    g_assert(g_file_get_contents(tx_snapshot_trace_path, &trace, NULL, NULL));
+    g_assert_nonnull(g_strstr_len(trace, -1,
+                                  "bytes=3 first=0x00e15b8d"));
+    g_free(trace);
+}
+
 static void test_rac_tx_snapshot_has_no_local_offers(void)
 {
     const uint32_t tx_channel = BUFC_BASE + BUFC_CH0;
@@ -780,6 +803,8 @@ int main(int argc, char **argv)
                    test_rac_tx_disable_cancels_completion);
     qtest_add_func("/efr32bg22/rac-tx-snapshot-captures-staged-bufc",
                    test_rac_tx_snapshot_captures_staged_bufc);
+    qtest_add_func("/efr32bg22/rac-tx-snapshot-captures-guest-backed-fifo",
+                   test_rac_tx_snapshot_captures_guest_backed_fifo);
     qtest_add_func("/efr32bg22/rac-tx-snapshot-has-no-local-offers",
                    test_rac_tx_snapshot_has_no_local_offers);
     qtest_add_func("/efr32bg22/rac-software-rx-enable",

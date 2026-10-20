@@ -402,6 +402,42 @@ static uint8_t efr32_bufc_read_data_port(Efr32Periph *s, unsigned channel)
     return value;
 }
 
+/*
+ * Capture the software-visible TX FIFO at a model-defined snapshot boundary.
+ * A direct BUFC data-port user is represented by bufc_data.  RAIL's normal
+ * SetTxFifo path instead preloads guest RAM and describes it with ADDR and
+ * the two offsets, so prefer that circular backing store when it is present.
+ * This is intentionally not a claim that hardware consumes the FIFO at TXEN.
+ */
+static GByteArray *efr32_bufc_snapshot_data(Efr32Periph *s, unsigned channel)
+{
+    uint32_t base = efr32_bufc_channel_base(channel);
+    uint32_t buffer_address = efr32_register_get(s, base + 0x004);
+    uint32_t capacity = efr32_bufc_capacity(s, channel);
+    uint32_t read_offset;
+    uint32_t length;
+    GByteArray *snapshot;
+
+    if (!buffer_address || !capacity) {
+        return g_byte_array_ref(s->bufc_data[channel]);
+    }
+
+    read_offset = efr32_register_get(s, base + EFR32_BUFC_READOFFSET) & 0x1fff;
+    length = MIN(efr32_bufc_count(s, channel), capacity);
+    snapshot = g_byte_array_sized_new(length);
+    g_byte_array_set_size(snapshot, length);
+    for (uint32_t index = 0; index < length; index++) {
+        uint8_t value;
+        uint32_t offset = efr32_bufc_storage_offset(
+            s, channel, read_offset + index);
+
+        address_space_read(&address_space_memory, buffer_address + offset,
+                           MEMTXATTRS_UNSPECIFIED, &value, 1);
+        snapshot->data[index] = value;
+    }
+    return snapshot;
+}
+
 static void efr32_bufc_clear(Efr32Periph *s, unsigned channel)
 {
     uint32_t base = efr32_bufc_channel_base(channel);
@@ -512,7 +548,8 @@ static void efr32_rac_capture_tx_snapshot(Efr32Periph *s)
         .trigger = EFR32_RF_TX_TRIGGER_RAC_CMD_TXEN,
         .buffer_channel = EFR32_RF_TX_BUFC_CHANNEL,
     };
-    GByteArray *data = s->bufc_data[EFR32_RF_TX_BUFC_CHANNEL];
+    GByteArray *data = efr32_bufc_snapshot_data(
+        s, EFR32_RF_TX_BUFC_CHANNEL);
     Efr32RfTxSnapshot *snapshot;
     const uint8_t *bytes;
     gsize length;
@@ -526,6 +563,7 @@ static void efr32_rac_capture_tx_snapshot(Efr32Periph *s)
     snapshot = efr32_rf_medium_snapshot_tx(
         s->rf_medium, EFR32_RF_RADIO(s), &metadata, data->data, data->len,
         &error_abort);
+    g_byte_array_unref(data);
     bytes = g_bytes_get_data(efr32_rf_tx_snapshot_get_data(snapshot), &length);
     for (unsigned index = 0; index < MIN(length, sizeof(first_word)); index++) {
         first_word |= (uint32_t)bytes[index] << (index * 8);
