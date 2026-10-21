@@ -247,6 +247,7 @@ struct Efr32Periph
     Clock *burtc_clk;
     ptimer_state *burtc_counter;
     bool burtc_running;
+    bool burtc_irq_asserted;
     QEMUTimer *burtc_compare_timer;
     uint32_t timer2_count;
     int64_t timer2_last_ns;
@@ -1118,15 +1119,22 @@ static void efr32_burtc_update_irq(Efr32Periph *s)
 {
     uint32_t pending = efr32_register_get(s, EFR32_BURTC_BASE + EFR32_BURTC_IF);
     uint32_t enabled = efr32_register_get(s, EFR32_BURTC_BASE + EFR32_BURTC_IEN);
+    bool asserted = !!(pending & enabled);
 
     /* xG22.dtsi and the part header both assign BURTC to external IRQ 18. */
-    qemu_set_irq(s->irq[18], !!(pending & enabled));
+    if (s->burtc_irq_asserted != asserted) {
+        trace_efr32bg22_burtc_irq(s->endpoint_id, asserted, pending, enabled);
+        s->burtc_irq_asserted = asserted;
+    }
+    qemu_set_irq(s->irq[18], asserted);
 }
 
 static void efr32_burtc_schedule_compare(Efr32Periph *s)
 {
     uint64_t ticks;
     int64_t deadline;
+    uint32_t counter;
+    uint32_t compare;
 
     timer_del(s->burtc_compare_timer);
     if (!s->burtc_running || !efr32_burtc_enabled(s)) {
@@ -1135,9 +1143,9 @@ static void efr32_burtc_schedule_compare(Efr32Periph *s)
 
     /* CNT counts up modulo 2^32.  Schedule this COMP match once; IF latches
      * until the guest clears it, exactly as the one-shot Zephyr alarm uses it. */
-    ticks = (uint32_t)(efr32_register_get(s, EFR32_BURTC_BASE +
-                                          EFR32_BURTC_COMP) -
-                       efr32_burtc_counter(s));
+    counter = efr32_burtc_counter(s);
+    compare = efr32_register_get(s, EFR32_BURTC_BASE + EFR32_BURTC_COMP);
+    ticks = (uint32_t)(compare - counter);
     if (ticks == 0) {
         /*
          * COMP is an edge in the free-running 32-bit counter.  If software
@@ -1149,6 +1157,9 @@ static void efr32_burtc_schedule_compare(Efr32Periph *s)
          */
         ticks = UINT64_C(1) << 32;
     }
+    trace_efr32bg22_burtc_compare_program(s->endpoint_id,
+                                           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                                           counter, compare, ticks);
     deadline = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                ((int64_t)ticks * NANOSECONDS_PER_SECOND + 32768 - 1) / 32768;
     timer_mod(s->burtc_compare_timer, deadline);
@@ -1161,6 +1172,11 @@ static void efr32_burtc_compare_expired(void *opaque)
     if (!s->burtc_running || !efr32_burtc_enabled(s)) {
         return;
     }
+    trace_efr32bg22_burtc_compare_expire(s->endpoint_id,
+                                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                                          efr32_burtc_counter(s),
+                                          efr32_register_get(s, EFR32_BURTC_BASE +
+                                                             EFR32_BURTC_COMP));
     efr32_register_put(s, EFR32_BURTC_BASE + EFR32_BURTC_IF,
                        efr32_register_get(s, EFR32_BURTC_BASE + EFR32_BURTC_IF) |
                            (1u << 1)); /* BURTC_IF_COMP */
@@ -1949,6 +1965,8 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     s->usart_tx_complete[0] = false;
     s->usart_tx_complete[1] = false;
     s->burtc_running = false;
+    s->burtc_irq_asserted = false;
+    qemu_set_irq(s->irq[18], 0);
     timer_del(s->burtc_compare_timer);
     s->timer2_running = false;
     s->timer2_count = 0;

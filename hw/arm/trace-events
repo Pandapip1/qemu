@@ -77,4 +77,7 @@ efr32bg22_rac_state(unsigned endpoint, uint64_t now, uint32_t previous, uint32_t
 efr32bg22_radio_write(uint32_t pc, uint32_t address, uint32_t value, unsigned size) "pc=0x%08x addr=0x%08x value=0x%08x size=%u"
 efr32bg22_tx_snapshot(unsigned endpoint, uint64_t sequence, unsigned length, uint32_t first_word) "endpoint=%u TX snapshot sequence=%" PRIu64 " bytes=%u first=0x%08x"
 efr32bg22_tx_offer_count(unsigned endpoint, unsigned offers) "endpoint=%u TX snapshot RX mailbox offers=%u"
+efr32bg22_burtc_compare_program(unsigned endpoint, uint64_t now, uint32_t counter, uint32_t compare, uint64_t ticks) "endpoint=%u now=%" PRIu64 " BURTC compare program CNT=0x%08x COMP=0x%08x ticks=%" PRIu64
+efr32bg22_burtc_compare_expire(unsigned endpoint, uint64_t now, uint32_t counter, uint32_t compare) "endpoint=%u now=%" PRIu64 " BURTC compare expired CNT=0x%08x COMP=0x%08x"
+efr32bg22_burtc_irq(unsigned endpoint, bool level, uint32_t pending, uint32_t enabled) "endpoint=%u BURTC IRQ18 level=%d IF=0x%08x IEN=0x%08x"
 efr32bg22_usart_tx(unsigned index, uint8_t value) "USART%u TX=0x%02x"
