@@ -699,10 +699,13 @@ static void test_bufc_data_port(void)
     writel(tx_channel + BUFC_READOFFSET, 0);
     g_assert_cmphex(readl(tx_channel + BUFC_READDATA), ==, 0x6b);
 
-    /* The recovered sequencer image writes RX buffer 1 via its secure alias. */
+    /*
+     * The recovered sequencer image uses 32-bit STR instructions here, but
+     * WRITEDATA is an 8-bit field. Only the low octet is consumed per write.
+     */
     writel(sequencer_channel + BUFC_CMD, 1);
     writel(sequencer_channel + 0x004, rx_buffer);
-    writel(sequencer_channel + BUFC_WRITEDATA, 0x3c);
+    writel(sequencer_channel + BUFC_WRITEDATA, 0xa5b63c);
     writel(nonsecure_rx_channel + BUFC_READOFFSET, 0);
     g_assert_cmphex(readl(nonsecure_rx_channel + BUFC_READDATA), ==, 0x3c);
     g_assert_cmphex(qtest_readb(global_qtest, rx_buffer), ==, 0x3c);
