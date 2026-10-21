@@ -241,6 +241,7 @@ struct Efr32Periph
     bool rx_offer_pending;
     bool usart_tx_enabled[2];
     bool usart_tx_complete[2];
+    unsigned endpoint_id;
     Clock *protimer_clk;
     ptimer_state *protimer_counter;
     Clock *burtc_clk;
@@ -815,7 +816,8 @@ static void efr32_rac_set_state(Efr32Periph *s, uint32_t state)
         efr32_rf_medium_offer_active_tx_to_receiver(
             s->rf_medium, EFR32_RF_RADIO(s), &error_abort);
     }
-    trace_efr32bg22_rac_state(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+    trace_efr32bg22_rac_state(s->endpoint_id,
+                              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
                               previous_state, state);
 }
 
@@ -959,10 +961,11 @@ static void efr32_rac_capture_tx_snapshot(Efr32Periph *s)
     for (unsigned index = 0; index < MIN(length, sizeof(first_word)); index++) {
         first_word |= (uint32_t)bytes[index] << (index * 8);
     }
-    trace_efr32bg22_tx_snapshot(efr32_rf_tx_snapshot_get_sequence(snapshot),
+    trace_efr32bg22_tx_snapshot(s->endpoint_id,
+                                 efr32_rf_tx_snapshot_get_sequence(snapshot),
                                  length, first_word);
     efr32_rf_medium_set_latest_tx_snapshot(s->rf_medium, snapshot);
-    trace_efr32bg22_tx_offer_count(
+    trace_efr32bg22_tx_offer_count(s->endpoint_id,
         efr32_rf_medium_offer_latest_tx(s->rf_medium, &error_abort));
 }
 
@@ -1648,7 +1651,7 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
             efr32_rac_set_state(s, EFR32_RAC_STATE_TX);
             efr32_rac_schedule_tx_completion(s);
         }
-        trace_efr32bg22_rac_command(next, s->rac_state);
+        trace_efr32bg22_rac_command(s->endpoint_id, next, s->rac_state);
         return;
     }
     if ((register_address & ~0x3fffu) == EFR32_BUFC_BASE &&
@@ -2085,6 +2088,7 @@ struct Efr32Bg22SoCState {
     Clock *clk;
     Clock *protimer_clk;
     Clock *burtc_clk;
+    unsigned endpoint_id;
 
     MemoryRegion *memory;
     Efr32RfMedium *rf_medium;
@@ -2233,6 +2237,7 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
     }
 
     s->periph.rf_medium = s->rf_medium;
+    s->periph.endpoint_id = s->endpoint_id;
     object_property_set_link(OBJECT(&s->periph), "memory", OBJECT(s->memory),
                              &error_abort);
     qdev_connect_clock_in(DEVICE(&s->periph), "protimerclk", s->protimer_clk);
@@ -2424,6 +2429,7 @@ static void dual_init(MachineState *m)
                            UINT64_C(1) << 32);
         object_initialize_child(OBJECT(m), name, &s->soc[index],
                                 TYPE_EFR32BG22_SOC);
+        s->soc[index].endpoint_id = index;
         object_property_set_link(OBJECT(&s->soc[index]), "memory",
                                  OBJECT(&s->memory[index]), &error_fatal);
         object_property_set_link(OBJECT(&s->soc[index]), "rf-medium",

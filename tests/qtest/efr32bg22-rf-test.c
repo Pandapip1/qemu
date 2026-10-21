@@ -6,6 +6,8 @@
 #include "qemu/osdep.h"
 #include "libqtest-single.h"
 
+static char *rf_trace_path;
+
 #define EFR32BG22_PEER_PERIPH_BASE 0x60000000
 #define EFR32BG22_PEER_RADIO_BASE  0x80000000
 
@@ -1032,14 +1034,31 @@ static void test_bidirectional_rac_txen_after_rx(void)
     g_assert_cmphex(qtest_readl(global_qtest, peer(FRC_BASE + FRC_IF)) &
                         FRC_IF_TXDONE,
                     ==, FRC_IF_TXDONE);
+
+    /* Endpoint IDs distinguish the two same-address SoCs in this exchange. */
+    gchar *trace;
+
+    g_assert(g_file_get_contents(rf_trace_path, &trace, NULL, NULL));
+    g_assert_nonnull(g_strstr_len(trace, -1, "endpoint=0 TX snapshot"));
+    g_assert_nonnull(g_strstr_len(trace, -1, "endpoint=1 TX snapshot"));
+    g_assert_nonnull(g_strstr_len(trace, -1, "endpoint=0 RAC.CMD="));
+    g_assert_nonnull(g_strstr_len(trace, -1, "endpoint=1 RAC.CMD="));
+    g_free(trace);
 }
 
 int main(int argc, char **argv)
 {
     int result;
+    gchar *qemu_args;
 
     g_test_init(&argc, &argv, NULL);
-    qtest_start("-machine efr32bg22-dual -S");
+    rf_trace_path = g_strdup_printf("%s/efr32bg22-rf-%u.trace",
+                                    g_get_tmp_dir(), g_random_int());
+    qemu_args = g_strdup_printf("-machine efr32bg22-dual -S "
+                                "-trace enable=efr32bg22_*,file=%s",
+                                rf_trace_path);
+    qtest_start(qemu_args);
+    g_free(qemu_args);
     qtest_add_func("/efr32bg22/rf/peer-bufc-dma-address-space",
                    test_peer_bufc_dma_uses_peer_address_space);
     qtest_add_func("/efr32bg22/rf/tx-offer-reaches-peer-rx-fifo",
@@ -1074,5 +1093,7 @@ int main(int argc, char **argv)
                    test_bidirectional_rac_txen_after_rx);
     result = g_test_run();
     qtest_end();
+    g_unlink(rf_trace_path);
+    g_free(rf_trace_path);
     return result;
 }

@@ -72,9 +72,9 @@ z2_aer915_event(int8_t event, int8_t len) "i2c event =0x%x len=%d bytes"
 bcm2838_gic_set_irq(int irq, int level) "gic irq:%d lvl:%d"
 
 # efr32bg22.c
-efr32bg22_rac_command(uint32_t command, uint32_t state) "RAC.CMD=0x%08x state=%u"
-efr32bg22_rac_state(uint64_t now, uint32_t previous, uint32_t state) "now=%" PRIu64 " RAC state %u -> %u"
+efr32bg22_rac_command(unsigned endpoint, uint32_t command, uint32_t state) "endpoint=%u RAC.CMD=0x%08x state=%u"
+efr32bg22_rac_state(unsigned endpoint, uint64_t now, uint32_t previous, uint32_t state) "endpoint=%u now=%" PRIu64 " RAC state %u -> %u"
 efr32bg22_radio_write(uint32_t pc, uint32_t address, uint32_t value, unsigned size) "pc=0x%08x addr=0x%08x value=0x%08x size=%u"
-efr32bg22_tx_snapshot(uint64_t sequence, unsigned length, uint32_t first_word) "TX snapshot sequence=%" PRIu64 " bytes=%u first=0x%08x"
-efr32bg22_tx_offer_count(unsigned offers) "TX snapshot RX mailbox offers=%u"
+efr32bg22_tx_snapshot(unsigned endpoint, uint64_t sequence, unsigned length, uint32_t first_word) "endpoint=%u TX snapshot sequence=%" PRIu64 " bytes=%u first=0x%08x"
+efr32bg22_tx_offer_count(unsigned endpoint, unsigned offers) "endpoint=%u TX snapshot RX mailbox offers=%u"
 efr32bg22_usart_tx(unsigned index, uint8_t value) "USART%u TX=0x%02x"
