@@ -117,7 +117,8 @@ void efr32_rf_medium_clear_latest_tx_snapshot(Efr32RfMedium *medium);
 unsigned efr32_rf_medium_withdraw_active_tx(Efr32RfMedium *medium,
                                              Efr32RfRadio *source);
 
-/* Mark @source's active synthetic TX transaction complete. */
+/* Mark @source's active synthetic TX transaction complete and retire its
+ * undelivered deferred offers. */
 void efr32_rf_medium_complete_tx(Efr32RfMedium *medium,
                                   Efr32RfRadio *source);
 

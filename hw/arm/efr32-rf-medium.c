@@ -356,13 +356,15 @@ unsigned efr32_rf_medium_offer_active_tx_to_receiver(Efr32RfMedium *medium,
     return 1;
 }
 
+static unsigned efr32_rf_medium_remove_rx_offers_for_transaction(
+    Efr32RfMedium *medium, Efr32RfRadio *source, uint64_t sequence);
+
 unsigned efr32_rf_medium_withdraw_active_tx(Efr32RfMedium *medium,
                                              Efr32RfRadio *source)
 {
     const Efr32RfTxSnapshot *snapshot = medium->latest_tx_snapshot;
     uint64_t *sequence;
-    unsigned withdrawn = 0;
-    GList *link;
+    unsigned withdrawn;
 
     sequence = g_hash_table_lookup(medium->active_tx_sequences, source);
     if (!sequence) {
@@ -372,25 +374,46 @@ unsigned efr32_rf_medium_withdraw_active_tx(Efr32RfMedium *medium,
     if (snapshot && efr32_rf_tx_snapshot_get_radio(snapshot) == source) {
         efr32_rf_medium_clear_latest_tx_snapshot(medium);
     }
-    g_hash_table_steal(medium->active_tx_sequences, source);
+
+    withdrawn = efr32_rf_medium_remove_rx_offers_for_transaction(
+        medium, source, *sequence);
+    g_hash_table_remove(medium->active_tx_sequences, source);
+    return withdrawn;
+}
+
+static unsigned efr32_rf_medium_remove_rx_offers_for_transaction(
+    Efr32RfMedium *medium, Efr32RfRadio *source, uint64_t sequence)
+{
+    unsigned removed = 0;
+    GList *link;
+
     for (link = medium->rx_offers.head; link;) {
         Efr32RfRxDeliveryRequest *request = link->data;
         GList *next = link->next;
 
-        if (request->source == source && request->tx_sequence == *sequence) {
+        if (request->source == source && request->tx_sequence == sequence) {
             g_queue_delete_link(&medium->rx_offers, link);
             efr32_rf_rx_delivery_request_free(request);
-            withdrawn++;
+            removed++;
         }
         link = next;
     }
-    g_free(sequence);
-    return withdrawn;
+    return removed;
 }
 
 void efr32_rf_medium_complete_tx(Efr32RfMedium *medium,
                                   Efr32RfRadio *source)
 {
+    uint64_t *sequence = g_hash_table_lookup(medium->active_tx_sequences,
+                                              source);
+
+    if (!sequence) {
+        return;
+    }
+
+    /* A completed TX cannot still deliver an undelivered deferred PDU. */
+    efr32_rf_medium_remove_rx_offers_for_transaction(medium, source,
+                                                      *sequence);
     g_hash_table_remove(medium->active_tx_sequences, source);
 }
 

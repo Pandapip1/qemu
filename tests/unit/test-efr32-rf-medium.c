@@ -509,6 +509,35 @@ static void test_abort_earlier_source_keeps_later_source_offer(
     object_unref(OBJECT(first_receiver));
 }
 
+static void test_complete_tx_discards_deferred_offer(RfMediumFixture *fixture,
+                                                      gconstpointer data)
+{
+    const uint8_t staged[] = {0x31, 0x62};
+    Efr32RfTxMetadata tx_metadata = valid_tx_metadata();
+    Efr32RfRadio *receiver = add_rx_ready_radio(fixture);
+    Efr32RfTxSnapshot *snapshot = efr32_rf_medium_snapshot_tx(
+        fixture->medium, fixture->radio, &tx_metadata, staged, sizeof(staged),
+        &error_abort);
+
+    efr32_rf_medium_set_latest_tx_snapshot(fixture->medium, snapshot);
+    g_assert_cmpuint(efr32_rf_medium_offer_latest_tx(fixture->medium,
+                                                       &error_abort), ==, 1);
+    g_assert_true(efr32_rf_medium_has_rx_offer_for_radio(fixture->medium,
+                                                          receiver));
+
+    efr32_rf_medium_complete_tx(fixture->medium, fixture->radio);
+    g_assert_false(efr32_rf_medium_has_rx_offer_for_radio(fixture->medium,
+                                                           receiver));
+    g_assert_cmpuint(efr32_rf_medium_get_rx_offer_count(fixture->medium), ==,
+                     0);
+    g_assert_cmpuint(efr32_rf_medium_offer_active_tx_to_receiver(
+                         fixture->medium, receiver, &error_abort),
+                     ==, 0);
+
+    efr32_rf_medium_detach(fixture->medium, receiver);
+    object_unref(OBJECT(receiver));
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -550,6 +579,10 @@ int main(int argc, char **argv)
     g_test_add("/efr32-rf-medium/abort-earlier-source-keeps-later-source-offer",
                RfMediumFixture, NULL, rf_medium_fixture_setup,
                test_abort_earlier_source_keeps_later_source_offer,
+               rf_medium_fixture_teardown);
+    g_test_add("/efr32-rf-medium/complete-tx-discards-deferred-offer",
+               RfMediumFixture, NULL, rf_medium_fixture_setup,
+               test_complete_tx_discards_deferred_offer,
                rf_medium_fixture_teardown);
     g_test_add("/efr32-rf-medium/rx-offers-are-receiver-scoped",
                RfMediumFixture, NULL, rf_medium_fixture_setup,
