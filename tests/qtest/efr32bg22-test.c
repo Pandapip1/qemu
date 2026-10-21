@@ -158,6 +158,13 @@ static char *tx_snapshot_trace_path;
 #define TIMER_CC_CFG_OUTPUTCOMPARE 0x2
 #define TIMER_IF_OF             (1u << 0)
 #define TIMER_IF_CC(n)          (1u << (4 + (n)))
+#define CMU_BASE_ADDR           0x40008000
+#define CMU_DPLLREFCLKCTRL      0x100
+#define CMU_EM01GRPACLKCTRL     0x120
+#define CMU_EM01GRPACLK_HFXO    2
+#define DPLL0_BASE_ADDR         0x4001c000
+#define DPLL_EN                 0x004
+#define DPLL_CFG1               0x00c
 #define RADIO_RAM_NS_BASE     0xb0000000
 #define RADIO_RAM_RHCLKPRESC  0x4fe0
 #define BUFC_BASE            0xaa000000
@@ -398,6 +405,7 @@ static void test_timer0_32bit_count_prescale_overflow(void)
 {
     qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
     g_assert_cmphex(readl(TIMER0_BASE + TIMER_TOP), ==, 0xffff);
+    writel(CMU_BASE_ADDR + CMU_EM01GRPACLKCTRL, CMU_EM01GRPACLK_HFXO);
 
     writel(TIMER0_NS_BASE + TIMER_EN + REGISTER_SET_WINDOW, TIMER_EN_EN);
     writel(TIMER0_NS_BASE + TIMER_TOP, 0xffffffff);
@@ -427,6 +435,7 @@ static void test_timer0_32bit_count_prescale_overflow(void)
 static void test_timer0_cc_output_compare(void)
 {
     qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    writel(CMU_BASE_ADDR + CMU_EM01GRPACLKCTRL, CMU_EM01GRPACLK_HFXO);
 
     writel(TIMER0_NS_BASE + TIMER_EN, TIMER_EN_EN);
     writel(TIMER0_NS_BASE + TIMER_TOP, 0xffffffff);
@@ -455,6 +464,31 @@ static void test_timer0_cc_output_compare(void)
     writel(TIMER0_BASE + TIMER_CC_OC(0), 10);
     timer0_step(100000);
     g_assert_cmphex(readl(TIMER0_BASE + TIMER_IF), ==, 0);
+}
+
+/*
+ * TIMER0 follows EM01GRPACLK.  The BG22 explorer kit runs it from HFRCODPLL
+ * locked to HFXO with M = 1919, N = 3839 (xg22_explorer_kit.dtsi), i.e.
+ * 38.4 MHz * 3840 / 1920 = 76.8 MHz.
+ */
+static void test_timer0_follows_em01grpaclk_dpll(void)
+{
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+
+    writel(CMU_BASE_ADDR + CMU_DPLLREFCLKCTRL, 1); /* HFXO reference */
+    writel(DPLL0_BASE_ADDR + DPLL_CFG1, (3839u << 16) | 1919u);
+    writel(DPLL0_BASE_ADDR + DPLL_EN, 1);
+    writel(TIMER0_NS_BASE + TIMER_EN, TIMER_EN_EN);
+    writel(TIMER0_NS_BASE + TIMER_TOP, 0xffffffff);
+    writel(TIMER0_NS_BASE + TIMER_CNT, 0);
+    writel(TIMER0_NS_BASE + TIMER_CMD, TIMER_CMD_START);
+    timer0_step(10000);
+    g_assert_cmphex(readl(TIMER0_BASE + TIMER_CNT), ==, 768);
+
+    /* Switching EM01GRPACLK to HFXO halves the rate from the current count. */
+    writel(CMU_BASE_ADDR + CMU_EM01GRPACLKCTRL, CMU_EM01GRPACLK_HFXO);
+    timer0_step(10000);
+    g_assert_cmphex(readl(TIMER0_BASE + TIMER_CNT), ==, 768 + 384);
 }
 
 static void test_timer4_cc0_compare_pending(void)
@@ -1506,6 +1540,8 @@ int main(int argc, char **argv)
                    test_timer0_32bit_count_prescale_overflow);
     qtest_add_func("/efr32bg22/timer0-cc-output-compare",
                    test_timer0_cc_output_compare);
+    qtest_add_func("/efr32bg22/timer0-follows-em01grpaclk-dpll",
+                   test_timer0_follows_em01grpaclk_dpll);
     qtest_add_func("/efr32bg22/system-reset-clears-radio-timer-state",
                    test_system_reset_clears_radio_timer_state);
     qtest_add_func("/efr32bg22/cmu-nonsecure-alias", test_cmu_nonsecure_alias);

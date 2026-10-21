@@ -104,6 +104,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_MASK 0x7u
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_FSRCO 1u
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_HFXO 3u
+#define EFR32_CMU_DPLLREFCLKCTRL 0x100u
+#define EFR32_CMU_DPLLREFCLKCTRL_CLKSEL_HFXO 1u
+#define EFR32_CMU_DPLLREFCLKCTRL_CLKSEL_LFXO 2u
+#define EFR32_CMU_EM01GRPACLKCTRL 0x120u
+#define EFR32_CMU_EM01GRPACLKCTRL_CLKSEL_HFRCODPLL 1u
+#define EFR32_CMU_EM01GRPACLKCTRL_CLKSEL_HFXO 2u
+#define EFR32_CMU_EM01GRPACLKCTRL_CLKSEL_FSRCO 3u
+/* Oscillator rates from xg22.dtsi. */
+#define EFR32_HFXO_HZ 38400000ULL
+#define EFR32_LFXO_HZ 32768ULL
+#define EFR32_FSRCO_HZ 20000000ULL
+#define EFR32_HFRCO_RESET_HZ 19000000ULL
 #define EFR32_HFXO_BASE 0x4000c000u
 #define EFR32_HFXO_CTRL 0x028u
 #define EFR32_HFXO_CMD 0x050u
@@ -1382,12 +1394,52 @@ static bool efr32_timer0_counting(Efr32Periph *s)
            !(efr32_timer0_reg(s, EFR32_TIMER_CFG) & EFR32_TIMER_CFG_MODE_MASK);
 }
 
+/*
+ * EM01GRPACLK, which clocks TIMER0 (xg22.dtsi: CLOCK_BRANCH_EM01GRPACLK).
+ * CMU_EM01GRPACLKCTRL.CLKSEL resets to HFRCODPLL and selects HFXO (2) or
+ * FSRCO (3) otherwise (efr32bg22_cmu.h).  A locked DPLL runs HFRCODPLL at
+ * f_ref * (N + 1) / (M + 1) from DPLL_CFG1 (efr32bg22_dpll.h), with the
+ * reference chosen by CMU_DPLLREFCLKCTRL; without it HFRCODPLL keeps its
+ * 19 MHz reset band.  Oscillator rates are the xg22.dtsi values.
+ */
+static uint64_t efr32_em01grpa_hz(Efr32Periph *s)
+{
+    uint32_t clksel = efr32_register_get(s, EFR32_CMU_BASE +
+                                            EFR32_CMU_EM01GRPACLKCTRL) & 0x3u;
+    uint32_t cfg1;
+    uint64_t ref;
+
+    switch (clksel) {
+    case EFR32_CMU_EM01GRPACLKCTRL_CLKSEL_HFXO:
+        return EFR32_HFXO_HZ;
+    case EFR32_CMU_EM01GRPACLKCTRL_CLKSEL_FSRCO:
+        return EFR32_FSRCO_HZ;
+    default:
+        break;
+    }
+    if (!efr32_dpll_enabled(s)) {
+        return EFR32_HFRCO_RESET_HZ;
+    }
+    switch (efr32_register_get(s, EFR32_CMU_BASE + EFR32_CMU_DPLLREFCLKCTRL) & 0x3u) {
+    case EFR32_CMU_DPLLREFCLKCTRL_CLKSEL_HFXO:
+        ref = EFR32_HFXO_HZ;
+        break;
+    case EFR32_CMU_DPLLREFCLKCTRL_CLKSEL_LFXO:
+        ref = EFR32_LFXO_HZ;
+        break;
+    default:
+        return EFR32_HFRCO_RESET_HZ; /* no reference: the DPLL cannot lock */
+    }
+    cfg1 = efr32_register_get(s, EFR32_DPLL0_BASE + EFR32_DPLL_CFG1);
+    return ref * (((cfg1 >> 16) & 0xfffu) + 1) / ((cfg1 & 0xfffu) + 1);
+}
+
 static uint32_t efr32_timer0_hz(Efr32Periph *s)
 {
     uint32_t presc = (efr32_timer0_reg(s, EFR32_TIMER_CFG) &
                       EFR32_TIMER_CFG_PRESC_MASK) >> EFR32_TIMER_CFG_PRESC_SHIFT;
 
-    return EFR32_TIMER_HZ / (presc + 1);
+    return efr32_em01grpa_hz(s) / (presc + 1);
 }
 
 static uint64_t efr32_timer0_period(Efr32Periph *s)
@@ -2106,8 +2158,20 @@ static uint64_t efr32_peripheral_mmio_read(void *opaque, hwaddr offset,
 static void efr32_peripheral_mmio_write(void *opaque, hwaddr offset,
                                         uint64_t value, unsigned size)
 {
-    efr32_peripheral_write(EFR32_PERIPH(opaque), PERIPH_BASE + offset, value,
-                           size);
+    Efr32Periph *s = EFR32_PERIPH(opaque);
+    uint32_t key = efr32_register_key(PERIPH_BASE + offset);
+    /* A change to TIMER0's clock source must not rescale elapsed counts. */
+    bool timer0_clock = key == EFR32_CMU_BASE + EFR32_CMU_EM01GRPACLKCTRL ||
+                        key == EFR32_CMU_BASE + EFR32_CMU_DPLLREFCLKCTRL ||
+                        (key & ~0x3fffu) == EFR32_DPLL0_BASE;
+
+    if (timer0_clock) {
+        efr32_timer0_rebase(s);
+    }
+    efr32_peripheral_write(s, PERIPH_BASE + offset, value, size);
+    if (timer0_clock) {
+        efr32_timer0_schedule(s);
+    }
 }
 static uint64_t efr32_radio_mmio_read(void *opaque, hwaddr offset,
                                       unsigned size)
@@ -2258,6 +2322,8 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     efr32_register_put(s, EFR32_TIMER2_BASE + EFR32_TIMER_TOP, 0xffff);
     efr32_register_put(s, EFR32_TIMER4_BASE + EFR32_TIMER_TOP, 0xffff);
     efr32_register_put(s, EFR32_TIMER0_BASE + EFR32_TIMER_TOP, 0xffff);
+    efr32_register_put(s, EFR32_CMU_BASE + EFR32_CMU_EM01GRPACLKCTRL,
+                       EFR32_CMU_EM01GRPACLKCTRL_CLKSEL_HFRCODPLL);
     efr32_register_put(s, EFR32_AGC_BASE + EFR32_AGC_RSSI, 0x8000);
     efr32_register_put(s, EFR32_AGC_BASE + EFR32_AGC_FRAMERSSI, 0x8000);
     for (unsigned irq = 0; irq < G_N_ELEMENTS(s->irq); irq++)
