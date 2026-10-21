@@ -215,6 +215,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_BUFC_THRESHOLD 0x024u
 #define EFR32_BUFC_CMD 0x028u
 #define EFR32_RF_RX_DESCRIPTOR_BUFC_CHANNEL 2
+#define EFR32_BUFC_DESCRIPTOR_OVERFLOW (1u << 16)
 
 /*
  * The M33-facing RF mailbox has two endpoints in the radio address space.
@@ -526,6 +527,25 @@ static bool efr32_bufc_descriptor_channel_configured(Efr32Periph *s)
            efr32_register_get(s, base + EFR32_BUFC_ADDR) != 0;
 }
 
+static void efr32_bufc_mark_descriptor_overflow(Efr32Periph *s)
+{
+    uint32_t pending = efr32_register_get(s, EFR32_BUFC_BASE + EFR32_BUFC_IF);
+
+    efr32_register_put(s, EFR32_BUFC_BASE + EFR32_BUFC_IF,
+                       pending | EFR32_BUFC_DESCRIPTOR_OVERFLOW);
+    efr32_bufc_update_irq(s);
+}
+
+static bool efr32_bufc_descriptor_has_room(Efr32Periph *s)
+{
+    uint32_t capacity = efr32_bufc_capacity(
+        s, EFR32_RF_RX_DESCRIPTOR_BUFC_CHANNEL);
+
+    return capacity >= 8U &&
+           efr32_bufc_count(s, EFR32_RF_RX_DESCRIPTOR_BUFC_CHANNEL) <=
+               capacity - 8U;
+}
+
 /*
  * Publish the QEMU-only successful-RX record after channel 1 has received the
  * synthetic payload.  The endpoint is the channel-1 write offset, encoded as
@@ -534,7 +554,7 @@ static bool efr32_bufc_descriptor_channel_configured(Efr32Periph *s)
  * and remain zero.  Each data-port write advances channel 2 and updates its
  * configured threshold before the caller raises any completion event.
  */
-static void efr32_bufc_enqueue_synthetic_rx_descriptor(Efr32Periph *s)
+static bool efr32_bufc_enqueue_synthetic_rx_descriptor(Efr32Periph *s)
 {
     uint32_t rx_base = efr32_bufc_channel_base(EFR32_RF_RX_BUFC_CHANNEL);
     uint32_t endpoint = efr32_register_get(
@@ -551,13 +571,20 @@ static void efr32_bufc_enqueue_synthetic_rx_descriptor(Efr32Periph *s)
     };
 
     if (!efr32_bufc_descriptor_channel_configured(s)) {
-        return;
+        return false;
+    }
+
+    /* Never overwrite an unconsumed synthetic record in the backing ring. */
+    if (!efr32_bufc_descriptor_has_room(s)) {
+        efr32_bufc_mark_descriptor_overflow(s);
+        return false;
     }
 
     for (size_t index = 0; index < sizeof(record); index++) {
         efr32_bufc_write_data_port(s, EFR32_RF_RX_DESCRIPTOR_BUFC_CHANNEL,
                                    record[index], false);
     }
+    return true;
 }
 
 static uint8_t efr32_bufc_read_data_port(Efr32Periph *s, unsigned channel)
@@ -831,6 +858,8 @@ static void efr32_rac_rx_handoff(void *opaque)
     const Efr32RfRxMetadata *metadata;
     const uint8_t *data;
     gsize length;
+    bool descriptor_configured;
+    bool descriptor_published;
 
     if (s->rac_state != EFR32_RAC_STATE_RXSEARCH) {
         return;
@@ -847,6 +876,20 @@ static void efr32_rac_rx_handoff(void *opaque)
     g_assert(metadata->buffer_channel == EFR32_RF_RX_BUFC_CHANNEL);
     data = g_bytes_get_data(efr32_rf_rx_delivery_request_get_data(request),
                             &length);
+
+    descriptor_configured = efr32_bufc_descriptor_channel_configured(s);
+    if (descriptor_configured && !efr32_bufc_descriptor_has_room(s)) {
+        /*
+         * Check the metadata ring before touching channel 1.  A dropped
+         * synthetic record must not leave bytes that a later endpoint could
+         * accidentally claim as a successful packet.
+         */
+        efr32_bufc_mark_descriptor_overflow(s);
+        efr32_rf_rx_delivery_request_free(request);
+        s->rx_offer_pending = efr32_rf_medium_has_rx_offer_for_radio(
+            s->rf_medium, EFR32_RF_RADIO(s));
+        return;
+    }
 
     /*
      * The retained sequencer reads FRC.RXRAWDATA then writes its four byte
@@ -865,8 +908,20 @@ static void efr32_rac_rx_handoff(void *opaque)
         efr32_bufc_write_data_port(s, EFR32_RF_RX_BUFC_CHANNEL,
                                    data[index], false);
     }
-    efr32_bufc_enqueue_synthetic_rx_descriptor(s);
+    descriptor_published = efr32_bufc_enqueue_synthetic_rx_descriptor(s);
     efr32_rf_rx_delivery_request_free(request);
+
+    if (descriptor_configured && !descriptor_published) {
+        /*
+         * A full descriptor ring is a dropped QEMU-only receive, not a
+         * successful packet.  In particular, do not raise RXDONE while the
+         * consumer still has no new descriptor and might revisit old data.
+         */
+        s->rx_offer_pending = efr32_rf_medium_has_rx_offer_for_radio(
+            s->rf_medium, EFR32_RF_RADIO(s));
+        return;
+    }
+
     /* This completion remains a simulator-only boundary. */
     efr32_frc_raise(s, EFR32_FRC_IF_RXDONE);
 
