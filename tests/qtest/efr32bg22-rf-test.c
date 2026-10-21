@@ -564,6 +564,60 @@ static void test_tx_offer_waits_for_receiver_rxsearch(void)
 }
 
 /*
+ * A board reset must retire both the deferred handoff timer and its medium
+ * mailbox.  Re-entering RXSEARCH after reset must not replay the pre-reset
+ * offer as a synthetic receive.
+ */
+static void test_system_reset_with_deferred_offer(void)
+{
+    const uint8_t payload[] = { 0x7a, 0x31 };
+    const uint32_t fifo_guest_address = 0x20000800;
+    const uint64_t peer_rx_channel = peer(BUFC_BASE + BUFC_CH1);
+    const uint32_t source_tx_channel = BUFC_BASE + BUFC_CH0;
+
+    qtest_writel(global_qtest, peer(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW),
+                 FRC_IF_RXDONE);
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_CMD, 1);
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_ADDR, fifo_guest_address);
+    qtest_writel(global_qtest, peer_rx_channel, 0); /* 64-byte peer RX FIFO */
+    qtest_writel(global_qtest,
+                 peer(RAC_BASE + RAC_RXENSRCEN + REGISTER_SET_WINDOW),
+                 RAC_RXENSRCEN_SWRXEN);
+
+    qtest_writel(global_qtest, source_tx_channel + BUFC_CMD, 1);
+    for (size_t index = 0; index < G_N_ELEMENTS(payload); index++) {
+        qtest_writeb(global_qtest, fifo_guest_address + index, payload[index]);
+    }
+    qtest_writel(global_qtest, source_tx_channel + BUFC_ADDR, fifo_guest_address);
+    qtest_writel(global_qtest, source_tx_channel, 0); /* 64-byte source TX FIFO */
+    qtest_writel(global_qtest, source_tx_channel + BUFC_WRITEOFFSET,
+                 G_N_ELEMENTS(payload));
+    qtest_writel(global_qtest, RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+
+    /* Reset before the deferred receiver handoff gets a virtual-clock turn. */
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+
+    qtest_writel(global_qtest, peer(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW),
+                 FRC_IF_RXDONE);
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_CMD, 1);
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_ADDR, fifo_guest_address);
+    qtest_writel(global_qtest, peer_rx_channel, 0);
+    qtest_writel(global_qtest,
+                 peer(RAC_BASE + RAC_RXENSRCEN + REGISTER_SET_WINDOW),
+                 RAC_RXENSRCEN_SWRXEN);
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(1);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+
+    g_assert_cmphex(qtest_readl(global_qtest, peer(FRC_BASE + FRC_IF)) &
+                        FRC_IF_RXDONE,
+                    ==, 0);
+    g_assert_cmphex(qtest_readl(global_qtest,
+                                peer_rx_channel + BUFC_WRITEOFFSET), ==, 0);
+}
+
+/*
  * TXEN snapshots staged BUFC data, but a subsequent TXDIS cancels that model
  * transaction.  In particular, an offer already deferred for a peer must not
  * leak through when the peer later re-enters RXSEARCH.
@@ -813,6 +867,8 @@ int main(int argc, char **argv)
                    test_completed_tx_withdraws_deferred_offer);
     qtest_add_func("/efr32bg22/rf/tx-offer-waits-for-receiver-rxsearch",
                    test_tx_offer_waits_for_receiver_rxsearch);
+    qtest_add_func("/efr32bg22/rf/system-reset-with-deferred-offer",
+                   test_system_reset_with_deferred_offer);
     qtest_add_func("/efr32bg22/rf/tx-disable-withdraws-deferred-offer",
                    test_tx_disable_withdraws_deferred_offer);
     qtest_add_func("/efr32bg22/rf/rx-disable-withdraws-active-tx-offer",
