@@ -44,6 +44,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_PROTIMER_NS_BASE 0xb801c000u
 #define EFR32_RAC_BASE 0xa8020000u
 
+#define EFR32_RADIO_IPVERSION 0x000u
+
 #define EFR32_FRC_IF 0x068u
 #define EFR32_FRC_IEN 0x06cu
 #define EFR32_FRC_RXRAWDATA 0x090u
@@ -602,6 +604,25 @@ static uint32_t efr32_register_key(uint32_t address)
     address = efr32_peripheral_canonical_address(address);
 
     return (address & ~0x3fffu) | (address & 0xffcu);
+}
+
+/* Public revB2 IPVERSION reset values; these registers are read-only. */
+static bool efr32_radio_ipversion(uint32_t address, uint32_t *value)
+{
+    switch (address) {
+    case EFR32_FRC_BASE + EFR32_RADIO_IPVERSION:
+    case EFR32_AGC_BASE + EFR32_RADIO_IPVERSION:
+    case EFR32_MODEM_BASE + EFR32_RADIO_IPVERSION:
+    case EFR32_SYNTH_BASE + EFR32_RADIO_IPVERSION:
+    case EFR32_RAC_BASE + EFR32_RADIO_IPVERSION:
+        *value = 1;
+        return true;
+    case EFR32_RFCRC_BASE + EFR32_RADIO_IPVERSION:
+        *value = 0;
+        return true;
+    default:
+        return false;
+    }
 }
 
 static uint32_t efr32_register_get(Efr32Periph *s, uint32_t address)
@@ -1187,11 +1208,17 @@ static void efr32_timer4_set_counter(Efr32Periph *s, uint32_t value)
 
 static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
 {
+    uint32_t ipversion;
+
     address = efr32_peripheral_canonical_address(address);
     uint32_t offset = address & 0xfff;
     unsigned channel;
     uint32_t register_offset;
     int usart_index = efr32_usart_index(address);
+
+    if (efr32_radio_ipversion(address, &ipversion)) {
+        return ipversion;
+    }
 
     if (usart_index >= 0 && offset == EFR32_USART_STATUS) {
         return efr32_usart_status(s, usart_index);
@@ -1322,6 +1349,11 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
     bool hfxo_was_enabled = efr32_hfxo_enabled(s);
     bool dpll_was_enabled = efr32_dpll_enabled(s);
     int usart_index = efr32_usart_index(register_address);
+    uint32_t ipversion;
+
+    if (efr32_radio_ipversion(register_address, &ipversion)) {
+        return;
+    }
 
     if (word >= RADIO_BASE && word < RADIO_BASE + RADIO_SIZE)
     {

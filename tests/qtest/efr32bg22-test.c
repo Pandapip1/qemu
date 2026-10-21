@@ -9,6 +9,7 @@
 static char *tx_snapshot_trace_path;
 
 #define FRC_BASE             0xa8004000
+#define RADIO_IPVERSION      0x000
 #define FRC_DATABUFFER       0x018
 #define FRC_RXRAWDATA        0x090
 #define FRC_IF               0x068
@@ -602,6 +603,32 @@ static void test_radio_enable_masks(void)
     for (size_t i = 0; i < G_N_ELEMENTS(blocks); i++) {
         writel(blocks[i] + 0x004, UINT32_MAX);
         g_assert_cmphex(readl(blocks[i] + 0x004), ==, 1);
+    }
+}
+
+static void test_radio_ipversions(void)
+{
+    static const struct {
+        uint32_t base;
+        uint32_t value;
+    } blocks[] = {
+        { FRC_BASE, 1 },
+        { AGC_BASE, 1 },
+        { RFCRC_BASE, 0 },
+        { MODEM_BASE, 1 },
+        { SYNTH_BASE, 1 },
+        { RAC_BASE, 1 },
+    };
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    for (size_t i = 0; i < G_N_ELEMENTS(blocks); i++) {
+        uint32_t secure = blocks[i].base + RADIO_IPVERSION;
+        uint32_t nonsecure = secure + RADIO_NONSECURE_ALIAS;
+
+        g_assert_cmphex(readl(secure), ==, blocks[i].value);
+        g_assert_cmphex(readl(nonsecure), ==, blocks[i].value);
+        writel(secure, UINT32_MAX);
+        g_assert_cmphex(readl(secure), ==, blocks[i].value);
     }
 }
 
@@ -1338,6 +1365,7 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/frc-completion-interrupt-enable",
                    test_frc_completion_interrupt_enable);
     qtest_add_func("/efr32bg22/radio-enable-masks", test_radio_enable_masks);
+    qtest_add_func("/efr32bg22/radio-ipversions", test_radio_ipversions);
     qtest_add_func("/efr32bg22/radio-nonsecure-alias",
                    test_radio_nonsecure_alias);
     qtest_add_func("/efr32bg22/stock-setup-aliases",
