@@ -29,6 +29,8 @@ static char *rf_trace_path;
 #define RAC_STATUS               0x00c
 #define RAC_STATUS_STATE_MASK     0x0f000000
 #define RAC_STATUS_STATE_RXSEARCH (2u << 24)
+#define SYNTH_BASE               0xa8018000
+#define SYNTH_CHCTRL             0x040
 #define BUFC_BASE                0xaa000000
 #define BUFC_CH0                 0x00c
 #define BUFC_CH1                 0x04c
@@ -147,6 +149,61 @@ static void test_tx_offer_reaches_peer_rx_fifo(void)
     g_assert_cmphex(qtest_readl(global_qtest, peer_rx_channel + BUFC_STATUS) &
                         0x1fff,
                     ==, 0);
+}
+
+/*
+ * The RF medium is still a raw-byte mailbox, but it must not hand a staged
+ * transmission to an RXSEARCH peer tuned to another physical channel.  The
+ * matching peer may enter RXSEARCH while the TX transaction is active and
+ * receive that same snapshot once.
+ */
+static void test_tx_offer_requires_matching_synth_channel(void)
+{
+    const uint8_t payload[] = { 0x6e, 0xb4 };
+    const uint32_t source_tx_channel = BUFC_BASE + BUFC_CH0;
+    const uint64_t peer_rx_channel = peer(BUFC_BASE + BUFC_CH1);
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_CMD, 1);
+    qtest_writel(global_qtest, peer_rx_channel, 0);
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_CHCTRL, 10);
+    qtest_writel(global_qtest, peer(SYNTH_BASE + SYNTH_CHCTRL), 11);
+    qtest_writel(global_qtest,
+                 peer(RAC_BASE + RAC_RXENSRCEN + REGISTER_SET_WINDOW),
+                 RAC_RXENSRCEN_SWRXEN);
+
+    qtest_writel(global_qtest, source_tx_channel + BUFC_CMD, 1);
+    for (size_t index = 0; index < G_N_ELEMENTS(payload); index++) {
+        qtest_writel(global_qtest, source_tx_channel + BUFC_WRITEDATA,
+                     payload[index]);
+    }
+    qtest_writel(global_qtest, RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(1);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+    g_assert_cmphex(qtest_readl(global_qtest, peer(FRC_BASE + FRC_IF)) &
+                        FRC_IF_RXDONE,
+                    ==, 0);
+
+    qtest_writel(global_qtest, peer(RAC_BASE + RAC_CMD), RAC_CMD_RXDIS);
+    qtest_writel(global_qtest, peer(SYNTH_BASE + SYNTH_CHCTRL), 10);
+    qtest_writel(global_qtest,
+                 peer(RAC_BASE + RAC_RXENSRCEN + REGISTER_SET_WINDOW),
+                 RAC_RXENSRCEN_SWRXEN);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(1);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+    g_assert_cmphex(qtest_readl(global_qtest, peer(FRC_BASE + FRC_IF)) &
+                        FRC_IF_RXDONE,
+                    ==, FRC_IF_RXDONE);
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_READOFFSET, 0);
+    for (size_t index = 0; index < G_N_ELEMENTS(payload); index++) {
+        g_assert_cmphex(qtest_readl(global_qtest,
+                                    peer_rx_channel + BUFC_READDATA),
+                        ==, payload[index]);
+    }
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
 }
 
 /*
@@ -1063,6 +1120,8 @@ int main(int argc, char **argv)
                    test_peer_bufc_dma_uses_peer_address_space);
     qtest_add_func("/efr32bg22/rf/tx-offer-reaches-peer-rx-fifo",
                    test_tx_offer_reaches_peer_rx_fifo);
+    qtest_add_func("/efr32bg22/rf/tx-offer-requires-matching-synth-channel",
+                   test_tx_offer_requires_matching_synth_channel);
     qtest_add_func("/efr32bg22/rf/tx-offer-enqueues-synthetic-rx-descriptor",
                    test_tx_offer_enqueues_synthetic_rx_descriptor);
     qtest_add_func("/efr32bg22/rf/tx-offer-drops-descriptor-ring-overflow",

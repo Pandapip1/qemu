@@ -40,6 +40,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_RFCRC_BASE 0xa8010000u
 #define EFR32_MODEM_BASE 0xa8014000u
 #define EFR32_SYNTH_BASE 0xa8018000u
+#define EFR32_SYNTH_CHCTRL 0x040u
+#define EFR32_SYNTH_CHCTRL_CHNO_MASK 0x3fu
 #define EFR32_PROTIMER_BASE 0xa801c000u
 #define EFR32_PROTIMER_NS_BASE 0xb801c000u
 #define EFR32_RAC_BASE 0xa8020000u
@@ -941,6 +943,9 @@ static void efr32_rac_capture_tx_snapshot(Efr32Periph *s)
     Efr32RfTxMetadata metadata = {
         .trigger = EFR32_RF_TX_TRIGGER_RAC_CMD_TXEN,
         .buffer_channel = EFR32_RF_TX_BUFC_CHANNEL,
+        .channel = efr32_register_get(s, EFR32_SYNTH_BASE +
+                                      EFR32_SYNTH_CHCTRL) &
+                   EFR32_SYNTH_CHCTRL_CHNO_MASK,
     };
     GByteArray *data = efr32_bufc_snapshot_data(
         s, EFR32_RF_TX_BUFC_CHANNEL);
@@ -2045,6 +2050,14 @@ static bool efr32_periph_is_rx_ready(Efr32RfRadio *radio)
     return s->rac_state == EFR32_RAC_STATE_RXSEARCH;
 }
 
+static uint8_t efr32_periph_get_channel(Efr32RfRadio *radio)
+{
+    Efr32Periph *s = EFR32_PERIPH(radio);
+
+    return efr32_register_get(s, EFR32_SYNTH_BASE + EFR32_SYNTH_CHCTRL) &
+           EFR32_SYNTH_CHCTRL_CHNO_MASK;
+}
+
 static void efr32_periph_rx_offer_available(Efr32RfRadio *radio)
 {
     Efr32Periph *s = EFR32_PERIPH(radio);
@@ -2069,6 +2082,7 @@ static void efr32_periph_class_init(ObjectClass *o, void *d)
     device_class_set_props(dc, efr32_periph_properties);
     RESETTABLE_CLASS(o)->phases.hold = efr32_periph_reset_hold;
     radio_class->is_rx_ready = efr32_periph_is_rx_ready;
+    radio_class->get_channel = efr32_periph_get_channel;
     radio_class->rx_offer_available = efr32_periph_rx_offer_available;
 }
 

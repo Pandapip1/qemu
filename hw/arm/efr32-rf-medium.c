@@ -58,6 +58,14 @@ bool efr32_rf_radio_is_rx_ready(Efr32RfRadio *radio)
     return klass->is_rx_ready && klass->is_rx_ready(radio);
 }
 
+uint8_t efr32_rf_radio_get_channel(Efr32RfRadio *radio)
+{
+    Efr32RfRadioClass *klass = EFR32_RF_RADIO_GET_CLASS(radio);
+
+    g_assert(klass->get_channel);
+    return klass->get_channel(radio);
+}
+
 void efr32_rf_radio_rx_offer_available(Efr32RfRadio *radio)
 {
     Efr32RfRadioClass *klass = EFR32_RF_RADIO_GET_CLASS(radio);
@@ -299,6 +307,7 @@ unsigned efr32_rf_medium_offer_latest_tx(Efr32RfMedium *medium,
 
         if (receiver == efr32_rf_tx_snapshot_get_radio(snapshot) ||
             !efr32_rf_radio_is_rx_ready(receiver) ||
+            efr32_rf_radio_get_channel(receiver) != snapshot->metadata.channel ||
             efr32_rf_tx_snapshot_receiver_delivered(snapshot, receiver)) {
             continue;
         }
@@ -349,6 +358,7 @@ unsigned efr32_rf_medium_offer_active_tx_to_receiver(Efr32RfMedium *medium,
     active_sequence = g_hash_table_lookup(medium->active_tx_sequences, source);
     if (source == receiver || !active_sequence ||
         *active_sequence != efr32_rf_tx_snapshot_get_sequence(snapshot) ||
+        efr32_rf_radio_get_channel(receiver) != snapshot->metadata.channel ||
         efr32_rf_tx_snapshot_receiver_delivered(snapshot, receiver)) {
         return 0;
     }

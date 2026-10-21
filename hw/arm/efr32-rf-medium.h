@@ -25,10 +25,13 @@ struct Efr32RfRadioClass {
     InterfaceClass parent_class;
 
     bool (*is_rx_ready)(Efr32RfRadio *radio);
+    /* Return the currently selected physical SYNTH channel (0..39). */
+    uint8_t (*get_channel)(Efr32RfRadio *radio);
     void (*rx_offer_available)(Efr32RfRadio *radio);
 };
 
 bool efr32_rf_radio_is_rx_ready(Efr32RfRadio *radio);
+uint8_t efr32_rf_radio_get_channel(Efr32RfRadio *radio);
 void efr32_rf_radio_rx_offer_available(Efr32RfRadio *radio);
 
 typedef enum Efr32RfTxTrigger {
@@ -46,6 +49,8 @@ typedef enum Efr32RfTxTrigger {
 typedef struct Efr32RfTxMetadata {
     Efr32RfTxTrigger trigger;
     uint8_t buffer_channel;
+    /* SYNTH.CHCTRL.CHNO captured with the channel-0 staging snapshot. */
+    uint8_t channel;
 } Efr32RfTxMetadata;
 
 typedef struct Efr32RfTxSnapshot Efr32RfTxSnapshot;
@@ -66,7 +71,8 @@ typedef struct Efr32RfRxDeliveryRequest Efr32RfRxDeliveryRequest;
  * This interface deliberately models only membership in an in-process RF
  * medium.  It does not define an air-frame format or a host HCI transport.
  * The intended EFR32 abstraction boundary is a snapshot of staged BUFC
- * channel 0 at RAC.CMD.TXEN/RAC->TX. Receive delivery remains deferred until a
+ * channel 0 and SYNTH.CHCTRL.CHNO at RAC.CMD.TXEN/RAC->TX. Receive delivery
+ * remains deferred until a
  * receiver is in RXSEARCH. The current RXRAWDATA-to-BUFC channel 1 seam
  * optionally publishes a QEMU-only successful-RX descriptor when the guest
  * configured channel 2; that is a simulator convention and not a claim about
@@ -151,7 +157,8 @@ GBytes *efr32_rf_rx_delivery_request_get_data(
 
 /*
  * Create mailbox offers from the newest TX snapshot for RX-ready attached
- * peers, in attachment order. This is not RF delivery or a timing model.
+ * peers tuned to the captured SYNTH channel, in attachment order. This is not
+ * RF delivery or a timing model.
  */
 unsigned efr32_rf_medium_offer_latest_tx(Efr32RfMedium *medium,
                                          Error **errp);
