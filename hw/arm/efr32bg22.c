@@ -212,6 +212,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_BUFC_THRESHOLD 0x024u
 #define EFR32_BUFC_CMD 0x028u
 
+/*
+ * The M33-facing RF mailbox has two endpoints in the radio address space.
+ * The board maps the 0xb802.... non-secure window as an alias of this secure
+ * window, so register handling uses these secure canonical addresses.
+ */
+#define EFR32_RFMAILBOX_B_BASE 0xa8028000u
+#define EFR32_RFMAILBOX_C_BASE 0xa802c000u
+#define EFR32_RFMAILBOX_FLAGS  0x040u
+
 struct Efr32Periph
 {
     SysBusDevice parent_obj;
@@ -1278,10 +1287,19 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
     }
     if (address == EFR32_AGC_BASE + EFR32_AGC_CMD)
         return 0; /* AGC.CMD is write-only in the public register model. */
-    if (((address & ~0x3fffu) == 0xa8028000 ||
-         (address & ~0x3fffu) == 0xa802c000) &&
-        offset == 0x40)
+    if (((address & ~0x3fffu) == EFR32_RFMAILBOX_B_BASE ||
+         (address & ~0x3fffu) == EFR32_RFMAILBOX_C_BASE) &&
+        offset == EFR32_RFMAILBOX_FLAGS)
+    {
+        /*
+         * Stock services this doorbell register, and RAIL uses the standard
+         * SET/CLR aliases.  The peer endpoint and its delivery timing have
+         * not been recovered, however.  Keeping FLAGS clear makes the
+         * modeled no-peer state explicit; it must not turn a guest mailbox
+         * write into a synthetic RDMAILBOX IRQ or an RX descriptor.
+         */
         return 0;
+    }
     return efr32_register_get(s, address);
 }
 static uint64_t efr32_peripheral_read(Efr32Periph *s, uint32_t address,

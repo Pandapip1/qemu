@@ -165,6 +165,12 @@ static char *tx_snapshot_trace_path;
 #define BUFC_TX_CHANNEL       BUFC_CH0
 #define BUFC_RX_CHANNEL       BUFC_CH1
 
+#define RFMAILBOX_B_BASE      0xa8028000
+#define RFMAILBOX_C_BASE      0xa802c000
+#define RFMAILBOX_NS_OFFSET   0x10000000
+#define RFMAILBOX_DATA        0x004
+#define RFMAILBOX_FLAGS       0x040
+
 #define BUFC_SECURE_BASE     0xaa000000
 #define RADIO_NONSECURE_ALIAS 0x10000000
 
@@ -1228,6 +1234,23 @@ static void test_rac_masks(void)
     g_assert_cmphex(readl(RAC_BASE + RAC_IEN), ==, 0x00ff000f);
 }
 
+/*
+ * The recovered M33-side protocol uses endpoint data plus FLAGS bit 1.  QEMU
+ * retains the guest data register but deliberately has no peer endpoint, so
+ * neither secure nor non-secure FLAGS reads may manufacture a doorbell.
+ */
+static void test_rfmailbox_no_peer(void)
+{
+    writel(RFMAILBOX_C_BASE + RFMAILBOX_NS_OFFSET + RFMAILBOX_DATA, 0x3412);
+    g_assert_cmphex(readl(RFMAILBOX_C_BASE + RFMAILBOX_DATA), ==, 0x3412);
+
+    writel(RFMAILBOX_C_BASE + RFMAILBOX_FLAGS + REGISTER_SET_WINDOW, 1u << 1);
+    g_assert_cmphex(readl(RFMAILBOX_C_BASE + RFMAILBOX_FLAGS), ==, 0);
+    g_assert_cmphex(readl(RFMAILBOX_C_BASE + RFMAILBOX_NS_OFFSET +
+                          RFMAILBOX_FLAGS), ==, 0);
+    g_assert_cmphex(readl(RFMAILBOX_B_BASE + RFMAILBOX_FLAGS), ==, 0);
+}
+
 /* RAIL_StartTx clears RAC.SR0 bit 5 through the Series-2 CLR alias. */
 static void test_rac_sr0_clear_alias(void)
 {
@@ -1371,6 +1394,7 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/rac-software-rx-enable",
                    test_rac_software_rx_enable);
     qtest_add_func("/efr32bg22/rac-masks", test_rac_masks);
+    qtest_add_func("/efr32bg22/rfmailbox-no-peer", test_rfmailbox_no_peer);
     qtest_add_func("/efr32bg22/rac-sr0-clear-alias",
                    test_rac_sr0_clear_alias);
     qtest_add_func("/efr32bg22/rac-force-disable", test_rac_force_disable);
