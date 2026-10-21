@@ -466,9 +466,10 @@ static void efr32_bufc_update_threshold(Efr32Periph *s, unsigned channel)
 
 /*
  * BUFC data ports are the boundary between the packet engines and the FIFO
- * backing store.  Host/RF ingress is not modeled yet, but keeping this write
- * path separate from MMIO dispatch gives a future FRC/RF producer the same
- * circular-buffer and guest-RAM behavior as sequencer programmed I/O.
+ * backing store. The current RF-medium seam uses this path only for raw
+ * channel-1 bytes and deliberately does not construct a stock RX descriptor.
+ * Keeping it separate from MMIO dispatch gives a future evidenced producer the
+ * same circular-buffer and guest-RAM behavior as sequencer programmed I/O.
  */
 static void efr32_bufc_write_data_port(Efr32Periph *s, unsigned channel,
                                        uint8_t value, bool xor_write)
