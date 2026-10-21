@@ -780,6 +780,27 @@ static void test_bufc_overflow_latch(void)
     g_assert_cmphex(readl(BUFC_BASE + BUFC_IF) & 1, ==, 1);
 }
 
+static void test_bufc_descriptor_ring_overflow_latch(void)
+{
+    const uint32_t channel = BUFC_BASE + BUFC_CH2;
+    const uint32_t overflow_flag = 1u << 16;
+
+    /*
+     * RAIL's archive-backed class-4 producer starts from BUF2OF.  The BUFC
+     * block supplies that channel-2 condition; software, not this generic
+     * FIFO model, decides whether and how to publish the eight-byte record.
+     */
+    writel(BUFC_BASE + BUFC_IF + REGISTER_CLEAR_WINDOW, overflow_flag);
+    writel(channel + BUFC_CMD, 1);
+    writel(channel, 0); /* 64-byte descriptor-ring backing FIFO */
+    for (unsigned i = 0; i <= 64; i++) {
+        writel(channel + BUFC_WRITEDATA, i);
+    }
+
+    g_assert_cmphex(readl(BUFC_BASE + BUFC_IF) & overflow_flag, ==,
+                    overflow_flag);
+}
+
 static void test_bufc_rx_fifo_setup_latches(void)
 {
     uint32_t channel = BUFC_BASE + BUFC_CH1;
@@ -1300,6 +1321,8 @@ int main(int argc, char **argv)
                    test_bufc_backing_memory_wrap);
     qtest_add_func("/efr32bg22/bufc-overflow-latch",
                    test_bufc_overflow_latch);
+    qtest_add_func("/efr32bg22/bufc-descriptor-ring-overflow-latch",
+                   test_bufc_descriptor_ring_overflow_latch);
     qtest_add_func("/efr32bg22/bufc-rx-fifo-setup-latches",
                    test_bufc_rx_fifo_setup_latches);
     qtest_add_func("/efr32bg22/bufc-rx-descriptor-ring-setup-latches",
