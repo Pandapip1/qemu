@@ -598,6 +598,58 @@ static void test_repeated_tx_delivers_each_sequence_once(
     object_unref(OBJECT(receiver));
 }
 
+static void test_bidirectional_rx_then_tx_delivery(
+    RfMediumFixture *fixture, gconstpointer data)
+{
+    /* The first byte is the BLE generic-PDU type value for CONNECT_IND. */
+    const uint8_t connect_ind[] = {0x05, 0x0a, 0x31, 0x62, 0x73, 0x84};
+    const uint8_t response[] = {0x02, 0x03, 0xa1, 0xb2, 0xc3};
+    Efr32RfTxMetadata tx_metadata = valid_tx_metadata();
+    Efr32RfRadio *scanner = add_rx_ready_radio(fixture);
+    Efr32RfTxSnapshot *snapshot;
+    Efr32RfRxDeliveryRequest *offer;
+    const uint8_t *payload;
+    gsize length;
+
+    /* Advertiser TX -> scanner RX. */
+    snapshot = efr32_rf_medium_snapshot_tx(
+        fixture->medium, fixture->radio, &tx_metadata, connect_ind,
+        sizeof(connect_ind), &error_abort);
+    efr32_rf_medium_set_latest_tx_snapshot(fixture->medium, snapshot);
+    g_assert_cmpuint(efr32_rf_medium_offer_latest_tx(fixture->medium,
+                                                       &error_abort), ==, 1);
+    offer = efr32_rf_medium_take_rx_offer_for_radio(fixture->medium, scanner);
+    g_assert_nonnull(offer);
+    payload = g_bytes_get_data(efr32_rf_rx_delivery_request_get_data(offer),
+                               &length);
+    g_assert_cmpuint(length, ==, sizeof(connect_ind));
+    g_assert_cmpmem(payload, length, connect_ind, sizeof(connect_ind));
+    efr32_rf_rx_delivery_request_free(offer);
+    efr32_rf_medium_complete_tx(fixture->medium, fixture->radio);
+
+    /* Scanner TX response -> advertiser RX, after consuming the first PDU. */
+    snapshot = efr32_rf_medium_snapshot_tx(
+        fixture->medium, scanner, &tx_metadata, response, sizeof(response),
+        &error_abort);
+    efr32_rf_medium_set_latest_tx_snapshot(fixture->medium, snapshot);
+    g_assert_cmpuint(efr32_rf_medium_offer_latest_tx(fixture->medium,
+                                                       &error_abort), ==, 1);
+    offer = efr32_rf_medium_take_rx_offer_for_radio(
+        fixture->medium, fixture->radio);
+    g_assert_nonnull(offer);
+    payload = g_bytes_get_data(efr32_rf_rx_delivery_request_get_data(offer),
+                               &length);
+    g_assert_cmpuint(length, ==, sizeof(response));
+    g_assert_cmpmem(payload, length, response, sizeof(response));
+    efr32_rf_rx_delivery_request_free(offer);
+    efr32_rf_medium_complete_tx(fixture->medium, scanner);
+    g_assert_cmpuint(efr32_rf_medium_get_rx_offer_count(fixture->medium), ==,
+                     0);
+
+    efr32_rf_medium_detach(fixture->medium, scanner);
+    object_unref(OBJECT(scanner));
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -647,6 +699,10 @@ int main(int argc, char **argv)
     g_test_add("/efr32-rf-medium/repeated-tx-delivers-each-sequence-once",
                RfMediumFixture, NULL, rf_medium_fixture_setup,
                test_repeated_tx_delivers_each_sequence_once,
+               rf_medium_fixture_teardown);
+    g_test_add("/efr32-rf-medium/bidirectional-rx-then-tx-delivery",
+               RfMediumFixture, NULL, rf_medium_fixture_setup,
+               test_bidirectional_rx_then_tx_delivery,
                rf_medium_fixture_teardown);
     g_test_add("/efr32-rf-medium/rx-offers-are-receiver-scoped",
                RfMediumFixture, NULL, rf_medium_fixture_setup,
