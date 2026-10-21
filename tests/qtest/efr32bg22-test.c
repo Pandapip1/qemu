@@ -149,6 +149,15 @@ static char *tx_snapshot_trace_path;
 #define TIMER_CMD_STOP           (1u << 1)
 #define TIMER_STATUS_RUNNING     (1u << 0)
 #define TIMER_IF_CC0             (1u << 4)
+#define TIMER0_BASE             0x40048000
+#define TIMER0_NS_BASE          0x50048000
+#define TIMER_CFG               0x004
+#define TIMER_CFG_PRESC_SHIFT   18
+#define TIMER_CC_CFG(n)         (0x060 + 0x20 * (n))
+#define TIMER_CC_OC(n)          (0x068 + 0x20 * (n))
+#define TIMER_CC_CFG_OUTPUTCOMPARE 0x2
+#define TIMER_IF_OF             (1u << 0)
+#define TIMER_IF_CC(n)          (1u << (4 + (n)))
 #define RADIO_RAM_NS_BASE     0xb0000000
 #define RADIO_RAM_RHCLKPRESC  0x4fe0
 #define BUFC_BASE            0xaa000000
@@ -375,6 +384,77 @@ static void test_timer2_counter_and_aliases(void)
 
     writel(TIMER2_NS_BASE + TIMER_EN + REGISTER_CLEAR_WINDOW, TIMER_EN_EN);
     g_assert_cmphex(readl(TIMER2_BASE + TIMER_STATUS), ==, 0);
+}
+
+static void timer0_step(int64_t ns)
+{
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    qtest_clock_step(global_qtest, ns);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+}
+
+/* TIMER0 is 32-bit (TIMER0_CNTWIDTH = 0x20) and counts HFXO / (PRESC + 1). */
+static void test_timer0_32bit_count_prescale_overflow(void)
+{
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    g_assert_cmphex(readl(TIMER0_BASE + TIMER_TOP), ==, 0xffff);
+
+    writel(TIMER0_NS_BASE + TIMER_EN + REGISTER_SET_WINDOW, TIMER_EN_EN);
+    writel(TIMER0_NS_BASE + TIMER_TOP, 0xffffffff);
+    writel(TIMER0_NS_BASE + TIMER_CNT, 0xffffff00);
+    writel(TIMER0_NS_BASE + TIMER_CMD, TIMER_CMD_START);
+    g_assert_cmphex(readl(TIMER0_BASE + TIMER_STATUS), ==,
+                    TIMER_STATUS_RUNNING);
+
+    /* 10 us at 38.4 MHz is exactly 384 ticks: past the 32-bit wrap. */
+    timer0_step(10000);
+    g_assert_cmphex(readl(TIMER0_BASE + TIMER_CNT), ==, 0x80);
+    g_assert_cmphex(readl(TIMER0_BASE + TIMER_IF) & TIMER_IF_OF, ==,
+                    TIMER_IF_OF);
+
+    /* PRESC = 3 divides by four from the current count. */
+    writel(TIMER0_BASE + TIMER_CFG, 3u << TIMER_CFG_PRESC_SHIFT);
+    timer0_step(10000);
+    g_assert_cmphex(readl(TIMER0_BASE + TIMER_CNT), ==, 0x80 + 96);
+
+    writel(TIMER0_BASE + TIMER_CMD + REGISTER_SET_WINDOW, TIMER_CMD_STOP);
+    g_assert_cmphex(readl(TIMER0_NS_BASE + TIMER_STATUS), ==, 0);
+    timer0_step(10000);
+    g_assert_cmphex(readl(TIMER0_BASE + TIMER_CNT), ==, 0x80 + 96);
+}
+
+/* Each output-compare channel flags only when CNT reaches its own OC. */
+static void test_timer0_cc_output_compare(void)
+{
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+
+    writel(TIMER0_NS_BASE + TIMER_EN, TIMER_EN_EN);
+    writel(TIMER0_NS_BASE + TIMER_TOP, 0xffffffff);
+    writel(TIMER0_NS_BASE + TIMER_CC_CFG(0), TIMER_CC_CFG_OUTPUTCOMPARE);
+    writel(TIMER0_NS_BASE + TIMER_CC_CFG(1), TIMER_CC_CFG_OUTPUTCOMPARE);
+    writel(TIMER0_NS_BASE + TIMER_CC_OC(0), 1000);
+    writel(TIMER0_NS_BASE + TIMER_CC_OC(1), 2000);
+    /* CC2 is left in OFF mode: its OC value must not raise a flag. */
+    writel(TIMER0_NS_BASE + TIMER_CC_OC(2), 500);
+    writel(TIMER0_NS_BASE + TIMER_IEN, TIMER_IF_CC(0) | TIMER_IF_CC(1));
+    writel(TIMER0_NS_BASE + TIMER_CNT, 0);
+    writel(TIMER0_NS_BASE + TIMER_CMD, TIMER_CMD_START);
+
+    /* 1000 ticks are 26041.67 ns. */
+    timer0_step(26041);
+    g_assert_cmphex(readl(TIMER0_BASE + TIMER_IF), ==, 0);
+    timer0_step(1);
+    g_assert_cmphex(readl(TIMER0_BASE + TIMER_IF), ==, TIMER_IF_CC(0));
+
+    writel(TIMER0_BASE + TIMER_IF + REGISTER_CLEAR_WINDOW, TIMER_IF_CC(0));
+    timer0_step(26042);
+    g_assert_cmphex(readl(TIMER0_BASE + TIMER_IF), ==, TIMER_IF_CC(1));
+
+    /* A compare moved behind CNT waits for the counter to come around. */
+    writel(TIMER0_BASE + TIMER_IF + REGISTER_CLEAR_WINDOW, TIMER_IF_CC(1));
+    writel(TIMER0_BASE + TIMER_CC_OC(0), 10);
+    timer0_step(100000);
+    g_assert_cmphex(readl(TIMER0_BASE + TIMER_IF), ==, 0);
 }
 
 static void test_timer4_cc0_compare_pending(void)
@@ -1422,6 +1502,10 @@ int main(int argc, char **argv)
                    test_timer2_counter_and_aliases);
     qtest_add_func("/efr32bg22/timer4-cc0-compare-pending",
                    test_timer4_cc0_compare_pending);
+    qtest_add_func("/efr32bg22/timer0-32bit-count-prescale-overflow",
+                   test_timer0_32bit_count_prescale_overflow);
+    qtest_add_func("/efr32bg22/timer0-cc-output-compare",
+                   test_timer0_cc_output_compare);
     qtest_add_func("/efr32bg22/system-reset-clears-radio-timer-state",
                    test_system_reset_clears_radio_timer_state);
     qtest_add_func("/efr32bg22/cmu-nonsecure-alias", test_cmu_nonsecure_alias);
