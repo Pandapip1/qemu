@@ -1095,11 +1095,15 @@ static void test_bidirectional_rac_txen_after_rx(void)
     /* Endpoint IDs distinguish the two same-address SoCs in this exchange. */
     gchar *trace;
 
+    /* The simple trace backend buffers records until explicitly flushed. */
+    g_free(qtest_hmp(global_qtest, "trace-file flush"));
     g_assert(g_file_get_contents(rf_trace_path, &trace, NULL, NULL));
     g_assert_nonnull(g_strstr_len(trace, -1, "endpoint=0 TX snapshot"));
     g_assert_nonnull(g_strstr_len(trace, -1, "endpoint=1 TX snapshot"));
-    g_assert_nonnull(g_strstr_len(trace, -1, "endpoint=0 RAC.CMD="));
-    g_assert_nonnull(g_strstr_len(trace, -1, "endpoint=1 RAC.CMD="));
+    g_assert_true(g_regex_match_simple("endpoint=0 now=[0-9]+ RAC\\.CMD=",
+                                       trace, 0, 0));
+    g_assert_true(g_regex_match_simple("endpoint=1 now=[0-9]+ RAC\\.CMD=",
+                                       trace, 0, 0));
     g_free(trace);
 }
 
