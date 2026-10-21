@@ -766,7 +766,10 @@ static void efr32_rac_rx_handoff(void *opaque)
      * The retained sequencer reads FRC.RXRAWDATA then writes its four byte
      * lanes to secure BUFC channel 1 WRITEDATA.  Replay only that observed
      * data path: these bytes are not framed, CRC checked, or made into a
-     * channel-2 descriptor.
+     * channel-2 descriptor.  Stock RAIL dispatches a received packet from a
+     * channel-2 descriptor threshold event, not directly from FRC.RXDONE;
+     * its descriptor record format is still incomplete.  The RXDONE below is
+     * therefore a simulator-only completion seam, not stock RX behaviour.
      */
     for (gsize index = 0; index < length; index++) {
         efr32_register_put(s, EFR32_FRC_BASE + EFR32_FRC_RXRAWDATA,
@@ -775,6 +778,7 @@ static void efr32_rac_rx_handoff(void *opaque)
                                    data[index], false);
     }
     efr32_rf_rx_delivery_request_free(request);
+    /* See the boundary documented above: this is deliberately synthetic. */
     efr32_frc_raise(s, EFR32_FRC_IF_RXDONE);
 
     /* One mailbox record is consumed per deferred handoff. */
