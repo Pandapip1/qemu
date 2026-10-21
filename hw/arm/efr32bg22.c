@@ -702,7 +702,7 @@ static void efr32_rac_set_state(Efr32Periph *s, uint32_t state)
     }
     efr32_register_put(s, EFR32_RAC_BASE + EFR32_RAC_SEQIF,
                        efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_SEQIF) |
-                           sequence_flag);
+                           sequence_flag | 1u);
     efr32_rac_update_irqs(s);
     if (state == EFR32_RAC_STATE_RXSEARCH) {
         /*

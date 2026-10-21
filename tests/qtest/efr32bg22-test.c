@@ -71,6 +71,7 @@ static char *tx_snapshot_trace_path;
 #define RAC_STATUS_TXENS      (1u << 30)
 #define RAC_STATUS_RXENS      (1u << 31)
 #define RAC_SEQIF_STATEOFF    (1u << 16)
+#define RAC_SEQIF_STATECHANGESEQ (1u << 0)
 #define RAC_SEQIF_STATERXSEARCH (1u << 18)
 #define RAC_SEQIF_STATETX     (1u << 25)
 #define DCDC_BASE             0x40094000
@@ -1039,12 +1040,16 @@ static void test_rac_tx_commands(void)
                     ==, RAC_STATUS_TXENS);
     g_assert_cmphex(readl(RAC_BASE + RAC_SEQIF) & RAC_SEQIF_STATETX, ==,
                     RAC_SEQIF_STATETX);
+    g_assert_cmphex(readl(RAC_BASE + RAC_SEQIF) & RAC_SEQIF_STATECHANGESEQ, ==,
+                    RAC_SEQIF_STATECHANGESEQ);
 
     writel(RAC_BASE + RAC_CMD, RAC_CMD_TXDIS);
     g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK, ==,
                     0);
     g_assert_cmphex(readl(RAC_BASE + RAC_SEQIF) & RAC_SEQIF_STATEOFF, ==,
                     RAC_SEQIF_STATEOFF);
+    g_assert_cmphex(readl(RAC_BASE + RAC_SEQIF) & RAC_SEQIF_STATECHANGESEQ, ==,
+                    RAC_SEQIF_STATECHANGESEQ);
 }
 
 static void test_rac_tx_completion(void)
