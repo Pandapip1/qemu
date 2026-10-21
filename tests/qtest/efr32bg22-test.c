@@ -1057,6 +1057,33 @@ static void test_protimer_counter_is_independent_from_radio_setup(void)
     g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_COUNTER), ==, 2);
 }
 
+static void test_protimer_counter_is_independent_from_burtc(void)
+{
+    uint32_t before;
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    before = readl(PROTIMER_BASE + PROTIMER_COUNTER);
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(1001);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_COUNTER), ==, before + 2);
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    writel(BURTC_BASE + BURTC_EN, BURTC_EN_EN);
+    writel(BURTC_BASE + BURTC_CNT, 0x12345678);
+    writel(BURTC_BASE + BURTC_CMD, BURTC_CMD_START);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_STATUS), ==,
+                    BURTC_STATUS_RUNNING);
+
+    before = readl(PROTIMER_BASE + PROTIMER_COUNTER);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(1001);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+    /* BURTC's separate 32.768 kHz clock must not replace PROTIMERCLK. */
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_COUNTER), ==, before + 2);
+}
+
 static void test_rac_tx_commands(void)
 {
     writel(RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
@@ -1408,6 +1435,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/protimer-counter", test_protimer_counter);
     qtest_add_func("/efr32bg22/protimer-counter-is-independent-from-radio-setup",
                    test_protimer_counter_is_independent_from_radio_setup);
+    qtest_add_func("/efr32bg22/protimer-counter-is-independent-from-burtc",
+                   test_protimer_counter_is_independent_from_burtc);
     qtest_add_func("/efr32bg22/rac-tx-commands", test_rac_tx_commands);
     qtest_add_func("/efr32bg22/rac-tx-completion", test_rac_tx_completion);
     qtest_add_func("/efr32bg22/rac-tx-disable-cancels-completion",
