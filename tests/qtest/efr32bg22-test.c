@@ -851,12 +851,25 @@ static void test_bufc_sparse_threshold_flag(void)
     uint32_t threshold_flag = 1u << 10;
 
     writel(BUFC_BASE + BUFC_IEN, threshold_flag);
-    writel(channel + BUFC_THRESHOLD, 0);
-    writel(channel + BUFC_WRITEDATA, 0x5a);
+    /*
+     * Stock RAIL programs threshold 7 for its eight-byte descriptor ring.
+     * Threshold signalling is strictly greater-than, so the eighth byte is
+     * the first one that asserts BUF2THR. These are manual port writes:
+     * they validate BUFC occupancy signalling, not descriptor production.
+     */
+    writel(channel + BUFC_THRESHOLD, 7);
+    for (unsigned int i = 0; i < 7; i++) {
+        writel(channel + BUFC_WRITEDATA, i);
+    }
+
+    g_assert_cmphex(readl(BUFC_BASE + BUFC_IF) & threshold_flag, ==, 0);
+    g_assert_cmphex(readl(channel + BUFC_STATUS), ==, 7);
+
+    writel(channel + BUFC_WRITEDATA, 7);
 
     g_assert_cmphex(readl(BUFC_BASE + BUFC_IF) & threshold_flag, ==,
                     threshold_flag);
-    g_assert_cmphex(readl(channel + BUFC_STATUS), ==, (1u << 20) | 1u);
+    g_assert_cmphex(readl(channel + BUFC_STATUS), ==, (1u << 20) | 8u);
 }
 
 static void test_bufc_descriptor_threshold_flag(void)
