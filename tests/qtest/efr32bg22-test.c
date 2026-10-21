@@ -1155,7 +1155,16 @@ static void test_rac_tx_completion(void)
     writel(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW, FRC_IF_TXDONE);
     writel(RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
     qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
-    clock_step(150001);
+    clock_step(149999);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+
+    /* QEMU's synthetic completion must not become visible before 150 us. */
+    g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK, ==,
+                    RAC_STATUS_STATE_TX);
+    g_assert_cmphex(readl(FRC_BASE + FRC_IF) & FRC_IF_TXDONE, ==, 0);
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(1);
     qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
 
     g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK, ==,
