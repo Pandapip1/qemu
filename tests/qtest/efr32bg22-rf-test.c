@@ -29,13 +29,17 @@
 #define BUFC_BASE                0xaa000000
 #define BUFC_CH0                 0x00c
 #define BUFC_CH1                 0x04c
+#define BUFC_CH2                 0x08c
 #define BUFC_ADDR                0x004
 #define BUFC_WRITEOFFSET         0x008
 #define BUFC_READOFFSET          0x00c
 #define BUFC_READDATA            0x014
 #define BUFC_WRITEDATA           0x018
 #define BUFC_STATUS              0x020
+#define BUFC_THRESHOLD           0x024
 #define BUFC_CMD                 0x028
+#define BUFC_IF                  0x114
+#define BUFC_IEN                 0x118
 #define REGISTER_SET_WINDOW      0x1000
 #define REGISTER_CLEAR_WINDOW    0x2000
 
@@ -136,6 +140,64 @@ static void test_tx_offer_reaches_peer_rx_fifo(void)
     g_assert_cmphex(qtest_readl(global_qtest, peer_rx_channel + BUFC_STATUS) &
                         0x1fff,
                     ==, 0);
+}
+
+/*
+ * The in-process medium has a deliberately narrow, synthetic receive seam:
+ * it writes raw bytes to BUFC channel 1 and raises FRC.RXDONE.  Stock RAIL
+ * instead publishes RX_PACKET_RECEIVED after a hardware-produced channel-2
+ * descriptor crosses BUF2THR.  Until that descriptor format and producer are
+ * evidenced, an RF-medium handoff must not silently manufacture one.
+ */
+static void test_tx_offer_does_not_fabricate_rx_descriptor(void)
+{
+    const uint8_t payload[] = { 0x2b, 0x6c, 0xf0 };
+    const uint32_t fifo_guest_address = 0x20000480;
+    const uint32_t descriptor_guest_address = 0x20000500;
+    const uint64_t peer_rx_channel = peer(BUFC_BASE + BUFC_CH1);
+    const uint64_t peer_descriptor_channel = peer(BUFC_BASE + BUFC_CH2);
+    const uint32_t source_tx_channel = BUFC_BASE + BUFC_CH0;
+    const uint32_t descriptor_threshold = 1u << 18;
+
+    qtest_writel(global_qtest, peer(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW),
+                 FRC_IF_RXDONE);
+    qtest_writel(global_qtest, peer(BUFC_BASE + BUFC_IF + REGISTER_CLEAR_WINDOW),
+                 descriptor_threshold);
+    qtest_writel(global_qtest, peer(BUFC_BASE + BUFC_IEN), descriptor_threshold);
+    qtest_writel(global_qtest, peer_descriptor_channel + BUFC_CMD, 1);
+    qtest_writel(global_qtest, peer_descriptor_channel + BUFC_ADDR,
+                 descriptor_guest_address);
+    qtest_writel(global_qtest, peer_descriptor_channel, 3);
+    qtest_writel(global_qtest, peer_descriptor_channel + BUFC_THRESHOLD, 7);
+
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_CMD, 1);
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_ADDR, fifo_guest_address);
+    qtest_writel(global_qtest, peer_rx_channel, 0); /* 64-byte RX FIFO */
+    qtest_writel(global_qtest,
+                 peer(RAC_BASE + RAC_RXENSRCEN + REGISTER_SET_WINDOW),
+                 RAC_RXENSRCEN_SWRXEN);
+
+    qtest_writel(global_qtest, source_tx_channel + BUFC_CMD, 1);
+    for (size_t index = 0; index < G_N_ELEMENTS(payload); index++) {
+        qtest_writel(global_qtest, source_tx_channel + BUFC_WRITEDATA,
+                     payload[index]);
+    }
+    qtest_writel(global_qtest, RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(1);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+
+    g_assert_cmphex(qtest_readl(global_qtest, peer(FRC_BASE + FRC_IF)) &
+                        FRC_IF_RXDONE,
+                    ==, FRC_IF_RXDONE);
+    g_assert_cmphex(qtest_readl(global_qtest, peer_descriptor_channel +
+                                BUFC_STATUS), ==, 0);
+    g_assert_cmphex(qtest_readl(global_qtest, peer(BUFC_BASE + BUFC_IF)) &
+                        descriptor_threshold,
+                    ==, 0);
+    g_assert_cmphex(qtest_readl(global_qtest, peer_descriptor_channel +
+                                BUFC_READDATA), ==, 0);
 }
 
 /*
@@ -491,6 +553,8 @@ int main(int argc, char **argv)
                    test_peer_bufc_dma_uses_peer_address_space);
     qtest_add_func("/efr32bg22/rf/tx-offer-reaches-peer-rx-fifo",
                    test_tx_offer_reaches_peer_rx_fifo);
+    qtest_add_func("/efr32bg22/rf/tx-offer-does-not-fabricate-rx-descriptor",
+                   test_tx_offer_does_not_fabricate_rx_descriptor);
     qtest_add_func("/efr32bg22/rf/peer-rxsearch-during-active-tx-gets-offer",
                    test_peer_rxsearch_during_active_tx_gets_offer);
     qtest_add_func("/efr32bg22/rf/tx-offer-waits-for-receiver-rxsearch",
