@@ -788,7 +788,8 @@ static void efr32_rac_set_state(Efr32Periph *s, uint32_t state)
         efr32_rf_medium_offer_active_tx_to_receiver(
             s->rf_medium, EFR32_RF_RADIO(s), &error_abort);
     }
-    trace_efr32bg22_rac_state(previous_state, state);
+    trace_efr32bg22_rac_state(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                              previous_state, state);
 }
 
 static void efr32_rac_tx_complete(void *opaque)
