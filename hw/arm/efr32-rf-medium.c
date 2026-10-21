@@ -22,6 +22,8 @@ struct Efr32RfTxSnapshot {
     Efr32RfTxMetadata metadata;
     uint64_t sequence;
     GBytes *data;
+    /* Each receiver may consume a given synthetic transmission at most once. */
+    GHashTable *delivered_receivers;
 };
 
 struct Efr32RfRxDeliveryRequest {
@@ -36,6 +38,18 @@ struct Efr32RfRxDeliveryRequest {
     Efr32RfRadio *source;
     uint64_t tx_sequence;
 };
+
+static bool efr32_rf_tx_snapshot_receiver_delivered(
+    const Efr32RfTxSnapshot *snapshot, Efr32RfRadio *receiver)
+{
+    return g_hash_table_contains(snapshot->delivered_receivers, receiver);
+}
+
+static void efr32_rf_tx_snapshot_mark_receiver_delivered(
+    const Efr32RfTxSnapshot *snapshot, Efr32RfRadio *receiver)
+{
+    g_hash_table_add(snapshot->delivered_receivers, receiver);
+}
 
 bool efr32_rf_radio_is_rx_ready(Efr32RfRadio *radio)
 {
@@ -122,6 +136,8 @@ Efr32RfTxSnapshot *efr32_rf_medium_snapshot_tx(
     snapshot->metadata = *metadata;
     snapshot->sequence = medium->next_tx_sequence++;
     snapshot->data = g_bytes_new(data, length);
+    snapshot->delivered_receivers = g_hash_table_new(g_direct_hash,
+                                                     g_direct_equal);
     return snapshot;
 }
 
@@ -133,6 +149,7 @@ void efr32_rf_tx_snapshot_free(Efr32RfTxSnapshot *snapshot)
 
     object_unref(OBJECT(snapshot->radio));
     g_bytes_unref(snapshot->data);
+    g_hash_table_destroy(snapshot->delivered_receivers);
     g_free(snapshot);
 }
 
@@ -281,7 +298,8 @@ unsigned efr32_rf_medium_offer_latest_tx(Efr32RfMedium *medium,
         const uint8_t *data;
 
         if (receiver == efr32_rf_tx_snapshot_get_radio(snapshot) ||
-            !efr32_rf_radio_is_rx_ready(receiver)) {
+            !efr32_rf_radio_is_rx_ready(receiver) ||
+            efr32_rf_tx_snapshot_receiver_delivered(snapshot, receiver)) {
             continue;
         }
 
@@ -296,6 +314,7 @@ unsigned efr32_rf_medium_offer_latest_tx(Efr32RfMedium *medium,
             efr32_rf_tx_snapshot_get_radio(snapshot))));
         request->tx_sequence = efr32_rf_tx_snapshot_get_sequence(snapshot);
         g_queue_push_tail(&medium->rx_offers, request);
+        efr32_rf_tx_snapshot_mark_receiver_delivered(snapshot, receiver);
         efr32_rf_radio_rx_offer_available(receiver);
         offers++;
     }
@@ -329,7 +348,8 @@ unsigned efr32_rf_medium_offer_active_tx_to_receiver(Efr32RfMedium *medium,
     source = efr32_rf_tx_snapshot_get_radio(snapshot);
     active_sequence = g_hash_table_lookup(medium->active_tx_sequences, source);
     if (source == receiver || !active_sequence ||
-        *active_sequence != efr32_rf_tx_snapshot_get_sequence(snapshot)) {
+        *active_sequence != efr32_rf_tx_snapshot_get_sequence(snapshot) ||
+        efr32_rf_tx_snapshot_receiver_delivered(snapshot, receiver)) {
         return 0;
     }
 
@@ -352,6 +372,7 @@ unsigned efr32_rf_medium_offer_active_tx_to_receiver(Efr32RfMedium *medium,
     request->source = EFR32_RF_RADIO(object_ref(OBJECT(source)));
     request->tx_sequence = *active_sequence;
     g_queue_push_tail(&medium->rx_offers, request);
+    efr32_rf_tx_snapshot_mark_receiver_delivered(snapshot, receiver);
     efr32_rf_radio_rx_offer_available(receiver);
     return 1;
 }

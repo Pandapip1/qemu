@@ -538,6 +538,66 @@ static void test_complete_tx_discards_deferred_offer(RfMediumFixture *fixture,
     object_unref(OBJECT(receiver));
 }
 
+static void test_repeated_tx_delivers_each_sequence_once(
+    RfMediumFixture *fixture, gconstpointer data)
+{
+    const uint8_t first_payload[] = {0x31};
+    const uint8_t second_payload[] = {0x62};
+    Efr32RfTxMetadata tx_metadata = valid_tx_metadata();
+    Efr32RfRadio *receiver = add_rx_ready_radio(fixture);
+    Efr32RfTxSnapshot *snapshot;
+    Efr32RfRxDeliveryRequest *offer;
+    const uint8_t *payload;
+    gsize length;
+    uint64_t first_sequence;
+    uint64_t second_sequence;
+
+    snapshot = efr32_rf_medium_snapshot_tx(
+        fixture->medium, fixture->radio, &tx_metadata, first_payload,
+        sizeof(first_payload), &error_abort);
+    first_sequence = efr32_rf_tx_snapshot_get_sequence(snapshot);
+    efr32_rf_medium_set_latest_tx_snapshot(fixture->medium, snapshot);
+    g_assert_cmpuint(efr32_rf_medium_offer_latest_tx(fixture->medium,
+                                                       &error_abort), ==, 1);
+    offer = efr32_rf_medium_take_rx_offer_for_radio(fixture->medium,
+                                                     receiver);
+    g_assert_nonnull(offer);
+    payload = g_bytes_get_data(efr32_rf_rx_delivery_request_get_data(offer),
+                               &length);
+    g_assert_cmpuint(length, ==, sizeof(first_payload));
+    g_assert_cmpuint(payload[0], ==, first_payload[0]);
+    efr32_rf_rx_delivery_request_free(offer);
+
+    /* Consuming an offer must not make the still-active sequence replayable. */
+    g_assert_cmpuint(efr32_rf_medium_offer_active_tx_to_receiver(
+                         fixture->medium, receiver, &error_abort),
+                     ==, 0);
+    g_assert_cmpuint(efr32_rf_medium_get_rx_offer_count(fixture->medium), ==,
+                     0);
+    efr32_rf_medium_complete_tx(fixture->medium, fixture->radio);
+
+    snapshot = efr32_rf_medium_snapshot_tx(
+        fixture->medium, fixture->radio, &tx_metadata, second_payload,
+        sizeof(second_payload), &error_abort);
+    second_sequence = efr32_rf_tx_snapshot_get_sequence(snapshot);
+    efr32_rf_medium_set_latest_tx_snapshot(fixture->medium, snapshot);
+    g_assert_cmpuint(second_sequence, ==, first_sequence + 1);
+    g_assert_cmpuint(efr32_rf_medium_offer_latest_tx(fixture->medium,
+                                                       &error_abort), ==, 1);
+    offer = efr32_rf_medium_take_rx_offer_for_radio(fixture->medium,
+                                                     receiver);
+    g_assert_nonnull(offer);
+    payload = g_bytes_get_data(efr32_rf_rx_delivery_request_get_data(offer),
+                               &length);
+    g_assert_cmpuint(length, ==, sizeof(second_payload));
+    g_assert_cmpuint(payload[0], ==, second_payload[0]);
+    efr32_rf_rx_delivery_request_free(offer);
+    efr32_rf_medium_complete_tx(fixture->medium, fixture->radio);
+
+    efr32_rf_medium_detach(fixture->medium, receiver);
+    object_unref(OBJECT(receiver));
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -583,6 +643,10 @@ int main(int argc, char **argv)
     g_test_add("/efr32-rf-medium/complete-tx-discards-deferred-offer",
                RfMediumFixture, NULL, rf_medium_fixture_setup,
                test_complete_tx_discards_deferred_offer,
+               rf_medium_fixture_teardown);
+    g_test_add("/efr32-rf-medium/repeated-tx-delivers-each-sequence-once",
+               RfMediumFixture, NULL, rf_medium_fixture_setup,
+               test_repeated_tx_delivers_each_sequence_once,
                rf_medium_fixture_teardown);
     g_test_add("/efr32-rf-medium/rx-offers-are-receiver-scoped",
                RfMediumFixture, NULL, rf_medium_fixture_setup,
