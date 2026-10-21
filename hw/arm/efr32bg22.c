@@ -2067,6 +2067,7 @@ struct Efr32DualState {
     MemoryRegion peer_periph;
     MemoryRegion peer_radio;
     Efr32RfMedium *rf_medium;
+    char *image[2];
 };
 
 /* ARMv7M CPUs require an explicit board reset registration. */
@@ -2374,6 +2375,20 @@ static void dual_init(MachineState *m)
         object_property_set_link(OBJECT(&s->soc[index]), "idau", OBJECT(m),
                                  &error_fatal);
         sysbus_realize(SYS_BUS_DEVICE(&s->soc[index]), &error_fatal);
+        if (s->image[index]) {
+            gchar *contents;
+            gsize length;
+
+            if (!g_file_get_contents(s->image[index], &contents, &length,
+                                     NULL) || length > FLASH_SIZE) {
+                error_report("efr32bg22-dual: cannot load flash image %s",
+                             s->image[index]);
+                exit(EXIT_FAILURE);
+            }
+            memcpy(memory_region_get_ram_ptr(&s->soc[index].flash), contents,
+                   length);
+            g_free(contents);
+        }
         qemu_register_reset(efr32_cpu_reset, s->soc[index].armv7m.cpu);
         g_free(memory_name);
         g_free(name);
@@ -2399,6 +2414,32 @@ static void dual_init(MachineState *m)
                                 EFR32BG22_PEER_RADIO_BASE, &s->peer_radio);
 }
 
+static char *dual_image0_get(Object *o, Error **errp)
+{
+    return g_strdup(EFR32BG22_DUAL_MACHINE(o)->image[0]);
+}
+
+static void dual_image0_set(Object *o, const char *value, Error **errp)
+{
+    Efr32DualState *s = EFR32BG22_DUAL_MACHINE(o);
+
+    g_free(s->image[0]);
+    s->image[0] = g_strdup(value);
+}
+
+static char *dual_image1_get(Object *o, Error **errp)
+{
+    return g_strdup(EFR32BG22_DUAL_MACHINE(o)->image[1]);
+}
+
+static void dual_image1_set(Object *o, const char *value, Error **errp)
+{
+    Efr32DualState *s = EFR32BG22_DUAL_MACHINE(o);
+
+    g_free(s->image[1]);
+    s->image[1] = g_strdup(value);
+}
+
 static void dual_mc(ObjectClass *o, void *d)
 {
     MachineClass *m = MACHINE_CLASS(o);
@@ -2415,6 +2456,10 @@ static void dual_mc(ObjectClass *o, void *d)
     m->max_cpus = 2;
     m->default_cpus = 2;
     m->ignore_memory_transaction_failures = true;
+    object_class_property_add_str(o, "flash0", dual_image0_get,
+                                  dual_image0_set);
+    object_class_property_add_str(o, "flash1", dual_image1_get,
+                                  dual_image1_set);
 }
 
 static const TypeInfo dual_machine_info = {
