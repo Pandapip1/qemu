@@ -245,6 +245,13 @@ static void icount_warp_rt(void)
         return;
     }
 
+    /*
+     * Reading the deadline reads QEMU_CLOCK_VIRTUAL, which takes the
+     * vm_clock seqlock for reading, so sample it before the write lock.
+     */
+    int64_t deadline = qemu_clock_deadline_ns_all(QEMU_CLOCK_VIRTUAL,
+                                                  QEMU_TIMER_ATTR_ALL);
+
     seqlock_write_lock(&timers_state.vm_clock_seqlock,
                        &timers_state.vm_clock_lock);
     if (runstate_is_running()) {
@@ -253,6 +260,15 @@ static void icount_warp_rt(void)
         int64_t warp_delta;
 
         warp_delta = clock - timers_state.vm_clock_warp_start;
+        /*
+         * The warp only stands in for idle time up to the next virtual
+         * deadline.  Host wakeup latency (for example millisecond poll
+         * granularity without ppoll) must not carry QEMU_CLOCK_VIRTUAL past
+         * that deadline: the timer would expire late in guest time.
+         */
+        if (deadline >= 0) {
+            warp_delta = MIN(warp_delta, deadline);
+        }
         if (icount_enabled() == ICOUNT_ADAPTATIVE) {
             /*
              * In adaptive mode, do not let QEMU_CLOCK_VIRTUAL run too far
