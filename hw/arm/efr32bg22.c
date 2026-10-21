@@ -928,6 +928,9 @@ static void efr32_rac_rx_handoff(void *opaque)
     }
 
     /* This completion remains a simulator-only boundary. */
+    trace_efr32bg22_rf_rx_handoff(s->endpoint_id,
+                                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                                  length);
     efr32_frc_raise(s, EFR32_FRC_IF_RXDONE);
 
     /* One mailbox record is consumed per deferred handoff. */
@@ -1128,7 +1131,9 @@ static void efr32_burtc_update_irq(Efr32Periph *s)
 
     /* xG22.dtsi and the part header both assign BURTC to external IRQ 18. */
     if (s->burtc_irq_asserted != asserted) {
-        trace_efr32bg22_burtc_irq(s->endpoint_id, asserted, pending, enabled);
+        trace_efr32bg22_burtc_irq(s->endpoint_id,
+                                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                                  asserted, pending, enabled);
         s->burtc_irq_asserted = asserted;
     }
     qemu_set_irq(s->irq[18], asserted);
@@ -1672,7 +1677,9 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
             efr32_rac_set_state(s, EFR32_RAC_STATE_TX);
             efr32_rac_schedule_tx_completion(s);
         }
-        trace_efr32bg22_rac_command(s->endpoint_id, next, s->rac_state);
+        trace_efr32bg22_rac_command(s->endpoint_id,
+                                    qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                                    next, s->rac_state);
         return;
     }
     if ((register_address & ~0x3fffu) == EFR32_BUFC_BASE &&
