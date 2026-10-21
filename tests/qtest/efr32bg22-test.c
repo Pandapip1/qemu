@@ -870,6 +870,8 @@ static void test_bufc_sparse_threshold_flag(void)
     g_assert_cmphex(readl(BUFC_BASE + BUFC_IF) & threshold_flag, ==,
                     threshold_flag);
     g_assert_cmphex(readl(channel + BUFC_STATUS), ==, (1u << 20) | 8u);
+    g_assert_cmphex(readl(0x20002400), ==, 0x03020100);
+    g_assert_cmphex(readl(0x20002404), ==, 0x07060504);
 }
 
 static void test_bufc_descriptor_threshold_flag(void)
