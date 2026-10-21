@@ -122,6 +122,10 @@ static void test_tx_offer_reaches_peer_rx_fifo(void)
                     ==, FRC_IF_RXDONE);
     g_assert_cmphex(qtest_readl(global_qtest, peer(FRC_BASE + FRC_RXRAWDATA)),
                     ==, payload[G_N_ELEMENTS(payload) - 1]);
+    /* An unconfigured channel 2 must not acquire a synthetic record. */
+    g_assert_cmphex(qtest_readl(global_qtest,
+                                peer(BUFC_BASE + BUFC_CH2 + BUFC_STATUS)),
+                    ==, 0);
     /*
      * RAIL's RX-FIFO reader consumes channel 1 using STATUS's low 13-bit
      * count together with READOFFSET.  The medium is deliberately a
@@ -144,12 +148,13 @@ static void test_tx_offer_reaches_peer_rx_fifo(void)
 
 /*
  * The in-process medium has a deliberately narrow, synthetic receive seam:
- * it writes raw bytes to BUFC channel 1 and raises FRC.RXDONE.  Stock RAIL
- * instead publishes RX_PACKET_RECEIVED after a hardware-produced channel-2
- * descriptor crosses BUF2THR.  Until that descriptor format and producer are
- * evidenced, an RF-medium handoff must not silently manufacture one.
+ * it writes raw bytes to BUFC channel 1 and raises FRC.RXDONE.  When the
+ * guest configures channel 2, QEMU additionally publishes its explicit
+ * simulator-only successful-RX record.  Stock RAIL instead publishes
+ * RX_PACKET_RECEIVED after a hardware-produced channel-2 descriptor crosses
+ * BUF2THR; this test does not claim to reproduce that silicon producer.
  */
-static void test_tx_offer_does_not_fabricate_rx_descriptor(void)
+static void test_tx_offer_enqueues_synthetic_rx_descriptor(void)
 {
     const uint8_t payload[] = { 0x2b, 0x6c, 0xf0 };
     const uint32_t fifo_guest_address = 0x20000480;
@@ -191,13 +196,36 @@ static void test_tx_offer_does_not_fabricate_rx_descriptor(void)
     g_assert_cmphex(qtest_readl(global_qtest, peer(FRC_BASE + FRC_IF)) &
                         FRC_IF_RXDONE,
                     ==, FRC_IF_RXDONE);
+    /*
+     * This record is deliberately a QEMU-only seam.  Its endpoint is the
+     * channel-1 write offset (three bytes), followed by the archive-observed
+     * received-packet class 0x06 and zero metadata/reserved bytes.  The
+     * channel-2 threshold must be visible by the time RXDONE is observed.
+     */
     g_assert_cmphex(qtest_readl(global_qtest, peer_descriptor_channel +
-                                BUFC_STATUS), ==, 0);
+                                BUFC_STATUS),
+                    ==, (1u << 20) | 8u);
     g_assert_cmphex(qtest_readl(global_qtest, peer(BUFC_BASE + BUFC_IF)) &
                         descriptor_threshold,
-                    ==, 0);
+                    ==, descriptor_threshold);
+    qtest_writel(global_qtest, peer_descriptor_channel + BUFC_READOFFSET, 0);
+    g_assert_cmphex(qtest_readl(global_qtest,
+                                peer_descriptor_channel + BUFC_READDATA),
+                    ==, 0x03);
+    g_assert_cmphex(qtest_readl(global_qtest,
+                                peer_descriptor_channel + BUFC_READDATA),
+                    ==, 0x00);
+    g_assert_cmphex(qtest_readl(global_qtest,
+                                peer_descriptor_channel + BUFC_READDATA),
+                    ==, 0x06);
+    for (size_t index = 3; index < 8; index++) {
+        g_assert_cmphex(qtest_readl(global_qtest,
+                                    peer_descriptor_channel + BUFC_READDATA),
+                        ==, 0);
+    }
     g_assert_cmphex(qtest_readl(global_qtest, peer_descriptor_channel +
-                                BUFC_READDATA), ==, 0);
+                                BUFC_STATUS) & 0x1fff,
+                    ==, 0);
 }
 
 /*
@@ -553,8 +581,8 @@ int main(int argc, char **argv)
                    test_peer_bufc_dma_uses_peer_address_space);
     qtest_add_func("/efr32bg22/rf/tx-offer-reaches-peer-rx-fifo",
                    test_tx_offer_reaches_peer_rx_fifo);
-    qtest_add_func("/efr32bg22/rf/tx-offer-does-not-fabricate-rx-descriptor",
-                   test_tx_offer_does_not_fabricate_rx_descriptor);
+    qtest_add_func("/efr32bg22/rf/tx-offer-enqueues-synthetic-rx-descriptor",
+                   test_tx_offer_enqueues_synthetic_rx_descriptor);
     qtest_add_func("/efr32bg22/rf/peer-rxsearch-during-active-tx-gets-offer",
                    test_peer_rxsearch_during_active_tx_gets_offer);
     qtest_add_func("/efr32bg22/rf/tx-offer-waits-for-receiver-rxsearch",

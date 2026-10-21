@@ -67,10 +67,11 @@ typedef struct Efr32RfRxDeliveryRequest Efr32RfRxDeliveryRequest;
  * medium.  It does not define an air-frame format or a host HCI transport.
  * The intended EFR32 abstraction boundary is a snapshot of staged BUFC
  * channel 0 at RAC.CMD.TXEN/RAC->TX. Receive delivery remains deferred until a
- * receiver is in RXSEARCH. The current RXRAWDATA-to-BUFC channel 1 seam ends
- * with a simulator-only RXDONE: stock RAIL instead reaches RX_PACKET_RECEIVED
- * through channel-2 descriptor-threshold dispatch. Do not present the seam as
- * a source-backed receive completion until descriptor production is modeled.
+ * receiver is in RXSEARCH. The current RXRAWDATA-to-BUFC channel 1 seam
+ * optionally publishes a QEMU-only successful-RX descriptor when the guest
+ * configured channel 2; that is a simulator convention and not a claim about
+ * the silicon producer or record format. Without channel 2 configuration, the
+ * seam ends with a synthetic RXDONE and remains raw-byte-only.
  * The controller firmware remains responsible for exposing standard HCI
  * through its own transport when that exists.
  */

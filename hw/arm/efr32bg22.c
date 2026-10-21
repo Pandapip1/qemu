@@ -202,6 +202,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_BUFC_BASE 0xaa000000u
 #define EFR32_BUFC_FIRST 0x00cu
 #define EFR32_BUFC_STRIDE 0x040u
+#define EFR32_BUFC_ADDR 0x004u
 #define EFR32_BUFC_IF 0x114u
 #define EFR32_BUFC_IEN 0x118u
 #define EFR32_BUFC_CTRL 0x000u
@@ -213,6 +214,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_BUFC_STATUS 0x020u
 #define EFR32_BUFC_THRESHOLD 0x024u
 #define EFR32_BUFC_CMD 0x028u
+#define EFR32_RF_RX_DESCRIPTOR_BUFC_CHANNEL 2
 
 /*
  * The M33-facing RF mailbox has two endpoints in the radio address space.
@@ -506,6 +508,58 @@ static void efr32_bufc_write_data_port(Efr32Periph *s, unsigned channel,
     efr32_bufc_update_threshold(s, channel);
 }
 
+/*
+ * A normal channel-2 descriptor producer is part of the radio/sequencer
+ * hardware and is not modeled here.  The in-process RF medium has a
+ * simulator-only convention, however: when the guest has configured channel
+ * 2 with both a valid FIFO size and backing address, it may publish one
+ * received-packet record after the synthetic channel-1 handoff.  Keeping the
+ * check here prevents an unconfigured guest from acquiring a descriptor as a
+ * side effect of the raw-byte receive seam.
+ */
+static bool efr32_bufc_descriptor_channel_configured(Efr32Periph *s)
+{
+    uint32_t base = efr32_bufc_channel_base(
+        EFR32_RF_RX_DESCRIPTOR_BUFC_CHANNEL);
+
+    return efr32_bufc_capacity(s, EFR32_RF_RX_DESCRIPTOR_BUFC_CHANNEL) &&
+           efr32_register_get(s, base + EFR32_BUFC_ADDR) != 0;
+}
+
+/*
+ * Publish the QEMU-only successful-RX record after channel 1 has received the
+ * synthetic payload.  The endpoint is the channel-1 write offset, encoded as
+ * the low 13 bits in little-endian order.  The class byte (0x06) is the
+ * archive-observed received-packet class; all remaining bytes are reserved
+ * and remain zero.  Each data-port write advances channel 2 and updates its
+ * configured threshold before the caller raises any completion event.
+ */
+static void efr32_bufc_enqueue_synthetic_rx_descriptor(Efr32Periph *s)
+{
+    uint32_t rx_base = efr32_bufc_channel_base(EFR32_RF_RX_BUFC_CHANNEL);
+    uint32_t endpoint = efr32_register_get(
+        s, rx_base + EFR32_BUFC_WRITEOFFSET) & 0x1fff;
+    uint8_t record[8] = {
+        endpoint & 0xff,
+        (endpoint >> 8) & 0x1f,
+        0x06,
+        0,
+        0,
+        0,
+        0,
+        0,
+    };
+
+    if (!efr32_bufc_descriptor_channel_configured(s)) {
+        return;
+    }
+
+    for (size_t index = 0; index < sizeof(record); index++) {
+        efr32_bufc_write_data_port(s, EFR32_RF_RX_DESCRIPTOR_BUFC_CHANNEL,
+                                   record[index], false);
+    }
+}
+
 static uint8_t efr32_bufc_read_data_port(Efr32Periph *s, unsigned channel)
 {
     uint32_t base = efr32_bufc_channel_base(channel);
@@ -796,11 +850,13 @@ static void efr32_rac_rx_handoff(void *opaque)
     /*
      * The retained sequencer reads FRC.RXRAWDATA then writes its four byte
      * lanes to secure BUFC channel 1 WRITEDATA.  Replay only that observed
-     * data path: these bytes are not framed, CRC checked, or made into a
-     * channel-2 descriptor.  Stock RAIL dispatches a received packet from a
-     * channel-2 descriptor threshold event, not directly from FRC.RXDONE;
-     * its descriptor record format is still incomplete.  The RXDONE below is
-     * therefore a simulator-only completion seam, not stock RX behaviour.
+     * data path: these bytes are not framed or CRC checked.  If the guest has
+     * configured channel 2, publish the QEMU-only successful-RX descriptor
+     * convention after those bytes; this makes the descriptor threshold
+     * available before the synthetic RXDONE completion below.  It does not
+     * claim that QEMU has identified or modeled the silicon descriptor
+     * producer.  With channel 2 unconfigured, the handoff remains a raw-byte
+     * FIFO seam and emits no descriptor.
      */
     for (gsize index = 0; index < length; index++) {
         efr32_register_put(s, EFR32_FRC_BASE + EFR32_FRC_RXRAWDATA,
@@ -808,8 +864,9 @@ static void efr32_rac_rx_handoff(void *opaque)
         efr32_bufc_write_data_port(s, EFR32_RF_RX_BUFC_CHANNEL,
                                    data[index], false);
     }
+    efr32_bufc_enqueue_synthetic_rx_descriptor(s);
     efr32_rf_rx_delivery_request_free(request);
-    /* See the boundary documented above: this is deliberately synthetic. */
+    /* This completion remains a simulator-only boundary. */
     efr32_frc_raise(s, EFR32_FRC_IF_RXDONE);
 
     /* One mailbox record is consumed per deferred handoff. */
