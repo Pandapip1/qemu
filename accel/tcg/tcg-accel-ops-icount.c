@@ -89,6 +89,14 @@ void icount_handle_deadline(void)
     }
 }
 
+/*
+ * Longest round-robin timeslice, in virtual time, when several vCPUs share the
+ * icount thread. Device timers only fire between timeslices, so an interrupt
+ * raised for one vCPU otherwise waits for the others to use up a share of the
+ * time to the next deadline, which can be milliseconds of guest time.
+ */
+#define ICOUNT_RR_MAX_TIMESLICE_NS 2000
+
 /* Distribute the budget evenly across all CPUs */
 int64_t icount_percpu_budget(int cpu_count)
 {
@@ -97,6 +105,10 @@ int64_t icount_percpu_budget(int cpu_count)
 
     if (timeslice == 0) {
         timeslice = limit;
+    }
+    if (cpu_count > 1) {
+        timeslice = MIN(timeslice,
+                        MAX(icount_round(ICOUNT_RR_MAX_TIMESLICE_NS), 1));
     }
 
     return timeslice;
