@@ -118,6 +118,7 @@ static char *tx_snapshot_trace_path;
 #define USART_STATUS_TXC      (1u << 5)
 #define USART_STATUS_TXBL     (1u << 6)
 #define BURTC_BASE             0x40064000
+#define BURTC_NONSECURE_BASE   0x50064000
 #define BURTC_EN               0x004
 #define BURTC_CFG              0x008
 #define BURTC_CMD              0x00c
@@ -226,6 +227,49 @@ static void test_burtc_counter_contract(void)
     writel(BURTC_BASE + BURTC_EN + REGISTER_CLEAR_WINDOW, BURTC_EN_EN);
     writel(BURTC_BASE + BURTC_CMD, BURTC_CMD_START);
     g_assert_cmphex(readl(BURTC_BASE + BURTC_STATUS), ==, 0);
+}
+
+/*
+ * Series-2 SET/CLR/TGL pages are alternate write views of the normal
+ * register page.  In particular, counter_silabs uses the alias forms for
+ * EN, IEN, and IF.  Exercise the observable consequences too: EN gates the
+ * free-running counter, and writes through the non-secure view share the
+ * same canonical state.
+ */
+static void test_burtc_register_aliases(void)
+{
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+
+    writel(BURTC_BASE + BURTC_EN + REGISTER_SET_WINDOW, BURTC_EN_EN);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_EN), ==, BURTC_EN_EN);
+    writel(BURTC_BASE + BURTC_CMD, BURTC_CMD_START);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_STATUS), ==,
+                    BURTC_STATUS_RUNNING);
+
+    writel(BURTC_BASE + BURTC_EN + REGISTER_TOGGLE_WINDOW, BURTC_EN_EN);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_EN), ==, 0);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_STATUS), ==, 0);
+    writel(BURTC_BASE + BURTC_EN + REGISTER_TOGGLE_WINDOW, BURTC_EN_EN);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_EN), ==, BURTC_EN_EN);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_STATUS), ==,
+                    BURTC_STATUS_RUNNING);
+
+    writel(BURTC_NONSECURE_BASE + BURTC_IEN + REGISTER_SET_WINDOW,
+           BURTC_IF_COMP);
+    writel(BURTC_NONSECURE_BASE + BURTC_IF + REGISTER_SET_WINDOW,
+           BURTC_IF_COMP);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_IEN), ==, BURTC_IF_COMP);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_IF), ==, BURTC_IF_COMP);
+
+    writel(BURTC_BASE + BURTC_IF + REGISTER_TOGGLE_WINDOW, BURTC_IF_COMP);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_IF), ==, 0);
+
+    writel(BURTC_BASE + BURTC_IEN + REGISTER_TOGGLE_WINDOW, BURTC_IF_COMP);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_IEN), ==, 0);
+    writel(BURTC_BASE + BURTC_IEN + REGISTER_TOGGLE_WINDOW, BURTC_IF_COMP);
+    writel(BURTC_BASE + BURTC_IF + REGISTER_SET_WINDOW, BURTC_IF_COMP);
+    writel(BURTC_BASE + BURTC_IEN + REGISTER_CLEAR_WINDOW, BURTC_IF_COMP);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_IEN), ==, 0);
 }
 
 /* The Zephyr counter driver uses COMP as a one-shot alarm and dispatches
@@ -1357,6 +1401,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/register-aliases", test_register_aliases);
     qtest_add_func("/efr32bg22/burtc-counter-contract",
                    test_burtc_counter_contract);
+    qtest_add_func("/efr32bg22/burtc-register-aliases",
+                   test_burtc_register_aliases);
     qtest_add_func("/efr32bg22/burtc-compare-pending",
                    test_burtc_compare_pending);
     qtest_add_func("/efr32bg22/burtc-current-compare-waits-for-wrap",
