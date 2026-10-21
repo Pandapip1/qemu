@@ -392,6 +392,56 @@ static void test_peer_rxsearch_during_active_tx_gets_offer(void)
 }
 
 /*
+ * Once the synthetic TX completion boundary retires a snapshot, a receiver
+ * entering RXSEARCH later must not manufacture a receive from that completed
+ * transaction.  This is a QEMU mailbox-lifetime contract, not a silicon
+ * airtime or completion-source claim.
+ */
+static void test_completed_tx_is_not_offered_to_late_rxsearch(void)
+{
+    const uint8_t payload[] = { 0x62, 0x1f };
+    const uint32_t fifo_guest_address = 0x20000500;
+    const uint64_t peer_rx_channel = peer(BUFC_BASE + BUFC_CH1);
+    const uint32_t source_tx_channel = BUFC_BASE + BUFC_CH0;
+
+    /* Leave the peer's state from the preceding in-process test behind. */
+    qtest_writel(global_qtest, peer(RAC_BASE + RAC_CMD), RAC_CMD_RXDIS);
+    qtest_writel(global_qtest, peer(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW),
+                 FRC_IF_RXDONE);
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_CMD, 1);
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_ADDR, fifo_guest_address);
+    qtest_writel(global_qtest, peer_rx_channel, 0); /* 64-byte peer RX FIFO */
+
+    qtest_writel(global_qtest, source_tx_channel + BUFC_CMD, 1);
+    for (size_t index = 0; index < G_N_ELEMENTS(payload); index++) {
+        qtest_writeb(global_qtest, fifo_guest_address + index, payload[index]);
+    }
+    qtest_writel(global_qtest, source_tx_channel + BUFC_ADDR, fifo_guest_address);
+    qtest_writel(global_qtest, source_tx_channel, 0); /* 64-byte source TX FIFO */
+    qtest_writel(global_qtest, source_tx_channel + BUFC_WRITEOFFSET,
+                 G_N_ELEMENTS(payload));
+    qtest_writel(global_qtest, RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+
+    /* Retire the model transaction before the peer begins RXSEARCH. */
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(150001);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+
+    qtest_writel(global_qtest,
+                 peer(RAC_BASE + RAC_RXENSRCEN + REGISTER_SET_WINDOW),
+                 RAC_RXENSRCEN_SWRXEN);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(1);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+
+    g_assert_cmphex(qtest_readl(global_qtest, peer(FRC_BASE + FRC_IF)) &
+                        FRC_IF_RXDONE,
+                    ==, 0);
+    g_assert_cmphex(qtest_readl(global_qtest,
+                                peer_rx_channel + BUFC_WRITEOFFSET), ==, 0);
+}
+
+/*
  * RX offers are deferred out of RAC.CMD.TXEN.  If the receiver leaves
  * RXSEARCH before that virtual-clock callback runs, it must not observe a
  * spurious RXDONE or partially written BUFC channel.  The offer is retained
@@ -699,6 +749,8 @@ int main(int argc, char **argv)
                    test_tx_offer_drops_descriptor_ring_overflow);
     qtest_add_func("/efr32bg22/rf/peer-rxsearch-during-active-tx-gets-offer",
                    test_peer_rxsearch_during_active_tx_gets_offer);
+    qtest_add_func("/efr32bg22/rf/completed-tx-is-not-offered-to-late-rxsearch",
+                   test_completed_tx_is_not_offered_to_late_rxsearch);
     qtest_add_func("/efr32bg22/rf/tx-offer-waits-for-receiver-rxsearch",
                    test_tx_offer_waits_for_receiver_rxsearch);
     qtest_add_func("/efr32bg22/rf/tx-disable-withdraws-deferred-offer",
