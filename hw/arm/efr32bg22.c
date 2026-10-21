@@ -1930,7 +1930,9 @@ struct Efr32State
     Efr32Bg22SoCState soc;
     Efr32RfMedium *rf_medium;
     char *image;
+    char *flash_overlay;
     uint32_t flash_offset;
+    uint32_t flash_overlay_offset;
     uint32_t boot_offset;
 };
 #define TYPE_EFR32BG22_MACHINE MACHINE_TYPE_NAME("efr32bg22")
@@ -2149,6 +2151,22 @@ static void init(MachineState *m)
                d, n);
         g_free(d);
     }
+    /* An optional raw overlay represents separately captured persistent data
+     * at its physical flash address. It never supplies a default value. */
+    if (s->flash_overlay) {
+        gchar *d;
+        gsize n;
+
+        if (!g_file_get_contents(s->flash_overlay, &d, &n, NULL) ||
+            n > FLASH_SIZE - s->flash_overlay_offset) {
+            error_report("efr32bg22: cannot load flash overlay %s",
+                         s->flash_overlay);
+            exit(EXIT_FAILURE);
+        }
+        memcpy(memory_region_get_ram_ptr(&s->soc.flash) +
+               s->flash_overlay_offset, d, n);
+        g_free(d);
+    }
     qemu_register_reset(efr32_cpu_reset, s->soc.armv7m.cpu);
 }
 static void idau(IDAUInterface *i, uint32_t a, int *r, bool *e, bool *n,
@@ -2169,6 +2187,17 @@ static void image_set(Object *o, const char *v, Error **e)
     g_free(s->image);
     s->image = g_strdup(v);
 }
+static char *flash_overlay_get(Object *o, Error **e)
+{
+    return g_strdup(EFR32BG22_MACHINE(o)->flash_overlay);
+}
+static void flash_overlay_set(Object *o, const char *v, Error **e)
+{
+    Efr32State *s = EFR32BG22_MACHINE(o);
+
+    g_free(s->flash_overlay);
+    s->flash_overlay = g_strdup(v);
+}
 
 static void efr32_machine_instance_init(Object *obj)
 {
@@ -2180,6 +2209,9 @@ static void efr32_machine_instance_init(Object *obj)
      * table that a real bootloader would select before handing them control.
      */
     object_property_add_uint32_ptr(obj, "flash-offset", &s->flash_offset,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_add_uint32_ptr(obj, "flash-overlay-offset",
+                                   &s->flash_overlay_offset,
                                    OBJ_PROP_FLAG_READWRITE);
     object_property_add_uint32_ptr(obj, "boot-offset", &s->boot_offset,
                                    OBJ_PROP_FLAG_READWRITE);
@@ -2198,6 +2230,8 @@ static void mc(ObjectClass *o, void *d)
     m->default_ram_size = FLASH_SIZE;
     m->ignore_memory_transaction_failures = true;
     object_class_property_add_str(o, "flash", image_get, image_set);
+    object_class_property_add_str(o, "flash-overlay", flash_overlay_get,
+                                  flash_overlay_set);
 }
 static const TypeInfo machine_info = {
     .name = TYPE_EFR32BG22_MACHINE,
