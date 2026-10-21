@@ -908,6 +908,132 @@ static void test_tx_enable_replaces_deferred_offer(void)
                                 peer_rx_channel + BUFC_READDATA), ==, 0);
 }
 
+/*
+ * Exercise the lower RX-to-TX boundary using only the native QEMU model:
+ * receive one staged packet, disable RX, stage a response in BUFC channel 0,
+ * and issue RAC.CMD.TXEN.  The response must be a fresh medium snapshot,
+ * complete once through the QEMU virtual timer, and not be replayed while
+ * the peer remains in RXSEARCH.  This is a simulator contract; it does not
+ * claim a silicon PHY timing or TX completion-source implementation.
+ */
+static void test_bidirectional_rac_txen_after_rx(void)
+{
+    const uint8_t request[] = { 0x05, 0x0a, 0x11, 0x22, 0x33 };
+    const uint8_t response[] = { 0x02, 0x03, 0xa5, 0x5a };
+    const uint32_t source_tx_channel = BUFC_BASE + BUFC_CH0;
+    const uint64_t source_rx_channel = BUFC_BASE + BUFC_CH1;
+    const uint64_t peer_tx_channel = peer(BUFC_BASE + BUFC_CH0);
+    const uint64_t peer_rx_channel = peer(BUFC_BASE + BUFC_CH1);
+
+    /* Keep this bilateral transaction independent from preceding qtests. */
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+
+    qtest_writel(global_qtest, FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW,
+                 FRC_IF_TXDONE | FRC_IF_RXDONE);
+    qtest_writel(global_qtest, peer(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW),
+                 FRC_IF_TXDONE | FRC_IF_RXDONE);
+
+    /* The peer starts as the receiver and must be in RXSEARCH first. */
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_CMD, 1);
+    qtest_writel(global_qtest, peer_rx_channel, 0);
+    qtest_writel(global_qtest,
+                 peer(RAC_BASE + RAC_RXENSRCEN + REGISTER_SET_WINDOW),
+                 RAC_RXENSRCEN_SWRXEN);
+    g_assert_cmphex(qtest_readl(global_qtest, peer(RAC_BASE + RAC_STATUS)) &
+                        RAC_STATUS_STATE_MASK,
+                    ==, RAC_STATUS_STATE_RXSEARCH);
+
+    /* Source A performs the first staged transmission. */
+    qtest_writel(global_qtest, source_tx_channel + BUFC_CMD, 1);
+    for (size_t index = 0; index < G_N_ELEMENTS(request); index++) {
+        qtest_writel(global_qtest, source_tx_channel + BUFC_WRITEDATA,
+                     request[index]);
+    }
+    qtest_writel(global_qtest, RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(1);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+
+    g_assert_cmphex(qtest_readl(global_qtest, peer(FRC_BASE + FRC_IF)) &
+                        FRC_IF_RXDONE,
+                    ==, FRC_IF_RXDONE);
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_READOFFSET, 0);
+    for (size_t index = 0; index < G_N_ELEMENTS(request); index++) {
+        g_assert_cmphex(qtest_readl(global_qtest,
+                                    peer_rx_channel + BUFC_READDATA),
+                        ==, request[index]);
+    }
+    qtest_writel(global_qtest, peer(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW),
+                 FRC_IF_RXDONE);
+
+    /* The first TX completion is separate from the RX handoff. */
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(150001);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+    g_assert_cmphex(qtest_readl(global_qtest, RAC_BASE + RAC_STATUS) &
+                        RAC_STATUS_STATE_MASK,
+                    ==, 0);
+    g_assert_cmphex(qtest_readl(global_qtest, FRC_BASE + FRC_IF) &
+                        FRC_IF_TXDONE,
+                    ==, FRC_IF_TXDONE);
+    qtest_writel(global_qtest, FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW,
+                 FRC_IF_TXDONE);
+
+    /* Model the scheduler-owned RX-to-TX turn-around at the peer. */
+    qtest_writel(global_qtest, peer(RAC_BASE + RAC_CMD), RAC_CMD_RXDIS);
+    qtest_writel(global_qtest, source_rx_channel + BUFC_CMD, 1);
+    qtest_writel(global_qtest,
+                 RAC_BASE + RAC_RXENSRCEN + REGISTER_SET_WINDOW,
+                 RAC_RXENSRCEN_SWRXEN);
+    g_assert_cmphex(qtest_readl(global_qtest, RAC_BASE + RAC_STATUS) &
+                        RAC_STATUS_STATE_MASK,
+                    ==, RAC_STATUS_STATE_RXSEARCH);
+
+    /* Source B stages exactly one response and starts a fresh TX snapshot. */
+    qtest_writel(global_qtest, peer_tx_channel + BUFC_CMD, 1);
+    for (size_t index = 0; index < G_N_ELEMENTS(response); index++) {
+        qtest_writel(global_qtest, peer_tx_channel + BUFC_WRITEDATA,
+                     response[index]);
+    }
+    qtest_writel(global_qtest, peer(RAC_BASE + RAC_CMD), RAC_CMD_TXEN);
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(1);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+
+    g_assert_cmphex(qtest_readl(global_qtest, FRC_BASE + FRC_IF) &
+                        FRC_IF_RXDONE,
+                    ==, FRC_IF_RXDONE);
+    qtest_writel(global_qtest, source_rx_channel + BUFC_READOFFSET, 0);
+    for (size_t index = 0; index < G_N_ELEMENTS(response); index++) {
+        g_assert_cmphex(qtest_readl(global_qtest,
+                                    source_rx_channel + BUFC_READDATA),
+                        ==, response[index]);
+    }
+
+    /* A second virtual-clock turn cannot replay the same active snapshot. */
+    qtest_writel(global_qtest, FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW,
+                 FRC_IF_RXDONE);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(1);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+    g_assert_cmphex(qtest_readl(global_qtest, FRC_BASE + FRC_IF) &
+                        FRC_IF_RXDONE,
+                    ==, 0);
+
+    /* The response's own completion must turn B OFF and raise TXDONE once. */
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(150001);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+    g_assert_cmphex(qtest_readl(global_qtest, peer(RAC_BASE + RAC_STATUS)) &
+                        RAC_STATUS_STATE_MASK,
+                    ==, 0);
+    g_assert_cmphex(qtest_readl(global_qtest, peer(FRC_BASE + FRC_IF)) &
+                        FRC_IF_TXDONE,
+                    ==, FRC_IF_TXDONE);
+}
+
 int main(int argc, char **argv)
 {
     int result;
@@ -944,6 +1070,8 @@ int main(int argc, char **argv)
                    test_rx_enable_withdraws_deferred_offer);
     qtest_add_func("/efr32bg22/rf/tx-enable-replaces-deferred-offer",
                    test_tx_enable_replaces_deferred_offer);
+    qtest_add_func("/efr32bg22/rf/bidirectional-rac-txen-after-rx",
+                   test_bidirectional_rac_txen_after_rx);
     result = g_test_run();
     qtest_end();
     return result;
