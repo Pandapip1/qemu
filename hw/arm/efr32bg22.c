@@ -1564,11 +1564,21 @@ static void efr32_timer0_event(void *opaque)
     efr32_timer0_schedule(s);
 }
 
-/* Returns true when the write was fully handled. */
+/*
+ * Returns true when the write was fully handled.
+ *
+ * CMD, CNT and STATUS are not stored in the register file (strobe / read-only
+ * generated), so they used to return before the tracepoint and the trace could
+ * not show a CMD.START write at all.  They now take the same exit path and are
+ * traced; only efr32_register_put()/efr32_timer0_update_irq() are skipped for
+ * them, exactly as before.  No semantics change.
+ */
 static bool efr32_timer0_write(Efr32Periph *s, uint32_t register_address,
                                uint32_t next)
 {
     uint32_t offset = register_address & 0xfff;
+    /* true for the registers that are traced but never stored. */
+    bool strobe = false;
 
     efr32_timer0_rebase(s);
     switch (offset) {
@@ -1580,13 +1590,16 @@ static bool efr32_timer0_write(Efr32Periph *s, uint32_t register_address,
         }
         efr32_timer0_rebase(s);
         efr32_timer0_schedule(s);
-        return true; /* CMD is write-only strobes. */
+        strobe = true; /* CMD is write-only strobes. */
+        break;
     case EFR32_TIMER_CNT:
         s->timer0_base_count = next % efr32_timer0_period(s);
         efr32_timer0_schedule(s);
-        return true;
+        strobe = true;
+        break;
     case EFR32_TIMER_STATUS:
-        return true; /* generated from EN and CMD state */
+        strobe = true; /* generated from EN and CMD state */
+        break;
     case EFR32_TIMER_EN:
         next &= EFR32_TIMER_EN_EN;
         break;
@@ -1600,15 +1613,19 @@ static bool efr32_timer0_write(Efr32Periph *s, uint32_t register_address,
     default:
         break;
     }
-    efr32_register_put(s, register_address, next);
-    if (offset == EFR32_TIMER_TOP) {
-        s->timer0_base_count %= efr32_timer0_period(s);
+    if (!strobe) {
+        efr32_register_put(s, register_address, next);
+        if (offset == EFR32_TIMER_TOP) {
+            s->timer0_base_count %= efr32_timer0_period(s);
+        }
+        efr32_timer0_schedule(s);
     }
-    efr32_timer0_schedule(s);
     trace_efr32bg22_timer0_write(s->endpoint_id,
                                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
                                  offset, next, efr32_timer0_counter(s));
-    efr32_timer0_update_irq(s);
+    if (!strobe) {
+        efr32_timer0_update_irq(s);
+    }
     return true;
 }
 
