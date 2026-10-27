@@ -1871,9 +1871,20 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
         /*
          * Stock services this doorbell register, and RAIL uses the standard
          * SET/CLR aliases.  The peer endpoint and its delivery timing have
-         * not been recovered, however.  Keeping FLAGS clear makes the
-         * modeled no-peer state explicit; it must not turn a guest mailbox
-         * write into a synthetic RDMAILBOX IRQ or an RX descriptor.
+         * not been recovered.  On real silicon, bit 0 of this exact register
+         * gates an M33-side RAIL calibration busy-wait that spins forever
+         * if the sequencer object is modified at all (owo-open-fw
+         * docs/radio-tables.md SS7.5.4, lockstepped on real hardware); this
+         * model's constant 0 cannot reproduce that, which is a known,
+         * recorded divergence from exact silicon semantics, not an
+         * oversight. It is deliberately NOT "fixed" by making FLAGS a real
+         * latch: there is no emulated M0+ peer here to ever clear one, so a
+         * real latch would just trade today's "always ready" simplification
+         * for an "always stuck after the first write" one -- equally
+         * unfaithful, and worse for any guest code that happens to probe
+         * this register. Keeping FLAGS clear makes the modeled no-peer state
+         * explicit; it must not turn a guest mailbox write into a synthetic
+         * RDMAILBOX IRQ or an RX descriptor.
          */
         return 0;
     }

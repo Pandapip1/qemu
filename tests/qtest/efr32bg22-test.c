@@ -1629,6 +1629,12 @@ static void test_rac_masks(void)
  * The recovered M33-side protocol uses endpoint data plus FLAGS bit 1.  QEMU
  * retains the guest data register but deliberately has no peer endpoint, so
  * neither secure nor non-secure FLAGS reads may manufacture a doorbell.
+ * This is a known, recorded divergence from real silicon, not an absence of
+ * one: bit 0 of this same register gates a real M33-side RAIL calibration
+ * busy-wait on real hardware (owo-open-fw docs/radio-tables.md SS7.5.4,
+ * lockstepped directly), which this model cannot reproduce. Not fixed here
+ * because there is no emulated M0+ peer to ever clear a real latch -- see
+ * the matching comment in hw/arm/efr32bg22.c.
  */
 static void test_rfmailbox_no_peer(void)
 {
