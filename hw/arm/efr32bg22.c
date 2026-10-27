@@ -1090,9 +1090,10 @@ static void efr32_rac_capture_tx_snapshot(Efr32Periph *s)
     uint32_t first_word = 0;
 
     /*
-     * The retained blob evidence places the TX handoff at RAC.CMD.TXEN.
-     * BUFC channel 0 is copied here, before the synthetic RAC completion
-     * timer is armed. This does not initiate RF delivery.
+     * BUFC channel 0 is copied only once the modeled sequencer has accepted
+     * TXWARM and advanced RAC to TX.  Callers without a released private core
+     * take the legacy abstract path and reach this helper directly at TXEN.
+     * A raw TXEN from a dual-core guest is not itself an RF transmission.
      */
     snapshot = efr32_rf_medium_snapshot_tx(
         s->rf_medium, EFR32_RF_RADIO(s), &metadata, data->data, data->len,
@@ -2083,7 +2084,6 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
              */
             efr32_rf_medium_withdraw_active_tx(s->rf_medium,
                                                 EFR32_RF_RADIO(s));
-            efr32_rac_capture_tx_snapshot(s);
             if (s->seq_released) {
                 /* Silicon first wakes sequencer IRQ8 in TXWARM.  The open
                  * auxiliary firmware acknowledges STATETXWARM before the
@@ -2092,6 +2092,7 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
             } else {
                 /* Compatibility for images which have not installed and
                  * released sequencer firmware yet. */
+                efr32_rac_capture_tx_snapshot(s);
                 efr32_rac_set_state(s, EFR32_RAC_STATE_TX);
                 efr32_rac_schedule_tx_completion(s);
             }
@@ -2312,6 +2313,11 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
 
         if (s->seq_released && s->rac_state == EFR32_RAC_STATE_TXWARM &&
             !(seqif & (1u << 24))) {
+            /* Clearing STATETXWARM is the first proof that the released
+             * private core accepted this launch.  Publish no frame before
+             * that handshake: real silicon can remain in TXWARM/SHUTDOWN
+             * with every byte still staged after RAC.CMD.TXEN. */
+            efr32_rac_capture_tx_snapshot(s);
             efr32_rac_set_state(s, EFR32_RAC_STATE_TX);
         } else if (s->seq_released && s->rac_state == EFR32_RAC_STATE_TX &&
                    !(seqif & (1u << 25))) {

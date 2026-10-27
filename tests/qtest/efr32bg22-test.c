@@ -86,6 +86,7 @@ static char *tx_snapshot_trace_path;
 #define RAC_RXENSRCEN_SWRXEN  (1u << 1)
 #define RAC_STATUS_STATE_MASK 0x0f000000
 #define RAC_STATUS_STATE_RXSEARCH (2u << 24)
+#define RAC_STATUS_STATE_TXWARM (8u << 24)
 #define RAC_STATUS_STATE_TX   (9u << 24)
 #define RAC_STATUS_STATE_SHUTDOWN (13u << 24)
 #define RAC_STATUS_TXENS      (1u << 30)
@@ -1698,6 +1699,21 @@ static void test_radio_sequencer_executes_open_code(void)
 
     g_assert_cmphex(qtest_readl(qts, SEQRAM_NS_BASE + SEQ_SPARE0), ==,
                     0x12345678);
+
+    /* This probe never acknowledges the TXWARM state interrupt.  Merely
+     * releasing a private core and issuing TXEN must therefore leave RAC at
+     * the handoff boundary; the old eager model incorrectly published and
+     * completed a frame from the staged FIFO here. */
+    qtest_writel(qts, RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+    g_assert_cmphex(qtest_readl(qts, RAC_BASE + RAC_STATUS) &
+                        RAC_STATUS_STATE_MASK,
+                    ==, RAC_STATUS_STATE_TXWARM);
+    qtest_qmp_assert_success(qts, "{'execute':'cont'}");
+    g_usleep(10000);
+    qtest_qmp_assert_success(qts, "{'execute':'stop'}");
+    g_assert_cmphex(qtest_readl(qts, RAC_BASE + RAC_STATUS) &
+                        RAC_STATUS_STATE_MASK,
+                    ==, RAC_STATUS_STATE_TXWARM);
     qtest_quit(qts);
 }
 
