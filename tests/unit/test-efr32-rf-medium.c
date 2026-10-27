@@ -13,6 +13,9 @@ typedef struct TestEfr32RfRadio {
     Object parent_obj;
     bool rx_ready;
     unsigned rx_offer_notifications;
+    /* Defaults to 0, matching valid_tx_metadata()'s unset .channel, so
+     * existing channel-oblivious tests keep matching on SYNTH channel 0. */
+    uint8_t channel;
 } TestEfr32RfRadio;
 
 static bool test_efr32_rf_radio_is_rx_ready(Efr32RfRadio *radio)
@@ -25,12 +28,18 @@ static void test_efr32_rf_radio_rx_offer_available(Efr32RfRadio *radio)
     ((TestEfr32RfRadio *)radio)->rx_offer_notifications++;
 }
 
+static uint8_t test_efr32_rf_radio_get_channel(Efr32RfRadio *radio)
+{
+    return ((TestEfr32RfRadio *)radio)->channel;
+}
+
 static void test_efr32_rf_radio_class_init(ObjectClass *oc, void *data)
 {
     Efr32RfRadioClass *radio_class = EFR32_RF_RADIO_CLASS(oc);
 
     radio_class->is_rx_ready = test_efr32_rf_radio_is_rx_ready;
     radio_class->rx_offer_available = test_efr32_rf_radio_rx_offer_available;
+    radio_class->get_channel = test_efr32_rf_radio_get_channel;
 }
 
 static const TypeInfo test_efr32_rf_radio_info = {
