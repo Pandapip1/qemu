@@ -12,6 +12,7 @@ static char *tx_snapshot_trace_path;
 #define RADIO_IPVERSION      0x000
 #define FRC_DATABUFFER       0x018
 #define FRC_RXRAWDATA        0x090
+#define FRC_STATUS           0x008
 #define FRC_IF               0x068
 #define FRC_IEN              0x06c
 #define FRC_IF_TXDONE        (1u << 0)
@@ -887,6 +888,31 @@ static void test_radio_ipversions(void)
         g_assert_cmphex(readl(secure), ==, 0);
         g_assert_cmphex(readl(nonsecure), ==, blocks[i].value);
     }
+}
+
+/*
+ * FRC.STATUS is hardware read-only (public revB2 FRC_S_register.py); no
+ * modelled command path sets ACTIVETXFCD or any other bit
+ * (docs/radio-tables.md SS7.4 records that open question separately). This
+ * only confirms the model cannot be made to disagree with that read-only
+ * contract through either address view; it is not a claim about what value
+ * real hardware would show at this point.
+ */
+static void test_frc_status_is_read_only(void)
+{
+    uint32_t secure = FRC_BASE + FRC_STATUS;
+    uint32_t nonsecure = secure + RADIO_NONSECURE_ALIAS;
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    g_assert_cmphex(readl(secure), ==, 0);
+    writel(secure, UINT32_MAX);
+    g_assert_cmphex(readl(secure), ==, 0);
+
+    attribute_radio_nonsecure();
+    g_assert_cmphex(readl(nonsecure), ==, 0);
+    writel(nonsecure, UINT32_MAX);
+    g_assert_cmphex(readl(nonsecure), ==, 0);
+    attribute_radio_secure();
 }
 
 static void test_radio_nonsecure_alias(void)
@@ -1816,6 +1842,8 @@ int main(int argc, char **argv)
                    test_frc_buffer_register_masks);
     qtest_add_func("/efr32bg22/frc-sniffctrl-mask", test_frc_sniffctrl_mask);
     qtest_add_func("/efr32bg22/frc-rawctrl-mask", test_frc_rawctrl_mask);
+    qtest_add_func("/efr32bg22/frc-status-is-read-only",
+                   test_frc_status_is_read_only);
     qtest_add_func("/efr32bg22/rail-initialization-latches",
                    test_rail_initialization_latches);
     qtest_add_func("/efr32bg22/rac-sr3-clear-alias", test_rac_sr3_clear_alias);

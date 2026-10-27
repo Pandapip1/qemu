@@ -50,6 +50,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_RADIO_IPVERSION 0x000u
 #define EFR32_RADIO_EN 0x004u
 
+/*
+ * Read-only (public revB2 FRC_S_register.py); software never sets ACTIVETXFCD
+ * or any other bit here. QEMU does not yet know what hardware condition sets
+ * ACTIVETXFCD (docs/radio-tables.md SS7.4), so this only enforces the
+ * read-only contract and the public mask; it does not synthesize a value.
+ */
+#define EFR32_FRC_STATUS 0x008u
+#define EFR32_FRC_STATUS_MASK 0x01ffffffu
 #define EFR32_FRC_IF 0x068u
 #define EFR32_FRC_IEN 0x06cu
 #define EFR32_FRC_CMD 0x02cu
@@ -781,6 +789,17 @@ static bool efr32_radio_ipversion(uint32_t address, uint32_t *value)
     default:
         return false;
     }
+}
+
+/*
+ * FRC.STATUS is hardware read-only (public revB2 FRC_S_register.py); no
+ * modelled command sets or clears any of its bits. Reject writes so the
+ * model cannot drift into a software-set value it would never reach on
+ * real silicon, and mask reads to the public bit width.
+ */
+static bool efr32_frc_status_write_ignored(uint32_t address)
+{
+    return address == EFR32_FRC_BASE + EFR32_FRC_STATUS;
 }
 
 static uint32_t efr32_register_get(Efr32Periph *s, uint32_t address)
@@ -1883,6 +1902,9 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
     uint32_t ipversion;
 
     if (efr32_radio_ipversion(register_address, &ipversion)) {
+        return;
+    }
+    if (efr32_frc_status_write_ignored(register_address)) {
         return;
     }
 
