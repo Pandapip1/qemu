@@ -23,6 +23,9 @@ static char *tx_snapshot_trace_path;
 #define AGC_IEN              0x048
 #define AGC_CMD              0x04c
 #define FRC_WHITEPOLY        0x034
+#define FRC_CMD              0x02c
+#define FRC_CMD_RXABORT      (1u << 0)
+#define FRC_CMD_CONVINIT     (1u << 9)
 #define FRC_BUFFERMODE       0x078
 #define FRC_SNIFFCTRL        0x084
 #define FRC_RAWCTRL          0x08c
@@ -53,6 +56,7 @@ static char *tx_snapshot_trace_path;
 #define PROTIMER_CMP0_TIME    0x10c
 #define SYNTH_BASE            0xa8018000
 #define RAC_BASE              0xa8020000
+#define RAC_EN                0x004
 #define RAC_STATUS            0x00c
 #define RAC_CMD               0x010
 #define RAC_CTRL              0x014
@@ -65,16 +69,33 @@ static char *tx_snapshot_trace_path;
 #define RAC_CMD_TXDIS         (1u << 5)
 #define RAC_CMD_RXDIS         (1u << 8)
 #define RAC_CTRL_FORCEDISABLE (1u << 0)
+#define RAC_CTRL_SEQRESET     (1u << 24)
+#define RAC_CTRL_CPUWAITDIS   (1u << 26)
+#define RAC_CTRL_ACTIVE_HIGH  (1u << 7)
+#define RAC_CTRL_PAEN_HIGH    (1u << 8)
+#define RAC_CTRL_LNAEN_HIGH   (1u << 9)
+#define RAC_CTRL_BOARD_POLARITIES \
+    (RAC_CTRL_ACTIVE_HIGH | RAC_CTRL_PAEN_HIGH | RAC_CTRL_LNAEN_HIGH)
+#define THUMB16_LDR_R0_PC_8      0x4802u
+#define THUMB16_LDR_R1_R0        0x6801u
+#define THUMB16_ADDS_R1_1        0x3101u
+#define THUMB16_STR_R1_R0        0x6001u
+#define THUMB16_BRANCH_SELF      0xe7feu
+#define THUMB16_PAIR(first, second) \
+    ((uint32_t)(first) | ((uint32_t)(second) << 16))
 #define RAC_RXENSRCEN_SWRXEN  (1u << 1)
 #define RAC_STATUS_STATE_MASK 0x0f000000
 #define RAC_STATUS_STATE_RXSEARCH (2u << 24)
 #define RAC_STATUS_STATE_TX   (9u << 24)
+#define RAC_STATUS_STATE_SHUTDOWN (13u << 24)
 #define RAC_STATUS_TXENS      (1u << 30)
 #define RAC_STATUS_RXENS      (1u << 31)
 #define RAC_SEQIF_STATEOFF    (1u << 16)
 #define RAC_SEQIF_STATECHANGESEQ (1u << 0)
 #define RAC_SEQIF_STATERXSEARCH (1u << 18)
 #define RAC_SEQIF_STATETX     (1u << 25)
+#define SEQRAM_NS_BASE         0xb0000000
+#define SEQ_SPARE0             0x4fe0
 #define DCDC_BASE             0x40094000
 #define DCDC_NONSECURE_BASE   0x50094000
 #define DCDC_CTRL             0x008
@@ -96,6 +117,10 @@ static char *tx_snapshot_trace_path;
 #define CMU_BASE              0x40008000
 #define CMU_NONSECURE_BASE    0x50008000
 #define CMU_SYSCLKCTRL        0x070
+#define CMU_CLKEN1            0x068
+#define CMU_RADIOCLKCTRL      0x280
+#define CMU_RADIOCLKCTRL_EN   (1u << 0)
+#define CMU_CLKEN1_RADIO_BLOCKS 0x87fu
 #define DPLL0_BASE            0x4001c000
 #define DPLL0_NONSECURE_BASE  0x5001c000
 #define DPLL_EN               0x004
@@ -158,6 +183,9 @@ static char *tx_snapshot_trace_path;
 #define TIMER_CC_CFG_OUTPUTCOMPARE 0x2
 #define TIMER_IF_OF             (1u << 0)
 #define TIMER_IF_CC(n)          (1u << (4 + (n)))
+#define SMU_BASE                0x44008000
+#define SMU_PPUSATD1            0x064
+#define SMU_PPUSATD1_AHBRADIO   (1u << 15)
 #define CMU_BASE_ADDR           0x40008000
 #define CMU_DPLLREFCLKCTRL      0x100
 #define CMU_EM01GRPACLKCTRL     0x120
@@ -195,7 +223,44 @@ static char *tx_snapshot_trace_path;
 
 #define REGISTER_SET_WINDOW  0x1000
 #define REGISTER_CLEAR_WINDOW 0x2000
+
+static void attribute_radio_nonsecure(void)
+{
+    writel(SMU_BASE + SMU_PPUSATD1 + REGISTER_CLEAR_WINDOW,
+           SMU_PPUSATD1_AHBRADIO);
+}
+
+static void attribute_radio_secure(void)
+{
+    writel(SMU_BASE + SMU_PPUSATD1 + REGISTER_SET_WINDOW,
+           SMU_PPUSATD1_AHBRADIO);
+}
 #define REGISTER_TOGGLE_WINDOW 0x3000
+#define DEVINFO_BASE          0x0fe00000
+#define DEVINFO_MODULENAME0   0x8130
+#define DEVINFO_MODULEINFO    0x814c
+
+static void enable_radio_bus_clocks(void)
+{
+    writel(CMU_BASE + CMU_RADIOCLKCTRL + REGISTER_SET_WINDOW,
+           CMU_RADIOCLKCTRL_EN);
+    writel(CMU_BASE + CMU_CLKEN1 + REGISTER_SET_WINDOW,
+           CMU_CLKEN1_RADIO_BLOCKS);
+}
+
+static void test_bgm220_module_identity(void)
+{
+    const uint32_t module_name[] = {
+        0x324d4742, 0x43503032, 0x4e483232, 0xffff3241,
+        UINT32_MAX, UINT32_MAX, UINT32_MAX,
+    };
+
+    for (size_t i = 0; i < G_N_ELEMENTS(module_name); i++) {
+        g_assert_cmphex(readl(DEVINFO_BASE + DEVINFO_MODULENAME0 + 4 * i),
+                        ==, module_name[i]);
+    }
+    g_assert_cmphex(readl(DEVINFO_BASE + DEVINFO_MODULEINFO), ==, 0x00570100);
+}
 
 static void test_register_aliases(void)
 {
@@ -630,6 +695,7 @@ static void test_modem_masks(void)
 
 static void test_rfcrc_masks(void)
 {
+    enable_radio_bus_clocks();
     writel(RFCRC_BASE + RFCRC_EN, UINT32_MAX);
     writel(RFCRC_BASE + RFCRC_CTRL, UINT32_MAX);
 
@@ -702,7 +768,11 @@ static void test_frc_rawctrl_mask(void)
 
 static void test_rail_initialization_latches(void)
 {
-    /* RAIL's RF initializer writes RXCTRL=0x60 and clears RAC.SR0 bit 6. */
+    /* RAIL initializes convolution state while aborting stale receive work. */
+    writel(FRC_BASE + FRC_CMD, FRC_CMD_RXABORT | FRC_CMD_CONVINIT);
+    g_assert_cmphex(readl(FRC_BASE + FRC_CMD), ==, 0);
+
+    /* Its RF initializer then writes RXCTRL=0x60 and clears RAC.SR0 bit 6. */
     writel(FRC_BASE + FRC_RXCTRL, 0x60);
     writel(RAC_BASE + RAC_SR0, UINT32_MAX);
     writel(RAC_BASE + RAC_SR0 + REGISTER_CLEAR_WINDOW, 1u << 6);
@@ -758,10 +828,29 @@ static void test_radio_enable_masks(void)
         RAC_BASE,
     };
 
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    enable_radio_bus_clocks();
     for (size_t i = 0; i < G_N_ELEMENTS(blocks); i++) {
         writel(blocks[i] + 0x004, UINT32_MAX);
         g_assert_cmphex(readl(blocks[i] + 0x004), ==, 1);
     }
+}
+
+static void test_radio_enable_requires_bus_clocks(void)
+{
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+
+    writel(AGC_BASE + 0x004, 1);
+    g_assert_cmphex(readl(AGC_BASE + 0x004), ==, 0);
+
+    writel(CMU_BASE + CMU_CLKEN1 + REGISTER_SET_WINDOW, 1u << 0);
+    writel(AGC_BASE + 0x004, 1);
+    g_assert_cmphex(readl(AGC_BASE + 0x004), ==, 0);
+
+    writel(CMU_BASE + CMU_RADIOCLKCTRL + REGISTER_SET_WINDOW,
+           CMU_RADIOCLKCTRL_EN);
+    writel(AGC_BASE + 0x004, 1);
+    g_assert_cmphex(readl(AGC_BASE + 0x004), ==, 1);
 }
 
 static void test_radio_ipversions(void)
@@ -784,9 +873,18 @@ static void test_radio_ipversions(void)
         uint32_t nonsecure = secure + RADIO_NONSECURE_ALIAS;
 
         g_assert_cmphex(readl(secure), ==, blocks[i].value);
-        g_assert_cmphex(readl(nonsecure), ==, blocks[i].value);
+        g_assert_cmphex(readl(nonsecure), ==, 0);
         writel(secure, UINT32_MAX);
         g_assert_cmphex(readl(secure), ==, blocks[i].value);
+    }
+
+    attribute_radio_nonsecure();
+    for (size_t i = 0; i < G_N_ELEMENTS(blocks); i++) {
+        uint32_t secure = blocks[i].base + RADIO_IPVERSION;
+        uint32_t nonsecure = secure + RADIO_NONSECURE_ALIAS;
+
+        g_assert_cmphex(readl(secure), ==, 0);
+        g_assert_cmphex(readl(nonsecure), ==, blocks[i].value);
     }
 }
 
@@ -795,21 +893,57 @@ static void test_radio_nonsecure_alias(void)
     uint32_t secure_address = FRC_BASE + FRC_WHITEPOLY;
     uint32_t nonsecure_address = secure_address + RADIO_NONSECURE_ALIAS;
 
-    writel(secure_address, 0);
-    writel(nonsecure_address, UINT32_MAX);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    writel(secure_address, 0x1234);
+    writel(nonsecure_address, UINT32_MAX); /* inactive alias is WI */
+    g_assert_cmphex(readl(secure_address), ==, 0x1234);
+    g_assert_cmphex(readl(nonsecure_address), ==, 0); /* inactive alias is RAZ */
 
-    g_assert_cmphex(readl(secure_address), ==, 0xffff);
+    attribute_radio_nonsecure();
+    g_assert_cmphex(readl(secure_address), ==, 0);
+    g_assert_cmphex(readl(nonsecure_address), ==, 0x1234);
+    writel(nonsecure_address, UINT32_MAX);
     g_assert_cmphex(readl(nonsecure_address), ==, 0xffff);
+
+    attribute_radio_secure();
+    g_assert_cmphex(readl(secure_address), ==, 0xffff);
+    g_assert_cmphex(readl(nonsecure_address), ==, 0);
 }
 
 static void test_stock_setup_aliases(void)
 {
     /* Stock writes one at +0x004 through these two radio windows. */
+    enable_radio_bus_clocks();
+    attribute_radio_nonsecure();
     writel(BUFC_BASE + RADIO_NONSECURE_ALIAS + BUFC_EN, 1);
     writel(PROTIMER_NS_BASE + PROTIMER_EN, 1);
 
-    g_assert_cmphex(readl(BUFC_BASE + BUFC_EN), ==, 1);
-    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_EN), ==, 1);
+    g_assert_cmphex(readl(BUFC_BASE + RADIO_NONSECURE_ALIAS + BUFC_EN), ==, 1);
+    g_assert_cmphex(readl(PROTIMER_NS_BASE + PROTIMER_EN), ==, 1);
+    g_assert_cmphex(readl(BUFC_BASE + BUFC_EN), ==, 0);
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_EN), ==, 0);
+}
+
+static void test_rac_enable_requires_dependency_order(void)
+{
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    enable_radio_bus_clocks();
+
+    writel(RAC_BASE + RAC_EN, 1);
+    g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK,
+                    ==, RAC_STATUS_STATE_SHUTDOWN);
+    writel(BUFC_BASE + BUFC_EN, 1);
+    writel(PROTIMER_BASE + PROTIMER_EN, 1);
+    g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK,
+                    ==, RAC_STATUS_STATE_SHUTDOWN);
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    enable_radio_bus_clocks();
+    writel(BUFC_BASE + BUFC_EN, 1);
+    writel(PROTIMER_BASE + PROTIMER_EN, 1);
+    writel(RAC_BASE + RAC_EN, 1);
+    g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK,
+                    ==, 0);
 }
 
 static void test_dcdc_regulation(void)
@@ -1131,11 +1265,13 @@ static void test_protimer_trace_latches(void)
 
 static void test_protimer_secure_nonsecure_alias(void)
 {
-    /* RAIL enables PROTIMER through the non-secure 0xb801c000 window. */
+    writel(PROTIMER_BASE + PROTIMER_CTRL, 0x00011102);
+    attribute_radio_nonsecure();
+    /* RAIL enables PROTIMER through the attributed 0xb801c000 window. */
     writel(PROTIMER_NS_BASE + PROTIMER_CTRL, 0x00011102);
     writel(PROTIMER_NS_BASE + PROTIMER_CMD, 1);
 
-    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_CTRL), ==, 0x00011102);
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_CTRL), ==, 0);
     g_assert_cmphex(readl(PROTIMER_NS_BASE + PROTIMER_CTRL), ==, 0x00011102);
 }
 
@@ -1146,17 +1282,18 @@ static void test_protimer_secure_nonsecure_alias(void)
  */
 static void test_protimer_interrupt_banks_are_aliasable(void)
 {
+    attribute_radio_nonsecure();
     writel(PROTIMER_NS_BASE + PROTIMER_IF, 0x02000010);
-    writel(PROTIMER_BASE + PROTIMER_IEN + REGISTER_SET_WINDOW, 0x00000010);
+    writel(PROTIMER_NS_BASE + PROTIMER_IEN + REGISTER_SET_WINDOW, 0x00000010);
 
-    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_IF), ==, 0x02000010);
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_IF), ==, 0);
     g_assert_cmphex(readl(PROTIMER_NS_BASE + PROTIMER_IEN), ==, 0x00000010);
 
     writel(PROTIMER_NS_BASE + PROTIMER_IF + REGISTER_CLEAR_WINDOW, 0x10);
-    writel(PROTIMER_BASE + PROTIMER_IEN + REGISTER_TOGGLE_WINDOW, 0x10);
+    writel(PROTIMER_NS_BASE + PROTIMER_IEN + REGISTER_TOGGLE_WINDOW, 0x10);
 
     g_assert_cmphex(readl(PROTIMER_NS_BASE + PROTIMER_IF), ==, 0x02000000);
-    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_IEN), ==, 0);
+    g_assert_cmphex(readl(PROTIMER_NS_BASE + PROTIMER_IEN), ==, 0);
 }
 
 /*
@@ -1166,14 +1303,15 @@ static void test_protimer_interrupt_banks_are_aliasable(void)
  */
 static void test_protimer_compare_slot_clear_alias(void)
 {
+    attribute_radio_nonsecure();
     writel(PROTIMER_NS_BASE + PROTIMER_CMP0, 0x11);
     writel(PROTIMER_NS_BASE + PROTIMER_CMP0_TIME, 0x12345678);
     writel(PROTIMER_NS_BASE + PROTIMER_CMP0 + REGISTER_CLEAR_WINDOW, 1);
 
-    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_CMP0), ==, 0x10);
-    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_CMP0_TIME), ==, 0x12345678);
+    g_assert_cmphex(readl(PROTIMER_NS_BASE + PROTIMER_CMP0), ==, 0x10);
+    g_assert_cmphex(readl(PROTIMER_NS_BASE + PROTIMER_CMP0_TIME), ==, 0x12345678);
 
-    writel(PROTIMER_BASE + PROTIMER_CMP0 + REGISTER_CLEAR_WINDOW, 0x10);
+    writel(PROTIMER_NS_BASE + PROTIMER_CMP0 + REGISTER_CLEAR_WINDOW, 0x10);
     g_assert_cmphex(readl(PROTIMER_NS_BASE + PROTIMER_CMP0), ==, 0);
 }
 
@@ -1181,15 +1319,15 @@ static void test_protimer_counter(void)
 {
     uint32_t before = readl(PROTIMER_BASE + PROTIMER_COUNTER);
 
+    attribute_radio_nonsecure();
     g_assert_cmphex(readl(PROTIMER_NS_BASE + PROTIMER_COUNTER), ==, before);
-    writel(PROTIMER_BASE + PROTIMER_COUNTER, UINT32_MAX);
-    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_COUNTER), ==, before);
+    writel(PROTIMER_NS_BASE + PROTIMER_COUNTER, UINT32_MAX);
+    g_assert_cmphex(readl(PROTIMER_NS_BASE + PROTIMER_COUNTER), ==, before);
 
     qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
     /* Step past the second 500 ns edge so QEMU dispatches both ptimer ticks. */
     clock_step(1001);
     qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
-    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_COUNTER), ==, before + 2);
     g_assert_cmphex(readl(PROTIMER_NS_BASE + PROTIMER_COUNTER), ==, before + 2);
 
     qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
@@ -1467,14 +1605,20 @@ static void test_rac_masks(void)
  */
 static void test_rfmailbox_no_peer(void)
 {
+    attribute_radio_nonsecure();
     writel(RFMAILBOX_C_BASE + RFMAILBOX_NS_OFFSET + RFMAILBOX_DATA, 0x3412);
-    g_assert_cmphex(readl(RFMAILBOX_C_BASE + RFMAILBOX_DATA), ==, 0x3412);
+    g_assert_cmphex(readl(RFMAILBOX_C_BASE + RFMAILBOX_DATA), ==, 0);
+    g_assert_cmphex(readl(RFMAILBOX_C_BASE + RFMAILBOX_NS_OFFSET +
+                          RFMAILBOX_DATA), ==, 0x3412);
 
-    writel(RFMAILBOX_C_BASE + RFMAILBOX_FLAGS + REGISTER_SET_WINDOW, 1u << 1);
+    writel(RFMAILBOX_C_BASE + RFMAILBOX_NS_OFFSET + RFMAILBOX_FLAGS +
+               REGISTER_SET_WINDOW,
+           1u << 1);
     g_assert_cmphex(readl(RFMAILBOX_C_BASE + RFMAILBOX_FLAGS), ==, 0);
     g_assert_cmphex(readl(RFMAILBOX_C_BASE + RFMAILBOX_NS_OFFSET +
                           RFMAILBOX_FLAGS), ==, 0);
     g_assert_cmphex(readl(RFMAILBOX_B_BASE + RFMAILBOX_FLAGS), ==, 0);
+    attribute_radio_secure();
 }
 
 /* RAIL_StartTx clears RAC.SR0 bit 5 through the Series-2 CLR alias. */
@@ -1496,7 +1640,7 @@ static void test_rac_force_disable(void)
     writel(RAC_BASE + RAC_CTRL, RAC_CTRL_FORCEDISABLE);
     g_assert_cmphex(readl(RAC_BASE + RAC_CTRL), ==, RAC_CTRL_FORCEDISABLE);
     g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK,
-                    ==, 0);
+                    ==, RAC_STATUS_STATE_SHUTDOWN);
 
     qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
     clock_step(150001);
@@ -1505,6 +1649,100 @@ static void test_rac_force_disable(void)
 
     writel(RAC_BASE + RAC_CTRL, 0);
     g_assert_cmphex(readl(RAC_BASE + RAC_CTRL), ==, 0);
+}
+
+static void test_radio_sequencer_executes_open_code(void)
+{
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel tcg -S");
+
+    /* Keep the image-less application M33 in a valid idle loop while TCG
+     * executes the independently released auxiliary core. */
+    qtest_writel(qts, 0x00000000, 0x20008000);
+    qtest_writel(qts, 0x00000004, 0x00000101);
+    qtest_writel(qts, 0x00000100, 0x0000e7fe);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+
+    /* Model the real stage-3 boundary: SEQRAM may retain an unrelated image
+     * from an earlier boot.  The M33 asserts the hardware-proven base-register
+     * SEQRESET request, overwrites that image, and only then replaces CTRL
+     * with CPUWAITDIS.  The replacement is important for the explicit-reset
+     * path; RAIL's SET-alias release is a warm path that did not set reset. */
+    qtest_writel(qts, SEQRAM_NS_BASE + 0x000, 0xdeadbeef);
+    qtest_writel(qts, SEQRAM_NS_BASE + 0x004, 0xcafebabe);
+    qtest_writel(qts, RAC_BASE + RAC_CTRL, RAC_CTRL_SEQRESET);
+
+    /* Same independent four-instruction ARMv6-M proof used on silicon:
+     * load the local SEQ.SPARE0 address/value, store it, then loop. */
+    qtest_writel(qts, SEQRAM_NS_BASE + 0x000, 0x00003e00);
+    qtest_writel(qts, SEQRAM_NS_BASE + 0x004, 0x00000101);
+    qtest_writel(qts, SEQRAM_NS_BASE + 0x100, 0x49024801);
+    qtest_writel(qts, SEQRAM_NS_BASE + 0x104, 0xe7fe6001);
+    qtest_writel(qts, SEQRAM_NS_BASE + 0x108, 0x00004fe0);
+    qtest_writel(qts, SEQRAM_NS_BASE + 0x10c, 0x12345678);
+    qtest_writel(qts, SEQRAM_NS_BASE + SEQ_SPARE0, 0);
+
+    g_assert_cmphex(qtest_readl(qts, SEQRAM_NS_BASE + 0x000), ==,
+                    0x00003e00);
+    g_assert_cmphex(qtest_readl(qts, SEQRAM_NS_BASE + 0x004), ==,
+                    0x00000101);
+
+    qtest_writel(qts, RAC_BASE + RAC_CTRL, RAC_CTRL_CPUWAITDIS);
+    qtest_qmp_assert_success(qts, "{'execute':'cont'}");
+    for (unsigned attempt = 0; attempt < 1000; attempt++) {
+        if (qtest_readl(qts, SEQRAM_NS_BASE + SEQ_SPARE0) == 0x12345678) {
+            break;
+        }
+        g_usleep(1000);
+    }
+    qtest_qmp_assert_success(qts, "{'execute':'stop'}");
+
+    g_assert_cmphex(qtest_readl(qts, SEQRAM_NS_BASE + SEQ_SPARE0), ==,
+                    0x12345678);
+    qtest_quit(qts);
+}
+
+static void test_radio_sequencer_release_is_idempotent(void)
+{
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel tcg -S");
+
+    qtest_writel(qts, 0x00000000, 0x20008000);
+    qtest_writel(qts, 0x00000004, 0x00000101);
+    qtest_writel(qts, 0x00000100, 0x0000e7fe);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+
+    /* Increment SPARE0 once at reset entry, then loop.  A second write of
+     * CPUWAITDIS must not restart the already-released sequencer. */
+    qtest_writel(qts, RAC_BASE + RAC_CTRL, RAC_CTRL_SEQRESET);
+    qtest_writel(qts, SEQRAM_NS_BASE + 0x000, 0x00003e00);
+    qtest_writel(qts, SEQRAM_NS_BASE + 0x004, 0x00000101);
+    qtest_writel(qts, SEQRAM_NS_BASE + 0x100,
+                 THUMB16_PAIR(THUMB16_LDR_R0_PC_8, THUMB16_LDR_R1_R0));
+    qtest_writel(qts, SEQRAM_NS_BASE + 0x104,
+                 THUMB16_PAIR(THUMB16_ADDS_R1_1, THUMB16_STR_R1_R0));
+    qtest_writel(qts, SEQRAM_NS_BASE + 0x108, THUMB16_BRANCH_SELF);
+    qtest_writel(qts, SEQRAM_NS_BASE + 0x10c, 0x00004fe0);
+    qtest_writel(qts, SEQRAM_NS_BASE + SEQ_SPARE0, 0);
+
+    qtest_writel(qts, RAC_BASE + RAC_CTRL, RAC_CTRL_CPUWAITDIS);
+    qtest_qmp_assert_success(qts, "{'execute':'cont'}");
+    for (unsigned attempt = 0; attempt < 1000; attempt++) {
+        if (qtest_readl(qts, SEQRAM_NS_BASE + SEQ_SPARE0) == 1) {
+            break;
+        }
+        g_usleep(1000);
+    }
+    qtest_qmp_assert_success(qts, "{'execute':'stop'}");
+    g_assert_cmphex(qtest_readl(qts, SEQRAM_NS_BASE + SEQ_SPARE0), ==, 1);
+
+    qtest_writel(qts, RAC_BASE + RAC_CTRL,
+                 RAC_CTRL_CPUWAITDIS | RAC_CTRL_BOARD_POLARITIES);
+    g_assert_cmphex(qtest_readl(qts, RAC_BASE + RAC_CTRL), ==,
+                    RAC_CTRL_CPUWAITDIS | RAC_CTRL_BOARD_POLARITIES);
+    qtest_qmp_assert_success(qts, "{'execute':'cont'}");
+    g_usleep(10000);
+    qtest_qmp_assert_success(qts, "{'execute':'stop'}");
+    g_assert_cmphex(qtest_readl(qts, SEQRAM_NS_BASE + SEQ_SPARE0), ==, 1);
+    qtest_quit(qts);
 }
 
 int main(int argc, char **argv)
@@ -1521,7 +1759,10 @@ int main(int argc, char **argv)
     qtest_start(qemu_args);
     g_free(qemu_args);
 
+
     qtest_add_func("/efr32bg22/register-aliases", test_register_aliases);
+    qtest_add_func("/efr32bg22/bgm220-module-identity",
+                   test_bgm220_module_identity);
     qtest_add_func("/efr32bg22/burtc-counter-contract",
                    test_burtc_counter_contract);
     qtest_add_func("/efr32bg22/burtc-register-aliases",
@@ -1567,11 +1808,15 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/frc-completion-interrupt-enable",
                    test_frc_completion_interrupt_enable);
     qtest_add_func("/efr32bg22/radio-enable-masks", test_radio_enable_masks);
+    qtest_add_func("/efr32bg22/radio-enable-requires-bus-clocks",
+                   test_radio_enable_requires_bus_clocks);
     qtest_add_func("/efr32bg22/radio-ipversions", test_radio_ipversions);
     qtest_add_func("/efr32bg22/radio-nonsecure-alias",
                    test_radio_nonsecure_alias);
     qtest_add_func("/efr32bg22/stock-setup-aliases",
                    test_stock_setup_aliases);
+    qtest_add_func("/efr32bg22/rac-enable-requires-dependency-order",
+                   test_rac_enable_requires_dependency_order);
     qtest_add_func("/efr32bg22/dcdc-regulation", test_dcdc_regulation);
     qtest_add_func("/efr32bg22/emu-status-reset", test_emu_status_reset);
     qtest_add_func("/efr32bg22/msc-status-reset", test_msc_status_reset);
@@ -1635,6 +1880,10 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/rac-sr0-clear-alias",
                    test_rac_sr0_clear_alias);
     qtest_add_func("/efr32bg22/rac-force-disable", test_rac_force_disable);
+    qtest_add_func("/efr32bg22/radio-sequencer-executes-open-code",
+                   test_radio_sequencer_executes_open_code);
+    qtest_add_func("/efr32bg22/radio-sequencer-release-is-idempotent",
+                   test_radio_sequencer_release_is_idempotent);
 
     result = g_test_run();
     qtest_end();

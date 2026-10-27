@@ -31,6 +31,7 @@ static char *rf_trace_path;
 #define RAC_STATUS_STATE_RXSEARCH (2u << 24)
 #define SYNTH_BASE               0xa8018000
 #define SYNTH_CHCTRL             0x040
+#define SYNTH_CHSP               0x044
 #define BUFC_BASE                0xaa000000
 #define BUFC_CH0                 0x00c
 #define BUFC_CH1                 0x04c
@@ -166,8 +167,13 @@ static void test_tx_offer_requires_matching_synth_channel(void)
     qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
     qtest_writel(global_qtest, peer_rx_channel + BUFC_CMD, 1);
     qtest_writel(global_qtest, peer_rx_channel, 0);
-    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_CHCTRL, 10);
-    qtest_writel(global_qtest, peer(SYNTH_BASE + SYNTH_CHCTRL), 11);
+    /* Silicon's working RAIL path leaves CHCTRL zero and selects the physical
+     * 2 MHz channel through CHSP.  A differing CHCTRL must not affect the
+     * modeled medium. */
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_CHCTRL, 31);
+    qtest_writel(global_qtest, peer(SYNTH_BASE + SYNTH_CHCTRL), 7);
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_CHSP, 10);
+    qtest_writel(global_qtest, peer(SYNTH_BASE + SYNTH_CHSP), 11);
     qtest_writel(global_qtest,
                  peer(RAC_BASE + RAC_RXENSRCEN + REGISTER_SET_WINDOW),
                  RAC_RXENSRCEN_SWRXEN);
@@ -186,7 +192,7 @@ static void test_tx_offer_requires_matching_synth_channel(void)
                     ==, 0);
 
     qtest_writel(global_qtest, peer(RAC_BASE + RAC_CMD), RAC_CMD_RXDIS);
-    qtest_writel(global_qtest, peer(SYNTH_BASE + SYNTH_CHCTRL), 10);
+    qtest_writel(global_qtest, peer(SYNTH_BASE + SYNTH_CHSP), 10);
     qtest_writel(global_qtest,
                  peer(RAC_BASE + RAC_RXENSRCEN + REGISTER_SET_WINDOW),
                  RAC_RXENSRCEN_SWRXEN);

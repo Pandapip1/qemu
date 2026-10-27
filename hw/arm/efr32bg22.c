@@ -41,16 +41,21 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_MODEM_BASE 0xa8014000u
 #define EFR32_SYNTH_BASE 0xa8018000u
 #define EFR32_SYNTH_CHCTRL 0x040u
-#define EFR32_SYNTH_CHCTRL_CHNO_MASK 0x3fu
+#define EFR32_SYNTH_CHSP 0x044u
+#define EFR32_SYNTH_CHSP_CHSP_MASK 0x3fu
 #define EFR32_PROTIMER_BASE 0xa801c000u
 #define EFR32_PROTIMER_NS_BASE 0xb801c000u
 #define EFR32_RAC_BASE 0xa8020000u
 
 #define EFR32_RADIO_IPVERSION 0x000u
+#define EFR32_RADIO_EN 0x004u
 
 #define EFR32_FRC_IF 0x068u
 #define EFR32_FRC_IEN 0x06cu
+#define EFR32_FRC_CMD 0x02cu
 #define EFR32_FRC_RXRAWDATA 0x090u
+#define EFR32_FRC_CMD_RXABORT (1u << 0)
+#define EFR32_FRC_CMD_CONVINIT (1u << 9)
 #define EFR32_FRC_IF_TXDONE (1u << 0)
 #define EFR32_FRC_IF_RXDONE (1u << 4)
 
@@ -72,10 +77,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_RAC_CMD_TXDIS (1u << 5)
 #define EFR32_RAC_CMD_RXDIS (1u << 8)
 #define EFR32_RAC_CTRL_FORCEDISABLE (1u << 0)
+#define EFR32_RAC_CTRL_SEQRESET (1u << 24)
+#define EFR32_RAC_CTRL_CPUWAITDIS (1u << 26)
 #define EFR32_RAC_RXENSRCEN_SWRXEN (1u << 1)
 #define EFR32_RAC_STATE_OFF 0u
 #define EFR32_RAC_STATE_RXSEARCH 2u
+#define EFR32_RAC_STATE_TXWARM 8u
 #define EFR32_RAC_STATE_TX 9u
+#define EFR32_RAC_STATE_SHUTDOWN 13u
 
 /* Synthetic model delay, not a measured on-air transmission duration. */
 #define EFR32_RAC_TX_COMPLETION_DELAY_NS 150000
@@ -100,7 +109,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 
 /* Minimal clock/power state required by the stock boot path. */
 #define EFR32_CMU_BASE 0x40008000u
+#define EFR32_CMU_CLKEN1 0x068u
 #define EFR32_CMU_SYSCLKCTRL 0x070u
+#define EFR32_CMU_RADIOCLKCTRL 0x280u
+#define EFR32_CMU_RADIOCLKCTRL_EN (1u << 0)
+#define EFR32_CMU_CLKEN1_AGC (1u << 0)
+#define EFR32_CMU_CLKEN1_MODEM (1u << 1)
+#define EFR32_CMU_CLKEN1_RFCRC (1u << 2)
+#define EFR32_CMU_CLKEN1_FRC (1u << 3)
+#define EFR32_CMU_CLKEN1_PROTIMER (1u << 4)
+#define EFR32_CMU_CLKEN1_RAC (1u << 5)
+#define EFR32_CMU_CLKEN1_SYNTH (1u << 6)
+#define EFR32_CMU_CLKEN1_BUFC (1u << 11)
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_MASK 0x7u
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_FSRCO 1u
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_HFXO 3u
@@ -237,6 +257,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_BURTC_CMD_STOP (1u << 1)
 #define EFR32_BURTC_STATUS_RUNNING (1u << 0)
 
+/* EFR32BG22 SMU peripheral attribution used by Zephyr's secure-only setup. */
+#define EFR32_SMU_BASE 0x44008000u
+#define EFR32_SMU_PPUSATD1 0x064u
+#define EFR32_SMU_PPUSATD1_AHBRADIO (1u << 15)
+
 #define EFR32_BUFC_BASE 0xaa000000u
 #define EFR32_BUFC_FIRST 0x00cu
 #define EFR32_BUFC_STRIDE 0x040u
@@ -270,6 +295,8 @@ struct Efr32Periph
     MemoryRegion peripheral_mmio;
     MemoryRegion radio_mmio;
     MemoryRegion *memory;
+    MemoryRegion *m33_radio_secure;
+    MemoryRegion *m33_radio_nonsecure;
     AddressSpace dma_as;
     bool dma_as_initialized;
     GHashTable *registers;
@@ -305,6 +332,10 @@ struct Efr32Periph
     GByteArray *bufc_data[4];
     Efr32RfMedium *rf_medium;
     qemu_irq irq[64];
+    qemu_irq seq_irq_txwarm;
+    qemu_irq seq_irq_tx;
+    CPUState *seq_cpu;
+    bool seq_released;
 };
 
 static uint32_t efr32_register_get(Efr32Periph *s, uint32_t address);
@@ -765,6 +796,46 @@ static void efr32_register_put(Efr32Periph *s, uint32_t address, uint32_t value)
                         GUINT_TO_POINTER(value));
 }
 
+/*
+ * Series-2 radio blocks reject accesses until both HCLKRADIO and the block's
+ * CLKEN1 gate are enabled.  At minimum, enforce that contract on EN: this is
+ * the first register touched by both RAIL and the open LLL, and permissive EN
+ * writes previously hid a real-hardware startup fault.
+ */
+static uint32_t efr32_radio_bus_clock(uint32_t address)
+{
+    switch (address & ~0x3fffu) {
+    case EFR32_FRC_BASE:
+        return EFR32_CMU_CLKEN1_FRC;
+    case EFR32_AGC_BASE:
+        return EFR32_CMU_CLKEN1_AGC;
+    case EFR32_RFCRC_BASE:
+        return EFR32_CMU_CLKEN1_RFCRC;
+    case EFR32_MODEM_BASE:
+        return EFR32_CMU_CLKEN1_MODEM;
+    case EFR32_SYNTH_BASE:
+        return EFR32_CMU_CLKEN1_SYNTH;
+    case EFR32_PROTIMER_BASE:
+        return EFR32_CMU_CLKEN1_PROTIMER;
+    case EFR32_RAC_BASE:
+        return EFR32_CMU_CLKEN1_RAC;
+    case EFR32_BUFC_BASE:
+        return EFR32_CMU_CLKEN1_BUFC;
+    default:
+        return 0;
+    }
+}
+
+static bool efr32_radio_en_accessible(Efr32Periph *s, uint32_t address)
+{
+    uint32_t gate = efr32_radio_bus_clock(address);
+
+    return gate &&
+           (efr32_register_get(s, EFR32_CMU_BASE + EFR32_CMU_RADIOCLKCTRL) &
+            EFR32_CMU_RADIOCLKCTRL_EN) &&
+           (efr32_register_get(s, EFR32_CMU_BASE + EFR32_CMU_CLKEN1) & gate);
+}
+
 static bool efr32_hfxo_enabled(Efr32Periph *s)
 {
     uint32_t hfxo_ctrl =
@@ -817,6 +888,18 @@ static void efr32_rac_update_irqs(Efr32Periph *s)
     qemu_set_irq(s->irq[38],
                  !!(efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_SEQIF) &
                     efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_SEQIEN)));
+    if (s->seq_irq_txwarm) {
+        qemu_set_irq(s->seq_irq_txwarm,
+                     !!(efr32_register_get(s, EFR32_RAC_BASE +
+                                              EFR32_RAC_SEQIF) &
+                        (1u << 24)));
+    }
+    if (s->seq_irq_tx) {
+        qemu_set_irq(s->seq_irq_tx,
+                     !!(efr32_register_get(s, EFR32_RAC_BASE +
+                                              EFR32_RAC_SEQIF) &
+                        (1u << 25)));
+    }
 }
 
 static void efr32_rac_set_state(Efr32Periph *s, uint32_t state)
@@ -842,8 +925,15 @@ static void efr32_rac_set_state(Efr32Periph *s, uint32_t state)
     case EFR32_RAC_STATE_RXSEARCH:
         sequence_flag = 1u << 18;
         break;
+    case EFR32_RAC_STATE_TXWARM:
+        sequence_flag = 1u << 24;
+        break;
     case EFR32_RAC_STATE_TX:
         sequence_flag = 1u << 25;
+        break;
+    case EFR32_RAC_STATE_SHUTDOWN:
+        /* SHUTDOWN has no dedicated SEQIF completion bit. */
+        sequence_flag = 0;
         break;
     default:
         g_assert_not_reached();
@@ -989,8 +1079,8 @@ static void efr32_rac_capture_tx_snapshot(Efr32Periph *s)
         .trigger = EFR32_RF_TX_TRIGGER_RAC_CMD_TXEN,
         .buffer_channel = EFR32_RF_TX_BUFC_CHANNEL,
         .channel = efr32_register_get(s, EFR32_SYNTH_BASE +
-                                      EFR32_SYNTH_CHCTRL) &
-                   EFR32_SYNTH_CHCTRL_CHNO_MASK,
+                                      EFR32_SYNTH_CHSP) &
+                   EFR32_SYNTH_CHSP_CHSP_MASK,
     };
     GByteArray *data = efr32_bufc_snapshot_data(
         s, EFR32_RF_TX_BUFC_CHANNEL);
@@ -1651,6 +1741,10 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
     if (efr32_radio_ipversion(address, &ipversion)) {
         return ipversion;
     }
+    if (offset == 0x004 && efr32_radio_bus_clock(address) &&
+        !efr32_radio_en_accessible(s, address)) {
+        return 0;
+    }
 
     if (usart_index >= 0 && offset == EFR32_USART_STATUS) {
         return efr32_usart_status(s, usart_index);
@@ -1808,6 +1902,23 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         break;
     case 3:
         next = old ^ next;
+    }
+
+    if (register_address == EFR32_SMU_BASE + EFR32_SMU_PPUSATD1 &&
+        ((uint32_t)value & EFR32_SMU_PPUSATD1_AHBRADIO) &&
+        s->m33_radio_secure && s->m33_radio_nonsecure)
+    {
+        bool secure = ((address >> 12) & 3) != 2;
+
+        /* SET attributes AHBRADIO secure; CLR attributes it non-secure. */
+        memory_region_set_enabled(s->m33_radio_secure, secure);
+        memory_region_set_enabled(s->m33_radio_nonsecure, !secure);
+    }
+
+    if ((register_address & 0xfff) == 0x004 &&
+        efr32_radio_bus_clock(register_address) &&
+        !efr32_radio_en_accessible(s, register_address)) {
+        return;
     }
 
     if (usart_index >= 0 && (register_address & 0xfff) == EFR32_USART_CMD)
@@ -1973,8 +2084,17 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
             efr32_rf_medium_withdraw_active_tx(s->rf_medium,
                                                 EFR32_RF_RADIO(s));
             efr32_rac_capture_tx_snapshot(s);
-            efr32_rac_set_state(s, EFR32_RAC_STATE_TX);
-            efr32_rac_schedule_tx_completion(s);
+            if (s->seq_released) {
+                /* Silicon first wakes sequencer IRQ8 in TXWARM.  The open
+                 * auxiliary firmware acknowledges STATETXWARM before the
+                 * hardware advances to TX/IRQ9. */
+                efr32_rac_set_state(s, EFR32_RAC_STATE_TXWARM);
+            } else {
+                /* Compatibility for images which have not installed and
+                 * released sequencer firmware yet. */
+                efr32_rac_set_state(s, EFR32_RAC_STATE_TX);
+                efr32_rac_schedule_tx_completion(s);
+            }
         }
         trace_efr32bg22_rac_command(s->endpoint_id,
                                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
@@ -2005,6 +2125,21 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         }
     }
 
+    /*
+     * CMD is a write-only command port. RXABORT cancels the model's deferred
+     * frame-controller receive handoff without changing RAC's separately
+     * controlled RXSEARCH state; an already offered frame remains available
+     * to a later receive operation. CONVINIT resets convolution state in
+     * silicon, but this model deliberately has no convolutional codec state.
+     */
+    if (register_address == EFR32_FRC_BASE + EFR32_FRC_CMD)
+    {
+        if (next & EFR32_FRC_CMD_RXABORT) {
+            timer_del(s->rac_rx_timer);
+        }
+        return;
+    }
+
     /* FRC drives RXRAWDATA; the captured sequencer only reads it. */
     if (register_address == EFR32_FRC_BASE + EFR32_FRC_RXRAWDATA)
     {
@@ -2026,6 +2161,21 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
 
     efr32_register_put(s, register_address,
                        efr32_radio_mask_write(register_address, next));
+
+    /*
+     * Matched hardware captures found that working RAIL enables BUFC and
+     * PROTIMER before RAC, whereas the original open HAL enabled RAC first
+     * and remained in SHUTDOWN.  Enabling the dependencies afterwards did
+     * not repair that boot.  Preserve that ordering-sensitive failure here;
+     * the successful proprietary sequencer hand-off itself is still outside
+     * this model, so the valid order retains the existing abstract OFF state.
+     */
+    if (register_address == EFR32_RAC_BASE + EFR32_RADIO_EN &&
+        !(old & 1u) && (next & 1u) &&
+        (!(efr32_register_get(s, EFR32_BUFC_BASE + EFR32_RADIO_EN) & 1u) ||
+         !(efr32_register_get(s, EFR32_PROTIMER_BASE + EFR32_RADIO_EN) & 1u))) {
+        efr32_rac_set_state(s, EFR32_RAC_STATE_SHUTDOWN);
+    }
 
     if (register_address == EFR32_BURTC_BASE + EFR32_BURTC_EN) {
         efr32_burtc_update_running(s);
@@ -2085,7 +2235,11 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         s->hfxo_fsm_locked = false;
     }
 
-    /* CTRL.FORCEDISABLE cancels an active RAC operation. */
+    /*
+     * Without sequencer firmware, silicon enters and remains in SHUTDOWN
+     * when CTRL.FORCEDISABLE is asserted.  Do not silently complete the
+     * proprietary sequencer hand-off that this model does not execute.
+     */
     if (register_address == EFR32_RAC_BASE + EFR32_RAC_CTRL &&
         (next & EFR32_RAC_CTRL_FORCEDISABLE))
     {
@@ -2097,7 +2251,31 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
          * a cancelled transmission into RXDONE.
          */
         efr32_rf_medium_withdraw_active_tx(s->rf_medium, EFR32_RF_RADIO(s));
-        efr32_rac_set_state(s, EFR32_RAC_STATE_OFF);
+        efr32_rac_set_state(s, EFR32_RAC_STATE_SHUTDOWN);
+    }
+
+    if (register_address == EFR32_RAC_BASE + EFR32_RAC_CTRL && s->seq_cpu) {
+        if (next & EFR32_RAC_CTRL_SEQRESET) {
+            cpu_reset(s->seq_cpu);
+            s->seq_cpu->halted = 1;
+            s->seq_released = false;
+        }
+        if ((next & EFR32_RAC_CTRL_CPUWAITDIS) && !s->seq_released) {
+            /* The held sequencer samples its freshly loaded vector table as
+             * the wait gate is released, not when SEQRESET was asserted
+             * before the M33 copied the image.  CPUWAITDIS remains asserted
+             * in normal RAC.CTRL presets; rewriting it while the sequencer is
+             * already running does not reset the auxiliary core. */
+            cpu_reset(s->seq_cpu);
+            s->seq_released = true;
+            s->seq_cpu->halted = 0;
+            s->seq_cpu->stopped = false;
+            s->seq_cpu->start_powered_off = false;
+            qemu_cpu_kick(s->seq_cpu);
+        }
+        /* SEQRESET is a write-only strobe. */
+        efr32_register_put(s, EFR32_RAC_BASE + EFR32_RAC_CTRL,
+                           next & ~EFR32_RAC_CTRL_SEQRESET);
     }
 
     /*
@@ -2129,6 +2307,16 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         register_address == EFR32_RAC_BASE + EFR32_RAC_SEQIF ||
         register_address == EFR32_RAC_BASE + EFR32_RAC_SEQIEN)
     {
+        uint32_t seqif = efr32_register_get(s, EFR32_RAC_BASE +
+                                               EFR32_RAC_SEQIF);
+
+        if (s->seq_released && s->rac_state == EFR32_RAC_STATE_TXWARM &&
+            !(seqif & (1u << 24))) {
+            efr32_rac_set_state(s, EFR32_RAC_STATE_TX);
+        } else if (s->seq_released && s->rac_state == EFR32_RAC_STATE_TX &&
+                   !(seqif & (1u << 25))) {
+            efr32_rac_schedule_tx_completion(s);
+        }
         efr32_rac_update_irqs(s);
     }
 
@@ -2232,6 +2420,7 @@ static void efr32_periph_init(Object *o)
     s->registers = g_hash_table_new(g_direct_hash, g_direct_equal);
     s->trng_state = 0x2545f491;
     s->rac_state = EFR32_RAC_STATE_OFF;
+    s->seq_released = false;
     s->hfxo_fsm_locked = true;
     s->rx_offer_pending = false;
     s->usart_tx_enabled[0] = false;
@@ -2284,7 +2473,12 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     g_hash_table_remove_all(s->registers);
     s->trng_state = 0x2545f491;
     s->rac_state = EFR32_RAC_STATE_OFF;
+    s->seq_released = false;
     s->hfxo_fsm_locked = true;
+    if (s->m33_radio_secure && s->m33_radio_nonsecure) {
+        memory_region_set_enabled(s->m33_radio_secure, true);
+        memory_region_set_enabled(s->m33_radio_nonsecure, false);
+    }
     s->usart_tx_enabled[0] = false;
     s->usart_tx_enabled[1] = false;
     s->usart_tx_complete[0] = false;
@@ -2292,6 +2486,12 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     s->burtc_running = false;
     s->burtc_irq_asserted = false;
     qemu_set_irq(s->irq[18], 0);
+    if (s->seq_irq_txwarm) {
+        qemu_set_irq(s->seq_irq_txwarm, 0);
+    }
+    if (s->seq_irq_tx) {
+        qemu_set_irq(s->seq_irq_tx, 0);
+    }
     timer_del(s->burtc_compare_timer);
     s->timer2_running = false;
     s->timer2_count = 0;
@@ -2383,8 +2583,8 @@ static uint8_t efr32_periph_get_channel(Efr32RfRadio *radio)
 {
     Efr32Periph *s = EFR32_PERIPH(radio);
 
-    return efr32_register_get(s, EFR32_SYNTH_BASE + EFR32_SYNTH_CHCTRL) &
-           EFR32_SYNTH_CHCTRL_CHNO_MASK;
+    return efr32_register_get(s, EFR32_SYNTH_BASE + EFR32_SYNTH_CHSP) &
+           EFR32_SYNTH_CHSP_CHSP_MASK;
 }
 
 static void efr32_periph_rx_offer_available(Efr32RfRadio *radio)
@@ -2439,12 +2639,17 @@ struct Efr32Bg22SoCState {
     SysBusDevice parent_obj;
 
     ARMv7MState armv7m;
+    ARMv7MState seq_armv7m;
     Efr32Periph periph;
     MemoryRegion flash;
     MemoryRegion sram;
+    MemoryRegion radio_secure;
     MemoryRegion radio_ns;
     MemoryRegion radio_ram;
     MemoryRegion radio_ram_ns;
+    MemoryRegion seq_memory;
+    MemoryRegion seq_ram_alias;
+    MemoryRegion seq_radio_alias;
     MemoryRegion devinfo;
     Clock *clk;
     Clock *protimer_clk;
@@ -2497,13 +2702,21 @@ static void efr32_cpu_reset(void *opaque)
     cpu_reset(CPU(opaque));
 }
 
+static void efr32_seq_cpu_reset(void *opaque)
+{
+    CPUState *cpu = CPU(opaque);
+
+    cpu_reset(cpu);
+    cpu->halted = 1;
+}
+
 static void efr32_initialize_devinfo(MemoryRegion *devinfo)
 {
     uint8_t *contents = memory_region_get_ram_ptr(devinfo);
     uint32_t value;
 
-    /* USERDATA/CHIPCONFIG are erased.  DEVINFO holds only public size data
-     * and an intentionally synthetic EUI-64; calibration words stay zero. */
+    /* USERDATA/CHIPCONFIG are erased.  Model the exact BGM220PC22HNA2 module
+     * identity observed on BRD4314A hardware; calibration words stay zero. */
     memset(contents, 0xff, 0x8000);
     memset(contents + 0x8000, 0, 0x2000);
     value = cpu_to_le32(512 | (32 << 16));
@@ -2512,6 +2725,20 @@ static void efr32_initialize_devinfo(MemoryRegion *devinfo)
     memcpy(contents + 0x8048, &value, sizeof(value));
     value = cpu_to_le32(0x00000a00);
     memcpy(contents + 0x804c, &value, sizeof(value));
+    value = cpu_to_le32(0x324d4742); /* "BGM2" */
+    memcpy(contents + 0x8130, &value, sizeof(value));
+    value = cpu_to_le32(0x43503032); /* "20PC" */
+    memcpy(contents + 0x8134, &value, sizeof(value));
+    value = cpu_to_le32(0x4e483232); /* "22HN" */
+    memcpy(contents + 0x8138, &value, sizeof(value));
+    value = cpu_to_le32(0xffff3241); /* "A2" */
+    memcpy(contents + 0x813c, &value, sizeof(value));
+    value = cpu_to_le32(UINT32_MAX);
+    memcpy(contents + 0x8140, &value, sizeof(value));
+    memcpy(contents + 0x8144, &value, sizeof(value));
+    memcpy(contents + 0x8148, &value, sizeof(value));
+    value = cpu_to_le32(0x00570100);
+    memcpy(contents + 0x814c, &value, sizeof(value));
 }
 
 static void efr32_soc_init(Object *obj)
@@ -2519,6 +2746,8 @@ static void efr32_soc_init(Object *obj)
     Efr32Bg22SoCState *s = EFR32BG22_SOC(obj);
 
     object_initialize_child(obj, "armv7m", &s->armv7m, TYPE_ARMV7M);
+    object_initialize_child(obj, "radio-sequencer", &s->seq_armv7m,
+                            TYPE_ARMV7M);
     object_initialize_child(obj, "periph", &s->periph, TYPE_EFR32_PERIPH);
 }
 
@@ -2527,7 +2756,7 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
     Efr32Bg22SoCState *s = EFR32BG22_SOC(dev);
     DeviceState *nvic = DEVICE(&s->armv7m);
     SysBusDevice *periph = SYS_BUS_DEVICE(&s->periph);
-    g_autofree gchar *name = object_get_canonical_path_component(OBJECT(s));
+    const gchar *name = object_get_canonical_path_component(OBJECT(s));
     g_autofree gchar *flash_name = NULL;
     g_autofree gchar *sram_name = NULL;
     g_autofree gchar *radio_ram_name = NULL;
@@ -2612,8 +2841,9 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
     }
     memory_region_add_subregion(s->memory, PERIPH_BASE,
                                 sysbus_mmio_get_region(periph, 0));
-    memory_region_add_subregion(s->memory, RADIO_BASE,
-                                sysbus_mmio_get_region(periph, 1));
+    memory_region_init_alias(&s->radio_secure, OBJECT(s), "radio-secure",
+                             sysbus_mmio_get_region(periph, 1), 0, RADIO_SIZE);
+    memory_region_add_subregion(s->memory, RADIO_BASE, &s->radio_secure);
     for (unsigned irq = 0; irq < 64; irq++) {
         sysbus_connect_irq(periph, irq, qdev_get_gpio_in(nvic, irq));
     }
@@ -2621,12 +2851,46 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
     memory_region_init_alias(&s->radio_ns, OBJECT(s), "radio-ns",
                              sysbus_mmio_get_region(periph, 1), 0, RADIO_SIZE);
     memory_region_add_subregion(s->memory, 0xb8000000, &s->radio_ns);
+    s->periph.m33_radio_secure = &s->radio_secure;
+    s->periph.m33_radio_nonsecure = &s->radio_ns;
+    memory_region_set_enabled(&s->radio_ns, false);
     memory_region_init_ram(&s->radio_ram, OBJECT(s), radio_ram_name, 0x8000,
                            &error_fatal);
     memory_region_add_subregion(s->memory, 0xa0000000, &s->radio_ram);
     memory_region_init_alias(&s->radio_ram_ns, OBJECT(s), "efr32.radioram-ns",
                              &s->radio_ram, 0, 0x8000);
     memory_region_add_subregion(s->memory, 0xb0000000, &s->radio_ram_ns);
+
+    /* The BG22 radio sequencer is an asymmetric Cortex-M0-class core.  Its
+     * local address zero is the first 16 KiB of shared SEQRAM, while radio
+     * peripherals retain their secure 0xa8xx/0xaaxx addresses. */
+    memory_region_init(&s->seq_memory, OBJECT(s), "efr32.seq-memory",
+                       UINT64_C(1) << 32);
+    memory_region_init_alias(&s->seq_ram_alias, OBJECT(s),
+                             "efr32.seq-local-ram", &s->radio_ram, 0,
+                             0x8000);
+    memory_region_add_subregion(&s->seq_memory, 0, &s->seq_ram_alias);
+    memory_region_init_alias(&s->seq_radio_alias, OBJECT(s),
+                             "efr32.seq-radio",
+                             sysbus_mmio_get_region(periph, 1), 0,
+                             RADIO_SIZE);
+    memory_region_add_subregion(&s->seq_memory, RADIO_BASE,
+                                &s->seq_radio_alias);
+    qdev_prop_set_uint32(DEVICE(&s->seq_armv7m), "num-irq", 64);
+    qdev_connect_clock_in(DEVICE(&s->seq_armv7m), "cpuclk", s->clk);
+    qdev_prop_set_string(DEVICE(&s->seq_armv7m), "cpu-type",
+                         ARM_CPU_TYPE_NAME("cortex-m0"));
+    object_property_set_link(OBJECT(&s->seq_armv7m), "memory",
+                             OBJECT(&s->seq_memory), &error_abort);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->seq_armv7m), errp)) {
+        return;
+    }
+    s->periph.seq_cpu = CPU(s->seq_armv7m.cpu);
+    s->periph.seq_cpu->halted = 1;
+    s->periph.seq_released = false;
+    s->periph.seq_irq_txwarm =
+        qdev_get_gpio_in(DEVICE(&s->seq_armv7m), 8);
+    s->periph.seq_irq_tx = qdev_get_gpio_in(DEVICE(&s->seq_armv7m), 9);
     memory_region_init_ram(&s->devinfo, OBJECT(s), devinfo_name, 0x10000,
                            &error_fatal);
     memory_region_add_subregion(s->memory, 0x0fe00000, &s->devinfo);
@@ -2703,6 +2967,7 @@ static void init(MachineState *m)
         g_free(d);
     }
     qemu_register_reset(efr32_cpu_reset, s->soc.armv7m.cpu);
+    qemu_register_reset(efr32_seq_cpu_reset, s->soc.seq_armv7m.cpu);
 }
 static void idau(IDAUInterface *i, uint32_t a, int *r, bool *e, bool *n,
                  bool *c)
@@ -2763,6 +3028,9 @@ static void mc(ObjectClass *o, void *d)
     m->valid_cpu_types = cpu;
     m->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-m33");
     m->default_ram_size = FLASH_SIZE;
+    m->min_cpus = 2;
+    m->max_cpus = 2;
+    m->default_cpus = 2;
     m->ignore_memory_transaction_failures = true;
     object_class_property_add_str(o, "flash", image_get, image_set);
     object_class_property_add_str(o, "flash-overlay", flash_overlay_get,
@@ -2813,6 +3081,8 @@ static void dual_init(MachineState *m)
             g_free(contents);
         }
         qemu_register_reset(efr32_cpu_reset, s->soc[index].armv7m.cpu);
+        qemu_register_reset(efr32_seq_cpu_reset,
+                            s->soc[index].seq_armv7m.cpu);
         g_free(memory_name);
         g_free(name);
     }
@@ -2875,9 +3145,9 @@ static void dual_mc(ObjectClass *o, void *d)
     m->valid_cpu_types = cpu;
     m->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-m33");
     m->default_ram_size = 2 * FLASH_SIZE;
-    m->min_cpus = 2;
-    m->max_cpus = 2;
-    m->default_cpus = 2;
+    m->min_cpus = 4;
+    m->max_cpus = 4;
+    m->default_cpus = 4;
     m->ignore_memory_transaction_failures = true;
     object_class_property_add_str(o, "flash0", dual_image0_get,
                                   dual_image0_set);

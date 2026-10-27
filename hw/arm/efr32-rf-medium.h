@@ -49,7 +49,7 @@ typedef enum Efr32RfTxTrigger {
 typedef struct Efr32RfTxMetadata {
     Efr32RfTxTrigger trigger;
     uint8_t buffer_channel;
-    /* SYNTH.CHCTRL.CHNO captured with the channel-0 staging snapshot. */
+    /* SYNTH.CHSP.CHSP captured with the channel-0 staging snapshot. */
     uint8_t channel;
 } Efr32RfTxMetadata;
 
@@ -71,7 +71,7 @@ typedef struct Efr32RfRxDeliveryRequest Efr32RfRxDeliveryRequest;
  * This interface deliberately models only membership in an in-process RF
  * medium.  It does not define an air-frame format or a host HCI transport.
  * The intended EFR32 abstraction boundary is a snapshot of staged BUFC
- * channel 0 and SYNTH.CHCTRL.CHNO at RAC.CMD.TXEN/RAC->TX. Receive delivery
+ * channel 0 and SYNTH.CHSP.CHSP at RAC.CMD.TXEN/RAC->TX. Receive delivery
  * remains deferred until a
  * receiver is in RXSEARCH. The current RXRAWDATA-to-BUFC channel 1 seam
  * optionally publishes a QEMU-only successful-RX descriptor when the guest
