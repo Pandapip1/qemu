@@ -67,6 +67,33 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_FRC_IF_TXDONE (1u << 0)
 #define EFR32_FRC_IF_RXDONE (1u << 4)
 
+/*
+ * DFLCTRL (0xa8004000+0x00c, public FRC_S_register.py) and WCNTCMP0
+ * (+0x020). Unlike ACTIVETXFCD above, this one IS confirmed: real hardware
+ * measures WCNTCMP0 == DFLOFFSET + <the extracted length-field byte> + 3
+ * (BLE's fixed 3-byte CRC, since this project's only configured
+ * DFLINCLUDECRC=0) for two independent payload sizes, 6 and 9 bytes
+ * (owo-open-fw docs/radio-tables.md SS7.29). Only DFLMODE==1 -- the only
+ * value this project's firmware ever configures (every PHY variant shares
+ * one DFLCTRL write in radio.c's base config table) -- is implemented;
+ * DFLMODE's other enum values have no public description text in the
+ * generated field model and no real-hardware confirmation here, so they
+ * are deliberately left alone (WCNTCMP0 keeps whatever software wrote).
+ */
+#define EFR32_FRC_DFLCTRL 0x00cu
+#define EFR32_FRC_DFLCTRL_DFLMODE_MASK 0x7u
+#define EFR32_FRC_DFLCTRL_DFLMODE_LENGTH_FIELD 0x1u
+#define EFR32_FRC_DFLCTRL_DFLBITORDER (1u << 3)
+#define EFR32_FRC_DFLCTRL_DFLSHIFT_SHIFT 4u
+#define EFR32_FRC_DFLCTRL_DFLSHIFT_MASK 0x7u
+#define EFR32_FRC_DFLCTRL_DFLOFFSET_SHIFT 8u
+#define EFR32_FRC_DFLCTRL_DFLOFFSET_MASK 0xfu
+#define EFR32_FRC_DFLCTRL_DFLBITS_SHIFT 12u
+#define EFR32_FRC_DFLCTRL_DFLBITS_MASK 0xfu
+#define EFR32_FRC_DFLCTRL_DFLINCLUDECRC (1u << 20)
+#define EFR32_FRC_WCNTCMP0 0x020u
+#define EFR32_BLE_CRC_LENGTH_BYTES 3u
+
 #define EFR32_AGC_RSSI 0x018u
 #define EFR32_AGC_FRAMERSSI 0x01cu
 #define EFR32_AGC_IF 0x044u
@@ -1132,6 +1159,46 @@ static void efr32_rac_rx_handoff(void *opaque)
     }
 }
 
+/*
+ * Returns the real FRC dynamic-length value for WCNTCMP0, or UINT32_MAX if
+ * the configured DFLCTRL mode isn't the one this project's firmware (and
+ * this function's derivation) is confirmed against -- see the DFLCTRL
+ * comment above EFR32_FRC_DFLCTRL for the hardware evidence.
+ */
+static uint32_t efr32_frc_dynamic_length_wcntcmp0(const uint8_t *bytes,
+                                                   gsize length,
+                                                   uint32_t dflctrl)
+{
+    uint32_t dflmode = dflctrl & EFR32_FRC_DFLCTRL_DFLMODE_MASK;
+    uint32_t dfloffset = (dflctrl >> EFR32_FRC_DFLCTRL_DFLOFFSET_SHIFT) &
+                          EFR32_FRC_DFLCTRL_DFLOFFSET_MASK;
+    uint32_t dflbits = (dflctrl >> EFR32_FRC_DFLCTRL_DFLBITS_SHIFT) &
+                        EFR32_FRC_DFLCTRL_DFLBITS_MASK;
+    uint32_t dflshift = (dflctrl >> EFR32_FRC_DFLCTRL_DFLSHIFT_SHIFT) &
+                         EFR32_FRC_DFLCTRL_DFLSHIFT_MASK;
+    bool dflbitorder = dflctrl & EFR32_FRC_DFLCTRL_DFLBITORDER;
+    bool dflincludecrc = dflctrl & EFR32_FRC_DFLCTRL_DFLINCLUDECRC;
+    uint32_t field;
+
+    if (dflmode != EFR32_FRC_DFLCTRL_DFLMODE_LENGTH_FIELD ||
+        dfloffset >= length || dflbits == 0) {
+        return UINT32_MAX;
+    }
+
+    field = (bytes[dfloffset] >> dflshift) & ((1u << dflbits) - 1u);
+    if (dflbitorder) {
+        uint32_t reversed = 0;
+
+        for (uint32_t bit = 0; bit < dflbits; bit++) {
+            reversed |= ((field >> bit) & 1u) << (dflbits - 1u - bit);
+        }
+        field = reversed;
+    }
+
+    return dfloffset + field +
+           (dflincludecrc ? 0u : EFR32_BLE_CRC_LENGTH_BYTES);
+}
+
 static void efr32_rac_capture_tx_snapshot(Efr32Periph *s)
 {
     Efr32RfTxMetadata metadata = {
@@ -1161,6 +1228,17 @@ static void efr32_rac_capture_tx_snapshot(Efr32Periph *s)
     bytes = g_bytes_get_data(efr32_rf_tx_snapshot_get_data(snapshot), &length);
     for (unsigned index = 0; index < MIN(length, sizeof(first_word)); index++) {
         first_word |= (uint32_t)bytes[index] << (index * 8);
+    }
+    {
+        uint32_t dflctrl = efr32_register_get(s, EFR32_FRC_BASE +
+                                              EFR32_FRC_DFLCTRL);
+        uint32_t wcntcmp0 = efr32_frc_dynamic_length_wcntcmp0(bytes, length,
+                                                              dflctrl);
+
+        if (wcntcmp0 != UINT32_MAX) {
+            efr32_register_put(s, EFR32_FRC_BASE + EFR32_FRC_WCNTCMP0,
+                               wcntcmp0);
+        }
     }
     trace_efr32bg22_tx_snapshot(s->endpoint_id,
                                  efr32_rf_tx_snapshot_get_sequence(snapshot),

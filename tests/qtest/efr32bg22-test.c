@@ -34,6 +34,7 @@ static char *tx_snapshot_trace_path;
 #define FRC_RXCTRL            0x04c
 #define FRC_SEQIF            0x0b4
 #define FRC_SEQIEN           0x0b8
+#define FRC_WCNTCMP0         0x020
 #define MODEM_BASE           0xa8014000
 #define MODEM_SHAPING1       0x098
 #define MODEM_LONGRANGE5     0x14c
@@ -1499,6 +1500,35 @@ static void test_rac_tx_commands(void)
                     RAC_SEQIF_STATECHANGESEQ);
 }
 
+static void test_frc_wcntcmp0_dynamic_length(void)
+{
+    const uint32_t tx_channel = BUFC_BASE + BUFC_CH0;
+
+    /*
+     * Two independent real-hardware measurements (owo-open-fw
+     * docs/radio-tables.md SS7.29): an 11-byte frame (BLE payload-length
+     * byte = 6) measures WCNTCMP0 == 0xA, and a 14-byte frame (payload-
+     * length byte = 9) measures WCNTCMP0 == 0xD. Both follow
+     * WCNTCMP0 == DFLOFFSET(1) + <payload-length byte> + 3 (BLE's CRC).
+     */
+    /* FRC.DFLCTRL: DFLMODE=1, DFLOFFSET=1, DFLBITS=8, MINLENGTH=1 --
+     * exactly the one configuration radio.c's efr32_ble_1m_base_table
+     * applies for every PHY variant this project supports. */
+    writel(FRC_BASE + 0x00c, 0x00018101);
+    writel(tx_channel + BUFC_CMD, 1);
+    writel(tx_channel + BUFC_WRITEDATA, 0x00); /* header byte 0 */
+    writel(tx_channel + BUFC_WRITEDATA, 6);    /* header byte 1: length */
+    writel(RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+    g_assert_cmphex(readl(FRC_BASE + FRC_WCNTCMP0), ==, 0xa);
+
+    writel(RAC_BASE + RAC_CMD, RAC_CMD_TXDIS);
+    writel(tx_channel + BUFC_CMD, 1);
+    writel(tx_channel + BUFC_WRITEDATA, 0x00); /* header byte 0 */
+    writel(tx_channel + BUFC_WRITEDATA, 9);    /* header byte 1: length */
+    writel(RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+    g_assert_cmphex(readl(FRC_BASE + FRC_WCNTCMP0), ==, 0xd);
+}
+
 static void test_rac_tx_completion(void)
 {
     writel(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW, FRC_IF_TXDONE);
@@ -2201,6 +2231,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/protimer-counter-is-independent-from-burtc",
                    test_protimer_counter_is_independent_from_burtc);
     qtest_add_func("/efr32bg22/rac-tx-commands", test_rac_tx_commands);
+    qtest_add_func("/efr32bg22/frc-wcntcmp0-dynamic-length",
+                   test_frc_wcntcmp0_dynamic_length);
     qtest_add_func("/efr32bg22/rac-tx-completion", test_rac_tx_completion);
     qtest_add_func("/efr32bg22/rac-tx-disable-cancels-completion",
                    test_rac_tx_disable_cancels_completion);
