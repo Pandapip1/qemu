@@ -44,6 +44,10 @@ static char *tx_snapshot_trace_path;
 #define RFCRC_BASE           0xa8010000
 #define RFCRC_EN             0x004
 #define RFCRC_CTRL           0x008
+#define RFCRC_CMD            0x010
+#define RFCRC_CMD_INITIALIZE (1u << 0)
+#define RFCRC_INIT           0x018
+#define RFCRC_DATA           0x01c
 #define PROTIMER_BASE         0xa801c000
 #define PROTIMER_NS_BASE      0xb801c000
 #define PROTIMER_EN           0x004
@@ -768,6 +772,29 @@ static void test_rfcrc_masks(void)
 
     g_assert_cmphex(readl(RFCRC_BASE + RFCRC_EN), ==, 1);
     g_assert_cmphex(readl(RFCRC_BASE + RFCRC_CTRL), ==, 0x1fef);
+}
+
+/*
+ * Real hardware (docs/radio-tables.md SS7.43): RFCRC.CMD.INITIALIZE loads
+ * the live CRC accumulator (DATA) from the configured seed (INIT). CMD is
+ * write-only and must not latch into its own register.
+ */
+static void test_rfcrc_cmd_initialize(void)
+{
+    enable_radio_bus_clocks();
+    writel(RFCRC_BASE + RFCRC_INIT, 0x00abcdef);
+    writel(RFCRC_BASE + RFCRC_DATA, 0);
+
+    writel(RFCRC_BASE + RFCRC_CMD, RFCRC_CMD_INITIALIZE);
+
+    g_assert_cmphex(readl(RFCRC_BASE + RFCRC_DATA), ==, 0x00abcdef);
+    g_assert_cmphex(readl(RFCRC_BASE + RFCRC_CMD), ==, 0);
+
+    writel(RFCRC_BASE + RFCRC_INIT, 0x00112233);
+    writel(RFCRC_BASE + RFCRC_DATA, 0x00445566);
+    writel(RFCRC_BASE + RFCRC_CMD, 0);
+
+    g_assert_cmphex(readl(RFCRC_BASE + RFCRC_DATA), ==, 0x00445566);
 }
 
 static void test_agc_rssi_status_registers(void)
@@ -2163,6 +2190,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/usart-tx-polling", test_usart_tx_polling);
     qtest_add_func("/efr32bg22/modem-masks", test_modem_masks);
     qtest_add_func("/efr32bg22/rfcrc-masks", test_rfcrc_masks);
+    qtest_add_func("/efr32bg22/rfcrc-cmd-initialize",
+                   test_rfcrc_cmd_initialize);
     qtest_add_func("/efr32bg22/agc-rssi-status-registers",
                    test_agc_rssi_status_registers);
     qtest_add_func("/efr32bg22/agc-rssi-valid-latches",

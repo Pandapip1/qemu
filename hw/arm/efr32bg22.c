@@ -38,6 +38,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_FRC_BASE 0xa8004000u
 #define EFR32_AGC_BASE 0xa800c000u
 #define EFR32_RFCRC_BASE 0xa8010000u
+#define EFR32_RFCRC_CMD 0x010u
+#define EFR32_RFCRC_CMD_INITIALIZE (1u << 0)
+#define EFR32_RFCRC_INIT 0x018u
+#define EFR32_RFCRC_DATA 0x01cu
 #define EFR32_MODEM_BASE 0xa8014000u
 #define EFR32_SYNTH_BASE 0xa8018000u
 #define EFR32_SYNTH_CHCTRL 0x040u
@@ -1289,7 +1293,7 @@ static uint32_t efr32_radio_mask_write(uint32_t address, uint32_t value)
                                      0x3ffff};
         return value & m[(offset - 0x34) / 4];
     }
-    if ((address & ~0x3fffu) == 0xa8010000)
+    if ((address & ~0x3fffu) == EFR32_RFCRC_BASE)
     {
         if (offset == 4)
             return value & 1;
@@ -2324,6 +2328,25 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
     /* FRC drives RXRAWDATA; the captured sequencer only reads it. */
     if (register_address == EFR32_FRC_BASE + EFR32_FRC_RXRAWDATA)
     {
+        return;
+    }
+
+    /*
+     * RFCRC.CMD is write-only. INITIALIZE loads the live CRC accumulator
+     * (DATA) from the configured seed (INIT) -- confirmed on real hardware
+     * (docs/radio-tables.md SS7.43); the production open driver was missing
+     * this write entirely (fixed in modules/efr32-radio/hal/radio.c). This
+     * model does not simulate the running per-byte CRC update itself (no
+     * byte-stream hookup to BUFC exists here), only this one documented,
+     * directly-observed register side effect.
+     */
+    if (register_address == EFR32_RFCRC_BASE + EFR32_RFCRC_CMD)
+    {
+        if (next & EFR32_RFCRC_CMD_INITIALIZE) {
+            efr32_register_put(s, EFR32_RFCRC_BASE + EFR32_RFCRC_DATA,
+                               efr32_register_get(s,
+                                   EFR32_RFCRC_BASE + EFR32_RFCRC_INIT));
+        }
         return;
     }
 
