@@ -63,6 +63,15 @@ static char *tx_snapshot_trace_path;
 #define RAC_CTRL              0x014
 #define RAC_SR0               0x040
 #define RAC_SR3               0x04c
+#define RAC_STCTRL            0x050
+/* STCAL[23:0] | STSKEW[24] -- the only two documented fields (RAC_S_field.py),
+ * confirmed structurally identical in layout to Armv6-M SysTick.CALIB's own
+ * TENMS[23:0]/SKEW[24] (see owo-open-fw docs/radio-tables.md SS7.9). */
+#define RAC_STCTRL_WRITABLE_MASK 0x01ffffffu
+/* The exact literal stock's sequencer reset handler writes to RAC.STCTRL,
+ * independently measured live on stock hardware (docs/radio-tables.md
+ * SS7.8/SS7.9). Not a derived or invented value. */
+#define RAC_STCTRL_STOCK_VALUE   0x01061a7fu
 #define RAC_RXENSRCEN         0x008
 #define RAC_IEN               0x020
 #define RAC_SEQIF             0x028
@@ -84,6 +93,61 @@ static char *tx_snapshot_trace_path;
 #define THUMB16_BRANCH_SELF      0xe7feu
 #define THUMB16_PAIR(first, second) \
     ((uint32_t)(first) | ((uint32_t)(second) << 16))
+
+/*
+ * Small Thumb-16 (ARMv6-M) instruction encoders used to assemble one-off
+ * probe snippets for the AP3 sequencer core at runtime, rather than hand-
+ * computing and transcribing magic opcode words. Each encoder is named
+ * after, and implements exactly, the architected encoding in the Armv6-M
+ * ARM ARM for that mnemonic; none of this invents or approximates behavior.
+ */
+static uint16_t thumb_ldr_pc(unsigned rd, uint32_t insn_addr,
+                             uint32_t literal_addr)
+{
+    uint32_t pc = (insn_addr + 4) & ~3u;
+    uint32_t imm8;
+
+    g_assert_cmpuint(literal_addr, >=, pc);
+    g_assert_cmpuint((literal_addr - pc) % 4, ==, 0);
+    imm8 = (literal_addr - pc) / 4;
+    g_assert_cmpuint(imm8, <=, 0xff);
+    return 0x4800u | (rd << 8) | imm8;
+}
+
+static uint16_t thumb_movs_imm8(unsigned rd, uint8_t imm8)
+{
+    return 0x2000u | (rd << 8) | imm8;
+}
+
+static uint16_t thumb_strb_imm(unsigned rt, unsigned rn, unsigned imm5)
+{
+    return 0x7000u | (imm5 << 6) | (rn << 3) | rt;
+}
+
+static uint16_t thumb_ldrb_imm(unsigned rt, unsigned rn, unsigned imm5)
+{
+    return 0x7800u | (imm5 << 6) | (rn << 3) | rt;
+}
+
+static uint16_t thumb_str_imm(unsigned rt, unsigned rn, unsigned imm5_words)
+{
+    return 0x6000u | (imm5_words << 6) | (rn << 3) | rt;
+}
+
+static uint16_t thumb_ldr_imm(unsigned rt, unsigned rn, unsigned imm5_words)
+{
+    return 0x6800u | (imm5_words << 6) | (rn << 3) | rt;
+}
+
+static uint16_t thumb_b(uint32_t insn_addr, uint32_t target_addr)
+{
+    int32_t offset = (int32_t)(target_addr - (insn_addr + 4));
+
+    g_assert_cmpint(offset, >=, -2048);
+    g_assert_cmpint(offset, <=, 2046);
+    g_assert_true(offset % 2 == 0);
+    return 0xe000u | (((uint32_t)offset >> 1) & 0x7ffu);
+}
 #define RAC_RXENSRCEN_SWRXEN  (1u << 1)
 #define RAC_STATUS_STATE_MASK 0x0f000000
 #define RAC_STATUS_STATE_RXSEARCH (2u << 24)
@@ -1684,6 +1748,229 @@ static void test_rac_force_disable(void)
     g_assert_cmphex(readl(RAC_BASE + RAC_CTRL), ==, 0);
 }
 
+/*
+ * RAC.STCTRL's only two documented fields -- STCAL[23:0] and STSKEW[24]
+ * (RAC_S_field.py) -- are the whole writable mask; everything else must be
+ * dropped. Checked against the real literal value (0x01061a7f) stock's own
+ * sequencer reset handler writes (docs/radio-tables.md SS7.8/SS7.9): that
+ * value already fits the mask exactly, so this also pins the mask against
+ * silently regressing to something that would truncate it.
+ */
+static void test_rac_stctrl_mask(void)
+{
+    writel(RAC_BASE + RAC_STCTRL, RAC_STCTRL_STOCK_VALUE);
+    g_assert_cmphex(readl(RAC_BASE + RAC_STCTRL), ==, RAC_STCTRL_STOCK_VALUE);
+
+    writel(RAC_BASE + RAC_STCTRL, UINT32_MAX);
+    g_assert_cmphex(readl(RAC_BASE + RAC_STCTRL), ==,
+                    RAC_STCTRL_WRITABLE_MASK);
+}
+
+/*
+ * Release the AP3 sequencer core exactly as
+ * test_radio_sequencer_executes_open_code does, then load an arbitrary
+ * caller-assembled Thumb-16 program (instruction count must be even)
+ * immediately followed by its literal pool, both at the same
+ * SEQRAM_NS_BASE + 0x100 the other sequencer probes use. SEQ.SPARE0 and
+ * the seven words after it are zeroed first and are the program's
+ * exfiltration channel back to the qtest side. Returns with the core
+ * already running ('cont' issued); callers stop/cont it themselves.
+ */
+static QTestState *seq_release_with_program(const uint16_t *insns,
+                                            size_t n_insns,
+                                            const uint32_t *literals,
+                                            size_t n_literals)
+{
+    const uint32_t code_base = SEQRAM_NS_BASE + 0x100;
+    QTestState *qts;
+    size_t i;
+
+    g_assert_cmpuint(n_insns % 2, ==, 0);
+
+    qts = qtest_initf("-machine efr32bg22 -accel tcg -S");
+
+    /* Keep the image-less application M33 in a valid idle loop while TCG
+     * executes the independently released auxiliary core. */
+    qtest_writel(qts, 0x00000000, 0x20008000);
+    qtest_writel(qts, 0x00000004, 0x00000101);
+    qtest_writel(qts, 0x00000100, 0x0000e7fe);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+
+    qtest_writel(qts, RAC_BASE + RAC_CTRL, RAC_CTRL_SEQRESET);
+    qtest_writel(qts, SEQRAM_NS_BASE + 0x000, 0x00003e00);
+    qtest_writel(qts, SEQRAM_NS_BASE + 0x004, 0x00000101);
+
+    for (i = 0; i < n_insns; i += 2) {
+        qtest_writel(qts, code_base + 2 * i,
+                    THUMB16_PAIR(insns[i], insns[i + 1]));
+    }
+    for (i = 0; i < n_literals; i++) {
+        qtest_writel(qts, code_base + 2 * n_insns + 4 * i, literals[i]);
+    }
+    for (i = 0; i < 8; i++) {
+        qtest_writel(qts, SEQRAM_NS_BASE + SEQ_SPARE0 + 4 * i, 0);
+    }
+
+    qtest_writel(qts, RAC_BASE + RAC_CTRL, RAC_CTRL_CPUWAITDIS);
+    qtest_qmp_assert_success(qts, "{'execute':'cont'}");
+    return qts;
+}
+
+/*
+ * IRQ8/IRQ9 are the two interrupts this project's radio_seq.S actually
+ * services (TXWARM and TX). Stock's own sequencer reset handler sets both
+ * to priority 1 through NVIC.IPR's byte-addressable aliases specifically
+ * so a single `strb` touches only its own IRQ's priority byte, never a
+ * neighboring one packed into the same 32-bit IPR word
+ * (docs/radio-tables.md SS7.9). This proves that behavior for AP3's own
+ * private NVIC instance -- not the M33's, which qtest's own memory
+ * access path always reaches first -- by having AP3 itself write and
+ * read back IRQ8..IRQ11's priority bytes (IRQ10/IRQ11 sharing NVIC.IPR2
+ * with IRQ8/IRQ9) and publish the results to shared RAM.
+ *
+ * It also pins down that AP3's NVIC is genuinely Armv6-M (2 priority bits
+ * implemented, not the M33's 8): every byte written here truncates to one
+ * of only four possible stored values (0x00/0x40/0x80/0xc0), which is
+ * itself a real, previously-unrecorded consequence of stock writing the
+ * literal priority value 1 -- it quantizes away to the same priority 0
+ * the core already resets to.
+ */
+static void test_seq_nvic_ipr_byte_isolation(void)
+{
+    static const uint32_t ipr2_addr = 0xe000e408; /* NVIC.IPR2: IRQ8..11 */
+    const uint32_t code_base = SEQRAM_NS_BASE + 0x100;
+    uint16_t insn[22];
+    uint32_t literals[3];
+    QTestState *qts;
+    unsigned n = 0;
+
+    insn[n++] = 0; /* [0] LDR r0, [PC, #...] -> ipr2_addr (patched below) */
+    insn[n++] = 0; /* [1] LDR r1, [PC, #...] -> SEQ_SPARE0 (patched below) */
+    insn[n++] = thumb_movs_imm8(2, 0x80);        /* [2] sentinel for IRQ10 */
+    insn[n++] = thumb_strb_imm(2, 0, 2);         /* [3] */
+    insn[n++] = thumb_movs_imm8(2, 0x00);        /* [4] sentinel for IRQ11 */
+    insn[n++] = thumb_strb_imm(2, 0, 3);         /* [5] */
+    insn[n++] = thumb_movs_imm8(2, 0x40);        /* [6] IRQ8 priority byte */
+    insn[n++] = thumb_strb_imm(2, 0, 0);         /* [7] */
+    insn[n++] = thumb_movs_imm8(2, 0xc0);        /* [8] IRQ9 priority byte */
+    insn[n++] = thumb_strb_imm(2, 0, 1);         /* [9] */
+    insn[n++] = thumb_ldrb_imm(3, 0, 0);         /* [10] read IRQ8 back */
+    insn[n++] = thumb_str_imm(3, 1, 0);          /* [11] -> SPARE0+0 */
+    insn[n++] = thumb_ldrb_imm(3, 0, 1);         /* [12] read IRQ9 back */
+    insn[n++] = thumb_str_imm(3, 1, 1);          /* [13] -> SPARE0+4 */
+    insn[n++] = thumb_ldrb_imm(3, 0, 2);         /* [14] read IRQ10 back */
+    insn[n++] = thumb_str_imm(3, 1, 2);          /* [15] -> SPARE0+8 */
+    insn[n++] = thumb_ldrb_imm(3, 0, 3);         /* [16] read IRQ11 back */
+    insn[n++] = thumb_str_imm(3, 1, 3);          /* [17] -> SPARE0+12 */
+    insn[n++] = 0; /* [18] LDR r4, [PC, #...] -> done marker (patched) */
+    insn[n++] = thumb_str_imm(4, 1, 4);          /* [19] -> SPARE0+16 */
+    insn[n++] = THUMB16_BRANCH_SELF;             /* [20] park here, done */
+    insn[n++] = THUMB16_BRANCH_SELF;             /* [21] padding */
+    g_assert_cmpuint(n, ==, 22);
+
+    literals[0] = ipr2_addr;
+    literals[1] = SEQ_SPARE0;
+    literals[2] = 0xabcd1234u; /* arbitrary completion marker */
+    insn[0] = thumb_ldr_pc(0, code_base + 0, code_base + 2 * n);
+    insn[1] = thumb_ldr_pc(1, code_base + 2, code_base + 2 * n + 4);
+    insn[18] = thumb_ldr_pc(4, code_base + 2 * 18, code_base + 2 * n + 8);
+
+    qts = seq_release_with_program(insn, n, literals, 3);
+
+    for (unsigned attempt = 0; attempt < 1000; attempt++) {
+        if (qtest_readl(qts, SEQRAM_NS_BASE + SEQ_SPARE0 + 16) ==
+            0xabcd1234u) {
+            break;
+        }
+        g_usleep(1000);
+    }
+    qtest_qmp_assert_success(qts, "{'execute':'stop'}");
+
+    g_assert_cmphex(qtest_readl(qts, SEQRAM_NS_BASE + SEQ_SPARE0 + 16), ==,
+                    0xabcd1234u);
+    /* IRQ8: wrote 0x40 (priority bits 01) -- untruncated, since the two
+     * implemented priority bits are exactly its top two. */
+    g_assert_cmphex(qtest_readl(qts, SEQRAM_NS_BASE + SEQ_SPARE0 + 0), ==,
+                    0x40);
+    /* IRQ9: wrote 0xc0 (priority bits 11). */
+    g_assert_cmphex(qtest_readl(qts, SEQRAM_NS_BASE + SEQ_SPARE0 + 4), ==,
+                    0xc0);
+    /* IRQ10: never touched after its 0x80 sentinel -- a word-wide or
+     * neighbor-clobbering write would corrupt this. */
+    g_assert_cmphex(qtest_readl(qts, SEQRAM_NS_BASE + SEQ_SPARE0 + 8), ==,
+                    0x80);
+    /* IRQ11: never touched after its 0x00 sentinel. */
+    g_assert_cmphex(qtest_readl(qts, SEQRAM_NS_BASE + SEQ_SPARE0 + 12), ==,
+                    0x00);
+    qtest_quit(qts);
+}
+
+/*
+ * This core's own private Armv6-M SysTick (0xE000E010) is separate from
+ * the M33's own SysTick -- stock's reset handler configures it (from
+ * SysTick.CALIB, enabled from the processor clock, no interrupt) right
+ * after the NVIC.IPR loop above (docs/radio-tables.md SS7.9). This test
+ * reads CALIB purely for the record: this model reports NOREF here
+ * because no refclk is wired into either core's SysTick, and this
+ * project has no confirmed real-hardware CALIB value to assert against
+ * (STCAL/CALIB is explicitly recorded as "an opaque empirical value this
+ * project has no theory for" -- not invented here either). The actual
+ * counting proof below instead drives RELOAD/CSR from a fixed,
+ * deliberately-arbitrary test constant, so it is testing the real
+ * Armv6-M counting mechanism for AP3's own SysTick instance, not a claimed
+ * real-hardware timing value.
+ */
+static void test_seq_systick_counts(void)
+{
+    static const uint32_t systick_base = 0xe000e010;
+    static const uint32_t test_reload = 0x00ffffffu;
+    const uint32_t code_base = SEQRAM_NS_BASE + 0x100;
+    uint16_t insn[12];
+    uint32_t literals[3];
+    QTestState *qts;
+    uint32_t val1, val2;
+
+    insn[0] = 0; /* LDR r0, [PC, #...] -> systick_base (patched below) */
+    insn[1] = 0; /* LDR r1, [PC, #...] -> SEQ_SPARE0 (patched below) */
+    insn[2] = thumb_ldr_imm(4, 0, 3);    /* r4 = CALIB (base+12) */
+    insn[3] = thumb_str_imm(4, 1, 4);    /* SPARE0+16 = CALIB, for the record */
+    insn[4] = 0; /* LDR r5, [PC, #...] -> test_reload (patched below) */
+    insn[5] = thumb_str_imm(5, 0, 1);    /* RELOAD (base+4) = test_reload */
+    insn[6] = thumb_movs_imm8(6, 5);     /* r6 = ENABLE | CLKSOURCE */
+    insn[7] = thumb_str_imm(6, 0, 0);    /* CSR (base+0) = r6 */
+    insn[8] = thumb_ldr_imm(2, 0, 2);    /* loop: r2 = CURRENT (base+8) */
+    insn[9] = thumb_str_imm(2, 1, 0);    /* SPARE0 = r2 */
+    insn[10] = thumb_b(code_base + 2 * 10, code_base + 2 * 8); /* -> loop */
+    insn[11] = THUMB16_BRANCH_SELF;      /* padding, never reached */
+
+    literals[0] = systick_base;
+    literals[1] = SEQ_SPARE0;
+    literals[2] = test_reload;
+    insn[0] = thumb_ldr_pc(0, code_base + 0, code_base + 24);
+    insn[1] = thumb_ldr_pc(1, code_base + 2, code_base + 28);
+    insn[4] = thumb_ldr_pc(5, code_base + 8, code_base + 32);
+
+    qts = seq_release_with_program(insn, 12, literals, 3);
+
+    /* The virtual clock only advances while the VM is actually running;
+     * stop before reading so the two samples below can't race the loop
+     * still rewriting SPARE0. */
+    g_usleep(5000);
+    qtest_qmp_assert_success(qts, "{'execute':'stop'}");
+    val1 = qtest_readl(qts, SEQRAM_NS_BASE + SEQ_SPARE0);
+
+    qtest_qmp_assert_success(qts, "{'execute':'cont'}");
+    g_usleep(5000);
+    qtest_qmp_assert_success(qts, "{'execute':'stop'}");
+    val2 = qtest_readl(qts, SEQRAM_NS_BASE + SEQ_SPARE0);
+
+    g_assert_cmpuint(val1, <=, test_reload);
+    g_assert_cmpuint(val2, <=, test_reload);
+    g_assert_cmphex(val1, !=, val2);
+
+    qtest_quit(qts);
+}
+
 static void test_radio_sequencer_executes_open_code(void)
 {
     QTestState *qts = qtest_initf("-machine efr32bg22 -accel tcg -S");
@@ -1930,6 +2217,10 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/rac-sr0-clear-alias",
                    test_rac_sr0_clear_alias);
     qtest_add_func("/efr32bg22/rac-force-disable", test_rac_force_disable);
+    qtest_add_func("/efr32bg22/rac-stctrl-mask", test_rac_stctrl_mask);
+    qtest_add_func("/efr32bg22/seq-nvic-ipr-byte-isolation",
+                   test_seq_nvic_ipr_byte_isolation);
+    qtest_add_func("/efr32bg22/seq-systick-counts", test_seq_systick_counts);
     qtest_add_func("/efr32bg22/radio-sequencer-executes-open-code",
                    test_radio_sequencer_executes_open_code);
     qtest_add_func("/efr32bg22/radio-sequencer-release-is-idempotent",
