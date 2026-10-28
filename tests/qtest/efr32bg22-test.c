@@ -1476,9 +1476,15 @@ static void test_rac_tx_commands(void)
     writel(RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
     g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK, ==,
                     RAC_STATUS_STATE_TX);
+    /*
+     * TXENS does NOT set here, matching real silicon: this exact
+     * TXEN sequence measures RAC.STATUS == 0x09400000 on real hardware
+     * (owo-open-fw docs/radio-tables.md SS7.21/SS7.25-27), i.e. STATE=TX
+     * with TXENS=0. Confirmed repeatedly, not a simplification gap.
+     */
     g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) &
                         (RAC_STATUS_TXENS | RAC_STATUS_RXENS),
-                    ==, RAC_STATUS_TXENS);
+                    ==, 0);
     g_assert_cmphex(readl(RAC_BASE + RAC_SEQIF) & RAC_SEQIF_STATETX, ==,
                     RAC_SEQIF_STATETX);
     g_assert_cmphex(readl(RAC_BASE + RAC_SEQIF) & RAC_SEQIF_STATECHANGESEQ, ==,

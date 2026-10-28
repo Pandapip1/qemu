@@ -1257,8 +1257,28 @@ static uint32_t efr32_rac_status(Efr32Periph *s)
 {
     uint32_t state = s->rac_state;
 
-    return state << 24 | (state != EFR32_RAC_STATE_OFF) << 28 |
-           (state == EFR32_RAC_STATE_TX) << 30 |
+    /*
+     * SEQACTIVE (bit 28) and TXENS (bit 30) were previously derived as
+     * "state != OFF" / "state == TX", the naive assumption that these
+     * status-mirror bits simply track the coarse STATE field. Real
+     * silicon directly contradicts this for state == TX: the exact
+     * open-firmware RAC.CMD.TXEN sequence this test suite drives
+     * measures RAC.STATUS == 0x09400000 on real hardware (confirmed
+     * repeatedly, not a one-off -- owo-open-fw docs/radio-tables.md
+     * SS7.21), i.e. SEQACTIVE=0 and TXENS=0 while STATE=TX. Fixed for
+     * the one state this project has direct silicon evidence for.
+     * RXSEARCH's SEQACTIVE/RXENS formula is left exactly as before --
+     * unconfirmed, not disproven, since no equivalent real-hardware RX
+     * measurement exists to check it against; changing it now would
+     * just swap one guess for another. TXENS has no state for which
+     * it's confirmed to read 1 at all, so it is left unset entirely
+     * (matching the EFR32_FRC_STATUS/ACTIVETXFCD precedent just above:
+     * don't synthesize a value for a trigger condition that isn't
+     * understood yet). SEQSLEEPING (bit 22) is the same kind of known
+     * gap, left entirely unmodeled for the same reason.
+     */
+    return state << 24 |
+           (state != EFR32_RAC_STATE_OFF && state != EFR32_RAC_STATE_TX) << 28 |
            (state == EFR32_RAC_STATE_RXSEARCH) << 31;
 }
 
