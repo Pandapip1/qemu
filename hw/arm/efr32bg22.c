@@ -70,12 +70,21 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 /*
  * DFLCTRL (0xa8004000+0x00c, public FRC_S_register.py) and WCNTCMP0
  * (+0x020). Unlike ACTIVETXFCD above, this one IS confirmed: real hardware
- * measures WCNTCMP0 == DFLOFFSET + <the extracted length-field byte> + 3
- * (BLE's fixed 3-byte CRC, since this project's only configured
- * DFLINCLUDECRC=0) for two independent payload sizes, 6 and 9 bytes
- * (owo-open-fw docs/radio-tables.md SS7.29). Only DFLMODE==1 -- the only
- * value this project's firmware ever configures (every PHY variant shares
- * one DFLCTRL write in radio.c's base config table) -- is implemented;
+ * measures WCNTCMP0 == <the extracted length-field byte> + 1 for two
+ * independent real BLE PDU Length header values (9 and 12, captured via a
+ * live execution trace of the real staged packet bytes, not assumed --
+ * owo-open-fw docs/radio-tables.md SS7.38). `+1` happens to equal this
+ * project's only-ever-configured MINLENGTH value, so the implementation
+ * below uses `field + MINLENGTH` -- a named field, not a bare increment --
+ * but only one MINLENGTH value has ever been tested, so this is "the
+ * simplest formula consistent with the real evidence, expressed in named
+ * terms," not an independently confirmed general law. (SS7.29's original
+ * fix used `DFLOFFSET + field + 3` instead, which happened to satisfy
+ * that commit's own self-constructed qtest because the test used assumed,
+ * not real, header byte values -- retracted in SS7.38 once a live trace
+ * showed the assumption was wrong.) Only DFLMODE==1 -- the only value
+ * this project's firmware ever configures (every PHY variant shares one
+ * DFLCTRL write in radio.c's base config table) -- is implemented;
  * DFLMODE's other enum values have no public description text in the
  * generated field model and no real-hardware confirmation here, so they
  * are deliberately left alone (WCNTCMP0 keeps whatever software wrote).
@@ -90,9 +99,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_FRC_DFLCTRL_DFLOFFSET_MASK 0xfu
 #define EFR32_FRC_DFLCTRL_DFLBITS_SHIFT 12u
 #define EFR32_FRC_DFLCTRL_DFLBITS_MASK 0xfu
-#define EFR32_FRC_DFLCTRL_DFLINCLUDECRC (1u << 20)
+#define EFR32_FRC_DFLCTRL_MINLENGTH_SHIFT 16u
+#define EFR32_FRC_DFLCTRL_MINLENGTH_MASK 0xfu
 #define EFR32_FRC_WCNTCMP0 0x020u
-#define EFR32_BLE_CRC_LENGTH_BYTES 3u
 
 #define EFR32_AGC_RSSI 0x018u
 #define EFR32_AGC_FRAMERSSI 0x01cu
@@ -1176,8 +1185,9 @@ static uint32_t efr32_frc_dynamic_length_wcntcmp0(const uint8_t *bytes,
                         EFR32_FRC_DFLCTRL_DFLBITS_MASK;
     uint32_t dflshift = (dflctrl >> EFR32_FRC_DFLCTRL_DFLSHIFT_SHIFT) &
                          EFR32_FRC_DFLCTRL_DFLSHIFT_MASK;
+    uint32_t minlength = (dflctrl >> EFR32_FRC_DFLCTRL_MINLENGTH_SHIFT) &
+                          EFR32_FRC_DFLCTRL_MINLENGTH_MASK;
     bool dflbitorder = dflctrl & EFR32_FRC_DFLCTRL_DFLBITORDER;
-    bool dflincludecrc = dflctrl & EFR32_FRC_DFLCTRL_DFLINCLUDECRC;
     uint32_t field;
 
     if (dflmode != EFR32_FRC_DFLCTRL_DFLMODE_LENGTH_FIELD ||
@@ -1195,8 +1205,7 @@ static uint32_t efr32_frc_dynamic_length_wcntcmp0(const uint8_t *bytes,
         field = reversed;
     }
 
-    return dfloffset + field +
-           (dflincludecrc ? 0u : EFR32_BLE_CRC_LENGTH_BYTES);
+    return field + minlength;
 }
 
 static void efr32_rac_capture_tx_snapshot(Efr32Periph *s)

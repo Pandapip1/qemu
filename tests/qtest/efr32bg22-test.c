@@ -1505,11 +1505,13 @@ static void test_frc_wcntcmp0_dynamic_length(void)
     const uint32_t tx_channel = BUFC_BASE + BUFC_CH0;
 
     /*
-     * Two independent real-hardware measurements (owo-open-fw
-     * docs/radio-tables.md SS7.29): an 11-byte frame (BLE payload-length
-     * byte = 6) measures WCNTCMP0 == 0xA, and a 14-byte frame (payload-
-     * length byte = 9) measures WCNTCMP0 == 0xD. Both follow
-     * WCNTCMP0 == DFLOFFSET(1) + <payload-length byte> + 3 (BLE's CRC).
+     * Two independent real-hardware measurements, both from a live
+     * execution trace of the actual staged packet bytes (owo-open-fw
+     * docs/radio-tables.md SS7.38, superseding SS7.29's assumed values):
+     * a real BLE Length header byte of 9 measures WCNTCMP0 == 0xA, and
+     * growing the advertising payload by 3 bytes (Length becomes 12)
+     * measures WCNTCMP0 == 0xD. Both follow
+     * WCNTCMP0 == <Length header byte> + MINLENGTH(1).
      */
     /* FRC.DFLCTRL: DFLMODE=1, DFLOFFSET=1, DFLBITS=8, MINLENGTH=1 --
      * exactly the one configuration radio.c's efr32_ble_1m_base_table
@@ -1517,14 +1519,14 @@ static void test_frc_wcntcmp0_dynamic_length(void)
     writel(FRC_BASE + 0x00c, 0x00018101);
     writel(tx_channel + BUFC_CMD, 1);
     writel(tx_channel + BUFC_WRITEDATA, 0x00); /* header byte 0 */
-    writel(tx_channel + BUFC_WRITEDATA, 6);    /* header byte 1: length */
+    writel(tx_channel + BUFC_WRITEDATA, 9);    /* header byte 1: length */
     writel(RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
     g_assert_cmphex(readl(FRC_BASE + FRC_WCNTCMP0), ==, 0xa);
 
     writel(RAC_BASE + RAC_CMD, RAC_CMD_TXDIS);
     writel(tx_channel + BUFC_CMD, 1);
     writel(tx_channel + BUFC_WRITEDATA, 0x00); /* header byte 0 */
-    writel(tx_channel + BUFC_WRITEDATA, 9);    /* header byte 1: length */
+    writel(tx_channel + BUFC_WRITEDATA, 12);   /* header byte 1: length */
     writel(RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
     g_assert_cmphex(readl(FRC_BASE + FRC_WCNTCMP0), ==, 0xd);
 }
