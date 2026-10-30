@@ -72,6 +72,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
  * silicon, while 0x1FBF and 0x7FBF (both containing these three) did.
  */
 #define EFR32_RAC_SYEN 0x15cu
+/*
+ * PA ramp completion.  Silicon latches MODEM.IF/SEQIF.TXRAMPDONE (public
+ * MODEM_S_field.py, bit 3) around a transmission; the sticky MODEM.IF of a
+ * live stage-3 board reads 0x0004000F, TXRAMPDONE included (owo-open-fw
+ * docs/radio-tables.md SS7.63).  Stock's and the open sequencer's TXPD
+ * handlers clear SEQIF.TXRAMPDONE, drop RAC.PAENCTRL.PARAMP and wait for it.
+ * The model has no ramp duration, so a PARAMP change completes at once.
+ */
+#define EFR32_RAC_PAENCTRL 0x0b4u
+#define EFR32_RAC_PAENCTRL_PARAMP (1u << 8)
+#define EFR32_MODEM_IF 0x208u
+#define EFR32_MODEM_SEQIF 0x24cu
+#define EFR32_MODEM_IF_TXRAMPDONE (1u << 3)
 #define EFR32_RAC_SYEN_VCO_POWER ((1u << 7) | (1u << 8) | (1u << 9))
 #define EFR32_PROTIMER_BASE 0xa801c000u
 #define EFR32_PROTIMER_NS_BASE 0xb801c000u
@@ -2294,6 +2307,20 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         }
     }
 
+    if (register_address == EFR32_RAC_BASE + EFR32_RAC_PAENCTRL &&
+        ((old ^ next) & EFR32_RAC_PAENCTRL_PARAMP))
+    {
+        efr32_register_put(s, register_address, next);
+        efr32_register_put(s, EFR32_MODEM_BASE + EFR32_MODEM_IF,
+                           efr32_register_get(s, EFR32_MODEM_BASE +
+                                                 EFR32_MODEM_IF) |
+                               EFR32_MODEM_IF_TXRAMPDONE);
+        efr32_register_put(s, EFR32_MODEM_BASE + EFR32_MODEM_SEQIF,
+                           efr32_register_get(s, EFR32_MODEM_BASE +
+                                                 EFR32_MODEM_SEQIF) |
+                               EFR32_MODEM_IF_TXRAMPDONE);
+        return;
+    }
     if (register_address == EFR32_SYNTH_BASE + EFR32_SYNTH_CMD)
     {
         /* Write-only command register: act on it, store nothing. */
