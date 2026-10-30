@@ -61,6 +61,13 @@ static char *tx_snapshot_trace_path;
 #define PROTIMER_CMP0         0x100
 #define PROTIMER_CMP0_TIME    0x10c
 #define SYNTH_BASE            0xa8018000
+#define SYNTH_STATUS          0x008
+#define SYNTH_STATUS_INLOCK   (1u << 0)
+#define SYNTH_CMD             0x00c
+#define SYNTH_CMD_SYNTHSTART  (1u << 0)
+#define SYNTH_CMD_SYNTHSTOP   (1u << 1)
+#define RAC_SYEN              0x15c
+#define RAC_SEQIF_STATETXWARM (1u << 24)
 #define RAC_BASE              0xa8020000
 #define RAC_EN                0x004
 #define RAC_STATUS            0x00c
@@ -2036,6 +2043,74 @@ static void test_seq_systick_counts(void)
     qtest_quit(qts);
 }
 
+/*
+ * Once sequencer firmware is released, a TX frame only drains while the
+ * synthesizer runs (owo-open-fw docs/radio-tables.md SS7.60/SS7.61): on
+ * silicon, RAC sat in TX with FRC stalled for as long as RAC.SYEN was clear
+ * and SYNTH.CMD.SYNTHSTART had not been issued, and writing SYEN then
+ * SYNTHSTART on that stuck radio drained the frame immediately.  SYNTHSTART
+ * alone did nothing.  The idle program stands in for the auxiliary core; the
+ * qtest side performs its STATETXWARM/STATETX acknowledgements.
+ */
+static void test_seq_tx_waits_for_synthesizer(void)
+{
+    static const uint16_t idle[] = { THUMB16_BRANCH_SELF, THUMB16_BRANCH_SELF };
+    /* Stock's own RAC.SYEN value while transmitting (SS7.60). */
+    static const uint32_t syen_stock_tx = 0x00001fbf;
+    QTestState *qts = seq_release_with_program(idle, 2, NULL, 0);
+
+    qtest_writel(qts, FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW, FRC_IF_TXDONE);
+    qtest_writel(qts, RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+    g_assert_cmphex(qtest_readl(qts, RAC_BASE + RAC_STATUS) &
+                        RAC_STATUS_STATE_MASK, ==, RAC_STATUS_STATE_TXWARM);
+    qtest_writel(qts, RAC_BASE + RAC_SEQIF + REGISTER_CLEAR_WINDOW,
+                 RAC_SEQIF_STATETXWARM);
+    g_assert_cmphex(qtest_readl(qts, RAC_BASE + RAC_STATUS) &
+                        RAC_STATUS_STATE_MASK, ==, RAC_STATUS_STATE_TX);
+    qtest_writel(qts, RAC_BASE + RAC_SEQIF + REGISTER_CLEAR_WINDOW,
+                 RAC_SEQIF_STATETX);
+
+    /* Far longer than the model's completion delay: still parked in TX. */
+    g_usleep(20000);
+    g_assert_cmphex(qtest_readl(qts, RAC_BASE + RAC_STATUS) &
+                        RAC_STATUS_STATE_MASK, ==, RAC_STATUS_STATE_TX);
+    g_assert_cmphex(qtest_readl(qts, FRC_BASE + FRC_IF) & FRC_IF_TXDONE, ==, 0);
+    g_assert_cmphex(qtest_readl(qts, SYNTH_BASE + SYNTH_STATUS) &
+                        SYNTH_STATUS_INLOCK, ==, 0);
+
+    /* SYNTHSTART with the VCO unpowered starts nothing. */
+    qtest_writel(qts, SYNTH_BASE + SYNTH_CMD, SYNTH_CMD_SYNTHSTART);
+    g_usleep(20000);
+    g_assert_cmphex(qtest_readl(qts, SYNTH_BASE + SYNTH_STATUS) &
+                        SYNTH_STATUS_INLOCK, ==, 0);
+    g_assert_cmphex(qtest_readl(qts, FRC_BASE + FRC_IF) & FRC_IF_TXDONE, ==, 0);
+
+    /* Software cannot fake lock. */
+    qtest_writel(qts, SYNTH_BASE + SYNTH_STATUS, SYNTH_STATUS_INLOCK);
+    g_assert_cmphex(qtest_readl(qts, SYNTH_BASE + SYNTH_STATUS) &
+                        SYNTH_STATUS_INLOCK, ==, 0);
+
+    qtest_writel(qts, RAC_BASE + RAC_SYEN, syen_stock_tx);
+    qtest_writel(qts, SYNTH_BASE + SYNTH_CMD, SYNTH_CMD_SYNTHSTART);
+    g_assert_cmphex(qtest_readl(qts, SYNTH_BASE + SYNTH_STATUS) &
+                        SYNTH_STATUS_INLOCK, ==, SYNTH_STATUS_INLOCK);
+    for (unsigned attempt = 0; attempt < 1000; attempt++) {
+        if (qtest_readl(qts, FRC_BASE + FRC_IF) & FRC_IF_TXDONE) {
+            break;
+        }
+        g_usleep(1000);
+    }
+    qtest_qmp_assert_success(qts, "{'execute':'stop'}");
+    g_assert_cmphex(qtest_readl(qts, FRC_BASE + FRC_IF) & FRC_IF_TXDONE, ==,
+                    FRC_IF_TXDONE);
+
+    /* SYNTHSTOP drops lock again. */
+    qtest_writel(qts, SYNTH_BASE + SYNTH_CMD, SYNTH_CMD_SYNTHSTOP);
+    g_assert_cmphex(qtest_readl(qts, SYNTH_BASE + SYNTH_STATUS) &
+                        SYNTH_STATUS_INLOCK, ==, 0);
+    qtest_quit(qts);
+}
+
 static void test_radio_sequencer_executes_open_code(void)
 {
     QTestState *qts = qtest_initf("-machine efr32bg22 -accel tcg -S");
@@ -2262,6 +2337,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/protimer-counter-is-independent-from-burtc",
                    test_protimer_counter_is_independent_from_burtc);
     qtest_add_func("/efr32bg22/rac-tx-commands", test_rac_tx_commands);
+    qtest_add_func("/efr32bg22/seq-tx-waits-for-synthesizer",
+                   test_seq_tx_waits_for_synthesizer);
     qtest_add_func("/efr32bg22/frc-wcntcmp0-dynamic-length",
                    test_frc_wcntcmp0_dynamic_length);
     qtest_add_func("/efr32bg22/rac-tx-completion", test_rac_tx_completion);

@@ -47,6 +47,32 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_SYNTH_CHCTRL 0x040u
 #define EFR32_SYNTH_CHSP 0x044u
 #define EFR32_SYNTH_CHSP_CHSP_MASK 0x3fu
+/*
+ * The frame path needs a running synthesizer (owo-open-fw
+ * docs/radio-tables.md SS7.60/SS7.61, measured on silicon): with RAC.SYEN
+ * clear and no SYNTH.CMD.SYNTHSTART, RAC sits in TX indefinitely and FRC
+ * never sets ACTIVETXFCD; writing SYEN and then SYNTHSTART on that stuck
+ * radio immediately drains the frame.  SYNTH.STATUS read 0x4 (SYNTHREADY
+ * only) throughout the stalled TX and reports INLOCK once started.  The
+ * register itself is read-only (public SYNTH_S_register.py).
+ */
+#define EFR32_SYNTH_STATUS 0x008u
+#define EFR32_SYNTH_STATUS_INLOCK (1u << 0)
+#define EFR32_SYNTH_STATUS_SYNTHREADY (1u << 2)
+#define EFR32_SYNTH_CMD 0x00cu
+#define EFR32_SYNTH_CMD_SYNTHSTART (1u << 0)
+#define EFR32_SYNTH_CMD_SYNTHSTOP (1u << 1)
+/* Hardware-derived from the programmed channel; read-only in the public
+ * model, so software writes must not reach them. */
+#define EFR32_SYNTH_LOCNTSTATUS 0x08cu
+#define EFR32_SYNTH_LOCNTTARGET 0x090u
+/*
+ * RAC.SYEN's VCO supply enables (public RAC_S_field.py).  [I] Taken as the
+ * condition for SYNTHSTART to start the VCO: SYEN=0 never started it on
+ * silicon, while 0x1FBF and 0x7FBF (both containing these three) did.
+ */
+#define EFR32_RAC_SYEN 0x15cu
+#define EFR32_RAC_SYEN_VCO_POWER ((1u << 7) | (1u << 8) | (1u << 9))
 #define EFR32_PROTIMER_BASE 0xa801c000u
 #define EFR32_PROTIMER_NS_BASE 0xb801c000u
 #define EFR32_RAC_BASE 0xa8020000u
@@ -384,6 +410,9 @@ struct Efr32Periph
     qemu_irq seq_irq_tx;
     CPUState *seq_cpu;
     bool seq_released;
+    bool synth_running;
+    /* A sequencer-driven TX reached completion with the synthesizer off. */
+    bool tx_waiting_for_synth;
 };
 
 static uint32_t efr32_register_get(Efr32Periph *s, uint32_t address);
@@ -879,7 +908,10 @@ static bool efr32_radio_ipversion(uint32_t address, uint32_t *value)
  */
 static bool efr32_frc_status_write_ignored(uint32_t address)
 {
-    return address == EFR32_FRC_BASE + EFR32_FRC_STATUS;
+    return address == EFR32_FRC_BASE + EFR32_FRC_STATUS ||
+           address == EFR32_SYNTH_BASE + EFR32_SYNTH_STATUS ||
+           address == EFR32_SYNTH_BASE + EFR32_SYNTH_LOCNTSTATUS ||
+           address == EFR32_SYNTH_BASE + EFR32_SYNTH_LOCNTTARGET;
 }
 
 static uint32_t efr32_register_get(Efr32Periph *s, uint32_t address)
@@ -1059,6 +1091,12 @@ static void efr32_rac_tx_complete(void *opaque)
 {
     Efr32Periph *s = EFR32_PERIPH(opaque);
 
+    /* Images that never release sequencer firmware keep the older QEMU-only
+     * shortcut; a released sequencer must start the synthesizer itself. */
+    if (s->seq_released && !s->synth_running) {
+        s->tx_waiting_for_synth = true;
+        return;
+    }
     efr32_rf_medium_complete_tx(s->rf_medium, EFR32_RF_RADIO(s));
     efr32_rac_set_state(s, EFR32_RAC_STATE_OFF);
     efr32_frc_raise(s, EFR32_FRC_IF_TXDONE);
@@ -1067,6 +1105,7 @@ static void efr32_rac_tx_complete(void *opaque)
 static void efr32_rac_cancel_tx_completion(Efr32Periph *s)
 {
     timer_del(s->rac_tx_timer);
+    s->tx_waiting_for_synth = false;
 }
 
 static void efr32_rac_schedule_tx_completion(Efr32Periph *s)
@@ -2237,6 +2276,28 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         }
     }
 
+    if (register_address == EFR32_SYNTH_BASE + EFR32_SYNTH_CMD)
+    {
+        /* Write-only command register: act on it, store nothing. */
+        if (next & EFR32_SYNTH_CMD_SYNTHSTOP) {
+            s->synth_running = false;
+        }
+        if ((next & EFR32_SYNTH_CMD_SYNTHSTART) &&
+            (efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_SYEN) &
+             EFR32_RAC_SYEN_VCO_POWER) == EFR32_RAC_SYEN_VCO_POWER) {
+            s->synth_running = true;
+        }
+        efr32_register_put(s, EFR32_SYNTH_BASE + EFR32_SYNTH_STATUS,
+                           EFR32_SYNTH_STATUS_SYNTHREADY |
+                               (s->synth_running ? EFR32_SYNTH_STATUS_INLOCK
+                                                 : 0));
+        if (s->synth_running && s->tx_waiting_for_synth) {
+            /* Silicon drains the parked frame as soon as the VCO runs. */
+            s->tx_waiting_for_synth = false;
+            efr32_rac_schedule_tx_completion(s);
+        }
+        return;
+    }
     if (register_address == EFR32_RAC_BASE + EFR32_RAC_CMD)
     {
         next &= 0xc000fdff;
@@ -2730,6 +2791,8 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     efr32_rac_cancel_tx_completion(s);
     timer_del(s->rac_rx_timer);
     s->rx_offer_pending = false;
+    s->synth_running = false;
+    efr32_register_put(s, EFR32_SYNTH_BASE + EFR32_SYNTH_STATUS, 0);
     efr32_rf_medium_reset_radio(s->rf_medium, EFR32_RF_RADIO(s));
     efr32_register_put(s, EFR32_CMU_BASE + EFR32_CMU_SYSCLKCTRL,
                        EFR32_CMU_SYSCLKCTRL_CLKSEL_FSRCO);
