@@ -68,6 +68,8 @@ static char *tx_snapshot_trace_path;
 #define SYNTH_CMD_SYNTHSTOP   (1u << 1)
 #define RAC_SYEN              0x15c
 #define RAC_SEQIF_STATETXWARM (1u << 24)
+#define RAC_SEQIF_STATETXPD   (1u << 26)
+#define RAC_STATUS_STATE_TXPD (10u << 24)
 #define RAC_BASE              0xa8020000
 #define RAC_EN                0x004
 #define RAC_STATUS            0x00c
@@ -2103,6 +2105,15 @@ static void test_seq_tx_waits_for_synthesizer(void)
     qtest_qmp_assert_success(qts, "{'execute':'stop'}");
     g_assert_cmphex(qtest_readl(qts, FRC_BASE + FRC_IF) & FRC_IF_TXDONE, ==,
                     FRC_IF_TXDONE);
+    /* The frame ends in TXPD, not OFF, until STATETXPD is acknowledged. */
+    g_assert_cmphex(qtest_readl(qts, RAC_BASE + RAC_STATUS) &
+                        RAC_STATUS_STATE_MASK, ==, RAC_STATUS_STATE_TXPD);
+    g_assert_cmphex(qtest_readl(qts, RAC_BASE + RAC_SEQIF) &
+                        RAC_SEQIF_STATETXPD, ==, RAC_SEQIF_STATETXPD);
+    qtest_writel(qts, RAC_BASE + RAC_SEQIF + REGISTER_CLEAR_WINDOW,
+                 RAC_SEQIF_STATETXPD);
+    g_assert_cmphex(qtest_readl(qts, RAC_BASE + RAC_STATUS) &
+                        RAC_STATUS_STATE_MASK, ==, 0);
 
     /* SYNTHSTOP drops lock again. */
     qtest_writel(qts, SYNTH_BASE + SYNTH_CMD, SYNTH_CMD_SYNTHSTOP);
