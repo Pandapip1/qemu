@@ -265,6 +265,7 @@ static uint16_t thumb_b(uint32_t insn_addr, uint32_t target_addr)
 #define USART_STATUS_TXENS    (1u << 1)
 #define USART_STATUS_TXC      (1u << 5)
 #define USART_STATUS_TXBL     (1u << 6)
+#define USART_STATUS_TXIDLE   (1u << 13)
 #define BURTC_BASE             0x40064000
 #define BURTC_NONSECURE_BASE   0x50064000
 #define BURTC_EN               0x004
@@ -923,28 +924,41 @@ static void test_dpll_lock(void)
     g_assert_cmphex(readl(DPLL0_NONSECURE_BASE + DPLL_STATUS), ==, 0);
 }
 
-/* Zephyr's USART_Tx() polls TXBL, then writes TXDATA through this sequence. */
+/*
+ * Zephyr's USART_Tx() polls TXBL, then writes TXDATA through this sequence.
+ * STATUS resets to TXIDLE | TXBL (RM 21.5.7); a written frame clears TXIDLE
+ * while it is on the wire and sets TXC and TXIDLE at its stop bit. TXDATA is
+ * write-only (RM 21.4).
+ */
 static void test_usart_tx_polling(void)
 {
+    /* One 8N1 frame at the reset rate takes well under this. */
+    const int64_t frame_bound_ns = 1000000;
+
     reset_with_radio_clocks();
 
     g_assert_cmphex(readl(USART0_BASE + USART_STATUS), ==,
-                    USART_STATUS_TXBL);
+                    USART_STATUS_TXIDLE | USART_STATUS_TXBL);
     writel(USART0_NONSECURE_BASE + USART_CMD + REGISTER_SET_WINDOW,
            USART_CMD_TXEN);
     g_assert_cmphex(readl(USART0_BASE + USART_STATUS), ==,
-                    USART_STATUS_TXENS | USART_STATUS_TXBL);
+                    USART_STATUS_TXIDLE | USART_STATUS_TXENS |
+                    USART_STATUS_TXBL);
 
     writel(USART0_NONSECURE_BASE + USART_TXDATA, 0x1a5);
-    g_assert_cmphex(readl(USART0_BASE + USART_TXDATA), ==, 0xa5);
+    g_assert_cmphex(readl(USART0_BASE + USART_STATUS) &
+                    (USART_STATUS_TXIDLE | USART_STATUS_TXC), ==, 0);
+    clock_run(frame_bound_ns);
     g_assert_cmphex(readl(USART0_BASE + USART_STATUS), ==,
-                    USART_STATUS_TXENS | USART_STATUS_TXBL | USART_STATUS_TXC);
+                    USART_STATUS_TXIDLE | USART_STATUS_TXENS |
+                    USART_STATUS_TXBL | USART_STATUS_TXC);
 
     writel(USART0_BASE + USART_CMD, USART_CMD_TXDIS);
     g_assert_cmphex(readl(USART0_NONSECURE_BASE + USART_STATUS), ==,
-                    USART_STATUS_TXBL | USART_STATUS_TXC);
+                    USART_STATUS_TXIDLE | USART_STATUS_TXBL |
+                    USART_STATUS_TXC);
     g_assert_cmphex(readl(USART1_BASE + USART_STATUS), ==,
-                    USART_STATUS_TXBL);
+                    USART_STATUS_TXIDLE | USART_STATUS_TXBL);
 }
 
 static void test_modem_masks(void)
