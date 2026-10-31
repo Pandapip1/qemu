@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "qemu/osdep.h"
+#include "qemu/units.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "exec/memory.h"
@@ -19,6 +20,7 @@
 #include "hw/sysbus.h"
 #include "hw/arm/armv7m.h"
 #include "sysemu/reset.h"
+#include "sysemu/runstate.h"
 #include "sysemu/cpu-timers.h"
 #include "target/arm/cpu.h"
 #include "target/arm/idau.h"
@@ -33,8 +35,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define PERIPH_NONSECURE_OFFSET (PERIPH_NONSECURE_BASE - PERIPH_BASE)
 #define RADIO_BASE 0xa8000000u
 #define RADIO_SIZE 0x04000000u
-#define FLASH_SIZE (512 * 1024)
-#define SRAM_SIZE (32 * 1024)
 
 /* Radio block addresses and source-backed register offsets. */
 #define EFR32_FRC_BASE 0xa8004000u
@@ -430,10 +430,118 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_EMU_BASE 0x40004000u
 #define EFR32_EMU_STATUS 0x084u
 #define EFR32_EMU_STATUS_RESET 0x00000080u
+/*
+ * EMU.RSTCAUSE (RM SS12.3.x, SS12.5.15): the cause of the last reset, kept
+ * across resets until software writes EMU_CMD.RSTCAUSECLR ("Once read,
+ * EMU_RSTCAUSE should be cleared").  Power-up sets POR; the M33's
+ * AIRCR.SYSRESETREQ sets SYSREQ.  The Gecko bootloader and AppLoader honour
+ * the reset-reason word in RAM only when SYSREQ is set.
+ * [I] Causes accumulate until cleared (the RM's instruction to clear after
+ * reading); unmeasured.  Pin, watchdog, lockup, BOD, EM4 and DCI causes are
+ * not modelled.
+ */
+#define EFR32_EMU_CMD 0x070u
+#define EFR32_EMU_CMD_RSTCAUSECLR (1u << 17)
+#define EFR32_EMU_RSTCAUSE 0x094u
+#define EFR32_EMU_RSTCAUSE_POR (1u << 0)
+#define EFR32_EMU_RSTCAUSE_SYSREQ (1u << 6)
 
+/*
+ * Part identity (EFR32xG22 reference manual rev. 1.2, SS6.3 Table 6.1 and
+ * SS6.4).  The information block at 0x0FE00000 holds the 1 KB User Data
+ * page; the 1 KB Device Information page sits at 0x0FE08000.  Software,
+ * and the MSC, size the part from DEVINFO.MSIZE (SS6.4.2.4): FLASH in KB
+ * (bits 15:0), SRAM in KB (bits 26:16).  The main flash is 16 KB to
+ * 512 KB in 8 KB pages (SS6.3), RAM up to 32 KB (SS4.1).
+ */
+#define EFR32_INFO_BASE 0x0fe00000u
+/* The model's information-block window; contents beyond the two pages
+ * below were never read from silicon (zero / erased placeholders). */
+#define EFR32_INFO_WINDOW_SIZE 0x10000u
+#define EFR32_USERDATA_OFFSET 0x0000u
+#define EFR32_USERDATA_SIZE 0x400u
+#define EFR32_DEVINFO_OFFSET 0x8000u
+#define EFR32_DEVINFO_SIZE 0x400u
+/* Span after the DI page that the model has always read as zero. */
+#define EFR32_DEVINFO_WINDOW_SIZE 0x2000u
+#define EFR32_FLASH_ERASED_BYTE 0xffu
+#define EFR32_FLASH_PAGE_SIZE 0x2000u
+/* GPIO ports A-D, 16 pins each at most (RM SS24.3.2 input routing). */
+#define EFR32_GPIO_PORTS 4
+#define EFR32_GPIO_PINS 16
+#define EFR32_DEVINFO_PART 0x004u
+#define EFR32_DEVINFO_PART_FAMILYNUM_SHIFT 16
+#define EFR32_DEVINFO_PART_FAMILYNUM_MASK 0x3fu
+#define EFR32_DEVINFO_PART_FAMILY_SHIFT 24
+#define EFR32_DEVINFO_PART_FAMILY_MASK 0x3fu
+/* DEVINFO.PART.FAMILY codes (public efr32bg22_devinfo.h). */
+#define EFR32_DEVINFO_PART_FAMILY_FG 0u
+#define EFR32_DEVINFO_PART_FAMILY_MG 1u
+#define EFR32_DEVINFO_PART_FAMILY_BG 2u
+#define EFR32_DEVINFO_PART_FAMILY_PG 5u
+#define EFR32_DEVINFO_PART_FAMILYNUM_XG22 22u
+
+/*
+ * SYSCFG.CHIPREV (RM SS6.6.6.4) resets to 0 in the register description,
+ * yet software reads the part's family there (SYSTEM_ChipRevisionGet) and
+ * NVM3 stamps it into every page header: the suit's NVM3 pages, written on
+ * silicon, carry family 0x35, the RM's BG22 code.  With CHIPREV = 0 the
+ * stock application judged every NVM3 page foreign and erased them.  The
+ * family follows DEVINFO.PART (FAMILY, FAMILYNUM 22) through the RM's
+ * enumeration.  [U] MAJOR and MINOR stay 0: never read from silicon.
+ */
+#define EFR32_SYSCFG_CHIPREV 0x014u
+#define EFR32_SYSCFG_CHIPREV_FAMILY_SHIFT 6
+#define EFR32_SYSCFG_CHIPREV_FAMILY_PG22 24u
+#define EFR32_SYSCFG_CHIPREV_FAMILY_MG22 52u
+#define EFR32_SYSCFG_CHIPREV_FAMILY_BG22 53u
+#define EFR32_SYSCFG_CHIPREV_FAMILY_FG22 55u
+
+/*
+ * MSC flash programming (RM SS6.3.12, register map SS6.7-6.8, reset values
+ * from the public efr32bg22_msc.h).  WREN in WRITECTRL enables the
+ * controller; ADDRB holds the target, INVADDR flags an address outside the
+ * main flash and the User Data page; WRITECMD.ERASEPAGE erases the page of
+ * ADDRB; each WDATA write programs one word (bits only go from 1 to 0) and
+ * advances ADDRB by 4.  PAGELOCKn and MISCLOCKWORD.UDLOCKBIT refuse the
+ * operation (STATUS.LOCKED).  MSC_LOCK with any value but the unlock key
+ * locks READCTRL and WRITECTRL (STATUS.REGLOCK).
+ * [U] Operations complete at once: write and erase times, the BUSY window
+ * and the flash read stall are unmeasured (TODO).
+ */
 #define EFR32_MSC_BASE 0x40030000u
+#define EFR32_MSC_READCTRL 0x008u
+#define EFR32_MSC_WRITECTRL 0x00cu
+#define EFR32_MSC_WRITECTRL_WREN (1u << 0)
+#define EFR32_MSC_WRITECMD 0x010u
+#define EFR32_MSC_WRITECMD_ERASEPAGE (1u << 1)
+#define EFR32_MSC_WRITECMD_ERASEMAIN0 (1u << 8)
+#define EFR32_MSC_ADDRB 0x014u
+#define EFR32_MSC_WDATA 0x018u
 #define EFR32_MSC_STATUS 0x01cu
+#define EFR32_MSC_STATUS_LOCKED (1u << 1)
+#define EFR32_MSC_STATUS_INVADDR (1u << 2)
+#define EFR32_MSC_STATUS_REGLOCK (1u << 16)
 #define EFR32_MSC_STATUS_RESET 0x08000008u
+#define EFR32_MSC_IF 0x020u
+#define EFR32_MSC_IF_ERASE (1u << 0)
+#define EFR32_MSC_IF_WRITE (1u << 1)
+#define EFR32_MSC_IEN 0x024u
+#define EFR32_MSC_USERDATASIZE 0x034u
+#define EFR32_MSC_USERDATASIZE_RESET 0x4u
+#define EFR32_MSC_USERDATASIZE_UNIT 256u
+#define EFR32_MSC_LOCK 0x03cu
+#define EFR32_MSC_LOCK_UNLOCK_KEY 0x1b71u
+#define EFR32_MSC_LOCK_LOCKKEY_MASK 0xffffu
+#define EFR32_MSC_MISCLOCKWORD 0x040u
+#define EFR32_MSC_MISCLOCKWORD_MELOCKBIT (1u << 0)
+#define EFR32_MSC_MISCLOCKWORD_UDLOCKBIT (1u << 4)
+#define EFR32_MSC_MISCLOCKWORD_RESET 0x00000011u
+#define EFR32_MSC_PAGELOCK0 0x120u
+#define EFR32_MSC_PAGELOCK1 0x124u
+#define EFR32_MSC_PAGES_PER_LOCKWORD 32u
+#define EFR32_MSC_IPVERSION_VALUE 0x1u
+#define EFR32_MSC_IRQ 49
 
 /* EFR32BG22 TIMER2/4: public Series-2 register layout, IRQs 9/11. */
 #define EFR32_TIMER2_BASE 0x40050000u
@@ -540,6 +648,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_RFMAILBOX_B_BASE 0xa8028000u
 #define EFR32_RFMAILBOX_C_BASE 0xa802c000u
 #define EFR32_RFMAILBOX_FLAGS  0x040u
+/*
+ * RDMAILBOX0/1: four message pointers (MSGPTR0-3 at 0x000-0x00c) with one
+ * flag each in IF (0x040), enabled by IEN (0x044), SET/CLR aliases as usual.
+ * Directions, from the stock firmware that runs on silicon: the M0+ posts
+ * on mailbox 0 (MSGPTR0, IF_SET bit 0, then waits for the bit to clear) and
+ * the M33 enables IEN on mailbox 0 and acknowledges it in its RDMAILBOX
+ * (IRQ 39) handler; the M0+ enables IEN on mailbox 1 and its vector table
+ * services mailbox 1's IF & IEN at M0+ IRQ 23.  [U] Delivery latency.
+ */
+#define EFR32_RFMAILBOX_IEN    0x044u
+#define EFR32_RFMAILBOX_IF_MASK 0xfu
+#define EFR32_RDMAILBOX_M33_IRQ 39
+#define EFR32_RDMAILBOX_SEQ_IRQ 23
 
 struct Efr32Periph
 {
@@ -576,6 +697,12 @@ struct Efr32Periph
         int64_t edge;
     } burtc_pend[3];
     QEMUTimer *burtc_timer;
+    /* RTCC: pre-counter and counter as one edge count, see efr32_rtcc_*. */
+    bool rtcc_run;
+    uint64_t rtcc_pos_base;
+    int64_t rtcc_edge_base;
+    int64_t rtcc_last_edge;
+    QEMUTimer *rtcc_timer;
     /* TIMERn counts base_count + elapsed ticks since base_ns while counting. */
     struct {
         bool running;
@@ -597,8 +724,19 @@ struct Efr32Periph
     QEMUTimer *rac_rx_timer;
     GByteArray *bufc_data[4];
     Efr32RfMedium *rf_medium;
+    /* Main flash size of this part (DEVINFO.MSIZE), for the MSC. */
+    uint32_t flash_size;
+    /* EMU.RSTCAUSE: survives system reset until RSTCAUSECLR. */
+    uint32_t rstcause;
+    /* SYSCFG.CHIPREV as the part leaves boot (from DEVINFO.PART). */
+    uint32_t chiprev;
+    /* Board: millivolts on each GPIO pin, -1 when undriven (IADC input). */
+    int32_t analog_mv[EFR32_GPIO_PORTS][EFR32_GPIO_PINS];
+    uint32_t iadc_fifo[4];
+    unsigned iadc_fifo_count;
     qemu_irq irq[64];
     qemu_irq seq_irq_state[EFR32_RAC_SEQ_STATE_EVENTS];
+    qemu_irq seq_irq_mailbox;
     CPUState *seq_cpu;
     /* Per-CPU clocks: the M33, and both cores' SysTick processor clocks. */
     CPUState *m33_cpu;
@@ -1218,14 +1356,28 @@ static uint32_t efr32_usart_status(Efr32Periph *s, unsigned index)
            (s->usart_tx_enabled[index] ? EFR32_USART_STATUS_TXENS : 0);
 }
 
+/*
+ * The M33's two RAC lines both come from RAC.IF & RAC.IEN (public
+ * RAC_S_field.py: IF bits 0-3 STATECHANGE, STIMCMPEV, SEQLOCKUP,
+ * SEQRESETREQ; bits 16-23 SEQ, the sequencer's flags to the host).
+ * RAC_RSM (IRQ 37) carries the first group: stock RAIL's RAC_RSM handler
+ * masks IF with IEN and acts on STATECHANGE (docs/radio-tables.md, RAIL
+ * archive).  RAC_SEQ (IRQ 38) carries IF.SEQ: the stock suit application
+ * enables only IEN bit 18 (IF.SEQ[2]) and its IRQ 38 handler services
+ * RAC.IF & RAC.IEN.  SEQIF/SEQIEN are the sequencer's own flags (to the
+ * M0+, below): stock runs on silicon with SEQIEN = 0x3FFF0000 and IRQ 38
+ * enabled, so they cannot drive the M33's line.
+ */
+#define EFR32_RAC_IF_RSM_MASK 0x0000000fu
+#define EFR32_RAC_IF_SEQ_MASK 0x00ff0000u
+
 static void efr32_rac_update_irqs(Efr32Periph *s)
 {
-    qemu_set_irq(s->irq[37],
-                 !!(efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_IF) &
-                    efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_IEN)));
-    qemu_set_irq(s->irq[38],
-                 !!(efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_SEQIF) &
-                    efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_SEQIEN)));
+    uint32_t pending = efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_IF) &
+                       efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_IEN);
+
+    qemu_set_irq(s->irq[37], !!(pending & EFR32_RAC_IF_RSM_MASK));
+    qemu_set_irq(s->irq[38], !!(pending & EFR32_RAC_IF_SEQ_MASK));
     for (unsigned state = 0; state < EFR32_RAC_SEQ_STATE_EVENTS; state++) {
         if (s->seq_irq_state[state]) {
             qemu_set_irq(s->seq_irq_state[state],
@@ -1233,6 +1385,22 @@ static void efr32_rac_update_irqs(Efr32Periph *s)
                                                   EFR32_RAC_SEQIF) &
                             efr32_rac_seq_state_flag(state)));
         }
+    }
+}
+
+static void efr32_rdmailbox_update_irqs(Efr32Periph *s)
+{
+    uint32_t to_m33 =
+        efr32_register_get(s, EFR32_RFMAILBOX_B_BASE + EFR32_RFMAILBOX_FLAGS) &
+        efr32_register_get(s, EFR32_RFMAILBOX_B_BASE + EFR32_RFMAILBOX_IEN);
+    uint32_t to_seq =
+        efr32_register_get(s, EFR32_RFMAILBOX_C_BASE + EFR32_RFMAILBOX_FLAGS) &
+        efr32_register_get(s, EFR32_RFMAILBOX_C_BASE + EFR32_RFMAILBOX_IEN);
+
+    qemu_set_irq(s->irq[EFR32_RDMAILBOX_M33_IRQ],
+                 !!(to_m33 & EFR32_RFMAILBOX_IF_MASK));
+    if (s->seq_irq_mailbox) {
+        qemu_set_irq(s->seq_irq_mailbox, !!(to_seq & EFR32_RFMAILBOX_IF_MASK));
     }
 }
 
@@ -3116,6 +3284,715 @@ static void efr32_pa_ramp_complete(Efr32Periph *s)
                            EFR32_MODEM_IF_TXRAMPDONE);
 }
 
+/*
+ * ------------------------------------------------------------------- RTCC
+ *
+ * RM SS15.3 (register map SS15.4, fields from the public efr32bg22_rtcc.h).
+ * EN requests the clock, CMD.START/STOP run the counter.  The 15-bit
+ * pre-counter counts every rising edge of the clock CMU.RTCCCLKCTRL
+ * selects (LFRCO/LFXO at the board's 32.768 kHz, ULFRCO 1 kHz); with
+ * CFG.CNTTICK = PRESC, CNT advances every 2^CFG.CNTPRESC edges.  In output
+ * compare mode with COMPBASE = CNT a channel matches when CNT equals its
+ * OCVALUE (Figure 15.3: the match is the CNT == OCVALUE cycle) and sets
+ * IF.CCn; CNT wrapping to 0 sets IF.OF.  IRQ 12 is IF & IEN.  "All RTCC
+ * registers use the new immediate synchronization scheme" (SS15.3.1): writes
+ * take effect at once and SYNCBUSY reads 0.
+ * [I] IF.CCn sets on the LF edge where CNT becomes OCVALUE (the figure, not
+ * a measurement; BURTC on silicon fires when CNT leaves COMP).  [U] Not
+ * modelled: CNTTICK = CCV0MATCH, COMPBASE = PRECNT, CCV1TOP, input
+ * capture, PRS outputs, LOCK; the timing of every edge is unmeasured.
+ */
+#define EFR32_RTCC_BASE 0x48000000u
+#define EFR32_RTCC_IRQ 12
+#define EFR32_RTCC_EN 0x004u
+#define EFR32_RTCC_EN_EN (1u << 0)
+#define EFR32_RTCC_CFG 0x008u
+#define EFR32_RTCC_CFG_CNTPRESC_SHIFT 4
+#define EFR32_RTCC_CFG_CNTPRESC_MASK 0xf0u
+#define EFR32_RTCC_CMD 0x00cu
+#define EFR32_RTCC_CMD_START (1u << 0)
+#define EFR32_RTCC_CMD_STOP (1u << 1)
+#define EFR32_RTCC_STATUS 0x010u
+#define EFR32_RTCC_STATUS_RUNNING (1u << 0)
+#define EFR32_RTCC_IF 0x014u
+#define EFR32_RTCC_IF_OF (1u << 0)
+#define EFR32_RTCC_IF_CC0 (1u << 4)
+#define EFR32_RTCC_IF_CC_STRIDE 2
+#define EFR32_RTCC_IEN 0x018u
+#define EFR32_RTCC_PRECNT 0x01cu
+#define EFR32_RTCC_PRECNT_BITS 15
+#define EFR32_RTCC_CNT 0x020u
+#define EFR32_RTCC_COMBCNT 0x024u
+#define EFR32_RTCC_SYNCBUSY 0x028u
+#define EFR32_RTCC_CC0_CTRL 0x030u
+#define EFR32_RTCC_CC_STRIDE 0x00cu
+#define EFR32_RTCC_CC_OCVALUE 0x004u
+#define EFR32_RTCC_CC_COUNT 3
+#define EFR32_RTCC_CC_CTRL_MODE_MASK 0x3u
+#define EFR32_RTCC_CC_CTRL_MODE_OUTPUTCOMPARE 0x2u
+#define EFR32_RTCC_CC_CTRL_COMPBASE_PRECNT (1u << 4)
+#define EFR32_RTCC_CNT_BITS 32
+#define EFR32_CMU_RTCCCLKCTRL 0x240u
+#define EFR32_CMU_RTCCCLKCTRL_RESET EFR32_CMU_LFCLKSEL_LFRCO
+
+static uint32_t efr32_rtcc_get(Efr32Periph *s, uint32_t offset)
+{
+    return efr32_register_get(s, EFR32_RTCC_BASE + offset);
+}
+
+static uint64_t efr32_rtcc_hz(Efr32Periph *s)
+{
+    switch (efr32_cmu_get(s, EFR32_CMU_RTCCCLKCTRL) &
+            EFR32_CMU_LFCLKSEL_MASK) {
+    case EFR32_CMU_LFCLKSEL_LFRCO:
+    case EFR32_CMU_LFCLKSEL_LFXO:
+        return clock_get_hz(s->burtc_clk);
+    case EFR32_CMU_LFCLKSEL_ULFRCO:
+        return EFR32_ULFRCO_HZ;
+    default:
+        return 0;
+    }
+}
+
+static int64_t efr32_rtcc_edge_at(Efr32Periph *s, int64_t t)
+{
+    uint64_t hz = efr32_rtcc_hz(s);
+
+    return hz ? muldiv64(t, hz, NANOSECONDS_PER_SECOND) : 0;
+}
+
+static unsigned efr32_rtcc_presc(Efr32Periph *s)
+{
+    return (efr32_rtcc_get(s, EFR32_RTCC_CFG) &
+            EFR32_RTCC_CFG_CNTPRESC_MASK) >> EFR32_RTCC_CFG_CNTPRESC_SHIFT;
+}
+
+static bool efr32_rtcc_counting(Efr32Periph *s)
+{
+    return s->rtcc_run && efr32_rtcc_hz(s) &&
+           (efr32_rtcc_get(s, EFR32_RTCC_EN) & EFR32_RTCC_EN_EN);
+}
+
+/* Edges counted (pre-counter and counter together) at LF edge @edge. */
+static uint64_t efr32_rtcc_pos_at(Efr32Periph *s, int64_t edge)
+{
+    if (!efr32_rtcc_counting(s) || edge <= s->rtcc_edge_base) {
+        return s->rtcc_pos_base;
+    }
+    return s->rtcc_pos_base + (uint64_t)(edge - s->rtcc_edge_base);
+}
+
+static uint32_t efr32_rtcc_cnt_of(Efr32Periph *s, uint64_t pos)
+{
+    return pos >> efr32_rtcc_presc(s);
+}
+
+/* First LF edge after @after at which CNT becomes @value. */
+static int64_t efr32_rtcc_next_cnt_edge(Efr32Periph *s, int64_t after,
+                                        uint32_t value)
+{
+    unsigned presc = efr32_rtcc_presc(s);
+    uint64_t period = UINT64_C(1) << (EFR32_RTCC_CNT_BITS + presc);
+    uint64_t pos = efr32_rtcc_pos_at(s, after);
+    uint64_t target = (uint64_t)value << presc;
+    uint64_t delta = (target - pos) & (period - 1);
+
+    return after + (int64_t)(delta ? delta : period);
+}
+
+static void efr32_rtcc_update_irq(Efr32Periph *s)
+{
+    qemu_set_irq(s->irq[EFR32_RTCC_IRQ],
+                 !!(efr32_rtcc_get(s, EFR32_RTCC_IF) &
+                    efr32_rtcc_get(s, EFR32_RTCC_IEN)));
+}
+
+static bool efr32_rtcc_cc_compares(Efr32Periph *s, unsigned channel)
+{
+    uint32_t ctrl = efr32_rtcc_get(s, EFR32_RTCC_CC0_CTRL +
+                                          channel * EFR32_RTCC_CC_STRIDE);
+
+    return (ctrl & EFR32_RTCC_CC_CTRL_MODE_MASK) ==
+               EFR32_RTCC_CC_CTRL_MODE_OUTPUTCOMPARE &&
+           !(ctrl & EFR32_RTCC_CC_CTRL_COMPBASE_PRECNT);
+}
+
+/* Latch every event up to now, then arm the timer for the next one. */
+static void efr32_rtcc_process(Efr32Periph *s)
+{
+    int64_t now = efr32_rtcc_edge_at(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    int64_t next = INT64_MAX;
+    uint32_t flags = 0;
+
+    timer_del(s->rtcc_timer);
+    if (!efr32_rtcc_counting(s)) {
+        s->rtcc_last_edge = now;
+        return;
+    }
+    for (int channel = -1; channel < EFR32_RTCC_CC_COUNT; channel++) {
+        uint32_t flag = channel < 0 ? EFR32_RTCC_IF_OF
+                                    : EFR32_RTCC_IF_CC0
+                                          << (channel *
+                                              EFR32_RTCC_IF_CC_STRIDE);
+        uint32_t value = channel < 0
+                             ? 0
+                             : efr32_rtcc_get(s, EFR32_RTCC_CC0_CTRL +
+                                                     channel *
+                                                         EFR32_RTCC_CC_STRIDE +
+                                                     EFR32_RTCC_CC_OCVALUE);
+        int64_t edge;
+
+        if (channel >= 0 && !efr32_rtcc_cc_compares(s, channel)) {
+            continue;
+        }
+        edge = efr32_rtcc_next_cnt_edge(s, s->rtcc_last_edge, value);
+        if (edge <= now) {
+            flags |= flag;
+            edge = efr32_rtcc_next_cnt_edge(s, now, value);
+        }
+        next = MIN(next, edge);
+    }
+    s->rtcc_last_edge = now;
+    if (flags) {
+        efr32_register_put(s, EFR32_RTCC_BASE + EFR32_RTCC_IF,
+                           efr32_rtcc_get(s, EFR32_RTCC_IF) | flags);
+        efr32_rtcc_update_irq(s);
+    }
+    if (next != INT64_MAX) {
+        timer_mod(s->rtcc_timer,
+                  muldiv64_round_up(next, NANOSECONDS_PER_SECOND,
+                                    efr32_rtcc_hz(s)));
+    }
+}
+
+static void efr32_rtcc_timer_expired(void *opaque)
+{
+    efr32_rtcc_process(EFR32_PERIPH(opaque));
+}
+
+/* Restart the count from @pos at the current edge. */
+static void efr32_rtcc_rebase(Efr32Periph *s, uint64_t pos)
+{
+    s->rtcc_edge_base = s->rtcc_last_edge;
+    s->rtcc_pos_base = pos;
+}
+
+static bool efr32_rtcc_read(Efr32Periph *s, uint32_t address, uint32_t *value)
+{
+    uint64_t pos;
+
+    if ((address & ~0x3fffu) != EFR32_RTCC_BASE) {
+        return false;
+    }
+    efr32_rtcc_process(s);
+    pos = efr32_rtcc_pos_at(s, s->rtcc_last_edge);
+    switch (address & 0xfffu) {
+    case EFR32_RTCC_CNT:
+        *value = efr32_rtcc_cnt_of(s, pos);
+        return true;
+    case EFR32_RTCC_PRECNT:
+        *value = extract64(pos, 0, EFR32_RTCC_PRECNT_BITS);
+        return true;
+    case EFR32_RTCC_COMBCNT:
+        *value = (efr32_rtcc_cnt_of(s, pos) << EFR32_RTCC_PRECNT_BITS) |
+                 extract64(pos, 0, EFR32_RTCC_PRECNT_BITS);
+        return true;
+    case EFR32_RTCC_STATUS:
+        *value = s->rtcc_run ? EFR32_RTCC_STATUS_RUNNING : 0;
+        return true;
+    case EFR32_RTCC_SYNCBUSY:
+    case EFR32_RTCC_CMD:
+        *value = 0;
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Returns true when the RTCC write is fully handled. */
+static bool efr32_rtcc_write(Efr32Periph *s, uint32_t offset, uint32_t next)
+{
+    uint64_t pos;
+    unsigned presc;
+
+    efr32_rtcc_process(s);
+    pos = efr32_rtcc_pos_at(s, s->rtcc_last_edge);
+    presc = efr32_rtcc_presc(s);
+    switch (offset) {
+    case EFR32_RTCC_CMD:
+        if (next & EFR32_RTCC_CMD_STOP) {
+            efr32_rtcc_rebase(s, pos);
+            s->rtcc_run = false;
+        } else if (next & EFR32_RTCC_CMD_START) {
+            efr32_rtcc_rebase(s, pos);
+            s->rtcc_run = true;
+        }
+        break;
+    case EFR32_RTCC_CNT:
+        efr32_rtcc_rebase(s, ((uint64_t)next << presc) |
+                                 (pos & ((UINT64_C(1) << presc) - 1)));
+        break;
+    case EFR32_RTCC_PRECNT:
+        efr32_rtcc_rebase(s, (pos & ~MAKE_64BIT_MASK(0,
+                                         EFR32_RTCC_PRECNT_BITS)) |
+                                 extract32(next, 0, EFR32_RTCC_PRECNT_BITS));
+        break;
+    case EFR32_RTCC_STATUS:
+    case EFR32_RTCC_COMBCNT:
+    case EFR32_RTCC_SYNCBUSY:
+        return true; /* read-only */
+    case EFR32_RTCC_EN:
+    case EFR32_RTCC_CFG:
+        /* The count so far keeps its value across EN and CFG changes. */
+        efr32_rtcc_rebase(s, pos);
+        efr32_register_put(s, EFR32_RTCC_BASE + offset, next);
+        break;
+    default:
+        efr32_register_put(s, EFR32_RTCC_BASE + offset, next);
+        break;
+    }
+    efr32_rtcc_update_irq(s);
+    efr32_rtcc_process(s);
+    return true;
+}
+
+static void efr32_rtcc_reset(Efr32Periph *s)
+{
+    timer_del(s->rtcc_timer);
+    s->rtcc_run = false;
+    s->rtcc_pos_base = 0;
+    s->rtcc_edge_base = 0;
+    s->rtcc_last_edge = 0;
+    efr32_register_put(s, EFR32_CMU_BASE + EFR32_CMU_RTCCCLKCTRL,
+                       EFR32_CMU_RTCCCLKCTRL_RESET);
+}
+
+/*
+ * ------------------------------------------------------------------- IADC
+ *
+ * RM SS24 (register map SS24.4, fields from the public efr32bg22_iadc.h).
+ * The single queue only: CMD.SINGLESTART converts the input SINGLE selects
+ * (PORTPOS/PINPOS against PORTNEG/PINNEG) with the CFGn that SINGLE.CFG
+ * names, pushes the result into the 4-entry single FIFO (RM SS24.3.5) and
+ * sets IF.SINGLEDONE; IF.SINGLEFIFODVL sets once the FIFO holds DVL + 1
+ * entries.  SINGLEFIFODATA pops; SINGLEFIFOSTAT counts; STATUS.SINGLEFIFODV
+ * reports a non-empty FIFO.  IRQ 48 is IF & IEN.
+ * The analog side is board input: each GPIO pin's voltage comes from the
+ * machine's "analog" property (millivolts, e.g. "PD02=968"); an undriven
+ * pin and GND read 0 V.  Reference VDDX is the board supply
+ * (EFR32_BOARD_VDDX_MV), VBGR the 1.21 V band-gap (RM SS24.3.3.1).
+ * Result = Vin * gain / Vref at 12 bits, right-aligned (ALIGNMENT RIGHT12)
+ * or left-aligned (LEFT12), unipolar for a single-ended input.
+ * [U] Not modelled: the scan queue, timer and PRS triggers, oversampling and
+ * 16/20-bit results, the window comparator, SUPPLY inputs, conversion and
+ * warm-up time (a conversion completes at the command).
+ */
+#define EFR32_IADC_BASE 0x4a004000u
+#define EFR32_IADC_IRQ 48
+#define EFR32_IADC_CMD 0x00cu
+#define EFR32_IADC_CMD_SINGLESTART (1u << 0)
+#define EFR32_IADC_CMD_SINGLEFIFOFLUSH (1u << 24)
+#define EFR32_IADC_STATUS 0x014u
+#define EFR32_IADC_STATUS_SINGLEFIFODV (1u << 8)
+#define EFR32_IADC_IF 0x024u
+#define EFR32_IADC_IF_SINGLEFIFODVL (1u << 0)
+#define EFR32_IADC_IF_SINGLEDONE (1u << 9)
+#define EFR32_IADC_IF_SINGLEFIFOOF (1u << 16)
+#define EFR32_IADC_IF_SINGLEFIFOUF (1u << 18)
+#define EFR32_IADC_IEN 0x028u
+#define EFR32_IADC_CFG0 0x048u
+#define EFR32_IADC_CFG_STRIDE 0x010u
+#define EFR32_IADC_CFG_ANALOGGAIN_SHIFT 12
+#define EFR32_IADC_CFG_ANALOGGAIN_MASK 0x7u
+#define EFR32_IADC_CFG_REFSEL_SHIFT 16
+#define EFR32_IADC_CFG_REFSEL_MASK 0x7u
+#define EFR32_IADC_CFG_REFSEL_VBGR 0u
+#define EFR32_IADC_CFG_REFSEL_VDDX 3u
+#define EFR32_IADC_SINGLEFIFOCFG 0x070u
+#define EFR32_IADC_SINGLEFIFOCFG_ALIGNMENT_MASK 0x7u
+#define EFR32_IADC_SINGLEFIFOCFG_ALIGNMENT_LEFT12 3u
+#define EFR32_IADC_SINGLEFIFOCFG_DVL_SHIFT 4
+#define EFR32_IADC_SINGLEFIFOCFG_DVL_MASK 0x3u
+#define EFR32_IADC_SINGLEFIFODATA 0x074u
+#define EFR32_IADC_SINGLEFIFOSTAT 0x078u
+#define EFR32_IADC_SINGLEDATA 0x07cu
+#define EFR32_IADC_SINGLE 0x098u
+#define EFR32_IADC_SINGLE_PINNEG_SHIFT 0
+#define EFR32_IADC_SINGLE_PORTNEG_SHIFT 4
+#define EFR32_IADC_SINGLE_PINPOS_SHIFT 8
+#define EFR32_IADC_SINGLE_PORTPOS_SHIFT 12
+#define EFR32_IADC_SINGLE_FIELD_MASK 0xfu
+#define EFR32_IADC_SINGLE_CFG (1u << 16)
+#define EFR32_IADC_PORT_GPIO_FIRST 8u /* PORTA; PORTB 9, PORTC 10, PORTD 11 */
+#define EFR32_IADC_FIFO_DEPTH 4
+#define EFR32_IADC_RESULT_BITS 12
+#define EFR32_IADC_LEFT12_SHIFT 4
+#define EFR32_IADC_VBGR_MV 1210u
+#define EFR32_BOARD_VDDX_MV 3300u
+/* ANALOGGAIN codes 1..5 are x0.5, x1, x2, x3, x4 (efr32bg22_iadc.h). */
+static const uint32_t efr32_iadc_gain_half[] = { 0, 1, 2, 4, 6, 8 };
+
+static uint32_t efr32_iadc_get(Efr32Periph *s, uint32_t offset)
+{
+    return efr32_register_get(s, EFR32_IADC_BASE + offset);
+}
+
+static void efr32_iadc_put(Efr32Periph *s, uint32_t offset, uint32_t value)
+{
+    efr32_register_put(s, EFR32_IADC_BASE + offset, value);
+}
+
+static void efr32_iadc_update(Efr32Periph *s)
+{
+    uint32_t status = efr32_iadc_get(s, EFR32_IADC_STATUS) &
+                      ~EFR32_IADC_STATUS_SINGLEFIFODV;
+
+    if (s->iadc_fifo_count) {
+        status |= EFR32_IADC_STATUS_SINGLEFIFODV;
+    }
+    efr32_iadc_put(s, EFR32_IADC_STATUS, status);
+    efr32_iadc_put(s, EFR32_IADC_SINGLEFIFOSTAT, s->iadc_fifo_count);
+    qemu_set_irq(s->irq[EFR32_IADC_IRQ],
+                 !!(efr32_iadc_get(s, EFR32_IADC_IF) &
+                    efr32_iadc_get(s, EFR32_IADC_IEN)));
+}
+
+/* Millivolts on an IADC input; GND, SUPPLY and undriven pins read 0. */
+static uint32_t efr32_iadc_input_mv(Efr32Periph *s, uint32_t port,
+                                    uint32_t pin)
+{
+    int32_t mv;
+
+    if (port < EFR32_IADC_PORT_GPIO_FIRST ||
+        port - EFR32_IADC_PORT_GPIO_FIRST >= EFR32_GPIO_PORTS ||
+        pin >= EFR32_GPIO_PINS) {
+        return 0;
+    }
+    mv = s->analog_mv[port - EFR32_IADC_PORT_GPIO_FIRST][pin];
+    return mv > 0 ? mv : 0;
+}
+
+static uint32_t efr32_iadc_convert(Efr32Periph *s)
+{
+    uint32_t single = efr32_iadc_get(s, EFR32_IADC_SINGLE);
+    uint32_t cfg = efr32_iadc_get(s, EFR32_IADC_CFG0 +
+                                         ((single & EFR32_IADC_SINGLE_CFG)
+                                              ? EFR32_IADC_CFG_STRIDE
+                                              : 0));
+    uint32_t gain = (cfg >> EFR32_IADC_CFG_ANALOGGAIN_SHIFT) &
+                    EFR32_IADC_CFG_ANALOGGAIN_MASK;
+    uint32_t refsel = (cfg >> EFR32_IADC_CFG_REFSEL_SHIFT) &
+                      EFR32_IADC_CFG_REFSEL_MASK;
+    uint32_t vref = refsel == EFR32_IADC_CFG_REFSEL_VDDX ? EFR32_BOARD_VDDX_MV
+                    : refsel == EFR32_IADC_CFG_REFSEL_VBGR
+                        ? EFR32_IADC_VBGR_MV
+                        : 0;
+    uint32_t full = (1u << EFR32_IADC_RESULT_BITS) - 1;
+    uint64_t pos = efr32_iadc_input_mv(
+        s, (single >> EFR32_IADC_SINGLE_PORTPOS_SHIFT) &
+               EFR32_IADC_SINGLE_FIELD_MASK,
+        (single >> EFR32_IADC_SINGLE_PINPOS_SHIFT) &
+            EFR32_IADC_SINGLE_FIELD_MASK);
+    uint64_t neg = efr32_iadc_input_mv(
+        s, (single >> EFR32_IADC_SINGLE_PORTNEG_SHIFT) &
+               EFR32_IADC_SINGLE_FIELD_MASK,
+        (single >> EFR32_IADC_SINGLE_PINNEG_SHIFT) &
+            EFR32_IADC_SINGLE_FIELD_MASK);
+    uint64_t code;
+
+    if (!vref || gain >= ARRAY_SIZE(efr32_iadc_gain_half) || pos <= neg) {
+        code = 0;
+    } else {
+        /* (pos - neg) * gain / vref of full scale, rounded, clipped. */
+        code = MIN((uint64_t)full,
+                   ((pos - neg) * efr32_iadc_gain_half[gain] * full +
+                    vref) / (2 * (uint64_t)vref));
+    }
+    if ((efr32_iadc_get(s, EFR32_IADC_SINGLEFIFOCFG) &
+         EFR32_IADC_SINGLEFIFOCFG_ALIGNMENT_MASK) ==
+        EFR32_IADC_SINGLEFIFOCFG_ALIGNMENT_LEFT12) {
+        code <<= EFR32_IADC_LEFT12_SHIFT;
+    }
+    return code;
+}
+
+static void efr32_iadc_command(Efr32Periph *s, uint32_t command)
+{
+    uint32_t flags = 0;
+
+    if (command & EFR32_IADC_CMD_SINGLEFIFOFLUSH) {
+        s->iadc_fifo_count = 0;
+    }
+    if (command & EFR32_IADC_CMD_SINGLESTART) {
+        uint32_t result = efr32_iadc_convert(s);
+        uint32_t dvl = (efr32_iadc_get(s, EFR32_IADC_SINGLEFIFOCFG) >>
+                        EFR32_IADC_SINGLEFIFOCFG_DVL_SHIFT) &
+                       EFR32_IADC_SINGLEFIFOCFG_DVL_MASK;
+
+        if (s->iadc_fifo_count < EFR32_IADC_FIFO_DEPTH) {
+            s->iadc_fifo[s->iadc_fifo_count++] = result;
+        } else {
+            flags |= EFR32_IADC_IF_SINGLEFIFOOF;
+        }
+        efr32_iadc_put(s, EFR32_IADC_SINGLEDATA, result);
+        flags |= EFR32_IADC_IF_SINGLEDONE;
+        if (s->iadc_fifo_count >= dvl + 1) {
+            flags |= EFR32_IADC_IF_SINGLEFIFODVL;
+        }
+    }
+    efr32_iadc_put(s, EFR32_IADC_IF, efr32_iadc_get(s, EFR32_IADC_IF) | flags);
+    efr32_iadc_update(s);
+}
+
+static bool efr32_iadc_read(Efr32Periph *s, uint32_t address, uint32_t *value)
+{
+    if ((address & ~0x3fffu) != EFR32_IADC_BASE) {
+        return false;
+    }
+    switch (address & 0xfffu) {
+    case EFR32_IADC_SINGLEFIFODATA:
+        if (!s->iadc_fifo_count) {
+            efr32_iadc_put(s, EFR32_IADC_IF, efr32_iadc_get(s, EFR32_IADC_IF) |
+                                                 EFR32_IADC_IF_SINGLEFIFOUF);
+            *value = 0;
+        } else {
+            *value = s->iadc_fifo[0];
+            memmove(s->iadc_fifo, s->iadc_fifo + 1,
+                    --s->iadc_fifo_count * sizeof(s->iadc_fifo[0]));
+        }
+        efr32_iadc_update(s);
+        return true;
+    case EFR32_IADC_CMD:
+        *value = 0;
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Returns true when the IADC write is fully handled. */
+static bool efr32_iadc_write(Efr32Periph *s, uint32_t offset, uint32_t next)
+{
+    switch (offset) {
+    case EFR32_IADC_CMD:
+        efr32_iadc_command(s, next);
+        return true;
+    case EFR32_IADC_STATUS:
+    case EFR32_IADC_SINGLEFIFOSTAT:
+    case EFR32_IADC_SINGLEFIFODATA:
+    case EFR32_IADC_SINGLEDATA:
+        return true; /* read-only */
+    case EFR32_IADC_IF:
+    case EFR32_IADC_IEN:
+        efr32_iadc_put(s, offset, next);
+        efr32_iadc_update(s);
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* ---- MSC: flash erase and write (see EFR32_MSC_BASE above) ---- */
+
+static uint32_t efr32_msc_get(Efr32Periph *s, uint32_t offset)
+{
+    return efr32_register_get(s, EFR32_MSC_BASE + offset);
+}
+
+static void efr32_msc_put(Efr32Periph *s, uint32_t offset, uint32_t value)
+{
+    efr32_register_put(s, EFR32_MSC_BASE + offset, value);
+}
+
+static void efr32_msc_update_irq(Efr32Periph *s)
+{
+    qemu_set_irq(s->irq[EFR32_MSC_IRQ],
+                 !!(efr32_msc_get(s, EFR32_MSC_IF) &
+                    efr32_msc_get(s, EFR32_MSC_IEN)));
+}
+
+static void efr32_msc_status(Efr32Periph *s, uint32_t clear, uint32_t set)
+{
+    efr32_msc_put(s, EFR32_MSC_STATUS,
+                  (efr32_msc_get(s, EFR32_MSC_STATUS) & ~clear) | set);
+}
+
+/* The erasable page that holds address: main flash or User Data. */
+static bool efr32_msc_page(Efr32Periph *s, uint32_t address,
+                           uint32_t *base, uint32_t *size)
+{
+    uint32_t userdata = EFR32_INFO_BASE + EFR32_USERDATA_OFFSET;
+    uint32_t userdata_size =
+        efr32_msc_get(s, EFR32_MSC_USERDATASIZE) *
+        EFR32_MSC_USERDATASIZE_UNIT;
+
+    if (address < s->flash_size) {
+        *base = address & ~(EFR32_FLASH_PAGE_SIZE - 1);
+        *size = EFR32_FLASH_PAGE_SIZE;
+        return true;
+    }
+    if (address >= userdata && address - userdata < userdata_size) {
+        *base = userdata;
+        *size = userdata_size;
+        return true;
+    }
+    return false;
+}
+
+static bool efr32_msc_page_locked(Efr32Periph *s, uint32_t address)
+{
+    uint32_t page = address / EFR32_FLASH_PAGE_SIZE;
+
+    if (address >= s->flash_size) {
+        return efr32_msc_get(s, EFR32_MSC_MISCLOCKWORD) &
+               EFR32_MSC_MISCLOCKWORD_UDLOCKBIT;
+    }
+    return efr32_msc_get(s, page < EFR32_MSC_PAGES_PER_LOCKWORD
+                                ? EFR32_MSC_PAGELOCK0
+                                : EFR32_MSC_PAGELOCK1) &
+           (1u << (page % EFR32_MSC_PAGES_PER_LOCKWORD));
+}
+
+static void efr32_msc_fill(Efr32Periph *s, uint32_t base, uint32_t size)
+{
+    g_autofree uint8_t *erased = g_malloc(size);
+
+    memset(erased, EFR32_FLASH_ERASED_BYTE, size);
+    address_space_write(&s->dma_as, base, MEMTXATTRS_UNSPECIFIED, erased,
+                        size);
+}
+
+/* An operation on this address may start: enabled, valid, not locked. */
+static bool efr32_msc_may_modify(Efr32Periph *s, uint32_t address)
+{
+    uint32_t base, size;
+
+    if (!(efr32_msc_get(s, EFR32_MSC_WRITECTRL) &
+          EFR32_MSC_WRITECTRL_WREN) ||
+        !efr32_msc_page(s, address, &base, &size)) {
+        return false;
+    }
+    if (efr32_msc_page_locked(s, address)) {
+        efr32_msc_status(s, 0, EFR32_MSC_STATUS_LOCKED);
+        return false;
+    }
+    efr32_msc_status(s, EFR32_MSC_STATUS_LOCKED, 0);
+    return true;
+}
+
+static void efr32_msc_command(Efr32Periph *s, uint32_t command)
+{
+    uint32_t address = efr32_msc_get(s, EFR32_MSC_ADDRB);
+    uint32_t base, size;
+
+    if ((command & EFR32_MSC_WRITECMD_ERASEPAGE) &&
+        efr32_msc_may_modify(s, address) &&
+        efr32_msc_page(s, address, &base, &size)) {
+        efr32_msc_fill(s, base, size);
+        efr32_msc_put(s, EFR32_MSC_IF,
+                      efr32_msc_get(s, EFR32_MSC_IF) | EFR32_MSC_IF_ERASE);
+    }
+    if (command & EFR32_MSC_WRITECMD_ERASEMAIN0) {
+        if (efr32_msc_get(s, EFR32_MSC_MISCLOCKWORD) &
+            EFR32_MSC_MISCLOCKWORD_MELOCKBIT) {
+            efr32_msc_status(s, 0, EFR32_MSC_STATUS_LOCKED);
+        } else {
+            efr32_msc_status(s, EFR32_MSC_STATUS_LOCKED, 0);
+            efr32_msc_fill(s, 0, s->flash_size);
+            efr32_msc_put(s, EFR32_MSC_IF, efr32_msc_get(s, EFR32_MSC_IF) |
+                                               EFR32_MSC_IF_ERASE);
+        }
+    }
+    /* WRITEEND, ERASEABORT, CLEARWDATA: nothing is ever in flight. */
+    efr32_msc_update_irq(s);
+}
+
+static void efr32_msc_program(Efr32Periph *s, uint32_t data)
+{
+    uint32_t address = efr32_msc_get(s, EFR32_MSC_ADDRB) & ~3u;
+    uint8_t word[4];
+
+    if (efr32_msc_may_modify(s, address)) {
+        /* Programming only clears bits (RM SS6.3.12). */
+        address_space_read(&s->dma_as, address, MEMTXATTRS_UNSPECIFIED, word,
+                           sizeof(word));
+        stl_le_p(word, ldl_le_p(word) & data);
+        address_space_write(&s->dma_as, address, MEMTXATTRS_UNSPECIFIED,
+                            word, sizeof(word));
+        efr32_msc_put(s, EFR32_MSC_IF,
+                      efr32_msc_get(s, EFR32_MSC_IF) | EFR32_MSC_IF_WRITE);
+    }
+    /* "After each word is written, ADDRB is incremented automatically by
+     * 4" (RM SS6.3.12). */
+    efr32_msc_put(s, EFR32_MSC_ADDRB, address + 4);
+    efr32_msc_update_irq(s);
+}
+
+static void efr32_msc_check_address(Efr32Periph *s)
+{
+    uint32_t base, size;
+    bool valid = efr32_msc_page(s, efr32_msc_get(s, EFR32_MSC_ADDRB), &base,
+                                &size);
+
+    efr32_msc_status(s, EFR32_MSC_STATUS_INVADDR,
+                     valid ? 0 : EFR32_MSC_STATUS_INVADDR);
+}
+
+/* Returns true when the write to this MSC register is fully handled. */
+static bool efr32_msc_write(Efr32Periph *s, uint32_t offset, uint32_t old,
+                            uint32_t next)
+{
+    bool reglocked = efr32_msc_get(s, EFR32_MSC_STATUS) &
+                     EFR32_MSC_STATUS_REGLOCK;
+
+    switch (offset) {
+    case EFR32_MSC_READCTRL:
+    case EFR32_MSC_WRITECTRL:
+        return reglocked;
+    case EFR32_MSC_WRITECMD:
+        efr32_msc_command(s, next);
+        return true;
+    case EFR32_MSC_ADDRB:
+        efr32_msc_put(s, offset, next);
+        efr32_msc_check_address(s);
+        return true;
+    case EFR32_MSC_WDATA:
+        efr32_msc_put(s, offset, next);
+        efr32_msc_program(s, next);
+        return true;
+    case EFR32_MSC_STATUS:
+    case EFR32_MSC_USERDATASIZE:
+        return true; /* read-only */
+    case EFR32_MSC_LOCK:
+        efr32_msc_status(s, EFR32_MSC_STATUS_REGLOCK,
+                         (next & EFR32_MSC_LOCK_LOCKKEY_MASK) ==
+                                 EFR32_MSC_LOCK_UNLOCK_KEY
+                             ? 0
+                             : EFR32_MSC_STATUS_REGLOCK);
+        return true;
+    case EFR32_MSC_PAGELOCK0:
+    case EFR32_MSC_PAGELOCK1:
+        /* "Host is only allowed to write one" (RM SS6.8.15-16). */
+        efr32_msc_put(s, offset, old | next);
+        return true;
+    case EFR32_MSC_IF:
+    case EFR32_MSC_IEN:
+        efr32_msc_put(s, offset, next);
+        efr32_msc_update_irq(s);
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void efr32_msc_reset(Efr32Periph *s)
+{
+    efr32_msc_put(s, EFR32_MSC_STATUS, EFR32_MSC_STATUS_RESET);
+    efr32_msc_put(s, EFR32_MSC_USERDATASIZE, EFR32_MSC_USERDATASIZE_RESET);
+    efr32_msc_put(s, EFR32_MSC_MISCLOCKWORD, EFR32_MSC_MISCLOCKWORD_RESET);
+    efr32_msc_update_irq(s);
+}
+
 static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
 {
     uint32_t ipversion;
@@ -3174,6 +4051,25 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
 
             return (count & 0x1fff) | threshold_flag;
         }
+    }
+    {
+        uint32_t rtcc_value;
+
+        if (efr32_rtcc_read(s, address, &rtcc_value) ||
+            efr32_iadc_read(s, address, &rtcc_value)) {
+            return rtcc_value;
+        }
+    }
+    if (address == EFR32_MSC_BASE + EFR32_MSC_LOCK) {
+        /* "bit 0 is set when the lock is enabled" (RM SS6.8.12). */
+        return !!(efr32_msc_get(s, EFR32_MSC_STATUS) &
+                  EFR32_MSC_STATUS_REGLOCK);
+    }
+    if (address == EFR32_MSC_BASE + EFR32_MSC_WRITECMD) {
+        return 0; /* write-only command strobes */
+    }
+    if (address == EFR32_MSC_BASE) {
+        return EFR32_MSC_IPVERSION_VALUE;
     }
     if (address == 0x4400003c)
         return 0x20; /* RADIOAES.STATUS WAITING */
@@ -3236,30 +4132,6 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
     }
     if (address == EFR32_AGC_BASE + EFR32_AGC_CMD)
         return 0; /* AGC.CMD is write-only in the public register model. */
-    if (((address & ~0x3fffu) == EFR32_RFMAILBOX_B_BASE ||
-         (address & ~0x3fffu) == EFR32_RFMAILBOX_C_BASE) &&
-        offset == EFR32_RFMAILBOX_FLAGS)
-    {
-        /*
-         * Stock services this doorbell register, and RAIL uses the standard
-         * SET/CLR aliases.  The peer endpoint and its delivery timing have
-         * not been recovered.  On real silicon, bit 0 of this exact register
-         * gates an M33-side RAIL calibration busy-wait that spins forever
-         * if the sequencer object is modified at all (owo-open-fw
-         * docs/radio-tables.md SS7.5.4, lockstepped on real hardware); this
-         * model's constant 0 cannot reproduce that, which is a known,
-         * recorded divergence from exact silicon semantics, not an
-         * oversight. It is deliberately NOT "fixed" by making FLAGS a real
-         * latch: there is no emulated M0+ peer here to ever clear one, so a
-         * real latch would just trade today's "always ready" simplification
-         * for an "always stuck after the first write" one -- equally
-         * unfaithful, and worse for any guest code that happens to probe
-         * this register. Keeping FLAGS clear makes the modeled no-peer state
-         * explicit; it must not turn a guest mailbox write into a synthetic
-         * RDMAILBOX IRQ or an RX descriptor.
-         */
-        return 0;
-    }
     return efr32_register_get(s, address);
 }
 static uint64_t efr32_peripheral_read(Efr32Periph *s, uint32_t address,
@@ -3344,6 +4216,30 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         efr32_register_put(s, register_address, next & 0xff);
         s->usart_tx_complete[usart_index] = true;
         trace_efr32bg22_usart_tx(usart_index, next & 0xff);
+        return;
+    }
+
+    if (register_address == EFR32_EMU_BASE + EFR32_EMU_RSTCAUSE) {
+        return; /* read-only */
+    }
+    if (register_address == EFR32_EMU_BASE + EFR32_EMU_CMD &&
+        (next & EFR32_EMU_CMD_RSTCAUSECLR)) {
+        s->rstcause = 0;
+        efr32_register_put(s, EFR32_EMU_BASE + EFR32_EMU_RSTCAUSE, 0);
+    }
+
+    if ((register_address & ~0x3fffu) == EFR32_IADC_BASE &&
+        efr32_iadc_write(s, register_address & 0xfffu, next)) {
+        return;
+    }
+
+    if ((register_address & ~0x3fffu) == EFR32_RTCC_BASE &&
+        efr32_rtcc_write(s, register_address & 0xfffu, next)) {
+        return;
+    }
+
+    if ((register_address & ~0x3fffu) == EFR32_MSC_BASE &&
+        efr32_msc_write(s, register_address & 0xfffu, old, next)) {
         return;
     }
 
@@ -3658,6 +4554,13 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         efr32_rac_update_irqs(s);
     }
 
+    if (((register_address & ~0x3fffu) == EFR32_RFMAILBOX_B_BASE ||
+         (register_address & ~0x3fffu) == EFR32_RFMAILBOX_C_BASE) &&
+        ((register_address & 0xfffu) == EFR32_RFMAILBOX_FLAGS ||
+         (register_address & 0xfffu) == EFR32_RFMAILBOX_IEN)) {
+        efr32_rdmailbox_update_irqs(s);
+    }
+
     if (register_address == EFR32_BUFC_BASE + EFR32_BUFC_IF ||
         register_address == EFR32_BUFC_BASE + EFR32_BUFC_IEN)
     {
@@ -3950,6 +4853,25 @@ static void efr32_bus_access(Efr32Periph *s, uint32_t address, unsigned size,
     icount_bus_access(&s->bus_model, current_cpu, address, size, is_write);
 }
 
+/* Every guest peripheral access, for coverage runs (trace only). */
+static void efr32_trace_mmio(Efr32Periph *s, bool is_write, uint32_t address,
+                             unsigned size, uint64_t value, MemTxResult r)
+{
+    if (trace_event_get_state_backends(TRACE_EFR32_MMIO_READ) ||
+        trace_event_get_state_backends(TRACE_EFR32_MMIO_WRITE)) {
+        int cpu = current_cpu ? current_cpu->cpu_index : -1;
+        uint32_t pc = current_cpu ? ARM_CPU(current_cpu)->env.regs[15] : 0;
+
+        if (is_write) {
+            trace_efr32_mmio_write(s->endpoint_id, cpu, pc, address,
+                                       size, value, r);
+        } else {
+            trace_efr32_mmio_read(s->endpoint_id, cpu, pc, address, size,
+                                      value, r);
+        }
+    }
+}
+
 static MemTxResult efr32_peripheral_mmio_read(void *opaque, hwaddr offset,
                                               uint64_t *data, unsigned size,
                                               MemTxAttrs attrs)
@@ -3960,9 +4882,12 @@ static MemTxResult efr32_peripheral_mmio_read(void *opaque, hwaddr offset,
 
     if (efr32_bus_error(s, PERIPH_BASE + offset)) {
         *data = 0;
+        efr32_trace_mmio(s, false, PERIPH_BASE + offset, size, 0,
+                         MEMTX_ERROR);
         return MEMTX_ERROR;
     }
     *data = efr32_peripheral_read(s, PERIPH_BASE + offset, size);
+    efr32_trace_mmio(s, false, PERIPH_BASE + offset, size, *data, MEMTX_OK);
     return MEMTX_OK;
 }
 static MemTxResult efr32_peripheral_mmio_write(void *opaque, hwaddr offset,
@@ -3971,6 +4896,7 @@ static MemTxResult efr32_peripheral_mmio_write(void *opaque, hwaddr offset,
 {
     Efr32Periph *s = EFR32_PERIPH(opaque);
     efr32_bus_access(s, PERIPH_BASE + offset, size, true);
+    efr32_trace_mmio(s, true, PERIPH_BASE + offset, size, value, MEMTX_OK);
     /*
      * TIMER and BURTC answer a gated write with a bus error too (each of
      * 20 debugger writes left the sticky error), and a TIMER rejects writes
@@ -4014,9 +4940,11 @@ static MemTxResult efr32_radio_mmio_read(void *opaque, hwaddr offset,
 
     if (efr32_bus_error(s, RADIO_BASE + offset)) {
         *data = 0;
+        efr32_trace_mmio(s, false, RADIO_BASE + offset, size, 0, MEMTX_ERROR);
         return MEMTX_ERROR;
     }
     *data = efr32_peripheral_read(s, RADIO_BASE + offset, size);
+    efr32_trace_mmio(s, false, RADIO_BASE + offset, size, *data, MEMTX_OK);
     return MEMTX_OK;
 }
 static MemTxResult efr32_radio_mmio_write(void *opaque, hwaddr offset,
@@ -4026,6 +4954,7 @@ static MemTxResult efr32_radio_mmio_write(void *opaque, hwaddr offset,
     Efr32Periph *s = EFR32_PERIPH(opaque);
 
     efr32_bus_access(s, RADIO_BASE + offset, size, true);
+    efr32_trace_mmio(s, true, RADIO_BASE + offset, size, value, MEMTX_OK);
 
     if (!efr32_bus_error(s, RADIO_BASE + offset)) {
         efr32_peripheral_write(s, RADIO_BASE + offset, value, size);
@@ -4060,6 +4989,7 @@ static void efr32_periph_init(Object *o)
 {
     Efr32Periph *s = EFR32_PERIPH(o);
     s->registers = g_hash_table_new(g_direct_hash, g_direct_equal);
+    s->rstcause = EFR32_EMU_RSTCAUSE_POR;
     s->trng_state = 0x2545f491;
     s->rac_state = EFR32_RAC_STATE_OFF;
     s->seq_released = false;
@@ -4081,6 +5011,8 @@ static void efr32_periph_init(Object *o)
                                       ClockUpdate);
     s->burtc_timer =
         timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_burtc_timer_expired, s);
+    s->rtcc_timer =
+        timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_rtcc_timer_expired, s);
     for (int i = 0; i < EFR32_TIMER_COUNT; i++) {
         s->timers[i].event = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                           efr32_timer_callbacks[i], s);
@@ -4133,6 +5065,9 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
             qemu_set_irq(s->seq_irq_state[state], 0);
         }
     }
+    if (s->seq_irq_mailbox) {
+        qemu_set_irq(s->seq_irq_mailbox, 0);
+    }
     efr32_timers_reset(s);
     timer_del(s->dpll_lock_timer);
     s->hfxo_request_ns = -1;
@@ -4164,8 +5099,12 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
                        EFR32_HFXO_CTRL_DISONDEMAND);
     efr32_register_put(s, EFR32_EMU_BASE + EFR32_EMU_STATUS,
                        EFR32_EMU_STATUS_RESET);
-    efr32_register_put(s, EFR32_MSC_BASE + EFR32_MSC_STATUS,
-                       EFR32_MSC_STATUS_RESET);
+    efr32_register_put(s, EFR32_EMU_BASE + EFR32_EMU_RSTCAUSE, s->rstcause);
+    efr32_msc_reset(s);
+    efr32_rtcc_reset(s);
+    s->iadc_fifo_count = 0;
+    efr32_register_put(s, EFR32_SYSCFG_BASE + EFR32_SYSCFG_CHIPREV,
+                       s->chiprev);
     /*
      * Zephyr's alarm-mode counter driver reports COMP as its top value.
      * The LL ticker requires a free-running 32-bit top, so this machine
@@ -4210,6 +5149,7 @@ static void efr32_periph_finalize(Object *obj)
     g_clear_pointer(&s->rx_frame, g_bytes_unref);
     timer_free(s->rac_tx_timer);
     timer_free(s->burtc_timer);
+    timer_free(s->rtcc_timer);
     for (int i = 0; i < EFR32_TIMER_COUNT; i++) {
         timer_free(s->timers[i].event);
     }
@@ -4299,6 +5239,9 @@ struct Efr32Bg22SoCState {
     MemoryRegion seq_memory;
     MemoryRegion seq_ram_alias;
     MemoryRegion seq_radio_alias;
+    MemoryRegion seq_sram_alias;
+    MemoryRegion seq_periph_ns_alias;
+    MemoryRegion seq_periph_s_window;
     MemoryRegion devinfo;
     Clock *clk;
     Clock *seq_clk;
@@ -4312,6 +5255,14 @@ struct Efr32Bg22SoCState {
     Object *idau;
     uint32_t boot_offset;
     bool core_clocks;
+    /* Part identity: optional DEVINFO and USERDATA page images. */
+    char *devinfo_file;
+    char *userdata_file;
+    /* Board analog inputs: "PD02=968,PA05=0" in millivolts. */
+    char *analog;
+    /* Sized from DEVINFO.MSIZE at realize, as on silicon. */
+    uint32_t flash_size;
+    uint32_t sram_size;
 };
 
 struct Efr32State
@@ -4321,6 +5272,9 @@ struct Efr32State
     Efr32RfMedium *rf_medium;
     char *image;
     char *flash_overlay;
+    char *devinfo;
+    char *userdata;
+    char *analog;
     uint32_t flash_offset;
     uint32_t flash_overlay_offset;
     uint32_t boot_offset;
@@ -4347,6 +5301,9 @@ struct Efr32DualState {
     MemoryRegion peer_radio;
     Efr32RfMedium *rf_medium;
     char *image[2];
+    char *devinfo[2];
+    char *userdata[2];
+    char *analog[2];
     bool core_clocks;
 };
 
@@ -4364,37 +5321,187 @@ static void efr32_seq_cpu_reset(void *opaque)
     cpu->halted = 1;
 }
 
-static void efr32_initialize_devinfo(MemoryRegion *devinfo)
-{
-    uint8_t *contents = memory_region_get_ram_ptr(devinfo);
-    uint32_t value;
+#define EFR32_DEVINFO_MSIZE 0x00cu
+#define EFR32_DEVINFO_MSIZE_FLASH_MASK 0xffffu
+#define EFR32_DEVINFO_MSIZE_SRAM_SHIFT 16
+#define EFR32_DEVINFO_MSIZE_SRAM_MASK 0x7ffu
+#define EFR32_DEVINFO_EUI64L 0x048u
+#define EFR32_DEVINFO_EUI64H 0x04cu
+#define EFR32_DEVINFO_MODULENAME0 0x130u
+#define EFR32_DEVINFO_MODULENAME_WORDS 7
+#define EFR32_DEVINFO_MODULEINFO 0x14cu
+#define EFR32_FLASH_MAX_SIZE 0x80000u
+#define EFR32_SRAM_MAX_SIZE 0x8000u
+#define EFR32_SRAM_BASE 0x20000000u
 
-    /* USERDATA/CHIPCONFIG are erased.  Model the exact BGM220PC22HNA2 module
-     * identity observed on BRD4314A hardware; calibration words stay zero. */
-    memset(contents, 0xff, 0x8000);
-    memset(contents + 0x8000, 0, 0x2000);
-    value = cpu_to_le32(512 | (32 << 16));
-    memcpy(contents + 0x800c, &value, sizeof(value));
-    value = cpu_to_le32(0x0000beef);
-    memcpy(contents + 0x8048, &value, sizeof(value));
-    value = cpu_to_le32(0x00000a00);
-    memcpy(contents + 0x804c, &value, sizeof(value));
-    value = cpu_to_le32(0x324d4742); /* "BGM2" */
-    memcpy(contents + 0x8130, &value, sizeof(value));
-    value = cpu_to_le32(0x43503032); /* "20PC" */
-    memcpy(contents + 0x8134, &value, sizeof(value));
-    value = cpu_to_le32(0x4e483232); /* "22HN" */
-    memcpy(contents + 0x8138, &value, sizeof(value));
-    value = cpu_to_le32(0xffff3241); /* "A2" */
-    memcpy(contents + 0x813c, &value, sizeof(value));
-    value = cpu_to_le32(UINT32_MAX);
-    memcpy(contents + 0x8140, &value, sizeof(value));
-    memcpy(contents + 0x8144, &value, sizeof(value));
-    memcpy(contents + 0x8148, &value, sizeof(value));
-    value = cpu_to_le32(0x00570100);
-    memcpy(contents + 0x814c, &value, sizeof(value));
+/*
+ * Default identity: the BGM220PC22HNA2 module of the BRD4314A explorer kit,
+ * as observed on that hardware.  Only these fields are known; the remaining
+ * DEVINFO words (PART, calibration, ...) read zero.
+ */
+#define EFR32_BGM220_HNA2_FLASH_KB 512u
+#define EFR32_BGM220_HNA2_SRAM_KB 32u
+#define EFR32_BGM220_HNA2_EUI64L 0x0000beefu
+#define EFR32_BGM220_HNA2_EUI64H 0x00000a00u
+#define EFR32_BGM220_HNA2_MODULEINFO 0x00570100u
+static const uint32_t efr32_bgm220_hna2_module_name[
+    EFR32_DEVINFO_MODULENAME_WORDS] = {
+    0x324d4742, /* "BGM2" */
+    0x43503032, /* "20PC" */
+    0x4e483232, /* "22HN" */
+    0xffff3241, /* "A2" */
+    UINT32_MAX, UINT32_MAX, UINT32_MAX,
+};
+
+/* SYSCFG.CHIPREV.FAMILY for a DEVINFO.PART; 0 for an unknown part. */
+static uint32_t efr32_chiprev_from_part(uint32_t part)
+{
+    uint32_t family = (part >> EFR32_DEVINFO_PART_FAMILY_SHIFT) &
+                      EFR32_DEVINFO_PART_FAMILY_MASK;
+    uint32_t number = (part >> EFR32_DEVINFO_PART_FAMILYNUM_SHIFT) &
+                      EFR32_DEVINFO_PART_FAMILYNUM_MASK;
+    uint32_t code;
+
+    if (number != EFR32_DEVINFO_PART_FAMILYNUM_XG22) {
+        return 0;
+    }
+    switch (family) {
+    case EFR32_DEVINFO_PART_FAMILY_FG:
+        code = EFR32_SYSCFG_CHIPREV_FAMILY_FG22;
+        break;
+    case EFR32_DEVINFO_PART_FAMILY_MG:
+        code = EFR32_SYSCFG_CHIPREV_FAMILY_MG22;
+        break;
+    case EFR32_DEVINFO_PART_FAMILY_BG:
+        code = EFR32_SYSCFG_CHIPREV_FAMILY_BG22;
+        break;
+    case EFR32_DEVINFO_PART_FAMILY_PG:
+        code = EFR32_SYSCFG_CHIPREV_FAMILY_PG22;
+        break;
+    default:
+        return 0;
+    }
+    return code << EFR32_SYSCFG_CHIPREV_FAMILY_SHIFT;
 }
 
+static void efr32_info_put(uint8_t *info, uint32_t offset, uint32_t value)
+{
+    stl_le_p(info + offset, value);
+}
+
+static bool efr32_info_load(uint8_t *dest, const char *file, size_t size,
+                            const char *what, Error **errp)
+{
+    g_autofree gchar *contents = NULL;
+    gsize length;
+
+    if (!file) {
+        return true;
+    }
+    if (!g_file_get_contents(file, &contents, &length, NULL)) {
+        error_setg(errp, "efr32bg22: cannot read %s image %s", what, file);
+        return false;
+    }
+    if (length == 0 || length > size) {
+        error_setg(errp, "efr32bg22: %s image %s is %zu bytes; the page "
+                   "holds 1..%zu", what, file, (size_t)length, size);
+        return false;
+    }
+    memcpy(dest, contents, length);
+    return true;
+}
+
+/*
+ * Fill the information block: the default module identity, or the DEVINFO
+ * and USERDATA pages read from a part.  Then size flash and RAM from
+ * DEVINFO.MSIZE.
+ */
+/* Parse "PD02=968,PA5=0": GPIO pin voltages in millivolts. */
+static bool efr32_soc_parse_analog(Efr32Bg22SoCState *s, Error **errp)
+{
+    g_auto(GStrv) items = NULL;
+
+    for (unsigned port = 0; port < EFR32_GPIO_PORTS; port++) {
+        for (unsigned pin = 0; pin < EFR32_GPIO_PINS; pin++) {
+            s->periph.analog_mv[port][pin] = -1;
+        }
+    }
+    if (!s->analog || !*s->analog) {
+        return true;
+    }
+    items = g_strsplit(s->analog, ",", -1);
+    for (char **item = items; *item; item++) {
+        unsigned pin, mv;
+        char port, end;
+
+        if (sscanf(*item, "P%c%u=%u%c", &port, &pin, &mv, &end) != 3 ||
+            port < 'A' || port >= 'A' + EFR32_GPIO_PORTS ||
+            pin >= EFR32_GPIO_PINS || mv > INT32_MAX) {
+            error_setg(errp, "efr32bg22: analog input '%s' is not "
+                       "P<port><pin>=<millivolts>", *item);
+            return false;
+        }
+        s->periph.analog_mv[port - 'A'][pin] = mv;
+    }
+    return true;
+}
+
+static bool efr32_soc_load_identity(Efr32Bg22SoCState *s, Error **errp)
+{
+    uint8_t *info = memory_region_get_ram_ptr(&s->devinfo);
+    uint8_t *devinfo = info + EFR32_DEVINFO_OFFSET;
+    uint32_t msize, flash_kb, sram_kb;
+
+    memset(info, EFR32_FLASH_ERASED_BYTE, EFR32_DEVINFO_OFFSET);
+    memset(devinfo, 0, EFR32_DEVINFO_WINDOW_SIZE);
+    if (s->devinfo_file) {
+        /* A captured page is taken whole; erased words stay erased. */
+        memset(devinfo, EFR32_FLASH_ERASED_BYTE, EFR32_DEVINFO_SIZE);
+        if (!efr32_info_load(devinfo, s->devinfo_file, EFR32_DEVINFO_SIZE,
+                             "DEVINFO", errp)) {
+            return false;
+        }
+    } else {
+        efr32_info_put(devinfo, EFR32_DEVINFO_MSIZE,
+                       EFR32_BGM220_HNA2_FLASH_KB |
+                       (EFR32_BGM220_HNA2_SRAM_KB <<
+                        EFR32_DEVINFO_MSIZE_SRAM_SHIFT));
+        efr32_info_put(devinfo, EFR32_DEVINFO_EUI64L,
+                       EFR32_BGM220_HNA2_EUI64L);
+        efr32_info_put(devinfo, EFR32_DEVINFO_EUI64H,
+                       EFR32_BGM220_HNA2_EUI64H);
+        for (unsigned i = 0; i < EFR32_DEVINFO_MODULENAME_WORDS; i++) {
+            efr32_info_put(devinfo, EFR32_DEVINFO_MODULENAME0 + 4 * i,
+                           efr32_bgm220_hna2_module_name[i]);
+        }
+        efr32_info_put(devinfo, EFR32_DEVINFO_MODULEINFO,
+                       EFR32_BGM220_HNA2_MODULEINFO);
+    }
+    if (!efr32_info_load(info + EFR32_USERDATA_OFFSET, s->userdata_file,
+                         EFR32_USERDATA_SIZE, "USERDATA", errp)) {
+        return false;
+    }
+
+    msize = ldl_le_p(devinfo + EFR32_DEVINFO_MSIZE);
+    flash_kb = msize & EFR32_DEVINFO_MSIZE_FLASH_MASK;
+    sram_kb = (msize >> EFR32_DEVINFO_MSIZE_SRAM_SHIFT) &
+              EFR32_DEVINFO_MSIZE_SRAM_MASK;
+    s->flash_size = flash_kb * KiB;
+    s->sram_size = sram_kb * KiB;
+    if (s->flash_size == 0 || s->flash_size > EFR32_FLASH_MAX_SIZE ||
+        s->flash_size % EFR32_FLASH_PAGE_SIZE) {
+        error_setg(errp, "efr32bg22: DEVINFO.MSIZE 0x%08x: FLASH %u KB is "
+                   "not a whole number of 8 KB pages up to 512 KB",
+                   msize, flash_kb);
+        return false;
+    }
+    if (s->sram_size == 0 || s->sram_size > EFR32_SRAM_MAX_SIZE) {
+        error_setg(errp, "efr32bg22: DEVINFO.MSIZE 0x%08x: SRAM %u KB is "
+                   "outside 1..32 KB", msize, sram_kb);
+        return false;
+    }
+    return true;
+}
 
 static MemTxResult efr32_seqram_m33_read(void *opaque, hwaddr offset,
                                          uint64_t *data, unsigned size,
@@ -4430,6 +5537,41 @@ static const MemoryRegionOps efr32_seqram_m33_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = {.min_access_size = 1, .max_access_size = 4},
     .impl = {.min_access_size = 1, .max_access_size = 4},
+};
+
+/* AIRCR.SYSRESETREQ of the M33: a system reset with RSTCAUSE.SYSREQ. */
+static void efr32_soc_sysresetreq(void *opaque, int n, int level)
+{
+    Efr32Bg22SoCState *s = opaque;
+
+    if (level) {
+        s->periph.rstcause |= EFR32_EMU_RSTCAUSE_SYSREQ;
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    }
+}
+
+/*
+ * The M0+'s view of the secure peripheral window 0x40000000-0x4fffffff
+ * (docs/radio-tables.md SS7.74, measured): no fault, and TIMER1.CNT at
+ * 0x4004C024 reads 0 while the same register at 0x5004C024 counts.
+ * [U] Whether a write there lands is unmeasured; it is dropped here.
+ */
+static uint64_t efr32_seq_periph_s_read(void *opaque, hwaddr offset,
+                                        unsigned size)
+{
+    return 0;
+}
+
+static void efr32_seq_periph_s_write(void *opaque, hwaddr offset,
+                                     uint64_t value, unsigned size)
+{
+}
+
+static const MemoryRegionOps efr32_seq_periph_s_ops = {
+    .read = efr32_seq_periph_s_read,
+    .write = efr32_seq_periph_s_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {.min_access_size = 1, .max_access_size = 4},
 };
 
 static void efr32_soc_init(Object *obj)
@@ -4507,12 +5649,31 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
     clock_set_hz(s->burtc_clk, 32768);
     s->pclk = clock_new(OBJECT(s), "PCLK");
 
-    memory_region_init_ram(&s->flash, OBJECT(s), flash_name, FLASH_SIZE,
+    /*
+     * Identity first: flash and RAM are sized from DEVINFO.MSIZE.  Addresses
+     * past the flash end are left unmapped, so an access there is a bus
+     * fault, as RM SS4.2.1.2 and SS6.6.4 describe for an address that is not
+     * assigned (SYSCFG_CTRL.ADDRFAULTEN, set by default).
+     */
+    memory_region_init_ram(&s->devinfo, OBJECT(s), devinfo_name,
+                           EFR32_INFO_WINDOW_SIZE, &error_fatal);
+    memory_region_add_subregion(s->memory, EFR32_INFO_BASE, &s->devinfo);
+    if (!efr32_soc_load_identity(s, errp)) {
+        return;
+    }
+    memory_region_init_ram(&s->flash, OBJECT(s), flash_name, s->flash_size,
                            &error_fatal);
     memory_region_add_subregion(s->memory, 0, &s->flash);
-    memory_region_init_ram(&s->sram, OBJECT(s), sram_name, SRAM_SIZE,
+    memory_region_init_ram(&s->sram, OBJECT(s), sram_name, s->sram_size,
                            &error_fatal);
-    memory_region_add_subregion(s->memory, 0x20000000, &s->sram);
+    memory_region_add_subregion(s->memory, EFR32_SRAM_BASE, &s->sram);
+    s->periph.flash_size = s->flash_size;
+    if (!efr32_soc_parse_analog(s, errp)) {
+        return;
+    }
+    s->periph.chiprev = efr32_chiprev_from_part(
+        ldl_le_p((uint8_t *)memory_region_get_ram_ptr(&s->devinfo) +
+                 EFR32_DEVINFO_OFFSET + EFR32_DEVINFO_PART));
 
     qdev_prop_set_uint32(nvic, "num-irq", 64);
     qdev_connect_clock_in(nvic, "cpuclk", s->clk);
@@ -4538,6 +5699,9 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->armv7m), errp)) {
         return;
     }
+    qdev_connect_gpio_out_named(nvic, "SYSRESETREQ", 0,
+                                qemu_allocate_irq(efr32_soc_sysresetreq, s,
+                                                  0));
 
     s->periph.rf_medium = s->rf_medium;
     s->periph.endpoint_id = s->endpoint_id;
@@ -4591,6 +5755,28 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
                              RADIO_SIZE);
     memory_region_add_subregion(&s->seq_memory, RADIO_BASE,
                                 &s->seq_radio_alias);
+    /*
+     * SS7.74 (silicon, M0+ address map): main SRAM at 0x20000000 is the
+     * M33's SRAM; the non-secure peripheral window 0x5xxxxxxx reaches the
+     * peripherals (TIMER1, PRS, CMU); the secure window reads 0.  The stock
+     * sequencer reads EMU.TEMP through the secure window (0x40004088).
+     */
+    memory_region_init_alias(&s->seq_sram_alias, OBJECT(s), "efr32.seq-sram",
+                             &s->sram, 0, s->sram_size);
+    memory_region_add_subregion(&s->seq_memory, EFR32_SRAM_BASE,
+                                &s->seq_sram_alias);
+    memory_region_init_alias(&s->seq_periph_ns_alias, OBJECT(s),
+                             "efr32.seq-periph-ns",
+                             sysbus_mmio_get_region(periph, 0),
+                             PERIPH_NONSECURE_OFFSET,
+                             PERIPH_NONSECURE_END - PERIPH_NONSECURE_BASE);
+    memory_region_add_subregion(&s->seq_memory, PERIPH_NONSECURE_BASE,
+                                &s->seq_periph_ns_alias);
+    memory_region_init_io(&s->seq_periph_s_window, OBJECT(s),
+                          &efr32_seq_periph_s_ops, s,
+                          "efr32.seq-periph-secure", PERIPH_NONSECURE_OFFSET);
+    memory_region_add_subregion(&s->seq_memory, PERIPH_BASE,
+                                &s->seq_periph_s_window);
     qdev_prop_set_uint32(DEVICE(&s->seq_armv7m), "num-irq", 64);
     qdev_connect_clock_in(DEVICE(&s->seq_armv7m), "cpuclk", s->seq_clk);
     qdev_prop_set_string(DEVICE(&s->seq_armv7m), "cpu-type",
@@ -4632,10 +5818,8 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
         s->periph.seq_irq_state[state] =
             qdev_get_gpio_in(DEVICE(&s->seq_armv7m), state);
     }
-    memory_region_init_ram(&s->devinfo, OBJECT(s), devinfo_name, 0x10000,
-                           &error_fatal);
-    memory_region_add_subregion(s->memory, 0x0fe00000, &s->devinfo);
-    efr32_initialize_devinfo(&s->devinfo);
+    s->periph.seq_irq_mailbox =
+        qdev_get_gpio_in(DEVICE(&s->seq_armv7m), EFR32_RDMAILBOX_SEQ_IRQ);
 }
 
 static Property efr32_soc_properties[] = {
@@ -4646,6 +5830,9 @@ static Property efr32_soc_properties[] = {
     DEFINE_PROP_LINK("idau", Efr32Bg22SoCState, idau, TYPE_IDAU_INTERFACE,
                      Object *),
     DEFINE_PROP_BOOL("core-clocks", Efr32Bg22SoCState, core_clocks, true),
+    DEFINE_PROP_STRING("devinfo", Efr32Bg22SoCState, devinfo_file),
+    DEFINE_PROP_STRING("userdata", Efr32Bg22SoCState, userdata_file),
+    DEFINE_PROP_STRING("analog", Efr32Bg22SoCState, analog),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -4665,6 +5852,13 @@ static const TypeInfo efr32_soc_info = {
     .class_init = efr32_soc_class_init,
 };
 
+/* A raw image of n bytes at offset lies inside this part's main flash. */
+static bool efr32_fits_flash(Efr32Bg22SoCState *soc, uint32_t offset,
+                             gsize n)
+{
+    return offset <= soc->flash_size && n <= soc->flash_size - offset;
+}
+
 static void init(MachineState *m)
 {
     Efr32State *s = EFR32BG22_MACHINE(m);
@@ -4679,13 +5873,25 @@ static void init(MachineState *m)
     object_property_set_link(OBJECT(&s->soc), "rf-medium", OBJECT(s->rf_medium),
                              &error_fatal);
     object_property_set_link(OBJECT(&s->soc), "idau", OBJECT(m), &error_fatal);
+    if (s->devinfo) {
+        object_property_set_str(OBJECT(&s->soc), "devinfo", s->devinfo,
+                                &error_fatal);
+    }
+    if (s->userdata) {
+        object_property_set_str(OBJECT(&s->soc), "userdata", s->userdata,
+                                &error_fatal);
+    }
+    if (s->analog) {
+        object_property_set_str(OBJECT(&s->soc), "analog", s->analog,
+                                &error_fatal);
+    }
     sysbus_realize(SYS_BUS_DEVICE(&s->soc), &error_fatal);
     if (s->image)
     {
         gchar *d;
         gsize n;
         if (!g_file_get_contents(s->image, &d, &n, NULL) ||
-            n > FLASH_SIZE - s->flash_offset)
+            !efr32_fits_flash(&s->soc, s->flash_offset, n))
         {
             error_report("efr32bg22: cannot load flash image %s", s->image);
             exit(EXIT_FAILURE);
@@ -4701,7 +5907,7 @@ static void init(MachineState *m)
         gsize n;
 
         if (!g_file_get_contents(s->flash_overlay, &d, &n, NULL) ||
-            n > FLASH_SIZE - s->flash_overlay_offset) {
+            !efr32_fits_flash(&s->soc, s->flash_overlay_offset, n)) {
             error_report("efr32bg22: cannot load flash overlay %s",
                          s->flash_overlay);
             exit(EXIT_FAILURE);
@@ -4741,6 +5947,40 @@ static void flash_overlay_set(Object *o, const char *v, Error **e)
 
     g_free(s->flash_overlay);
     s->flash_overlay = g_strdup(v);
+}
+
+static char *devinfo_get(Object *o, Error **e)
+{
+    return g_strdup(EFR32BG22_MACHINE(o)->devinfo);
+}
+static void devinfo_set(Object *o, const char *v, Error **e)
+{
+    Efr32State *s = EFR32BG22_MACHINE(o);
+
+    g_free(s->devinfo);
+    s->devinfo = g_strdup(v);
+}
+static char *analog_get(Object *o, Error **e)
+{
+    return g_strdup(EFR32BG22_MACHINE(o)->analog);
+}
+static void analog_set(Object *o, const char *v, Error **e)
+{
+    Efr32State *s = EFR32BG22_MACHINE(o);
+
+    g_free(s->analog);
+    s->analog = g_strdup(v);
+}
+static char *userdata_get(Object *o, Error **e)
+{
+    return g_strdup(EFR32BG22_MACHINE(o)->userdata);
+}
+static void userdata_set(Object *o, const char *v, Error **e)
+{
+    Efr32State *s = EFR32BG22_MACHINE(o);
+
+    g_free(s->userdata);
+    s->userdata = g_strdup(v);
 }
 
 static bool *efr32_core_clocks_field(Object *o)
@@ -4793,7 +6033,7 @@ static void mc(ObjectClass *o, void *d)
     m->init = init;
     m->valid_cpu_types = cpu;
     m->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-m33");
-    m->default_ram_size = FLASH_SIZE;
+    m->default_ram_size = EFR32_FLASH_MAX_SIZE;
     m->min_cpus = 2;
     m->max_cpus = 2;
     m->default_cpus = 2;
@@ -4801,6 +6041,15 @@ static void mc(ObjectClass *o, void *d)
     object_class_property_add_str(o, "flash", image_get, image_set);
     object_class_property_add_str(o, "flash-overlay", flash_overlay_get,
                                   flash_overlay_set);
+    /*
+     * Part identity: raw DEVINFO (0x0FE08000) and USERDATA (0x0FE00000)
+     * page images read from a chip.  Flash and RAM follow DEVINFO.MSIZE.
+     * Without them the board is the BGM220PC22HNA2 explorer-kit module.
+     */
+    object_class_property_add_str(o, "devinfo", devinfo_get, devinfo_set);
+    object_class_property_add_str(o, "userdata", userdata_get, userdata_set);
+    /* Board analog inputs for the IADC: "PD02=968,..." in millivolts. */
+    object_class_property_add_str(o, "analog", analog_get, analog_set);
 }
 static const TypeInfo machine_info = {
     .name = TYPE_EFR32BG22_MACHINE,
@@ -4833,13 +6082,26 @@ static void dual_init(MachineState *m)
                                  OBJECT(s->rf_medium), &error_fatal);
         object_property_set_link(OBJECT(&s->soc[index]), "idau", OBJECT(m),
                                  &error_fatal);
+        if (s->devinfo[index]) {
+            object_property_set_str(OBJECT(&s->soc[index]), "devinfo",
+                                    s->devinfo[index], &error_fatal);
+        }
+        if (s->userdata[index]) {
+            object_property_set_str(OBJECT(&s->soc[index]), "userdata",
+                                    s->userdata[index], &error_fatal);
+        }
+        if (s->analog[index]) {
+            object_property_set_str(OBJECT(&s->soc[index]), "analog",
+                                    s->analog[index], &error_fatal);
+        }
         sysbus_realize(SYS_BUS_DEVICE(&s->soc[index]), &error_fatal);
         if (s->image[index]) {
             gchar *contents;
             gsize length;
 
             if (!g_file_get_contents(s->image[index], &contents, &length,
-                                     NULL) || length > FLASH_SIZE) {
+                                     NULL) ||
+                !efr32_fits_flash(&s->soc[index], 0, length)) {
                 error_report("efr32bg22-dual: cannot load flash image %s",
                              s->image[index]);
                 exit(EXIT_FAILURE);
@@ -4901,6 +6163,51 @@ static void dual_image1_set(Object *o, const char *value, Error **errp)
     s->image[1] = g_strdup(value);
 }
 
+/* Per-SoC board files of the dual machine: devinfo, userdata, analog 0/1. */
+static char **efr32_dual_identity_field(Object *o, const char *name)
+{
+    Efr32DualState *s = EFR32BG22_DUAL_MACHINE(o);
+    unsigned index = name[strlen(name) - 1] - '0';
+
+    if (g_str_has_prefix(name, "devinfo")) {
+        return &s->devinfo[index];
+    }
+    if (g_str_has_prefix(name, "analog")) {
+        return &s->analog[index];
+    }
+    return &s->userdata[index];
+}
+
+static char *dual_identity_get(Object *o, Error **errp, const char *name)
+{
+    return g_strdup(*efr32_dual_identity_field(o, name));
+}
+
+static void dual_identity_set(Object *o, const char *value, Error **errp,
+                              const char *name)
+{
+    char **field = efr32_dual_identity_field(o, name);
+
+    g_free(*field);
+    *field = g_strdup(value);
+}
+
+#define EFR32_DUAL_IDENTITY_ACCESSORS(prop)                                  \
+    static char *dual_##prop##_get(Object *o, Error **errp)                  \
+    {                                                                        \
+        return dual_identity_get(o, errp, #prop);                            \
+    }                                                                        \
+    static void dual_##prop##_set(Object *o, const char *v, Error **errp)    \
+    {                                                                        \
+        dual_identity_set(o, v, errp, #prop);                                \
+    }
+EFR32_DUAL_IDENTITY_ACCESSORS(devinfo0)
+EFR32_DUAL_IDENTITY_ACCESSORS(devinfo1)
+EFR32_DUAL_IDENTITY_ACCESSORS(userdata0)
+EFR32_DUAL_IDENTITY_ACCESSORS(userdata1)
+EFR32_DUAL_IDENTITY_ACCESSORS(analog0)
+EFR32_DUAL_IDENTITY_ACCESSORS(analog1)
+
 static void efr32_dual_machine_instance_init(Object *obj)
 {
     Efr32DualState *s = EFR32BG22_DUAL_MACHINE(obj);
@@ -4921,7 +6228,7 @@ static void dual_mc(ObjectClass *o, void *d)
     m->init = dual_init;
     m->valid_cpu_types = cpu;
     m->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-m33");
-    m->default_ram_size = 2 * FLASH_SIZE;
+    m->default_ram_size = 2 * EFR32_FLASH_MAX_SIZE;
     m->min_cpus = 4;
     m->max_cpus = 4;
     m->default_cpus = 4;
@@ -4930,6 +6237,18 @@ static void dual_mc(ObjectClass *o, void *d)
                                   dual_image0_set);
     object_class_property_add_str(o, "flash1", dual_image1_get,
                                   dual_image1_set);
+    object_class_property_add_str(o, "devinfo0", dual_devinfo0_get,
+                                  dual_devinfo0_set);
+    object_class_property_add_str(o, "devinfo1", dual_devinfo1_get,
+                                  dual_devinfo1_set);
+    object_class_property_add_str(o, "userdata0", dual_userdata0_get,
+                                  dual_userdata0_set);
+    object_class_property_add_str(o, "userdata1", dual_userdata1_get,
+                                  dual_userdata1_set);
+    object_class_property_add_str(o, "analog0", dual_analog0_get,
+                                  dual_analog0_set);
+    object_class_property_add_str(o, "analog1", dual_analog1_get,
+                                  dual_analog1_set);
 }
 
 static const TypeInfo dual_machine_info = {

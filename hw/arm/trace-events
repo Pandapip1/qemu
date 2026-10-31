@@ -84,6 +84,8 @@ efr32bg22_burtc_irq(unsigned endpoint, uint64_t now, bool level, uint32_t pendin
 efr32bg22_timer0_event(unsigned endpoint, uint64_t now, uint32_t count, uint32_t flags) "endpoint=%u now=%" PRIu64 " TIMER0 event CNT=0x%08x IF|=0x%08x"
 efr32bg22_timer0_write(unsigned endpoint, uint64_t now, uint32_t offset, uint32_t value, uint32_t count) "endpoint=%u now=%" PRIu64 " TIMER0 write +0x%03x=0x%08x CNT=0x%08x"
 efr32bg22_usart_tx(unsigned index, uint8_t value) "USART%u TX=0x%02x"
+efr32_mmio_read(unsigned endpoint, int cpu, uint32_t pc, uint32_t address, unsigned size, uint64_t value, int result) "endpoint=%u cpu=%d pc=0x%08x R addr=0x%08x size=%u value=0x%08" PRIx64 " result=%d"
+efr32_mmio_write(unsigned endpoint, int cpu, uint32_t pc, uint32_t address, unsigned size, uint64_t value, int result) "endpoint=%u cpu=%d pc=0x%08x W addr=0x%08x size=%u value=0x%08" PRIx64 " result=%d"
 
 # efr32-usart.c
 efr32_usart_rx(unsigned index, uint8_t value) "USART%u RX=0x%02x"
