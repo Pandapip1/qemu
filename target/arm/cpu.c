@@ -133,6 +133,10 @@ static bool arm_cpu_has_work(CPUState *cs)
 {
     ARMCPU *cpu = ARM_CPU(cs);
 
+    /* A core in Debug state does not run or take interrupts (B13.2.1). */
+    if (cpu->m_debug_halted) {
+        return false;
+    }
     return (cpu->power_state != PSCI_OFF)
         && cs->interrupt_request &
         (CPU_INTERRUPT_FIQ | CPU_INTERRUPT_HARD
@@ -577,6 +581,19 @@ static void arm_cpu_reset_hold(Object *obj, ResetType type)
         hw_watchpoint_update_all(cpu);
 
         arm_rebuild_hflags(env);
+    }
+
+    /*
+     * Reset leaves Debug state; the debug unit (which a Warm reset does not
+     * reset) decides what follows, e.g. a reset vector catch.  It also
+     * re-arms its breakpoint comparators, which hw_breakpoint_update_all()
+     * has just removed.
+     */
+    if (arm_feature(env, ARM_FEATURE_M)) {
+        cpu->m_debug_halted = false;
+        if (cpu->m_debug_ops) {
+            cpu->m_debug_ops->reset(cpu->m_debug_opaque);
+        }
     }
 }
 

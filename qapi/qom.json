@@ -520,6 +520,27 @@
   'if': 'CONFIG_LINUX' }
 
 ##
+# @UsbGadgetHostProperties:
+#
+# Properties for usb-gadget-host objects: a host USB device controller
+# (UDC), driven through Linux raw-gadget, handed to an emulated USB
+# device.
+#
+# @path: the raw-gadget device node (default: /dev/raw-gadget)
+#
+# @udc-driver: the UDC's driver name
+#
+# @udc-device: the UDC's device name, as listed in /sys/class/udc
+#
+# Since: 9.2
+##
+{ 'struct': 'UsbGadgetHostProperties',
+  'data': { '*path': 'str',
+            'udc-driver': 'str',
+            'udc-device': 'str' },
+  'if': 'CONFIG_LINUX' }
+
+##
 # @EventLoopBaseProperties:
 #
 # Common properties for event loops
@@ -1137,6 +1158,8 @@
     'tls-creds-psk',
     'tls-creds-x509',
     'tls-cipher-suites',
+    { 'name': 'usb-gadget-host',
+      'if': 'CONFIG_LINUX' },
     { 'name': 'x-remote-object', 'features': [ 'unstable' ] },
     { 'name': 'x-vfio-user-server', 'features': [ 'unstable' ] }
   ] }
@@ -1210,6 +1233,8 @@
       'tls-creds-psk':              'TlsCredsPskProperties',
       'tls-creds-x509':             'TlsCredsX509Properties',
       'tls-cipher-suites':          'TlsCredsProperties',
+      'usb-gadget-host':            { 'type': 'UsbGadgetHostProperties',
+                                      'if': 'CONFIG_LINUX' },
       'x-remote-object':            'RemoteObjectProperties',
       'x-vfio-user-server':         'VfioUserServerProperties'
   } }

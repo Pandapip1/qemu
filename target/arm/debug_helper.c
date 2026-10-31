@@ -381,6 +381,12 @@ bool arm_debug_check_breakpoint(CPUState *cs)
     target_ulong pc;
     int n;
 
+    /* M-profile breakpoints are the board debug unit's FPB comparators. */
+    if (arm_feature(env, ARM_FEATURE_M)) {
+        return cpu->m_debug_ops &&
+               cpu->m_debug_ops->check_breakpoint(cpu->m_debug_opaque);
+    }
+
     /*
      * If breakpoints are disabled globally or we can't take debug
      * exceptions here then breakpoint firings are ignored.
@@ -471,6 +477,16 @@ void arm_debug_excp_handler(CPUState *cs)
     ARMCPU *cpu = ARM_CPU(cs);
     CPUARMState *env = &cpu->env;
     CPUWatchpoint *wp_hit = cs->watchpoint_hit;
+
+    /*
+     * M profile: a halting step or an FPB match.  GDB's own breakpoints and
+     * single-steps (no debug unit attached) keep their gdbstub handling.
+     */
+    if (arm_feature(env, ARM_FEATURE_M) && cpu->m_debug_ops && !wp_hit &&
+        !cpu_breakpoint_test(cs, env->regs[15], BP_GDB)) {
+        cpu->m_debug_ops->debug_event(cpu->m_debug_opaque);
+        return;
+    }
 
     if (wp_hit) {
         if (wp_hit->flags & BP_CPU) {

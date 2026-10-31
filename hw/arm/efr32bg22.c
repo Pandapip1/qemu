@@ -19,6 +19,7 @@
 #include "hw/irq.h"
 #include "hw/sysbus.h"
 #include "hw/arm/armv7m.h"
+#include "hw/arm/efr32bg22-debug.h"
 #include "sysemu/reset.h"
 #include "sysemu/runstate.h"
 #include "sysemu/cpu-timers.h"
@@ -496,6 +497,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_SYSCFG_CHIPREV_FAMILY_MG22 52u
 #define EFR32_SYSCFG_CHIPREV_FAMILY_BG22 53u
 #define EFR32_SYSCFG_CHIPREV_FAMILY_FG22 55u
+/*
+ * Core identity: CPUID of the BG22's Cortex-M33, r0p4 as OpenOCD reads it
+ * on the EK and the suit (owo-open-fw docs/debug-port-model.md).
+ */
+#define EFR32_M33_CPUID 0x410fd214u
 
 /*
  * MSC flash programming (RM SS6.3.12, register map SS6.7-6.8, reset values
@@ -542,6 +548,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_MSC_PAGES_PER_LOCKWORD 32u
 #define EFR32_MSC_IPVERSION_VALUE 0x1u
 #define EFR32_MSC_IRQ 49
+/* READCTRL resets to MODE = 2 (RM SS6.8.2) */
+#define EFR32_MSC_READCTRL_RESET 0x00200000u
+/* WREN, IRQERASEABORT and LPWRITE are the writable fields (RM SS6.8.3) */
+#define EFR32_MSC_WRITECTRL_MASK 0x0000000bu
+#define EFR32_MSC_MISCLOCKWORD_MASK (EFR32_MSC_MISCLOCKWORD_MELOCKBIT | \
+                                     EFR32_MSC_MISCLOCKWORD_UDLOCKBIT)
+/* PWRCTRL resets to PWROFFDLY 0x10, PWROFFONEM1PENTRY (RM SS6.8.14) */
+#define EFR32_MSC_PWRCTRL 0x050u
+#define EFR32_MSC_PWRCTRL_RESET 0x00100002u
 
 /* EFR32BG22 TIMER2/4: public Series-2 register layout, IRQs 9/11. */
 #define EFR32_TIMER2_BASE 0x40050000u
@@ -3936,6 +3951,14 @@ static void efr32_msc_check_address(Efr32Periph *s)
 
     efr32_msc_status(s, EFR32_MSC_STATUS_INVADDR,
                      valid ? 0 : EFR32_MSC_STATUS_INVADDR);
+    /*
+     * Software checks INVADDR and LOCKED after loading ADDRB, before it
+     * starts an operation (RM SS6.3.12), so LOCKED follows ADDRB too.
+     */
+    efr32_msc_status(s, EFR32_MSC_STATUS_LOCKED,
+                     valid && efr32_msc_page_locked(
+                         s, efr32_msc_get(s, EFR32_MSC_ADDRB)) ?
+                     EFR32_MSC_STATUS_LOCKED : 0);
 }
 
 /* Returns true when the write to this MSC register is fully handled. */
@@ -3947,8 +3970,21 @@ static bool efr32_msc_write(Efr32Periph *s, uint32_t offset, uint32_t old,
 
     switch (offset) {
     case EFR32_MSC_READCTRL:
-    case EFR32_MSC_WRITECTRL:
         return reglocked;
+    case EFR32_MSC_WRITECTRL:
+        if (!reglocked) {
+            efr32_msc_put(s, offset, next & EFR32_MSC_WRITECTRL_MASK);
+        }
+        return true;
+    case EFR32_MSC_MISCLOCKWORD:
+        /*
+         * "Host is only allowed to write one. Root and debug can clear this
+         * bit" (RM SS6.8.13): a core can only set the locks; a debugger
+         * access (no current CPU: the debug port) may clear them.
+         */
+        efr32_msc_put(s, offset, (current_cpu ? old | next : next) &
+                                 EFR32_MSC_MISCLOCKWORD_MASK);
+        return true;
     case EFR32_MSC_WRITECMD:
         efr32_msc_command(s, next);
         return true;
@@ -3990,6 +4026,8 @@ static void efr32_msc_reset(Efr32Periph *s)
     efr32_msc_put(s, EFR32_MSC_STATUS, EFR32_MSC_STATUS_RESET);
     efr32_msc_put(s, EFR32_MSC_USERDATASIZE, EFR32_MSC_USERDATASIZE_RESET);
     efr32_msc_put(s, EFR32_MSC_MISCLOCKWORD, EFR32_MSC_MISCLOCKWORD_RESET);
+    efr32_msc_put(s, EFR32_MSC_READCTRL, EFR32_MSC_READCTRL_RESET);
+    efr32_msc_put(s, EFR32_MSC_PWRCTRL, EFR32_MSC_PWRCTRL_RESET);
     efr32_msc_update_irq(s);
 }
 
@@ -5546,6 +5584,8 @@ static void efr32_soc_sysresetreq(void *opaque, int n, int level)
 
     if (level) {
         s->periph.rstcause |= EFR32_EMU_RSTCAUSE_SYSREQ;
+        /* The debug port sees the system reset begin (efr32-dap) */
+        efr32bg22_debug_system_reset(OBJECT(s));
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
     }
 }
@@ -5699,9 +5739,18 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->armv7m), errp)) {
         return;
     }
+    /*
+     * CPUID: OpenOCD reports "Cortex-M33 r0p4 processor detected" on the
+     * EK and the suit; QEMU's cortex-m33 is r0p3.
+     */
+    s->armv7m.cpu->midr = EFR32_M33_CPUID;
     qdev_connect_gpio_out_named(nvic, "SYSRESETREQ", 0,
                                 qemu_allocate_irq(efr32_soc_sysresetreq, s,
                                                   0));
+    efr32bg22_debug_realize(OBJECT(s), &s->armv7m, &s->flash, s->clk, errp);
+    if (*errp) {
+        return;
+    }
 
     s->periph.rf_medium = s->rf_medium;
     s->periph.endpoint_id = s->endpoint_id;

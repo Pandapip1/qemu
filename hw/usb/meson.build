@@ -89,4 +89,10 @@ endif
 
 system_ss.add(when: ['CONFIG_USB', 'CONFIG_XEN_BUS', libusb], if_true: files('xen-usb.c'))
 
+# USB gadget passthrough (Linux raw-gadget) and the J-Link probe built on it
+if host_os == 'linux' and cc.has_header('linux/usb/raw_gadget.h')
+  system_ss.add(when: 'CONFIG_EFR32BG22',
+                if_true: files('gadget-host.c', '../misc/jlink.c'))
+endif
+
 modules += { 'hw-usb': hw_usb_modules }

@@ -549,6 +549,197 @@ static void switch_v7m_security_state(CPUARMState *env, bool new_secstate)
     }
 }
 
+/* DCRSR.REGSEL encodings (Armv8-M ARM, C1.6.3 / D1.2.3 DCRSR). */
+enum {
+    M_DEBUG_REGSEL_R12 = 0x0c,
+    M_DEBUG_REGSEL_SP = 0x0d,
+    M_DEBUG_REGSEL_LR = 0x0e,
+    M_DEBUG_REGSEL_DEBUGRETURNADDRESS = 0x0f,
+    M_DEBUG_REGSEL_XPSR = 0x10,
+    M_DEBUG_REGSEL_MSP = 0x11,
+    M_DEBUG_REGSEL_PSP = 0x12,
+    M_DEBUG_REGSEL_CONTROL_PACKED = 0x14,
+    M_DEBUG_REGSEL_MSP_NS = 0x18,
+    M_DEBUG_REGSEL_PSP_NS = 0x19,
+    M_DEBUG_REGSEL_MSP_S = 0x1a,
+    M_DEBUG_REGSEL_PSP_S = 0x1b,
+    M_DEBUG_REGSEL_MSPLIM_S = 0x1c,
+    M_DEBUG_REGSEL_PSPLIM_S = 0x1d,
+    M_DEBUG_REGSEL_MSPLIM_NS = 0x1e,
+    M_DEBUG_REGSEL_PSPLIM_NS = 0x1f,
+    M_DEBUG_REGSEL_FPSCR = 0x21,
+    M_DEBUG_REGSEL_CONTROL_PACKED_S = 0x22,
+    M_DEBUG_REGSEL_CONTROL_PACKED_NS = 0x23,
+    M_DEBUG_REGSEL_S0 = 0x40,
+    M_DEBUG_REGSEL_S31 = 0x5f,
+};
+
+/* Packed {CONTROL, FAULTMASK, BASEPRI, PRIMASK} word, one byte each. */
+#define M_DEBUG_PACKED_CONTROL_SHIFT 24
+#define M_DEBUG_PACKED_FAULTMASK_SHIFT 16
+#define M_DEBUG_PACKED_BASEPRI_SHIFT 8
+#define M_DEBUG_PACKED_PRIMASK_SHIFT 0
+
+static uint32_t *m_debug_sp_ptr(CPUARMState *env, unsigned regsel,
+                                bool secure)
+{
+    switch (regsel) {
+    case M_DEBUG_REGSEL_MSP:
+        return arm_v7m_get_sp_ptr(env, secure, false, true);
+    case M_DEBUG_REGSEL_PSP:
+        return arm_v7m_get_sp_ptr(env, secure, true, true);
+    case M_DEBUG_REGSEL_MSP_NS:
+        return arm_v7m_get_sp_ptr(env, false, false, true);
+    case M_DEBUG_REGSEL_PSP_NS:
+        return arm_v7m_get_sp_ptr(env, false, true, true);
+    case M_DEBUG_REGSEL_MSP_S:
+        return arm_v7m_get_sp_ptr(env, true, false, true);
+    case M_DEBUG_REGSEL_PSP_S:
+        return arm_v7m_get_sp_ptr(env, true, true, true);
+    case M_DEBUG_REGSEL_MSPLIM_S:
+        return &env->v7m.msplim[M_REG_S];
+    case M_DEBUG_REGSEL_PSPLIM_S:
+        return &env->v7m.psplim[M_REG_S];
+    case M_DEBUG_REGSEL_MSPLIM_NS:
+        return &env->v7m.msplim[M_REG_NS];
+    case M_DEBUG_REGSEL_PSPLIM_NS:
+        return &env->v7m.psplim[M_REG_NS];
+    default:
+        return NULL;
+    }
+}
+
+static bool m_debug_packed_bank(CPUARMState *env, unsigned regsel,
+                                bool secure, bool *bank)
+{
+    switch (regsel) {
+    case M_DEBUG_REGSEL_CONTROL_PACKED:
+        *bank = secure;
+        return true;
+    case M_DEBUG_REGSEL_CONTROL_PACKED_S:
+        *bank = true;
+        return arm_feature(env, ARM_FEATURE_M_SECURITY);
+    case M_DEBUG_REGSEL_CONTROL_PACKED_NS:
+        *bank = false;
+        return arm_feature(env, ARM_FEATURE_M_SECURITY);
+    default:
+        return false;
+    }
+}
+
+bool arm_m_debug_read_reg(ARMCPU *cpu, unsigned regsel, bool secure,
+                          uint32_t *value)
+{
+    CPUARMState *env = &cpu->env;
+    uint32_t *ptr;
+    bool bank;
+
+    if (regsel <= M_DEBUG_REGSEL_R12 || regsel == M_DEBUG_REGSEL_SP ||
+        regsel == M_DEBUG_REGSEL_LR ||
+        regsel == M_DEBUG_REGSEL_DEBUGRETURNADDRESS) {
+        *value = env->regs[regsel];
+        return true;
+    }
+    if (regsel == M_DEBUG_REGSEL_XPSR) {
+        *value = xpsr_read(env);
+        return true;
+    }
+    if (m_debug_packed_bank(env, regsel, secure, &bank)) {
+        *value = (arm_v7m_mrs_control(env, bank)
+                  << M_DEBUG_PACKED_CONTROL_SHIFT) |
+                 (env->v7m.faultmask[bank] << M_DEBUG_PACKED_FAULTMASK_SHIFT) |
+                 (env->v7m.basepri[bank] << M_DEBUG_PACKED_BASEPRI_SHIFT) |
+                 (env->v7m.primask[bank] << M_DEBUG_PACKED_PRIMASK_SHIFT);
+        return true;
+    }
+    if (regsel == M_DEBUG_REGSEL_FPSCR) {
+        *value = vfp_get_fpscr(env);
+        return true;
+    }
+    if (regsel >= M_DEBUG_REGSEL_S0 && regsel <= M_DEBUG_REGSEL_S31) {
+        unsigned s = regsel - M_DEBUG_REGSEL_S0;
+
+        *value = extract64(*aa32_vfp_dreg(env, s / 2), (s % 2) * 32, 32);
+        return true;
+    }
+    ptr = m_debug_sp_ptr(env, regsel, secure);
+    if (ptr) {
+        *value = *ptr;
+        return true;
+    }
+    return false;
+}
+
+bool arm_m_debug_write_reg(ARMCPU *cpu, unsigned regsel, bool secure,
+                           uint32_t value)
+{
+    CPUARMState *env = &cpu->env;
+    uint32_t *ptr;
+    bool bank;
+
+    if (regsel <= M_DEBUG_REGSEL_R12 || regsel == M_DEBUG_REGSEL_LR) {
+        env->regs[regsel] = value;
+    } else if (regsel == M_DEBUG_REGSEL_SP) {
+        env->regs[13] = value & ~3u;
+    } else if (regsel == M_DEBUG_REGSEL_DEBUGRETURNADDRESS) {
+        /* Bit 0 of DebugReturnAddress is ignored (C1.6.3). */
+        env->regs[15] = value & ~1u;
+    } else if (regsel == M_DEBUG_REGSEL_XPSR) {
+        /* IPSR changes Handler/Thread mode and so the active SP. */
+        write_v7m_exception(env, value & XPSR_EXCP);
+        xpsr_write(env, value, ~XPSR_EXCP);
+    } else if (m_debug_packed_bank(env, regsel, secure, &bank)) {
+        uint32_t control = extract32(value, M_DEBUG_PACKED_CONTROL_SHIFT, 8);
+
+        env->v7m.primask[bank] =
+            extract32(value, M_DEBUG_PACKED_PRIMASK_SHIFT, 1);
+        env->v7m.basepri[bank] =
+            extract32(value, M_DEBUG_PACKED_BASEPRI_SHIFT, 8);
+        env->v7m.faultmask[bank] =
+            extract32(value, M_DEBUG_PACKED_FAULTMASK_SHIFT, 1);
+        env->v7m.control[bank] =
+            deposit32(env->v7m.control[bank], R_V7M_CONTROL_NPRIV_SHIFT, 1,
+                      extract32(control, R_V7M_CONTROL_NPRIV_SHIFT, 1));
+        write_v7m_control_spsel_for_secstate(
+            env, extract32(control, R_V7M_CONTROL_SPSEL_SHIFT, 1), bank);
+        if (cpu_isar_feature(aa32_vfp_simd, cpu)) {
+            /* FPCA and SFPA live in the Secure bank in QEMU. */
+            env->v7m.control[M_REG_S] =
+                deposit32(env->v7m.control[M_REG_S],
+                          R_V7M_CONTROL_FPCA_SHIFT, 1,
+                          extract32(control, R_V7M_CONTROL_FPCA_SHIFT, 1));
+            if (bank) {
+                env->v7m.control[M_REG_S] =
+                    deposit32(env->v7m.control[M_REG_S],
+                              R_V7M_CONTROL_SFPA_SHIFT, 1,
+                              extract32(control, R_V7M_CONTROL_SFPA_SHIFT,
+                                        1));
+            }
+        }
+    } else if (regsel == M_DEBUG_REGSEL_FPSCR) {
+        vfp_set_fpscr(env, value);
+    } else if (regsel >= M_DEBUG_REGSEL_S0 && regsel <= M_DEBUG_REGSEL_S31) {
+        unsigned s = regsel - M_DEBUG_REGSEL_S0;
+        uint64_t *d = aa32_vfp_dreg(env, s / 2);
+
+        *d = deposit64(*d, (s % 2) * 32, 32, value);
+    } else {
+        ptr = m_debug_sp_ptr(env, regsel, secure);
+        if (!ptr) {
+            return false;
+        }
+        *ptr = value & ~3u;
+    }
+    arm_rebuild_hflags(env);
+    return true;
+}
+
+void arm_m_debug_set_secure(ARMCPU *cpu, bool secure)
+{
+    switch_v7m_security_state(&cpu->env, secure);
+    arm_rebuild_hflags(&cpu->env);
+}
+
 void HELPER(v7m_bxns)(CPUARMState *env, uint32_t dest)
 {
     /*
@@ -2356,6 +2547,10 @@ void arm_v7m_cpu_do_interrupt(CPUState *cs)
         env->regs[15] += env->thumb ? 2 : 4;
         return;
     case EXCP_BKPT:
+        /* With halting debug enabled, BKPT enters Debug state (C1.6). */
+        if (cpu->m_debug_ops && cpu->m_debug_ops->bkpt(cpu->m_debug_opaque)) {
+            return;
+        }
         armv7m_nvic_set_pending(env->nvic, ARMV7M_EXCP_DEBUG, false);
         break;
     case EXCP_IRQ:

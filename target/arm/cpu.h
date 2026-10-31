@@ -829,6 +829,26 @@ typedef struct {
 } ARMVQMap;
 
 /**
+ * ARMMDebugOps: M-profile halting debug provided by a board debug unit
+ * (Armv8-M ARM, chapter B13 "Debug"; DHCSR, DCRSR, FPB).  The CPU core only
+ * reports debug events and the debug unit decides whether the core enters
+ * Debug state; while ArchCPU.m_debug_halted is set the core has no work.
+ *
+ * @bkpt: a BKPT instruction executed (C1.6); true if the core halted.
+ * @check_breakpoint: a BP_CPU breakpoint matches the current PC; true if it
+ *     is an enabled FPB comparator match that must stop the core.
+ * @debug_event: EXCP_DEBUG reached the core (FPB match or end of a halting
+ *     step); the debug unit halts the core (it does not return then).
+ * @reset: the core has been reset (Warm reset, B13.1).
+ */
+typedef struct ARMMDebugOps {
+    bool (*bkpt)(void *opaque);
+    bool (*check_breakpoint)(void *opaque);
+    void (*debug_event)(void *opaque);
+    void (*reset)(void *opaque);
+} ARMMDebugOps;
+
+/**
  * ARMCPU:
  * @env: #CPUARMState
  *
@@ -940,6 +960,12 @@ struct ArchCPU {
     uint32_t init_svtor;
     /* For v8M, initial value of the Non-secure VTOR */
     uint32_t init_nsvtor;
+
+    /* M-profile halting debug unit, if the board provides one. */
+    const ARMMDebugOps *m_debug_ops;
+    void *m_debug_opaque;
+    /* M-profile core is in Debug state (DHCSR.S_HALT). */
+    bool m_debug_halted;
 
     /* [QEMU_]KVM_ARM_TARGET_* constant for this CPU, or
      * QEMU_KVM_ARM_TARGET_NONE if the kernel doesn't support this CPU type.
@@ -1539,6 +1565,21 @@ typedef enum CPSRWriteType {
  */
 void cpsr_write(CPUARMState *env, uint32_t val, uint32_t mask,
                 CPSRWriteType write_type);
+
+/*
+ * M-profile Debug state core register access through DCRSR/DCRDR
+ * (Armv8-M ARM C1.6.3, DCRSR.REGSEL encoding).  The core must be in Debug
+ * state.  @secure selects the bank for the REGSEL values that name "the
+ * current Security state" (SP, MSP, PSP and the packed CONTROL word); the
+ * debug unit passes DSCSR.SBRSEL when SBRSELEN is set.  Return false for
+ * reserved REGSEL values.
+ */
+bool arm_m_debug_read_reg(ARMCPU *cpu, unsigned regsel, bool secure,
+                          uint32_t *value);
+bool arm_m_debug_write_reg(ARMCPU *cpu, unsigned regsel, bool secure,
+                           uint32_t value);
+/* DSCSR.CDS write in Debug state: change the core's current Security state */
+void arm_m_debug_set_secure(ARMCPU *cpu, bool secure);
 
 /* Return the current xPSR value.  */
 static inline uint32_t xpsr_read(CPUARMState *env)
