@@ -13,6 +13,10 @@
 #include "hw/boards.h"
 #include "hw/arm/efr32-rf-medium.h"
 #include "hw/arm/efr32-usart.h"
+#include "hw/arm/efr32-gpio.h"
+#include "hw/arm/efr32-i2c.h"
+#include "hw/misc/analog-source.h"
+#include "hw/misc/owo-suit.h"
 #include "hw/ptimer.h"
 #include "hw/qdev-clock.h"
 #include "hw/qdev-properties.h"
@@ -747,8 +751,25 @@ struct Efr32Periph
     uint32_t chiprev;
     /* Board: millivolts on each GPIO pin, -1 when undriven (IADC input). */
     int32_t analog_mv[EFR32_GPIO_PORTS][EFR32_GPIO_PINS];
-    uint32_t iadc_fifo[4];
-    unsigned iadc_fifo_count;
+    /* IADC single (0) and scan (1) FIFOs. */
+    struct {
+        uint32_t data[4];
+        unsigned count;
+    } iadc_fifo[2];
+    /* Board analog inputs not named by "analog" (an analog-source). */
+    Object *analog_source;
+    /* Fault injection: IADC conversions never complete. */
+    uint32_t iadc_stall;
+    /* TIMERn CCm compare/PWM outputs, to the GPIO routes. */
+    qemu_irq timer_cc_out[5 * 3];
+    bool timer_cc_level[5][3];
+    QEMUTimer *timer_pwm[5];
+    /* TOPB (EFR32_TIMER_BUF_TOPB) and OCBn (bit n) awaiting the overflow. */
+    uint32_t timer_buf_pending[5];
+    /* WDOG0: counter epoch (virtual ns) while counting, see efr32_wdog_*. */
+    bool wdog_running;
+    int64_t wdog_epoch_ns;
+    QEMUTimer *wdog_timer;
     qemu_irq irq[64];
     qemu_irq seq_irq_state[EFR32_RAC_SEQ_STATE_EVENTS];
     qemu_irq seq_irq_mailbox;
@@ -3148,10 +3169,136 @@ static void efr32_timer_schedule(Efr32Periph *s, int i)
                                     efr32_timer_hz(s, i)));
 }
 
+/*
+ * Compare/PWM outputs (RM SS19.3.3.9, Figure 19.20): in up-count PWM mode
+ * (CCn_CFG.MODE = PWM) the output is high while CNT < CCn_OC, so the period
+ * is TOP + 1 and the output is high for OC cycles (constant high for
+ * OC >= TOP + 1, constant low for OC = 0); CCn_CTRL.OUTINV inverts it.  A
+ * channel not in PWM mode drives CCn_CFG.COIST (its initial state) and a
+ * stopped timer holds its outputs.  Writes to TOPB and CCn_OCB set
+ * STATUS.TOPBV/OCBVn and take effect at the next overflow ("Buffer update"
+ * in Figure 19.20).  The outputs reach pins through the GPIO routes.
+ * [U] Not modelled: output-compare match actions (CMOA/COFOA) on the pin,
+ * up/down and 2x count, dead-time insertion, and the one-cycle output
+ * delay the RM mentions.
+ */
+#define EFR32_TIMER_CC_CFG_MODE_PWM 0x3u
+#define EFR32_TIMER_CC_CFG_COIST (1u << 4)
+#define EFR32_TIMER_CC_CTRL_OUTINV (1u << 2)
+#define EFR32_TIMER_STATUS_TOPBV (1u << 2)
+#define EFR32_TIMER_STATUS_OCBV_SHIFT 8
+#define EFR32_TIMER_BUF_TOPB (1u << 31)
+
+static bool efr32_timer_cc_is_pwm(Efr32Periph *s, int i, unsigned n)
+{
+    return (efr32_timer_reg(s, i, EFR32_TIMER_CC_CFG(n)) &
+            EFR32_TIMER_CC_CFG_MODE_MASK) == EFR32_TIMER_CC_CFG_MODE_PWM;
+}
+
+static bool efr32_timer_cc_level(Efr32Periph *s, int i, unsigned n,
+                                 uint64_t count)
+{
+    bool level;
+
+    if (!efr32_timer_cc_is_pwm(s, i, n)) {
+        level = efr32_timer_reg(s, i, EFR32_TIMER_CC_CFG(n)) &
+                EFR32_TIMER_CC_CFG_COIST;
+    } else if (!efr32_timer_counting(s, i)) {
+        return s->timer_cc_level[i][n]; /* held */
+    } else {
+        level = count < (efr32_timer_reg(s, i, EFR32_TIMER_CC_OC(n)) &
+                         efr32_timers[i].width_mask);
+    }
+    return level ^ !!(efr32_timer_reg(s, i, EFR32_TIMER_CC_CTRL(n)) &
+                      EFR32_TIMER_CC_CTRL_OUTINV);
+}
+
+static void efr32_timer_pwm_update(Efr32Periph *s, int i)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t period = efr32_timer_period(s, i);
+    uint64_t elapsed = efr32_timer_elapsed(s, i, now);
+    uint64_t count = ((uint64_t)s->timers[i].base_count + elapsed) % period;
+    uint64_t best = UINT64_MAX;
+
+    timer_del(s->timer_pwm[i]);
+    for (unsigned n = 0; n < EFR32_TIMER0_CHANNELS; n++) {
+        bool level = efr32_timer_cc_level(s, i, n, count);
+
+        if (level != s->timer_cc_level[i][n]) {
+            s->timer_cc_level[i][n] = level;
+            qemu_set_irq(s->timer_cc_out[i * EFR32_TIMER0_CHANNELS + n],
+                         level);
+        }
+        if (efr32_timer_counting(s, i) && efr32_timer_cc_is_pwm(s, i, n)) {
+            uint64_t oc = efr32_timer_reg(s, i, EFR32_TIMER_CC_OC(n)) &
+                          efr32_timers[i].width_mask;
+
+            if (count < oc && oc < period) {
+                best = MIN(best, oc - count);      /* falls at CNT = OC */
+            } else if (count >= oc && oc > 0) {
+                best = MIN(best, period - count);  /* rises at the wrap */
+            }
+        }
+    }
+    if (efr32_timer_counting(s, i) && s->timer_buf_pending[i]) {
+        best = MIN(best, period - count);          /* buffer update */
+    }
+    if (best != UINT64_MAX) {
+        timer_mod(s->timer_pwm[i],
+                  s->timers[i].base_ns +
+                      muldiv64_round_up(elapsed + best,
+                                        NANOSECONDS_PER_SECOND,
+                                        efr32_timer_hz(s, i)));
+    }
+}
+
+static void efr32_timer_pwm_expired(Efr32Periph *s, int i)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t period = efr32_timer_period(s, i);
+    uint64_t count = ((uint64_t)s->timers[i].base_count +
+                      efr32_timer_elapsed(s, i, now)) % period;
+
+    if (count == 0 && s->timer_buf_pending[i]) {
+        uint32_t pending = s->timer_buf_pending[i];
+
+        efr32_timer_rebase(s, i);
+        if (pending & EFR32_TIMER_BUF_TOPB) {
+            efr32_register_put(s, efr32_timers[i].base + EFR32_TIMER_TOP,
+                               efr32_timer_reg(s, i, EFR32_TIMER_TOPB) &
+                                   efr32_timers[i].width_mask);
+        }
+        for (unsigned n = 0; n < EFR32_TIMER0_CHANNELS; n++) {
+            if (pending & (1u << n)) {
+                efr32_register_put(s, efr32_timers[i].base +
+                                          EFR32_TIMER_CC_OC(n),
+                                   efr32_timer_reg(s, i,
+                                                   EFR32_TIMER_CC_OCB(n)));
+            }
+        }
+        s->timer_buf_pending[i] = 0;
+        efr32_timer_schedule(s, i);
+    }
+    efr32_timer_pwm_update(s, i);
+}
+
+static void efr32_timer0_pwm(void *opaque) { efr32_timer_pwm_expired(EFR32_PERIPH(opaque), 0); }
+static void efr32_timer1_pwm(void *opaque) { efr32_timer_pwm_expired(EFR32_PERIPH(opaque), 1); }
+static void efr32_timer2_pwm(void *opaque) { efr32_timer_pwm_expired(EFR32_PERIPH(opaque), 2); }
+static void efr32_timer3_pwm(void *opaque) { efr32_timer_pwm_expired(EFR32_PERIPH(opaque), 3); }
+static void efr32_timer4_pwm(void *opaque) { efr32_timer_pwm_expired(EFR32_PERIPH(opaque), 4); }
+
+static QEMUTimerCB *const efr32_timer_pwm_callbacks[EFR32_TIMER_COUNT] = {
+    efr32_timer0_pwm, efr32_timer1_pwm, efr32_timer2_pwm, efr32_timer3_pwm,
+    efr32_timer4_pwm,
+};
+
 static void efr32_timer0_schedule(Efr32Periph *s)
 {
     for (int i = 0; i < EFR32_TIMER_COUNT; i++) {
         efr32_timer_schedule(s, i);
+        efr32_timer_pwm_update(s, i);
     }
 }
 
@@ -3205,7 +3352,12 @@ static bool efr32_timer_read(Efr32Periph *s, uint32_t address, uint32_t *value)
         *value = (efr32_timer_counting(s, i) ? EFR32_TIMER_STATUS_RUNNING : 0) |
                  (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) <
                           s->timers[i].sync_until_ns
-                      ? EFR32_TIMER_STATUS_SYNCBUSY : 0);
+                      ? EFR32_TIMER_STATUS_SYNCBUSY : 0) |
+                 (s->timer_buf_pending[i] & EFR32_TIMER_BUF_TOPB
+                      ? EFR32_TIMER_STATUS_TOPBV : 0) |
+                 ((s->timer_buf_pending[i] &
+                   MAKE_64BIT_MASK(0, EFR32_TIMER0_CHANNELS))
+                  << EFR32_TIMER_STATUS_OCBV_SHIFT);
         return true;
     case EFR32_TIMER_CMD:
         *value = 0;
@@ -3261,9 +3413,18 @@ static void efr32_timer_write(Efr32Periph *s, uint32_t register_address,
                            efr32_timer_sync_reg(offset) &&
                            offset != EFR32_TIMER_CTRL &&
                            offset != EFR32_TIMER_DTCTRL ? next & width : next);
+        if (offset == EFR32_TIMER_TOPB) {
+            s->timer_buf_pending[i] |= EFR32_TIMER_BUF_TOPB;
+        }
+        for (unsigned n = 0; n < EFR32_TIMER0_CHANNELS; n++) {
+            if (offset == EFR32_TIMER_CC_OCB(n)) {
+                s->timer_buf_pending[i] |= 1u << n;
+            }
+        }
         break;
     }
     efr32_timer_schedule(s, i);
+    efr32_timer_pwm_update(s, i);
     if (i == 0) {
         trace_efr32bg22_timer0_write(s->endpoint_id, now, offset, next,
                                      efr32_timer_counter(s, i));
@@ -3283,6 +3444,12 @@ static void efr32_timers_reset(Efr32Periph *s)
         s->timers[i].pending_flags = 0;
         s->timers[i].sync_until_ns = 0;
         qemu_set_irq(s->irq[efr32_timers[i].irq], 0);
+        timer_del(s->timer_pwm[i]);
+        s->timer_buf_pending[i] = 0;
+        for (unsigned n = 0; n < EFR32_TIMER0_CHANNELS; n++) {
+            s->timer_cc_level[i][n] = false;
+            qemu_set_irq(s->timer_cc_out[i * EFR32_TIMER0_CHANNELS + n], 0);
+        }
     }
 }
 
@@ -3583,37 +3750,301 @@ static void efr32_rtcc_reset(Efr32Periph *s)
 }
 
 /*
+ * ------------------------------------------------------------------- WDOG0
+ *
+ * RM chapter 27 (register map SS27.4, fields from the public
+ * efr32bg22_wdog.h).  EN.EN starts the counter from 0 (and clearing EN
+ * resets it, SS27.3); CMD.CLEAR returns it to 0; it counts the clock
+ * CMU.WDOG0CLKCTRL.CLKSEL selects (LFRCO, LFXO, ULFRCO or HCLK / 1024,
+ * SS27.3.1).  It times out after 2^(PERSEL + 3) + 1 cycles (Figure in
+ * SS27.3.1 and the PERSEL table: SEL0 = 9 cycles ... SEL15 = 256k): IF.TOUT
+ * sets and, unless CFG.WDOGRSTDIS, the chip resets with EMU.RSTCAUSE.WDOG0
+ * (bit 3, efr32bg22_emu.h).  IF.WARN sets at WARNSEL x 25 % of the period
+ * (SS27.3.4).  WDOG0 is IRQ 43 (IF & IEN).  Writing LOCK with anything but
+ * 0xABE8 locks EN and CFG (STATUS.LOCK, SS27.3).
+ * [U] Not modelled: freezing in EM2/EM3 (EM2RUN/EM3RUN; the model does not
+ * distinguish sleep depths, so the counter runs in every sleep mode), the
+ * debug halt (a halted QEMU stops virtual time, which freezes the counter
+ * as DEBUGRUN = 0 does), the window interrupt, PRS clear and monitoring,
+ * EM4BLOCK, and the LF synchronisation delay of CMD.CLEAR (SYNCBUSY reads 0;
+ * the RM requires CLEAR 4 cycles before the timeout, not checked).
+ */
+#define EFR32_WDOG0_BASE 0x4a018000u
+#define EFR32_WDOG0_IRQ 43
+#define EFR32_WDOG_EN 0x004u
+#define EFR32_WDOG_EN_EN (1u << 0)
+#define EFR32_WDOG_CFG 0x008u
+#define EFR32_WDOG_CFG_RESET 0x000f0000u
+#define EFR32_WDOG_CFG_WDOGRSTDIS (1u << 8)
+#define EFR32_WDOG_CFG_PERSEL_SHIFT 16
+#define EFR32_WDOG_CFG_PERSEL_MASK 0xfu
+#define EFR32_WDOG_CFG_WARNSEL_SHIFT 24
+#define EFR32_WDOG_CFG_WARNSEL_MASK 0x3u
+#define EFR32_WDOG_CMD 0x00cu
+#define EFR32_WDOG_CMD_CLEAR (1u << 0)
+#define EFR32_WDOG_STATUS 0x014u
+#define EFR32_WDOG_STATUS_LOCK (1u << 31)
+#define EFR32_WDOG_IF 0x018u
+#define EFR32_WDOG_IF_TOUT (1u << 0)
+#define EFR32_WDOG_IF_WARN (1u << 1)
+#define EFR32_WDOG_IF_MASK 0x1fu
+#define EFR32_WDOG_IEN 0x01cu
+#define EFR32_WDOG_LOCK 0x020u
+#define EFR32_WDOG_LOCK_UNLOCK 0xabe8u
+#define EFR32_WDOG_SYNCBUSY 0x024u
+/* SS27.3.1: TTIMEOUT = [2^(PERSEL + 3) + 1] / f. */
+#define EFR32_WDOG_PERSEL_BIAS 3
+/* SS27.3.4: TWARNING = TTIMEOUT x WARNSEL / 4. */
+#define EFR32_WDOG_WARN_QUARTERS 4
+#define EFR32_CMU_WDOG0CLKCTRL 0x200u
+#define EFR32_CMU_WDOG0CLKCTRL_RESET 1u
+#define EFR32_CMU_WDOG0CLKCTRL_CLKSEL_MASK 0x7u
+#define EFR32_CMU_WDOG0CLKCTRL_HCLKDIV1024 4u
+#define EFR32_WDOG_HCLK_DIVIDER 1024u
+#define EFR32_EMU_RSTCAUSE_WDOG0 (1u << 3)
+
+static uint64_t efr32_sysclk_hz(Efr32Periph *s);
+
+static uint32_t efr32_wdog_get(Efr32Periph *s, uint32_t offset)
+{
+    return efr32_register_get(s, EFR32_WDOG0_BASE + offset);
+}
+
+static void efr32_wdog_put(Efr32Periph *s, uint32_t offset, uint32_t value)
+{
+    efr32_register_put(s, EFR32_WDOG0_BASE + offset, value);
+}
+
+static uint64_t efr32_wdog_hz(Efr32Periph *s)
+{
+    switch (efr32_cmu_get(s, EFR32_CMU_WDOG0CLKCTRL) &
+            EFR32_CMU_WDOG0CLKCTRL_CLKSEL_MASK) {
+    case EFR32_CMU_LFCLKSEL_LFRCO:
+    case EFR32_CMU_LFCLKSEL_LFXO:
+        return clock_get_hz(s->burtc_clk);
+    case EFR32_CMU_LFCLKSEL_ULFRCO:
+        return EFR32_ULFRCO_HZ;
+    case EFR32_CMU_WDOG0CLKCTRL_HCLKDIV1024:
+        return efr32_sysclk_hz(s) / EFR32_WDOG_HCLK_DIVIDER;
+    default:
+        return 0;
+    }
+}
+
+static uint64_t efr32_wdog_period_cycles(Efr32Periph *s)
+{
+    uint32_t persel = (efr32_wdog_get(s, EFR32_WDOG_CFG) >>
+                       EFR32_WDOG_CFG_PERSEL_SHIFT) &
+                      EFR32_WDOG_CFG_PERSEL_MASK;
+
+    return (UINT64_C(1) << (persel + EFR32_WDOG_PERSEL_BIAS)) + 1;
+}
+
+static void efr32_wdog_update_irq(Efr32Periph *s)
+{
+    qemu_set_irq(s->irq[EFR32_WDOG0_IRQ],
+                 !!(efr32_wdog_get(s, EFR32_WDOG_IF) &
+                    efr32_wdog_get(s, EFR32_WDOG_IEN)));
+}
+
+/* Arm the next event: the warning if still ahead, else the timeout. */
+static void efr32_wdog_schedule(Efr32Periph *s)
+{
+    uint64_t hz = efr32_wdog_hz(s);
+    uint64_t period = efr32_wdog_period_cycles(s);
+    uint32_t warnsel = (efr32_wdog_get(s, EFR32_WDOG_CFG) >>
+                        EFR32_WDOG_CFG_WARNSEL_SHIFT) &
+                       EFR32_WDOG_CFG_WARNSEL_MASK;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t warn_ns, tout_ns;
+
+    timer_del(s->wdog_timer);
+    if (!s->wdog_running || !hz) {
+        return;
+    }
+    tout_ns = s->wdog_epoch_ns +
+              muldiv64(period, NANOSECONDS_PER_SECOND, hz);
+    warn_ns = s->wdog_epoch_ns +
+              muldiv64(period * warnsel, NANOSECONDS_PER_SECOND,
+                       hz * EFR32_WDOG_WARN_QUARTERS);
+    timer_mod(s->wdog_timer, warnsel && warn_ns > now &&
+                             !(efr32_wdog_get(s, EFR32_WDOG_IF) &
+                               EFR32_WDOG_IF_WARN)
+                                 ? warn_ns : tout_ns);
+}
+
+static void efr32_wdog_expired(void *opaque)
+{
+    Efr32Periph *s = EFR32_PERIPH(opaque);
+    uint64_t hz = efr32_wdog_hz(s);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t tout_ns;
+
+    if (!s->wdog_running || !hz) {
+        return;
+    }
+    tout_ns = s->wdog_epoch_ns +
+              muldiv64(efr32_wdog_period_cycles(s), NANOSECONDS_PER_SECOND,
+                       hz);
+    if (now < tout_ns) {
+        efr32_wdog_put(s, EFR32_WDOG_IF, efr32_wdog_get(s, EFR32_WDOG_IF) |
+                                             EFR32_WDOG_IF_WARN);
+        trace_efr32_wdog(s->endpoint_id, now, "warning", 0);
+        efr32_wdog_update_irq(s);
+        efr32_wdog_schedule(s);
+        return;
+    }
+    efr32_wdog_put(s, EFR32_WDOG_IF, efr32_wdog_get(s, EFR32_WDOG_IF) |
+                                         EFR32_WDOG_IF_TOUT);
+    efr32_wdog_update_irq(s);
+    trace_efr32_wdog(s->endpoint_id, now, "timeout",
+                     efr32_wdog_get(s, EFR32_WDOG_CFG));
+    if (!(efr32_wdog_get(s, EFR32_WDOG_CFG) & EFR32_WDOG_CFG_WDOGRSTDIS)) {
+        s->rstcause |= EFR32_EMU_RSTCAUSE_WDOG0;
+        s->wdog_running = false;
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        return;
+    }
+    /* Reset disabled: the counter wraps and runs on. */
+    s->wdog_epoch_ns = tout_ns;
+    efr32_wdog_schedule(s);
+}
+
+static bool efr32_wdog_read(Efr32Periph *s, uint32_t address,
+                            uint32_t *value)
+{
+    if ((address & ~0x3fffu) != EFR32_WDOG0_BASE) {
+        return false;
+    }
+    switch (address & 0xfffu) {
+    case EFR32_WDOG_CMD:
+    case EFR32_WDOG_LOCK:
+    case EFR32_WDOG_SYNCBUSY:
+        *value = 0;
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Returns true when the WDOG write is fully handled. */
+static bool efr32_wdog_write(Efr32Periph *s, uint32_t offset, uint32_t next)
+{
+    bool locked = efr32_wdog_get(s, EFR32_WDOG_STATUS) &
+                  EFR32_WDOG_STATUS_LOCK;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    switch (offset) {
+    case EFR32_WDOG_EN:
+        if (locked) {
+            return true;
+        }
+        efr32_wdog_put(s, offset, next & EFR32_WDOG_EN_EN);
+        if (!(next & EFR32_WDOG_EN_EN)) {
+            s->wdog_running = false;
+        } else if (!s->wdog_running) {
+            s->wdog_running = true;
+            s->wdog_epoch_ns = now;
+        }
+        trace_efr32_wdog(s->endpoint_id, now, "enable", next);
+        break;
+    case EFR32_WDOG_CFG:
+        if (!locked) {
+            efr32_wdog_put(s, offset, next);
+            trace_efr32_wdog(s->endpoint_id, now, "config", next);
+        }
+        break;
+    case EFR32_WDOG_CMD:
+        if (next & EFR32_WDOG_CMD_CLEAR) {
+            s->wdog_epoch_ns = now;
+            efr32_wdog_put(s, EFR32_WDOG_IF, efr32_wdog_get(s, EFR32_WDOG_IF) &
+                                                 ~EFR32_WDOG_IF_WARN);
+        }
+        break;
+    case EFR32_WDOG_LOCK:
+        if ((next & 0xffffu) != EFR32_WDOG_LOCK_UNLOCK) {
+            efr32_wdog_put(s, EFR32_WDOG_STATUS, EFR32_WDOG_STATUS_LOCK);
+        } else {
+            efr32_wdog_put(s, EFR32_WDOG_STATUS, 0);
+        }
+        return true;
+    case EFR32_WDOG_STATUS:
+    case EFR32_WDOG_SYNCBUSY:
+        return true;
+    case EFR32_WDOG_IF:
+    case EFR32_WDOG_IEN:
+        efr32_wdog_put(s, offset, next & EFR32_WDOG_IF_MASK);
+        break;
+    default:
+        return false;
+    }
+    efr32_wdog_update_irq(s);
+    efr32_wdog_schedule(s);
+    return true;
+}
+
+static void efr32_wdog_reset(Efr32Periph *s)
+{
+    timer_del(s->wdog_timer);
+    s->wdog_running = false;
+    efr32_wdog_put(s, EFR32_WDOG_CFG, EFR32_WDOG_CFG_RESET);
+    efr32_register_put(s, EFR32_CMU_BASE + EFR32_CMU_WDOG0CLKCTRL,
+                       EFR32_CMU_WDOG0CLKCTRL_RESET);
+}
+
+/*
  * ------------------------------------------------------------------- IADC
  *
  * RM SS24 (register map SS24.4, fields from the public efr32bg22_iadc.h).
- * The single queue only: CMD.SINGLESTART converts the input SINGLE selects
- * (PORTPOS/PINPOS against PORTNEG/PINNEG) with the CFGn that SINGLE.CFG
- * names, pushes the result into the 4-entry single FIFO (RM SS24.3.5) and
- * sets IF.SINGLEDONE; IF.SINGLEFIFODVL sets once the FIFO holds DVL + 1
- * entries.  SINGLEFIFODATA pops; SINGLEFIFOSTAT counts; STATUS.SINGLEFIFODV
- * reports a non-empty FIFO.  IRQ 48 is IF & IEN.
- * The analog side is board input: each GPIO pin's voltage comes from the
- * machine's "analog" property (millivolts, e.g. "PD02=968"); an undriven
- * pin and GND read 0 V.  Reference VDDX is the board supply
+ *  - Single queue: CMD.SINGLESTART converts the input SINGLE selects
+ *    (PORTPOS/PINPOS against PORTNEG/PINNEG) with the CFGn that SINGLE.CFG
+ *    names, pushes the result into the 4-entry single FIFO (RM SS24.3.5) and
+ *    sets IF.SINGLEDONE; IF.SINGLEFIFODVL sets once the FIFO holds DVL + 1
+ *    entries.  SINGLEFIFODATA pops; SINGLEFIFOSTAT counts;
+ *    STATUS.SINGLEFIFODV reports a non-empty FIFO.
+ *  - Scan queue (RM SS24.3.4): CMD.SCANSTART converts, in table order, every
+ *    SCANTABLE entry whose MASKREQ bit is set (same input fields as SINGLE),
+ *    each into the 4-entry scan FIFO with IF.SCANENTRYDONE, then sets
+ *    IF.SCANTABLEDONE; IF.SCANFIFODVL / SCANFIFOOF as for the single FIFO.
+ *    With SCANFIFOCFG.SHOWID the entry's index is in bits 31:24 of a
+ *    right-aligned result and bits 7:0 of a left-aligned one (the layout
+ *    sl_hal_iadc's result decoder reads).
+ *  IRQ 48 is IF & IEN.
+ * The analog side is the board: a pin's voltage comes from the machine's
+ * "analog" property (millivolts, e.g. "PD02=968") if it names the pin, else
+ * from the board's analog source (an "analog-source" object, sampled at the
+ * conversion), else 0 V; GND reads 0 V.  Reference VDDX is the board supply
  * (EFR32_BOARD_VDDX_MV), VBGR the 1.21 V band-gap (RM SS24.3.3.1).
  * Result = Vin * gain / Vref at 12 bits, right-aligned (ALIGNMENT RIGHT12)
  * or left-aligned (LEFT12), unipolar for a single-ended input.
- * [U] Not modelled: the scan queue, timer and PRS triggers, oversampling and
- * 16/20-bit results, the window comparator, SUPPLY inputs, conversion and
- * warm-up time (a conversion completes at the command).
+ * Fault injection: "x-iadc-stall" (periph property) makes conversions never
+ * complete: commands are accepted and nothing ever comes out.
+ * [U] Not modelled: timer and PRS triggers, oversampling and 16/20-bit
+ * results, the window comparator, SUPPLY inputs, conversion and warm-up
+ * time (a conversion completes at the command).
  */
 #define EFR32_IADC_BASE 0x4a004000u
 #define EFR32_IADC_IRQ 48
 #define EFR32_IADC_CMD 0x00cu
 #define EFR32_IADC_CMD_SINGLESTART (1u << 0)
+#define EFR32_IADC_CMD_SCANSTART (1u << 3)
 #define EFR32_IADC_CMD_SINGLEFIFOFLUSH (1u << 24)
+#define EFR32_IADC_CMD_SCANFIFOFLUSH (1u << 25)
 #define EFR32_IADC_STATUS 0x014u
 #define EFR32_IADC_STATUS_SINGLEFIFODV (1u << 8)
+#define EFR32_IADC_STATUS_SCANFIFODV (1u << 9)
+#define EFR32_IADC_MASKREQ 0x018u
+#define EFR32_IADC_MASKREQ_MASK 0xffffu
 #define EFR32_IADC_IF 0x024u
 #define EFR32_IADC_IF_SINGLEFIFODVL (1u << 0)
+#define EFR32_IADC_IF_SCANFIFODVL (1u << 1)
+#define EFR32_IADC_IF_SCANENTRYDONE (1u << 7)
+#define EFR32_IADC_IF_SCANTABLEDONE (1u << 8)
 #define EFR32_IADC_IF_SINGLEDONE (1u << 9)
 #define EFR32_IADC_IF_SINGLEFIFOOF (1u << 16)
+#define EFR32_IADC_IF_SCANFIFOOF (1u << 17)
 #define EFR32_IADC_IF_SINGLEFIFOUF (1u << 18)
+#define EFR32_IADC_IF_SCANFIFOUF (1u << 19)
 #define EFR32_IADC_IEN 0x028u
 #define EFR32_IADC_CFG0 0x048u
 #define EFR32_IADC_CFG_STRIDE 0x010u
@@ -3624,28 +4055,59 @@ static void efr32_rtcc_reset(Efr32Periph *s)
 #define EFR32_IADC_CFG_REFSEL_VBGR 0u
 #define EFR32_IADC_CFG_REFSEL_VDDX 3u
 #define EFR32_IADC_SINGLEFIFOCFG 0x070u
-#define EFR32_IADC_SINGLEFIFOCFG_ALIGNMENT_MASK 0x7u
-#define EFR32_IADC_SINGLEFIFOCFG_ALIGNMENT_LEFT12 3u
-#define EFR32_IADC_SINGLEFIFOCFG_DVL_SHIFT 4
-#define EFR32_IADC_SINGLEFIFOCFG_DVL_MASK 0x3u
+#define EFR32_IADC_FIFOCFG_ALIGNMENT_MASK 0x7u
+#define EFR32_IADC_FIFOCFG_ALIGNMENT_LEFT12 3u
+#define EFR32_IADC_FIFOCFG_SHOWID (1u << 3)
+#define EFR32_IADC_FIFOCFG_DVL_SHIFT 4
+#define EFR32_IADC_FIFOCFG_DVL_MASK 0x3u
 #define EFR32_IADC_SINGLEFIFODATA 0x074u
 #define EFR32_IADC_SINGLEFIFOSTAT 0x078u
 #define EFR32_IADC_SINGLEDATA 0x07cu
+#define EFR32_IADC_SCANFIFOCFG 0x080u
+#define EFR32_IADC_SCANFIFODATA 0x084u
+#define EFR32_IADC_SCANFIFOSTAT 0x088u
+#define EFR32_IADC_SCANDATA 0x08cu
 #define EFR32_IADC_SINGLE 0x098u
-#define EFR32_IADC_SINGLE_PINNEG_SHIFT 0
-#define EFR32_IADC_SINGLE_PORTNEG_SHIFT 4
-#define EFR32_IADC_SINGLE_PINPOS_SHIFT 8
-#define EFR32_IADC_SINGLE_PORTPOS_SHIFT 12
-#define EFR32_IADC_SINGLE_FIELD_MASK 0xfu
-#define EFR32_IADC_SINGLE_CFG (1u << 16)
+#define EFR32_IADC_SCANTABLE0 0x0a0u
+#define EFR32_IADC_SCANTABLE_ENTRIES 16
+#define EFR32_IADC_INPUT_PINNEG_SHIFT 0
+#define EFR32_IADC_INPUT_PORTNEG_SHIFT 4
+#define EFR32_IADC_INPUT_PINPOS_SHIFT 8
+#define EFR32_IADC_INPUT_PORTPOS_SHIFT 12
+#define EFR32_IADC_INPUT_FIELD_MASK 0xfu
+#define EFR32_IADC_INPUT_CFG (1u << 16)
 #define EFR32_IADC_PORT_GPIO_FIRST 8u /* PORTA; PORTB 9, PORTC 10, PORTD 11 */
 #define EFR32_IADC_FIFO_DEPTH 4
 #define EFR32_IADC_RESULT_BITS 12
 #define EFR32_IADC_LEFT12_SHIFT 4
+/* SHOWID: entry index in bits 31:24 (right-aligned), 7:0 (left-aligned). */
+#define EFR32_IADC_ID_RIGHT_SHIFT 24
+#define EFR32_IADC_SINGLE_ID 0x20u
 #define EFR32_IADC_VBGR_MV 1210u
 #define EFR32_BOARD_VDDX_MV 3300u
+#define EFR32_UV_PER_MV 1000
 /* ANALOGGAIN codes 1..5 are x0.5, x1, x2, x3, x4 (efr32bg22_iadc.h). */
 static const uint32_t efr32_iadc_gain_half[] = { 0, 1, 2, 4, 6, 8 };
+
+typedef struct Efr32IadcQueue {
+    uint32_t fifocfg, fifodata, fifostat, data;
+    uint32_t if_dvl, if_of, if_uf, status_dv, flush;
+} Efr32IadcQueue;
+
+static const Efr32IadcQueue efr32_iadc_single = {
+    EFR32_IADC_SINGLEFIFOCFG, EFR32_IADC_SINGLEFIFODATA,
+    EFR32_IADC_SINGLEFIFOSTAT, EFR32_IADC_SINGLEDATA,
+    EFR32_IADC_IF_SINGLEFIFODVL, EFR32_IADC_IF_SINGLEFIFOOF,
+    EFR32_IADC_IF_SINGLEFIFOUF, EFR32_IADC_STATUS_SINGLEFIFODV,
+    EFR32_IADC_CMD_SINGLEFIFOFLUSH,
+};
+static const Efr32IadcQueue efr32_iadc_scan = {
+    EFR32_IADC_SCANFIFOCFG, EFR32_IADC_SCANFIFODATA,
+    EFR32_IADC_SCANFIFOSTAT, EFR32_IADC_SCANDATA,
+    EFR32_IADC_IF_SCANFIFODVL, EFR32_IADC_IF_SCANFIFOOF,
+    EFR32_IADC_IF_SCANFIFOUF, EFR32_IADC_STATUS_SCANFIFODV,
+    EFR32_IADC_CMD_SCANFIFOFLUSH,
+};
 
 static uint32_t efr32_iadc_get(Efr32Periph *s, uint32_t offset)
 {
@@ -3660,13 +4122,18 @@ static void efr32_iadc_put(Efr32Periph *s, uint32_t offset, uint32_t value)
 static void efr32_iadc_update(Efr32Periph *s)
 {
     uint32_t status = efr32_iadc_get(s, EFR32_IADC_STATUS) &
-                      ~EFR32_IADC_STATUS_SINGLEFIFODV;
+                      ~(EFR32_IADC_STATUS_SINGLEFIFODV |
+                        EFR32_IADC_STATUS_SCANFIFODV);
 
-    if (s->iadc_fifo_count) {
+    if (s->iadc_fifo[0].count) {
         status |= EFR32_IADC_STATUS_SINGLEFIFODV;
     }
+    if (s->iadc_fifo[1].count) {
+        status |= EFR32_IADC_STATUS_SCANFIFODV;
+    }
     efr32_iadc_put(s, EFR32_IADC_STATUS, status);
-    efr32_iadc_put(s, EFR32_IADC_SINGLEFIFOSTAT, s->iadc_fifo_count);
+    efr32_iadc_put(s, EFR32_IADC_SINGLEFIFOSTAT, s->iadc_fifo[0].count);
+    efr32_iadc_put(s, EFR32_IADC_SCANFIFOSTAT, s->iadc_fifo[1].count);
     qemu_set_irq(s->irq[EFR32_IADC_IRQ],
                  !!(efr32_iadc_get(s, EFR32_IADC_IF) &
                     efr32_iadc_get(s, EFR32_IADC_IEN)));
@@ -3683,15 +4150,24 @@ static uint32_t efr32_iadc_input_mv(Efr32Periph *s, uint32_t port,
         pin >= EFR32_GPIO_PINS) {
         return 0;
     }
-    mv = s->analog_mv[port - EFR32_IADC_PORT_GPIO_FIRST][pin];
+    port -= EFR32_IADC_PORT_GPIO_FIRST;
+    mv = s->analog_mv[port][pin];
+    if (mv < 0 && s->analog_source) {
+        char net[8];
+
+        snprintf(net, sizeof(net), "P%c%02u", 'A' + port, pin);
+        mv = analog_source_read_uv(ANALOG_SOURCE(s->analog_source), net) /
+             EFR32_UV_PER_MV;
+    }
     return mv > 0 ? mv : 0;
 }
 
-static uint32_t efr32_iadc_convert(Efr32Periph *s)
+/* Convert the input an entry (SINGLE or a SCANTABLE word) selects. */
+static uint32_t efr32_iadc_convert(Efr32Periph *s, uint32_t input,
+                                   uint32_t fifocfg)
 {
-    uint32_t single = efr32_iadc_get(s, EFR32_IADC_SINGLE);
     uint32_t cfg = efr32_iadc_get(s, EFR32_IADC_CFG0 +
-                                         ((single & EFR32_IADC_SINGLE_CFG)
+                                         ((input & EFR32_IADC_INPUT_CFG)
                                               ? EFR32_IADC_CFG_STRIDE
                                               : 0));
     uint32_t gain = (cfg >> EFR32_IADC_CFG_ANALOGGAIN_SHIFT) &
@@ -3704,15 +4180,15 @@ static uint32_t efr32_iadc_convert(Efr32Periph *s)
                         : 0;
     uint32_t full = (1u << EFR32_IADC_RESULT_BITS) - 1;
     uint64_t pos = efr32_iadc_input_mv(
-        s, (single >> EFR32_IADC_SINGLE_PORTPOS_SHIFT) &
-               EFR32_IADC_SINGLE_FIELD_MASK,
-        (single >> EFR32_IADC_SINGLE_PINPOS_SHIFT) &
-            EFR32_IADC_SINGLE_FIELD_MASK);
+        s, (input >> EFR32_IADC_INPUT_PORTPOS_SHIFT) &
+               EFR32_IADC_INPUT_FIELD_MASK,
+        (input >> EFR32_IADC_INPUT_PINPOS_SHIFT) &
+            EFR32_IADC_INPUT_FIELD_MASK);
     uint64_t neg = efr32_iadc_input_mv(
-        s, (single >> EFR32_IADC_SINGLE_PORTNEG_SHIFT) &
-               EFR32_IADC_SINGLE_FIELD_MASK,
-        (single >> EFR32_IADC_SINGLE_PINNEG_SHIFT) &
-            EFR32_IADC_SINGLE_FIELD_MASK);
+        s, (input >> EFR32_IADC_INPUT_PORTNEG_SHIFT) &
+               EFR32_IADC_INPUT_FIELD_MASK,
+        (input >> EFR32_IADC_INPUT_PINNEG_SHIFT) &
+            EFR32_IADC_INPUT_FIELD_MASK);
     uint64_t code;
 
     if (!vref || gain >= ARRAY_SIZE(efr32_iadc_gain_half) || pos <= neg) {
@@ -3723,12 +4199,39 @@ static uint32_t efr32_iadc_convert(Efr32Periph *s)
                    ((pos - neg) * efr32_iadc_gain_half[gain] * full +
                     vref) / (2 * (uint64_t)vref));
     }
-    if ((efr32_iadc_get(s, EFR32_IADC_SINGLEFIFOCFG) &
-         EFR32_IADC_SINGLEFIFOCFG_ALIGNMENT_MASK) ==
-        EFR32_IADC_SINGLEFIFOCFG_ALIGNMENT_LEFT12) {
+    if ((fifocfg & EFR32_IADC_FIFOCFG_ALIGNMENT_MASK) ==
+        EFR32_IADC_FIFOCFG_ALIGNMENT_LEFT12) {
         code <<= EFR32_IADC_LEFT12_SHIFT;
     }
     return code;
+}
+
+/* Push one result into a queue's FIFO; returns the IF bits it raises. */
+static uint32_t efr32_iadc_push(Efr32Periph *s, unsigned q,
+                                const Efr32IadcQueue *queue, uint32_t result,
+                                uint32_t id)
+{
+    uint32_t fifocfg = efr32_iadc_get(s, queue->fifocfg);
+    uint32_t dvl = (fifocfg >> EFR32_IADC_FIFOCFG_DVL_SHIFT) &
+                   EFR32_IADC_FIFOCFG_DVL_MASK;
+    uint32_t flags = 0;
+
+    if (fifocfg & EFR32_IADC_FIFOCFG_SHOWID) {
+        result |= (fifocfg & EFR32_IADC_FIFOCFG_ALIGNMENT_MASK) ==
+                          EFR32_IADC_FIFOCFG_ALIGNMENT_LEFT12
+                      ? id
+                      : id << EFR32_IADC_ID_RIGHT_SHIFT;
+    }
+    if (s->iadc_fifo[q].count < EFR32_IADC_FIFO_DEPTH) {
+        s->iadc_fifo[q].data[s->iadc_fifo[q].count++] = result;
+    } else {
+        flags |= queue->if_of;
+    }
+    efr32_iadc_put(s, queue->data, result);
+    if (s->iadc_fifo[q].count >= dvl + 1) {
+        flags |= queue->if_dvl;
+    }
+    return flags;
 }
 
 static void efr32_iadc_command(Efr32Periph *s, uint32_t command)
@@ -3736,24 +4239,35 @@ static void efr32_iadc_command(Efr32Periph *s, uint32_t command)
     uint32_t flags = 0;
 
     if (command & EFR32_IADC_CMD_SINGLEFIFOFLUSH) {
-        s->iadc_fifo_count = 0;
+        s->iadc_fifo[0].count = 0;
     }
-    if (command & EFR32_IADC_CMD_SINGLESTART) {
-        uint32_t result = efr32_iadc_convert(s);
-        uint32_t dvl = (efr32_iadc_get(s, EFR32_IADC_SINGLEFIFOCFG) >>
-                        EFR32_IADC_SINGLEFIFOCFG_DVL_SHIFT) &
-                       EFR32_IADC_SINGLEFIFOCFG_DVL_MASK;
+    if (command & EFR32_IADC_CMD_SCANFIFOFLUSH) {
+        s->iadc_fifo[1].count = 0;
+    }
+    if ((command & EFR32_IADC_CMD_SINGLESTART) && !s->iadc_stall) {
+        uint32_t result = efr32_iadc_convert(
+            s, efr32_iadc_get(s, EFR32_IADC_SINGLE),
+            efr32_iadc_get(s, EFR32_IADC_SINGLEFIFOCFG));
 
-        if (s->iadc_fifo_count < EFR32_IADC_FIFO_DEPTH) {
-            s->iadc_fifo[s->iadc_fifo_count++] = result;
-        } else {
-            flags |= EFR32_IADC_IF_SINGLEFIFOOF;
-        }
-        efr32_iadc_put(s, EFR32_IADC_SINGLEDATA, result);
+        flags |= efr32_iadc_push(s, 0, &efr32_iadc_single, result,
+                                 EFR32_IADC_SINGLE_ID);
         flags |= EFR32_IADC_IF_SINGLEDONE;
-        if (s->iadc_fifo_count >= dvl + 1) {
-            flags |= EFR32_IADC_IF_SINGLEFIFODVL;
+    }
+    if ((command & EFR32_IADC_CMD_SCANSTART) && !s->iadc_stall) {
+        uint32_t mask = efr32_iadc_get(s, EFR32_IADC_MASKREQ) &
+                        EFR32_IADC_MASKREQ_MASK;
+
+        for (unsigned id = 0; id < EFR32_IADC_SCANTABLE_ENTRIES; id++) {
+            if (mask & (1u << id)) {
+                uint32_t result = efr32_iadc_convert(
+                    s, efr32_iadc_get(s, EFR32_IADC_SCANTABLE0 + 4 * id),
+                    efr32_iadc_get(s, EFR32_IADC_SCANFIFOCFG));
+
+                flags |= efr32_iadc_push(s, 1, &efr32_iadc_scan, result, id);
+                flags |= EFR32_IADC_IF_SCANENTRYDONE;
+            }
         }
+        flags |= EFR32_IADC_IF_SCANTABLEDONE;
     }
     efr32_iadc_put(s, EFR32_IADC_IF, efr32_iadc_get(s, EFR32_IADC_IF) | flags);
     efr32_iadc_update(s);
@@ -3761,28 +4275,38 @@ static void efr32_iadc_command(Efr32Periph *s, uint32_t command)
 
 static bool efr32_iadc_read(Efr32Periph *s, uint32_t address, uint32_t *value)
 {
+    unsigned q;
+    const Efr32IadcQueue *queue;
+
     if ((address & ~0x3fffu) != EFR32_IADC_BASE) {
         return false;
     }
     switch (address & 0xfffu) {
     case EFR32_IADC_SINGLEFIFODATA:
-        if (!s->iadc_fifo_count) {
-            efr32_iadc_put(s, EFR32_IADC_IF, efr32_iadc_get(s, EFR32_IADC_IF) |
-                                                 EFR32_IADC_IF_SINGLEFIFOUF);
-            *value = 0;
-        } else {
-            *value = s->iadc_fifo[0];
-            memmove(s->iadc_fifo, s->iadc_fifo + 1,
-                    --s->iadc_fifo_count * sizeof(s->iadc_fifo[0]));
-        }
-        efr32_iadc_update(s);
-        return true;
+        q = 0;
+        queue = &efr32_iadc_single;
+        break;
+    case EFR32_IADC_SCANFIFODATA:
+        q = 1;
+        queue = &efr32_iadc_scan;
+        break;
     case EFR32_IADC_CMD:
         *value = 0;
         return true;
     default:
         return false;
     }
+    if (!s->iadc_fifo[q].count) {
+        efr32_iadc_put(s, EFR32_IADC_IF,
+                       efr32_iadc_get(s, EFR32_IADC_IF) | queue->if_uf);
+        *value = 0;
+    } else {
+        *value = s->iadc_fifo[q].data[0];
+        memmove(s->iadc_fifo[q].data, s->iadc_fifo[q].data + 1,
+                --s->iadc_fifo[q].count * sizeof(s->iadc_fifo[q].data[0]));
+    }
+    efr32_iadc_update(s);
+    return true;
 }
 
 /* Returns true when the IADC write is fully handled. */
@@ -3796,6 +4320,9 @@ static bool efr32_iadc_write(Efr32Periph *s, uint32_t offset, uint32_t next)
     case EFR32_IADC_SINGLEFIFOSTAT:
     case EFR32_IADC_SINGLEFIFODATA:
     case EFR32_IADC_SINGLEDATA:
+    case EFR32_IADC_SCANFIFOSTAT:
+    case EFR32_IADC_SCANFIFODATA:
+    case EFR32_IADC_SCANDATA:
         return true; /* read-only */
     case EFR32_IADC_IF:
     case EFR32_IADC_IEN:
@@ -4094,7 +4621,8 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
         uint32_t rtcc_value;
 
         if (efr32_rtcc_read(s, address, &rtcc_value) ||
-            efr32_iadc_read(s, address, &rtcc_value)) {
+            efr32_iadc_read(s, address, &rtcc_value) ||
+            efr32_wdog_read(s, address, &rtcc_value)) {
             return rtcc_value;
         }
     }
@@ -4141,8 +4669,6 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
         return efr32_register_get(s, EFR32_DCDC_BASE + EFR32_DCDC_CTRL) & 1
                    ? EFR32_DCDC_STATUS_WARM | EFR32_DCDC_STATUS_RUNNING
                    : EFR32_DCDC_STATUS_WARM;
-    if (address == 0x4a018004 || address == 0x4a018024)
-        return 0;
     if (address == EFR32_BURTC_BASE + EFR32_BURTC_CNT)
         return efr32_burtc_counter(s);
     if (address == EFR32_BURTC_BASE + EFR32_BURTC_STATUS)
@@ -4268,6 +4794,10 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
 
     if ((register_address & ~0x3fffu) == EFR32_IADC_BASE &&
         efr32_iadc_write(s, register_address & 0xfffu, next)) {
+        return;
+    }
+    if ((register_address & ~0x3fffu) == EFR32_WDOG0_BASE &&
+        efr32_wdog_write(s, register_address & 0xfffu, next)) {
         return;
     }
 
@@ -5054,7 +5584,15 @@ static void efr32_periph_init(Object *o)
     for (int i = 0; i < EFR32_TIMER_COUNT; i++) {
         s->timers[i].event = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                           efr32_timer_callbacks[i], s);
+        s->timer_pwm[i] = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                       efr32_timer_pwm_callbacks[i], s);
     }
+    s->wdog_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_wdog_expired, s);
+    /* Fault injection (qom-set at run time): conversions never complete. */
+    object_property_add_uint32_ptr(o, "x-iadc-stall", &s->iadc_stall,
+                                 OBJ_PROP_FLAG_READWRITE);
+    qdev_init_gpio_out_named(DEVICE(o), s->timer_cc_out, "timer-cc",
+                             ARRAY_SIZE(s->timer_cc_out));
     s->dpll_lock_timer =
         timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_dpll_lock_expired, s);
     s->rac_tx_timer =
@@ -5140,7 +5678,8 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     efr32_register_put(s, EFR32_EMU_BASE + EFR32_EMU_RSTCAUSE, s->rstcause);
     efr32_msc_reset(s);
     efr32_rtcc_reset(s);
-    s->iadc_fifo_count = 0;
+    memset(s->iadc_fifo, 0, sizeof(s->iadc_fifo));
+    efr32_wdog_reset(s);
     efr32_register_put(s, EFR32_SYSCFG_BASE + EFR32_SYSCFG_CHIPREV,
                        s->chiprev);
     /*
@@ -5190,7 +5729,9 @@ static void efr32_periph_finalize(Object *obj)
     timer_free(s->rtcc_timer);
     for (int i = 0; i < EFR32_TIMER_COUNT; i++) {
         timer_free(s->timers[i].event);
+        timer_free(s->timer_pwm[i]);
     }
+    timer_free(s->wdog_timer);
     timer_free(s->dpll_lock_timer);
     ptimer_free(s->protimer_counter);
     for (unsigned channel = 0; channel < G_N_ELEMENTS(s->bufc_data); channel++) {
@@ -5313,6 +5854,8 @@ struct Efr32State
     char *devinfo;
     char *userdata;
     char *analog;
+    /* The board around the SoC ("owo-suit"), or none. */
+    char *board;
     uint32_t flash_offset;
     uint32_t flash_overlay_offset;
     uint32_t boot_offset;
@@ -5629,6 +6172,12 @@ static void efr32_soc_init(Object *obj)
 #define EFR32_USART0_TX_IRQ 14
 #define EFR32_USART1_RX_IRQ 15
 #define EFR32_USART1_TX_IRQ 16
+#define EFR32_GPIO_ODD_IRQ 25
+#define EFR32_GPIO_EVEN_IRQ 26
+#define EFR32_I2C0_IRQ 27
+/* efr32bg22c224f512im40.h GPIO_S_BASE, I2C0_S_BASE. */
+#define EFR32_GPIO_BASE 0x4003c000u
+#define EFR32_I2C0_BASE 0x4a010000u
 
 /*
  * USART0/1 (the dual machine's SoC n takes
@@ -5863,6 +6412,22 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
         efr32_usart_create(OBJECT(s), s->memory, nvic, s->pclk,
                            &s->periph.bus_model, &usart);
     }
+    {
+        DeviceState *gpio = efr32_gpio_create(
+            OBJECT(s), s->memory, nvic, &s->periph.bus_model,
+            EFR32_GPIO_BASE, PERIPH_NONSECURE_OFFSET, EFR32_GPIO_ODD_IRQ,
+            EFR32_GPIO_EVEN_IRQ);
+
+        for (unsigned n = 0; n < EFR32_GPIO_TIMERS * EFR32_GPIO_TIMER_CCS;
+             n++) {
+            qdev_connect_gpio_out_named(
+                DEVICE(&s->periph), "timer-cc", n,
+                qdev_get_gpio_in_named(gpio, EFR32_GPIO_TIMER_CC, n));
+        }
+        efr32_i2c_create(OBJECT(s), s->memory, nvic, s->pclk,
+                         &s->periph.bus_model, 0, EFR32_I2C0_BASE,
+                         PERIPH_NONSECURE_OFFSET, EFR32_I2C0_IRQ);
+    }
     for (unsigned state = 0; state < EFR32_RAC_SEQ_STATE_EVENTS; state++) {
         s->periph.seq_irq_state[state] =
             qdev_get_gpio_in(DEVICE(&s->seq_armv7m), state);
@@ -5967,6 +6532,21 @@ static void init(MachineState *m)
     }
     qemu_register_reset(efr32_cpu_reset, s->soc.armv7m.cpu);
     qemu_register_reset(efr32_seq_cpu_reset, s->soc.seq_armv7m.cpu);
+    if (s->board && !strcmp(s->board, TYPE_OWO_SUIT)) {
+        DeviceState *board = qdev_new(TYPE_OWO_SUIT);
+
+        object_property_add_child(OBJECT(m), "suit", OBJECT(board));
+        object_property_set_link(OBJECT(board), "soc", OBJECT(&s->soc),
+                                 &error_fatal);
+        qdev_realize_and_unref(board, NULL, &error_fatal);
+        /* The board's analog nets feed the IADC (unless "analog" names
+         * the pin). */
+        s->soc.periph.analog_source = OBJECT(board);
+    } else if (s->board) {
+        error_report("efr32bg22: unknown board '%s' (known: %s)", s->board,
+                     TYPE_OWO_SUIT);
+        exit(EXIT_FAILURE);
+    }
 }
 static void idau(IDAUInterface *i, uint32_t a, int *r, bool *e, bool *n,
                  bool *c)
@@ -6019,6 +6599,17 @@ static void analog_set(Object *o, const char *v, Error **e)
 
     g_free(s->analog);
     s->analog = g_strdup(v);
+}
+static char *board_get(Object *o, Error **e)
+{
+    return g_strdup(EFR32BG22_MACHINE(o)->board);
+}
+static void board_set(Object *o, const char *v, Error **e)
+{
+    Efr32State *s = EFR32BG22_MACHINE(o);
+
+    g_free(s->board);
+    s->board = g_strdup(v);
 }
 static char *userdata_get(Object *o, Error **e)
 {
@@ -6099,6 +6690,12 @@ static void mc(ObjectClass *o, void *d)
     object_class_property_add_str(o, "userdata", userdata_get, userdata_set);
     /* Board analog inputs for the IADC: "PD02=968,..." in millivolts. */
     object_class_property_add_str(o, "analog", analog_get, analog_set);
+    /*
+     * The board around the SoC: "owo-suit" adds the suit's control-unit
+     * parts and output stage on the SoC's buses (hw/misc/owo-suit.c);
+     * tune it with -global owo-suit.<property>=<value>.
+     */
+    object_class_property_add_str(o, "board", board_get, board_set);
 }
 static const TypeInfo machine_info = {
     .name = TYPE_EFR32BG22_MACHINE,

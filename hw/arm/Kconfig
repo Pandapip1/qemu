@@ -406,6 +406,10 @@ config EFR32BG22
     default y
     depends on TCG && ARM
     select ARM_V7M
+    select SSI
+    select I2C
+    select OWO_SUIT
+    imply HOST_PASSTHROUGH
 
 config B_L475E_IOT01A
     bool

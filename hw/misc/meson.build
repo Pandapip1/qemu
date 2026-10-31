@@ -159,4 +159,12 @@ system_ss.add(when: 'CONFIG_EFR32BG22', if_true: files(
   'efr32-dap.c',
   'swd.c',
   'swd-remote-bitbang.c',
+  'analog-source.c',
+))
+system_ss.add(when: 'CONFIG_OWO_SUIT', if_true: files(
+  'owo-suit.c',
+  'owo-suit-parts.c',
+))
+system_ss.add(when: 'CONFIG_HOST_PASSTHROUGH', if_true: files(
+  'host-passthrough.c',
 ))

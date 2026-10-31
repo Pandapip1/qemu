@@ -90,3 +90,13 @@ efr32_mmio_write(unsigned endpoint, int cpu, uint32_t pc, uint32_t address, unsi
 # efr32-usart.c
 efr32_usart_rx(unsigned index, uint8_t value) "USART%u RX=0x%02x"
 efr32_usart_rx_overflow(unsigned index, uint8_t value) "USART%u RX overflow, lost 0x%02x"
+efr32_usart_sync(unsigned index, uint8_t tx, uint8_t rx) "USART%u SPI TX=0x%02x RX=0x%02x"
+
+# efr32-gpio.c
+efr32_gpio_pin(unsigned port, unsigned pin, bool oe, bool level) "port=%u pin=%u oe=%d level=%d"
+
+# efr32-i2c.c
+efr32_i2c_event(unsigned index, const char *event, uint32_t data, int result) "I2C%u %s data=0x%02x result=%d"
+
+# efr32bg22.c (WDOG0)
+efr32_wdog(unsigned endpoint, uint64_t now, const char *event, uint32_t value) "endpoint=%u now=%" PRIu64 " WDOG0 %s 0x%08x"

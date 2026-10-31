@@ -215,4 +215,18 @@ config IOSB
 config XLNX_VERSAL_TRNG
     bool
 
+# The OWO suit's control-unit board: output stage, DAC, channel switches,
+# expander, battery (owo-suit.c, owo-suit-parts.c).
+config OWO_SUIT
+    bool
+    select SSI
+    select I2C
+
+# Host-device backends for emulated buses: spidev, i2c-dev, IIO (Linux).
+config HOST_PASSTHROUGH
+    bool
+    depends on LINUX
+    select SSI
+    select I2C
+
 source macio/Kconfig

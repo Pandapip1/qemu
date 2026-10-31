@@ -15,10 +15,24 @@
  * Modelled: EN, CTRL (OVS, TXBIL, LOOPBK), FRAME, CMD (RX/TX enable and
  * disable, CLEARRX/CLEARTX), STATUS, CLKDIV, the RX/TX data registers
  * including the DOUBLE and peek forms, IF/IEN with the SET/CLR/TGL aliases,
- * and the RX and TX interrupt lines.  Not modelled: synchronous (SPI) mode,
- * IrDA, I2S, the USART timer (TIMECMPn), multi-processor and 9-bit frames,
- * parity/framing errors (the chardev carries bytes, not line levels) and
- * PRS triggers; enabling any of them is reported as unimplemented.
+ * and the RX and TX interrupt lines.  Not modelled: synchronous secondary
+ * mode, AUTOCS, IrDA, I2S, the USART timer (TIMECMPn), multi-processor and
+ * 9-bit frames, parity/framing errors (the chardev carries bytes, not line
+ * levels) and PRS triggers; enabling any of them is reported as
+ * unimplemented.
+ *
+ * Synchronous main mode (CTRL.SYNC with CMD.MASTEREN, RM SS21.3.3): the
+ * line side is the USART's SSI bus ("ssi"), to which SPI devices attach as
+ * they would to MOSI/MISO/SCLK: a board model, or a host spidev through a
+ * passthrough device.  Chip selects are GPIO pins driven by software, as
+ * the stock and Zephyr drivers do.  Each frame takes its data bits at the
+ * synchronous bit rate br = fPCLK / (2 x (1 + CLKDIV / 256)) (RM Figure
+ * 21.17); at its end the byte the device returned enters the receiver as
+ * the last sample edge sets RXDATAV (RM SS21.3.3.2).  The bus carries
+ * MSB-first bytes: with CTRL.MSBF clear the USART reverses the bit order on
+ * both directions, which is what the wire order means to the device.
+ * CLKPOL/CLKPHA have no effect on the bytes exchanged with a device that
+ * samples in the same SPI mode; a mode mismatch is not modelled.
  *
  * Flow control: while the receiver is disabled the line is held (the host
  * side's data waits in its chardev, as a host waits on a deasserted RTS).
@@ -40,6 +54,7 @@
 #include "chardev/char-serial.h"
 #include "sysemu/sysemu.h"
 #include "hw/arm/efr32-usart.h"
+#include "hw/ssi/ssi.h"
 #include "trace.h"
 
 OBJECT_DECLARE_SIMPLE_TYPE(Efr32UsartState, EFR32_USART)
@@ -88,6 +103,10 @@ enum { USART_ALIAS_NONE, USART_ALIAS_SET, USART_ALIAS_CLR, USART_ALIAS_TGL };
 #define USART_CTRL_OVS_SHIFT 5
 #define USART_CTRL_OVS_MASK 0x60u
 #define USART_CTRL_TXBIL (1u << 12)
+#define USART_CTRL_MSBF (1u << 10)
+#define USART_CTRL_AUTOCS (1u << 16)
+/* Synchronous mode: two PCLK cycles per bit at CLKDIV = 0 (RM Fig. 21.17). */
+#define USART_SYNC_PCLK_PER_BIT 2u
 
 #define USART_FRAME_RESETVALUE 0x00001005u
 #define USART_FRAME_DATABITS_MASK 0xfu
@@ -111,9 +130,12 @@ enum { USART_ALIAS_NONE, USART_ALIAS_SET, USART_ALIAS_CLR, USART_ALIAS_TGL };
 #define USART_CMD_TXDIS (1u << 3)
 #define USART_CMD_CLEARTX (1u << 10)
 #define USART_CMD_CLEARRX (1u << 11)
+#define USART_CMD_MASTEREN (1u << 4)
+#define USART_CMD_MASTERDIS (1u << 5)
 
 #define USART_STATUS_RXENS (1u << 0)
 #define USART_STATUS_TXENS (1u << 1)
+#define USART_STATUS_MASTER (1u << 2)
 #define USART_STATUS_TXC (1u << 5)
 #define USART_STATUS_TXBL (1u << 6)
 #define USART_STATUS_RXDATAV (1u << 7)
@@ -193,6 +215,9 @@ struct Efr32UsartState {
     bool tx_complete;
     Fifo8 rx_fifo;
     Fifo8 tx_fifo;
+    /* Synchronous main mode: CMD.MASTEREN, and the SPI bus it drives. */
+    bool master;
+    SSIBus *ssi;
     /* The frame on the wire towards the host, and when it ends. */
     bool tx_shifting;
     uint8_t tx_shift;
@@ -233,6 +258,13 @@ static int64_t usart_frame_ns(Efr32UsartState *s)
     if (!pclk_hz) {
         return -1;
     }
+    if (ctrl & USART_CTRL_SYNC) {
+        /* data_bits * 2 * (256 + DIV) / (256 * fPCLK) seconds. */
+        return muldiv64((uint64_t)data_bits * USART_SYNC_PCLK_PER_BIT *
+                            divisor,
+                        NANOSECONDS_PER_SECOND,
+                        USART_CLKDIV_UNITY * pclk_hz);
+    }
     /* half_bits / 2 * ovs * (256 + DIV) / (256 * fPCLK) seconds. */
     return muldiv64((uint64_t)half_bits * ovs * divisor, NANOSECONDS_PER_SECOND,
                     2 * USART_CLKDIV_UNITY * pclk_hz);
@@ -255,6 +287,7 @@ static uint32_t usart_status(Efr32UsartState *s)
 {
     return (s->rx_enabled ? USART_STATUS_RXENS : 0) |
            (s->tx_enabled ? USART_STATUS_TXENS : 0) |
+           (s->master ? USART_STATUS_MASTER : 0) |
            (s->tx_complete ? USART_STATUS_TXC : 0) |
            (usart_tx_buffer_level(s) ? USART_STATUS_TXBL : 0) |
            (!fifo8_is_empty(&s->rx_fifo) ? USART_STATUS_RXDATAV : 0) |
@@ -313,9 +346,12 @@ static void usart_check_unimplemented(Efr32UsartState *s)
 {
     uint32_t data_bits = usart_reg(s, USART_FRAME) & USART_FRAME_DATABITS_MASK;
 
-    if (usart_reg(s, USART_CTRL) & USART_CTRL_SYNC) {
-        qemu_log_mask(LOG_UNIMP, "efr32-usart%u: synchronous mode\n",
+    if ((usart_reg(s, USART_CTRL) & USART_CTRL_SYNC) && !s->master) {
+        qemu_log_mask(LOG_UNIMP, "efr32-usart%u: synchronous secondary mode\n",
                       s->index);
+    }
+    if (usart_reg(s, USART_CTRL) & USART_CTRL_AUTOCS) {
+        qemu_log_mask(LOG_UNIMP, "efr32-usart%u: AUTOCS\n", s->index);
     }
     if (data_bits > USART_FRAME_DATABITS_EIGHT) {
         qemu_log_mask(LOG_UNIMP, "efr32-usart%u: %u-bit frames\n", s->index,
@@ -358,6 +394,14 @@ static void usart_tx_frame_end(void *opaque)
     trace_efr32bg22_usart_tx(s->index, value);
     if (usart_reg(s, USART_CTRL) & USART_CTRL_LOOPBK) {
         usart_receive_frame(s, value);
+    } else if (usart_reg(s, USART_CTRL) & USART_CTRL_SYNC) {
+        bool lsb_first = !(usart_reg(s, USART_CTRL) & USART_CTRL_MSBF);
+        uint8_t wire = lsb_first ? revbit8(value) : value;
+        uint8_t back = s->master ? ssi_transfer(s->ssi, wire) : 0;
+
+        back = lsb_first ? revbit8(back) : back;
+        trace_efr32_usart_sync(s->index, value, back);
+        usart_receive_frame(s, back);
     } else {
         qemu_chr_fe_write_all(&s->chr, &value, 1);
     }
@@ -410,7 +454,9 @@ static int usart_can_receive(void *opaque)
 {
     Efr32UsartState *s = opaque;
 
-    return s->rx_enabled && !s->rx_shifting && usart_frame_ns(s) > 0;
+    /* In synchronous mode the receiver takes what the SPI bus returns. */
+    return s->rx_enabled && !s->rx_shifting && usart_frame_ns(s) > 0 &&
+           !(usart_reg(s, USART_CTRL) & USART_CTRL_SYNC);
 }
 
 static void usart_receive(void *opaque, const uint8_t *buf, int size)
@@ -461,7 +507,12 @@ static void usart_command(Efr32UsartState *s, uint32_t command)
     } else if (command & USART_CMD_TXEN) {
         s->tx_enabled = true;
     }
-    if (command & (USART_CMD_RXEN | USART_CMD_TXEN)) {
+    if (command & USART_CMD_MASTERDIS) {
+        s->master = false;
+    } else if (command & USART_CMD_MASTEREN) {
+        s->master = true;
+    }
+    if (command & (USART_CMD_RXEN | USART_CMD_TXEN | USART_CMD_MASTEREN)) {
         usart_check_unimplemented(s);
         usart_update_line_params(s);
     }
@@ -631,6 +682,7 @@ static void usart_reset_hold(Object *obj, ResetType type)
     s->if_latched = 0;
     s->rx_enabled = false;
     s->tx_enabled = false;
+    s->master = false;
     s->tx_complete = false;
     s->tx_shifting = false;
     s->rx_shifting = false;
@@ -643,7 +695,10 @@ static void usart_reset_hold(Object *obj, ResetType type)
 static void usart_realize(DeviceState *dev, Error **errp)
 {
     Efr32UsartState *s = EFR32_USART(dev);
+    g_autofree char *bus = g_strdup_printf("usart%u.ssi", s->index);
 
+    /* "-device <spi-device>,bus=usart1.ssi" attaches to USART1's SPI bus. */
+    s->ssi = ssi_create_bus(dev, bus);
     qemu_chr_fe_set_handlers(&s->chr, usart_can_receive, usart_receive,
                              NULL, NULL, s, NULL, true);
 }
