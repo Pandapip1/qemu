@@ -173,6 +173,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_RAC_RXENSRCEN_SWRXEN (1u << 1)
 #define EFR32_RAC_STATE_OFF 0u
 #define EFR32_RAC_STATE_RXSEARCH 2u
+/*
+ * Receive-side and turnaround states (public RAC_S STATE encoding; the
+ * sequencer IRQ of each is IRQ<state>).  Silicon with a released sequencer
+ * ends a TX frame in TX2RX when an RX source is asserted, then reaches
+ * RXSEARCH; RXDIS from RXSEARCH passes RXPD before OFF (owo-open-fw
+ * docs/radio-tables.md SS7.63).  A TXEN issued during RXFRAME with SWRXEN
+ * withdrawn turns the RAC into RX2TX at frame end; with SWRXEN still asserted
+ * it returns to receive instead (SS7.65), and the RAC can rest in RX2RX
+ * (SS7.69).  RX2TX is held until STATERX2TX is acknowledged and TX begins
+ * shortly after that acknowledgement (SS7.67, SS7.68).
+ */
+#define EFR32_RAC_STATE_RXFRAME 3u
+#define EFR32_RAC_STATE_RXPD 4u
+#define EFR32_RAC_STATE_RX2RX 5u
+#define EFR32_RAC_STATE_RX2TX 7u
+#define EFR32_RAC_STATE_TX2RX 11u
 #define EFR32_RAC_STATE_TXWARM 8u
 #define EFR32_RAC_STATE_TX 9u
 /*
@@ -197,6 +213,56 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 
 /* Synthetic model delay, not a measured on-air transmission duration. */
 #define EFR32_RAC_TX_COMPLETION_DELAY_NS 150000
+/*
+ * Synthetic: a received frame occupies RXFRAME for as long as the model's
+ * transmitter occupies TX, so a receiver offered a frame at the peer's TX
+ * start reaches frame end when that peer's TX completes.  Not a measured
+ * airtime.
+ */
+#define EFR32_RAC_RX_FRAME_DURATION_NS EFR32_RAC_TX_COMPLETION_DELAY_NS
+/*
+ * Silicon enters TX ~3 us after the sequencer acknowledges STATERX2TX,
+ * measured with the M0+ SysTick calibrated against RAC.STIMER (owo-open-fw
+ * docs/radio-tables.md SS7.68).
+ */
+#define EFR32_RAC_RX2TX_TX_START_DELAY_NS 3000
+
+/*
+ * RAC.STIMER: read-only, 16 bits wide (public RAC_S.STIMER).  Measured at
+ * ~4.8 ticks/us against BURTC (SS7.66), restarting on every RAC state change
+ * (SS7.68).  The prescaler (RAC.PRESC.STIMER) is not modelled; the rate is
+ * the one measured with the open sequencer's own PRESC setting.
+ */
+#define EFR32_RAC_STIMER 0x030u
+#define EFR32_RAC_STIMER_MASK 0x0000ffffu
+#define EFR32_RAC_STIMER_TICKS_PER_10US 48u
+#define EFR32_RAC_STIMER_NS_PER_10US 10000u
+
+/*
+ * RAC.STATUS fields (public RAC_S.STATUS).  RXENS follows the asserted RX
+ * source: stock read 0x89400002 in TX with SWRXEN set (RXENS, RXMASK bit 1),
+ * stage 3 0x09400000 in TX without it (SS7.21/SS7.63), and stock read
+ * 0x63400000 in RXFRAME after withdrawing SWRXEN and issuing TXEN: TXENS set,
+ * RXENS clear (SS7.65).
+ */
+#define EFR32_RAC_STATUS_STATE_SHIFT 24u
+#define EFR32_RAC_STATUS_SEQACTIVE (1u << 28)
+#define EFR32_RAC_STATUS_TXENS (1u << 30)
+#define EFR32_RAC_STATUS_RXENS (1u << 31)
+#define EFR32_RAC_STATUS_RXMASK_SWRXEN EFR32_RAC_RXENSRCEN_SWRXEN
+
+/*
+ * FRC.TRAILRXDATA is configuration (public FRC_S, read-write): with CRCOK set
+ * FRC appends one octet after each received frame, [I] whose bit 7 is the CRC
+ * result; its low bits vary with the signal on silicon (owo-open-fw
+ * docs/radio-tables.md SS7.66).  The model's medium has no bit errors, so the
+ * octet always reports CRC success, and its signal-dependent low bits are a
+ * synthetic zero.  The other trailer fields (RSSI, PROTIMER/RTC stamps) are
+ * not modelled.
+ */
+#define EFR32_FRC_TRAILRXDATA 0x054u
+#define EFR32_FRC_TRAILRXDATA_CRCOK (1u << 1)
+#define EFR32_FRC_TRAILER_CRCOK (1u << 7)
 
 /* Observed in rfhal_protimer.o and the retained stock trace; latch only. */
 #define EFR32_PROTIMER_EN 0x004u
@@ -451,6 +517,17 @@ struct Efr32Periph
     bool txen_held;
     /* RAC.PAENCTRL.PARAMP changed; TXRAMPDONE not yet latched. */
     bool pa_ramp_pending;
+    /* RAC.CMD.TXEN latched during RXFRAME (RAC.STATUS.TXENS). */
+    bool tx_after_frame;
+    /* A hardware transition held by a pending SEQIEN-enabled state event. */
+    bool rac_transition_held;
+    uint32_t rac_held_state;
+    /* Virtual time of the last RAC state change; RAC.STIMER counts from it. */
+    int64_t rac_stimer_epoch_ns;
+    /* Frame being received in RXFRAME; written to BUFC at frame end. */
+    GBytes *rx_frame;
+    QEMUTimer *rac_frame_timer;
+    QEMUTimer *rac_tx_start_timer;
 };
 
 static uint32_t efr32_register_get(Efr32Periph *s, uint32_t address);
@@ -1093,6 +1170,7 @@ static void efr32_rac_set_state(Efr32Periph *s, uint32_t state)
 
     previous_state = s->rac_state;
     s->rac_state = state;
+    s->rac_stimer_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     efr32_register_put(s, EFR32_RAC_BASE + EFR32_RAC_IF,
                        efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_IF) |
                            1);
@@ -1116,6 +1194,55 @@ static void efr32_rac_set_state(Efr32Periph *s, uint32_t state)
                               previous_state, state);
 }
 
+static void efr32_rac_capture_tx_snapshot(Efr32Periph *s);
+static void efr32_rac_schedule_rx_handoff(Efr32Periph *s);
+
+static bool efr32_rac_swrxen(Efr32Periph *s)
+{
+    return efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_RXENSRCEN) &
+           EFR32_RAC_RXENSRCEN_SWRXEN;
+}
+
+/* Enter @state, with the work silicon performs on that entry. */
+static void efr32_rac_enter_state(Efr32Periph *s, uint32_t state)
+{
+    if (state == EFR32_RAC_STATE_TX) {
+        /* A TX entered from RX2TX was latched by TXEN during RXFRAME. */
+        s->tx_after_frame = false;
+        efr32_rac_capture_tx_snapshot(s);
+    }
+    efr32_rac_set_state(s, state);
+    if (state == EFR32_RAC_STATE_RXSEARCH && s->rx_offer_pending) {
+        efr32_rac_schedule_rx_handoff(s);
+    }
+}
+
+/*
+ * A transition the radio makes by itself (frame end, TX end) waits, like a
+ * TXEN does, while any SEQIEN-enabled state event is uncleared (SS7.69); it
+ * is applied when the sequencer clears the last one.
+ */
+static void efr32_rac_hardware_transition(Efr32Periph *s, uint32_t state)
+{
+    if (efr32_rac_seq_events_pending(s)) {
+        s->rac_transition_held = true;
+        s->rac_held_state = state;
+        return;
+    }
+    s->rac_transition_held = false;
+    efr32_rac_enter_state(s, state);
+}
+
+/* Forget receive and turnaround work in progress (abort or reset). */
+static void efr32_rac_cancel_turnaround(Efr32Periph *s)
+{
+    timer_del(s->rac_frame_timer);
+    timer_del(s->rac_tx_start_timer);
+    g_clear_pointer(&s->rx_frame, g_bytes_unref);
+    s->tx_after_frame = false;
+    s->rac_transition_held = false;
+}
+
 static void efr32_rac_tx_complete(void *opaque)
 {
     Efr32Periph *s = EFR32_PERIPH(opaque);
@@ -1127,9 +1254,126 @@ static void efr32_rac_tx_complete(void *opaque)
         return;
     }
     efr32_rf_medium_complete_tx(s->rf_medium, EFR32_RF_RADIO(s));
-    efr32_rac_set_state(s, s->seq_released ? EFR32_RAC_STATE_TXPD
-                                           : EFR32_RAC_STATE_OFF);
+    if (s->seq_released) {
+        /* An RX request asserted during TX turns the RAC around (SS7.63). */
+        efr32_rac_hardware_transition(s, efr32_rac_swrxen(s)
+                                             ? EFR32_RAC_STATE_TX2RX
+                                             : EFR32_RAC_STATE_TXPD);
+    } else {
+        efr32_rac_set_state(s, EFR32_RAC_STATE_OFF);
+    }
     efr32_frc_raise(s, EFR32_FRC_IF_TXDONE);
+}
+
+/*
+ * End of a frame received in RXFRAME.  FRC has written the frame to BUFC RX
+ * channel 1 as header, length and payload octets -- the layout measured on
+ * silicon (SS7.66) -- followed by the TRAILRXDATA-selected trailer, and raises
+ * RXDONE.  The RAC then goes to RX2RX while an RX source is still asserted,
+ * to RX2TX when TXEN was latched with SWRXEN withdrawn (SS7.65), and
+ * otherwise to RXPD.  [I] RXPD for a frame end with neither request, and
+ * dropping a TXEN latched with SWRXEN still asserted, are inferred, not
+ * measured.
+ */
+static void efr32_rac_rx_frame_end(void *opaque)
+{
+    Efr32Periph *s = EFR32_PERIPH(opaque);
+    const uint8_t *data;
+    gsize length;
+    uint32_t next_state;
+
+    if (s->rac_state != EFR32_RAC_STATE_RXFRAME || !s->rx_frame) {
+        return;
+    }
+
+    data = g_bytes_get_data(s->rx_frame, &length);
+    for (gsize index = 0; index < length; index++) {
+        efr32_register_put(s, EFR32_FRC_BASE + EFR32_FRC_RXRAWDATA,
+                           data[index]);
+        efr32_bufc_write_data_port(s, EFR32_RF_RX_BUFC_CHANNEL, data[index],
+                                   false);
+    }
+    if (efr32_register_get(s, EFR32_FRC_BASE + EFR32_FRC_TRAILRXDATA) &
+        EFR32_FRC_TRAILRXDATA_CRCOK) {
+        efr32_bufc_write_data_port(s, EFR32_RF_RX_BUFC_CHANNEL,
+                                   EFR32_FRC_TRAILER_CRCOK, false);
+    }
+    g_clear_pointer(&s->rx_frame, g_bytes_unref);
+    trace_efr32bg22_rf_rx_handoff(s->endpoint_id,
+                                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                                  length);
+
+    if (efr32_rac_swrxen(s)) {
+        s->tx_after_frame = false;
+        next_state = EFR32_RAC_STATE_RX2RX;
+    } else if (s->tx_after_frame) {
+        next_state = EFR32_RAC_STATE_RX2TX;
+    } else {
+        next_state = EFR32_RAC_STATE_RXPD;
+    }
+    efr32_frc_raise(s, EFR32_FRC_IF_RXDONE);
+    efr32_rac_hardware_transition(s, next_state);
+}
+
+/*
+ * RAC.CMD as a released sequencer's receive and turnaround states see it.
+ * Returns false to leave a command to the model's older, abstract handling,
+ * which still ends TX-side operations directly in OFF.
+ *
+ * RXDIS in a receive state passes RXPD, whose acknowledgement reaches OFF:
+ * silicon cycles RXSEARCH -> RXPD -> OFF when a silent window is disabled
+ * (owo-open-fw docs/radio-tables.md SS7.63), but only once the RX source is
+ * withdrawn: RXDIS with SWRXEN asserted left it receiving (also SS7.63; [I]
+ * whether it briefly left RXSEARCH is not known).  TXEN during RXFRAME is latched
+ * (RAC.STATUS.TXENS) and decides the frame-end transition (SS7.65).  [I] A
+ * disable during RXPD/TXPD leaves that power-down to finish, and TXDIS in a
+ * receive state only withdraws a latched TXEN; neither is measured.
+ */
+static bool efr32_rac_seq_command(Efr32Periph *s, uint32_t command)
+{
+    uint32_t state = s->rac_state;
+    bool receiving = state == EFR32_RAC_STATE_RXSEARCH ||
+                     state == EFR32_RAC_STATE_RXFRAME ||
+                     state == EFR32_RAC_STATE_RX2RX;
+    bool powering_down = state == EFR32_RAC_STATE_RXPD ||
+                         state == EFR32_RAC_STATE_TXPD;
+
+    if (command & EFR32_RAC_CMD_RXDIS) {
+        if (receiving && efr32_rac_swrxen(s)) {
+            /* With SWRXEN still asserted, RXDIS left silicon in RXSEARCH
+             * (SS7.63); the open driver withdraws the source first. */
+            return true;
+        }
+        if (receiving) {
+            timer_del(s->rac_rx_timer);
+            efr32_rac_cancel_turnaround(s);
+            efr32_rac_hardware_transition(s, EFR32_RAC_STATE_RXPD);
+            return true;
+        }
+        return powering_down;
+    }
+    if (command & EFR32_RAC_CMD_TXDIS) {
+        if (receiving || powering_down) {
+            s->tx_after_frame = false;
+            return true;
+        }
+        return false;
+    }
+    if ((command & EFR32_RAC_CMD_TXEN) && state == EFR32_RAC_STATE_RXFRAME) {
+        s->tx_after_frame = true;
+        return true;
+    }
+    return false;
+}
+
+/* TX begins shortly after STATERX2TX is acknowledged (SS7.68). */
+static void efr32_rac_rx2tx_tx_start(void *opaque)
+{
+    Efr32Periph *s = EFR32_PERIPH(opaque);
+
+    if (s->rac_state == EFR32_RAC_STATE_RX2TX && s->tx_after_frame) {
+        efr32_rac_hardware_transition(s, EFR32_RAC_STATE_TX);
+    }
 }
 
 static void efr32_rac_cancel_tx_completion(Efr32Periph *s)
@@ -1167,6 +1411,37 @@ static void efr32_rac_rx_handoff(void *opaque)
     bool descriptor_published;
 
     if (s->rac_state != EFR32_RAC_STATE_RXSEARCH) {
+        return;
+    }
+
+    /*
+     * With sequencer firmware released and no QEMU-only descriptor ring, a
+     * frame is received the way silicon does it: the RAC enters RXFRAME as
+     * it starts and FRC delivers it to BUFC at frame end, raising RXDONE
+     * then (efr32_rac_rx_frame_end).  Like any transition, RXFRAME entry
+     * waits for pending SEQIEN-enabled state events; the offer stays queued
+     * and is retried when they are cleared.  [I] Whether silicon holds this
+     * demodulator-driven transition is not measured.
+     */
+    if (s->seq_released && !efr32_bufc_descriptor_channel_configured(s)) {
+        if (efr32_rac_seq_events_pending(s)) {
+            return;
+        }
+        request = efr32_rf_medium_take_rx_offer_for_radio(
+            s->rf_medium, EFR32_RF_RADIO(s));
+        if (!request) {
+            s->rx_offer_pending = false;
+            return;
+        }
+        g_clear_pointer(&s->rx_frame, g_bytes_unref);
+        s->rx_frame = g_bytes_ref(
+            efr32_rf_rx_delivery_request_get_data(request));
+        efr32_rf_rx_delivery_request_free(request);
+        s->rx_offer_pending = efr32_rf_medium_has_rx_offer_for_radio(
+            s->rf_medium, EFR32_RF_RADIO(s));
+        efr32_rac_set_state(s, EFR32_RAC_STATE_RXFRAME);
+        timer_mod(s->rac_frame_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                                          EFR32_RAC_RX_FRAME_DURATION_NS);
         return;
     }
 
@@ -1427,19 +1702,38 @@ static uint32_t efr32_rac_status(Efr32Periph *s)
      * repeatedly, not a one-off -- owo-open-fw docs/radio-tables.md
      * SS7.21), i.e. SEQACTIVE=0 and TXENS=0 while STATE=TX. Fixed for
      * the one state this project has direct silicon evidence for.
-     * RXSEARCH's SEQACTIVE/RXENS formula is left exactly as before --
-     * unconfirmed, not disproven, since no equivalent real-hardware RX
-     * measurement exists to check it against; changing it now would
-     * just swap one guess for another. TXENS has no state for which
-     * it's confirmed to read 1 at all, so it is left unset entirely
-     * (matching the EFR32_FRC_STATUS/ACTIVETXFCD precedent just above:
-     * don't synthesize a value for a trigger condition that isn't
-     * understood yet). SEQSLEEPING (bit 22) is the same kind of known
-     * gap, left entirely unmodeled for the same reason.
+     * SEQSLEEPING (bit 22) is a known gap, left entirely unmodeled: it is
+     * set in every sample quoted here and its trigger is not understood.
+     *
+     * Receive-side measurements since (SS7.63/SS7.65) ground three more
+     * bits: RXENS and RXMASK bit 1 follow RXENSRCEN.SWRXEN (set in stock's
+     * TX with SWRXEN, clear in stage 3's TX and in stock's RXFRAME once
+     * SWRXEN was withdrawn; set in RXSEARCH on both stacks), TXENS reports
+     * a TXEN latched during RXFRAME (stock's RXFRAME 0x63400000), and
+     * SEQACTIVE read 0 in that same RXFRAME sample.  SEQACTIVE in the
+     * other non-OFF states is still the old unconfirmed guess; DEMODENS
+     * (set in both RXSEARCH and RXFRAME samples) is not modelled because
+     * its relation to RAC.CMD.DEMODENSET/CLEAR is not understood.
      */
-    return state << 24 |
-           (state != EFR32_RAC_STATE_OFF && state != EFR32_RAC_STATE_TX) << 28 |
-           (state == EFR32_RAC_STATE_RXSEARCH) << 31;
+    bool seqactive = state != EFR32_RAC_STATE_OFF &&
+                     state != EFR32_RAC_STATE_TX &&
+                     state != EFR32_RAC_STATE_RXFRAME;
+
+    return state << EFR32_RAC_STATUS_STATE_SHIFT |
+           (seqactive ? EFR32_RAC_STATUS_SEQACTIVE : 0) |
+           (s->tx_after_frame ? EFR32_RAC_STATUS_TXENS : 0) |
+           (efr32_rac_swrxen(s) ? EFR32_RAC_STATUS_RXENS |
+                                      EFR32_RAC_STATUS_RXMASK_SWRXEN : 0);
+}
+
+/* RAC.STIMER ticks since the last RAC state change (SS7.66, SS7.68). */
+static uint32_t efr32_rac_stimer(Efr32Periph *s)
+{
+    int64_t elapsed = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+                      s->rac_stimer_epoch_ns;
+
+    return muldiv64(elapsed, EFR32_RAC_STIMER_TICKS_PER_10US,
+                    EFR32_RAC_STIMER_NS_PER_10US) & EFR32_RAC_STIMER_MASK;
 }
 
 static void efr32_free_running_counter_expired(void *opaque)
@@ -2094,6 +2388,8 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
                    EFR32_TIMER_STATUS_RUNNING : 0;
     if (address == EFR32_RAC_BASE + EFR32_RAC_STATUS)
         return efr32_rac_status(s);
+    if (address == EFR32_RAC_BASE + EFR32_RAC_STIMER)
+        return efr32_rac_stimer(s);
     if (((address & ~0x3fffu) == EFR32_PROTIMER_BASE ||
          (address & ~0x3fffu) == EFR32_PROTIMER_NS_BASE) &&
         offset == EFR32_PROTIMER_COUNTER)
@@ -2356,7 +2652,10 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
     if (register_address == EFR32_RAC_BASE + EFR32_RAC_CMD)
     {
         next &= 0xc000fdff;
-        if (next & (EFR32_RAC_CMD_TXDIS | EFR32_RAC_CMD_RXDIS))
+        if (s->seq_released && efr32_rac_seq_command(s, next)) {
+            /* Handled as the released sequencer's receive-side RAC does. */
+        }
+        else if (next & (EFR32_RAC_CMD_TXDIS | EFR32_RAC_CMD_RXDIS))
         {
             efr32_rac_cancel_tx_completion(s);
             timer_del(s->rac_rx_timer);
@@ -2370,6 +2669,7 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
             efr32_rf_medium_withdraw_active_tx(s->rf_medium,
                                                 EFR32_RF_RADIO(s));
             s->txen_held = false;
+            efr32_rac_cancel_turnaround(s);
             efr32_rac_set_state(s, EFR32_RAC_STATE_OFF);
         }
         else if (next & EFR32_RAC_CMD_TXEN)
@@ -2576,6 +2876,7 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
          */
         efr32_rf_medium_withdraw_active_tx(s->rf_medium, EFR32_RF_RADIO(s));
         s->txen_held = false;
+        efr32_rac_cancel_turnaround(s);
         efr32_rac_set_state(s, EFR32_RAC_STATE_SHUTDOWN);
     }
 
@@ -2607,10 +2908,22 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
      * RAIL_StartRx writes SWRXEN through the RXENSRCEN SET alias.  The
      * hardware sequencer has many intermediate states; RXSEARCH is the
      * first stable receive state that its public register model exposes.
+     *
+     * With sequencer firmware released, SWRXEN asserted while the radio is
+     * busy is a pending RX request rather than an immediate state change:
+     * stock's RAC.STATUS shows RXENS with the SWRXEN source throughout
+     * TXWARM and TX, and the RAC turns around through TX2RX when the frame
+     * ends (owo-open-fw docs/radio-tables.md SS7.63; efr32_rac_tx_complete).
+     * A held TXEN counts as busy.  [I] The idle (OFF/SHUTDOWN) case still
+     * enters RXSEARCH directly; the RXWARM state silicon presumably passes
+     * through is not modelled.
      */
     if (register_address == EFR32_RAC_BASE + EFR32_RAC_RXENSRCEN &&
         ((word >> 12) & 3) == 1 &&
-        (next & EFR32_RAC_RXENSRCEN_SWRXEN))
+        (next & EFR32_RAC_RXENSRCEN_SWRXEN) &&
+        !(s->seq_released &&
+          (s->txen_held || (s->rac_state != EFR32_RAC_STATE_OFF &&
+                            s->rac_state != EFR32_RAC_STATE_SHUTDOWN))))
     {
         /* RX replaces this model's active synthetic TX operation. */
         efr32_rac_cancel_tx_completion(s);
@@ -2635,26 +2948,62 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         uint32_t seqif = efr32_register_get(s, EFR32_RAC_BASE +
                                                EFR32_RAC_SEQIF);
 
+        bool acknowledged = s->seq_released &&
+            !(seqif & efr32_rac_seq_state_flag(s->rac_state));
+
         if (efr32_rac_seq_events_pending(s)) {
             /* Every enabled state event must be cleared first. */
+        } else if (s->rac_transition_held) {
+            s->rac_transition_held = false;
+            efr32_rac_enter_state(s, s->rac_held_state);
         } else if (s->txen_held) {
             s->txen_held = false;
             efr32_rac_set_state(s, EFR32_RAC_STATE_TXWARM);
-        } else if (s->seq_released && s->rac_state == EFR32_RAC_STATE_TXWARM &&
-                   !(seqif & efr32_rac_seq_state_flag(
-                                 EFR32_RAC_STATE_TXWARM))) {
-            /* Clearing STATETXWARM is the first proof that the released
-             * private core accepted this launch.  Publish no frame before
-             * that handshake: real silicon can remain in TXWARM/SHUTDOWN
-             * with every byte still staged after RAC.CMD.TXEN. */
-            efr32_rac_capture_tx_snapshot(s);
-            efr32_rac_set_state(s, EFR32_RAC_STATE_TX);
-        } else if (s->seq_released && s->rac_state == EFR32_RAC_STATE_TX &&
-                   !(seqif & efr32_rac_seq_state_flag(EFR32_RAC_STATE_TX))) {
-            efr32_rac_schedule_tx_completion(s);
-        } else if (s->seq_released && s->rac_state == EFR32_RAC_STATE_TXPD &&
-                   !(seqif & efr32_rac_seq_state_flag(EFR32_RAC_STATE_TXPD))) {
-            efr32_rac_set_state(s, EFR32_RAC_STATE_OFF);
+        } else if (acknowledged) {
+            switch (s->rac_state) {
+            case EFR32_RAC_STATE_TXWARM:
+                /* Clearing STATETXWARM is the first proof that the released
+                 * private core accepted this launch.  Publish no frame
+                 * before that handshake: real silicon can remain in
+                 * TXWARM/SHUTDOWN with every byte still staged after
+                 * RAC.CMD.TXEN. */
+                efr32_rac_enter_state(s, EFR32_RAC_STATE_TX);
+                break;
+            case EFR32_RAC_STATE_TX:
+                /* Arm the frame once; later writes must not postpone it. */
+                if (!timer_pending(s->rac_tx_timer) &&
+                    !s->tx_waiting_for_synth) {
+                    efr32_rac_schedule_tx_completion(s);
+                }
+                break;
+            case EFR32_RAC_STATE_TXPD:
+            case EFR32_RAC_STATE_RXPD:
+                /* Power-down ends in OFF once acknowledged (SS7.62/7.65). */
+                efr32_rac_set_state(s, EFR32_RAC_STATE_OFF);
+                break;
+            case EFR32_RAC_STATE_TX2RX:
+            case EFR32_RAC_STATE_RX2RX:
+                /* The sequencer has brought the receiver up (SS7.63). */
+                efr32_rac_enter_state(s, EFR32_RAC_STATE_RXSEARCH);
+                break;
+            case EFR32_RAC_STATE_RX2TX:
+                /* The acknowledgement controls the TX start (SS7.68). */
+                if (s->tx_after_frame &&
+                    !timer_pending(s->rac_tx_start_timer)) {
+                    timer_mod(s->rac_tx_start_timer,
+                              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                                  EFR32_RAC_RX2TX_TX_START_DELAY_NS);
+                }
+                break;
+            case EFR32_RAC_STATE_RXSEARCH:
+                /* A frame offered while an event was pending can start. */
+                if (s->rx_offer_pending) {
+                    efr32_rac_schedule_rx_handoff(s);
+                }
+                break;
+            default:
+                break;
+            }
         }
         efr32_rac_update_irqs(s);
     }
@@ -2790,6 +3139,10 @@ static void efr32_periph_init(Object *o)
         timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_rac_tx_complete, s);
     s->rac_rx_timer =
         timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_rac_rx_handoff, s);
+    s->rac_frame_timer =
+        timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_rac_rx_frame_end, s);
+    s->rac_tx_start_timer =
+        timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_rac_rx2tx_tx_start, s);
     for (unsigned channel = 0; channel < G_N_ELEMENTS(s->bufc_data); channel++)
     {
         s->bufc_data[channel] = g_byte_array_new();
@@ -2859,6 +3212,8 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     ptimer_transaction_commit(s->burtc_counter);
     efr32_rac_cancel_tx_completion(s);
     timer_del(s->rac_rx_timer);
+    efr32_rac_cancel_turnaround(s);
+    s->rac_stimer_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->rx_offer_pending = false;
     s->synth_running = false;
     efr32_register_put(s, EFR32_SYNTH_BASE + EFR32_SYNTH_STATUS, 0);
@@ -2903,6 +3258,9 @@ static void efr32_periph_finalize(Object *obj)
         address_space_destroy(&s->dma_as);
     }
     timer_free(s->rac_rx_timer);
+    timer_free(s->rac_frame_timer);
+    timer_free(s->rac_tx_start_timer);
+    g_clear_pointer(&s->rx_frame, g_bytes_unref);
     timer_free(s->rac_tx_timer);
     timer_free(s->burtc_compare_timer);
     timer_free(s->timer4_compare_timer);
