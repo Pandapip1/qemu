@@ -74,6 +74,75 @@ void icount_account_warp_timer(void);
 void icount_notify_exit(void);
 
 /*
+ * Per-CPU clocks under icount (opt-in, precise icount only).
+ *
+ * By default every instruction of every vCPU advances one global virtual
+ * clock by 2^shift ns, so vCPUs that share the round-robin thread share one
+ * instruction rate.  With per-CPU clocks each vCPU has its own clock rate
+ * and keeps its own virtual time.  Virtual time advances in rounds of at
+ * most @quantum_ns, never past the next QEMU_CLOCK_VIRTUAL deadline; in a
+ * round every runnable vCPU executes until its own time reaches the round
+ * end, and QEMU_CLOCK_VIRTUAL read from inside a vCPU returns that vCPU's
+ * own time.  A vCPU that overshoots the round end (an instruction or an
+ * access charge cannot be split) carries the excess into the next round, so
+ * no time is lost or invented.  A halted vCPU woken by another vCPU resumes
+ * at the waker's time.
+ *
+ * icount_cpu_clocks_enable: switch the mode on, before the vCPUs start.
+ * Returns false (and changes nothing) unless icount is in precise mode.
+ */
+bool icount_cpu_clocks_enable(int64_t quantum_ns);
+bool icount_cpu_clocks_enabled(void);
+/*
+ * icount_set_cpu_clock: @cpu runs at @hz and an instruction takes
+ * @cycles_per_insn_milli / 1000 cycles on average.  @hz = 0 stops the
+ * clock: the vCPU keeps its state, does not execute and its time follows
+ * the rounds.  May be called from the vCPU itself (e.g. on a clock-tree
+ * register write): the instructions executed so far are accounted at the
+ * old rate first.
+ */
+void icount_set_cpu_clock(CPUState *cpu, uint64_t hz,
+                          uint32_t cycles_per_insn_milli);
+/* icount_set_cpu_exception_cycles: cycles each exception entry costs. */
+void icount_set_cpu_exception_cycles(CPUState *cpu, uint64_t millicycles);
+void icount_charge_exception(CPUState *cpu);
+/*
+ * icount_charge_cycles: add @millicycles / 1000 of @cpu's own cycles to its
+ * time.  @cpu may be the executing vCPU (call before the access takes
+ * effect) or another one (cycles it loses to the executing vCPU, e.g. bus
+ * contention).  A no-op unless per-CPU clocks are on.
+ */
+void icount_charge_cycles(CPUState *cpu, uint64_t millicycles);
+
+/*
+ * Bus model of the per-CPU clocks.  A device calls icount_bus_access() for
+ * every access a vCPU makes to it; the model's @access hook prices it as
+ * (master, address, size, direction) -> extra cycles of that master and a
+ * target class < ICOUNT_BUS_TARGETS.  The core charges the cycles and
+ * counts the access in the master's per-round occupancy
+ * (CPUState.icount_bus_accesses).  @access may also charge other vCPUs
+ * through icount_charge_cycles() for contention.  @round_end, if set, runs
+ * when a round completes, before the occupancy is cleared, so a model can
+ * resolve contention from what every master did in the round.
+ */
+typedef struct IcountBusModel {
+    uint64_t (*access)(void *opaque, CPUState *master, uint64_t addr,
+                       unsigned size, bool is_write, unsigned *target);
+    void (*round_end)(void *opaque, int64_t start_ns, int64_t end_ns);
+    void *opaque;
+} IcountBusModel;
+void icount_register_bus_model(IcountBusModel *model);
+void icount_bus_access(IcountBusModel *model, CPUState *master,
+                       uint64_t addr, unsigned size, bool is_write);
+/*
+ * icount_cpu_clocks_wake: @cpu, if halted, is being woken; it resumes no
+ * earlier than the caller's time (the running vCPU's, else the global
+ * time).  Called on every interrupt raise; a device that un-halts a vCPU by
+ * other means calls it first.
+ */
+void icount_cpu_clocks_wake(CPUState *cpu);
+
+/*
  * CPU Ticks and Clock
  */
 

@@ -395,6 +395,9 @@ struct qemu_work_item;
 
 #define CPU_UNSET_NUMA_NODE_ID -1
 
+/* Bus-model target classes counted per vCPU and round (IcountBusModel). */
+#define ICOUNT_BUS_TARGETS 8
+
 /**
  * struct CPUState - common state of one CPU core or thread.
  *
@@ -494,6 +497,25 @@ struct CPUState {
     int singlestep_enabled;
     int64_t icount_budget;
     int64_t icount_extra;
+    /*
+     * Per-CPU clocks under icount (icount_cpu_clocks_enable()): this
+     * CPU's own virtual time, split into ns and a sub-ns remainder in fs,
+     * and the virtual time one instruction and one core cycle take.
+     * Unused, and zero, unless the machine enabled per-CPU clocks.
+     */
+    int64_t icount_time_ns;
+    uint64_t icount_time_fs;
+    uint64_t icount_insn_fs;
+    uint64_t icount_cycle_fs;
+    /* Extra cycles (x1000) charged on each exception entry. */
+    uint64_t icount_exception_millicycles;
+    /* The clock is stopped: the vCPU keeps its state and does not run. */
+    bool icount_clock_stopped;
+    /*
+     * Device accesses in the current round, by bus-model target class
+     * (IcountBusModel), for a model that resolves contention per round.
+     */
+    uint32_t icount_bus_accesses[ICOUNT_BUS_TARGETS];
     uint64_t random_seed;
     sigjmp_buf jmp_env;
 

@@ -2589,6 +2589,205 @@ static void test_seq_systick_counts(void)
 }
 
 /*
+ * Per-CPU clocks under -icount (owo-open-fw docs/radio-tables.md SS7.73).
+ * On silicon the M33 runs at HCLK and the M0+ at SYSCLK / (RHCLKPRESC + 1),
+ * each at its own rate while the other runs; firmware code averaged 1.84
+ * M33 cycles and 2 M0+ cycles per instruction, and a radio-register access
+ * costs extra cycles.  Each core here times a loop with its own SysTick
+ * (core cycles) and with RAC.STIMER (4.8 ticks/us of virtual time), both
+ * cores at once.
+ */
+#define CORE_CLOCK_SYSTICK_BASE      0xe000e010u
+#define CORE_CLOCK_SYSTICK_FULL      0x00ffffffu
+#define CORE_CLOCK_SYSTICK_ON_CORE   5u    /* ENABLE | CLKSOURCE */
+#define CORE_CLOCK_STIMER            (RAC_BASE + 0x030)
+#define CORE_CLOCK_STIMER_PER_US     4.8
+#define CORE_CLOCK_LOOPS             4800u
+#define CORE_CLOCK_M33_RESULT        0x20001000u
+#define CORE_CLOCK_SEQ_RESULT_LOCAL  0x00003000u
+#define CORE_CLOCK_SEQ_RESULT        (SEQRAM_NS_BASE + 0x3000)
+#define CORE_CLOCK_CMU_SYSCLK_HFXO   3u
+#define CORE_CLOCK_CMU_RHCLK_DIV2    (1u << 16)
+#define CORE_CLOCK_HFXO_HZ           38400000.0
+#define CORE_CLOCK_M33_CPI           1.84
+#define CORE_CLOCK_SEQ_CPI           2.0
+#define THUMB16_SUBS_R3_1            0x3b01u
+#define THUMB16_BNE_BACK_ONE         0xd1fdu  /* bne to the insn before */
+
+/*
+ * Write a probe at @code (address as the core sees it: @local) that stores
+ * {SysTick before, SysTick after, STIMER before, STIMER after} around
+ * CORE_CLOCK_LOOPS iterations of a two-instruction loop.  Between the
+ * samples it executes 2 * CORE_CLOCK_LOOPS + 2 instructions, one of them a
+ * radio-register load.
+ */
+static void core_clock_write_probe(QTestState *qts, uint32_t code,
+                                   uint32_t local, uint32_t result)
+{
+    uint16_t insn[20];
+    uint32_t lit = local + 2 * G_N_ELEMENTS(insn);
+    uint32_t literals[] = { CORE_CLOCK_SYSTICK_BASE, CORE_CLOCK_SYSTICK_FULL,
+                            CORE_CLOCK_STIMER, CORE_CLOCK_LOOPS, result };
+    size_t i;
+
+    insn[0] = thumb_ldr_pc(0, local + 0, lit + 0);
+    insn[1] = thumb_ldr_pc(1, local + 2, lit + 4);
+    insn[2] = thumb_str_imm(1, 0, 1);          /* RELOAD */
+    insn[3] = thumb_movs_imm8(1, CORE_CLOCK_SYSTICK_ON_CORE);
+    insn[4] = thumb_str_imm(1, 0, 0);          /* CSR */
+    insn[5] = thumb_ldr_pc(6, local + 10, lit + 8);
+    insn[6] = thumb_ldr_pc(3, local + 12, lit + 12);
+    insn[7] = thumb_ldr_imm(2, 0, 2);          /* SysTick before */
+    insn[8] = thumb_ldr_imm(7, 6, 0);          /* STIMER before */
+    insn[9] = THUMB16_SUBS_R3_1;
+    insn[10] = THUMB16_BNE_BACK_ONE;
+    insn[11] = thumb_ldr_imm(4, 0, 2);         /* SysTick after */
+    insn[12] = thumb_ldr_imm(5, 6, 0);         /* STIMER after */
+    insn[13] = thumb_ldr_pc(1, local + 26, lit + 16);
+    insn[14] = thumb_str_imm(2, 1, 0);
+    insn[15] = thumb_str_imm(4, 1, 1);
+    insn[16] = thumb_str_imm(7, 1, 2);
+    insn[17] = thumb_str_imm(5, 1, 3);
+    insn[18] = THUMB16_BRANCH_SELF;
+    insn[19] = THUMB16_BRANCH_SELF;
+    for (i = 0; i < G_N_ELEMENTS(insn); i += 2) {
+        qtest_writel(qts, code + 2 * i, THUMB16_PAIR(insn[i], insn[i + 1]));
+    }
+    for (i = 0; i < G_N_ELEMENTS(literals); i++) {
+        qtest_writel(qts, code + 2 * G_N_ELEMENTS(insn) + 4 * i, literals[i]);
+    }
+    for (i = 0; i < 4; i++) {
+        qtest_writel(qts, result == CORE_CLOCK_SEQ_RESULT_LOCAL ?
+                     CORE_CLOCK_SEQ_RESULT + 4 * i : result + 4 * i, 0);
+    }
+}
+
+static void core_clock_check(QTestState *qts, uint32_t result,
+                             double cpi, double hz)
+{
+    uint32_t c0 = 0, c1, s0, s1;
+    double insns = 2.0 * CORE_CLOCK_LOOPS + 2, cycles, us;
+
+    for (unsigned attempt = 0; attempt < 5000; attempt++) {
+        if (qtest_readl(qts, result + 12)) {
+            break;
+        }
+        g_usleep(1000);
+    }
+    c0 = qtest_readl(qts, result);
+    c1 = qtest_readl(qts, result + 4);
+    s0 = qtest_readl(qts, result + 8);
+    s1 = qtest_readl(qts, result + 12);
+    g_assert_cmpuint(s1, !=, 0);
+    cycles = (double)((c0 - c1) & CORE_CLOCK_SYSTICK_FULL);
+    us = (double)((s1 - s0) & 0xffffu) / CORE_CLOCK_STIMER_PER_US;
+    /* Average cycles per instruction (the radio load adds a few cycles). */
+    g_assert_cmpfloat(cycles / insns, >=, cpi);
+    g_assert_cmpfloat(cycles / insns, <=, cpi * 1.01);
+    /* Core clock against virtual time: within STIMER's resolution. */
+    g_assert_cmpfloat(cycles / us * 1e6, >=, hz * 0.98);
+    g_assert_cmpfloat(cycles / us * 1e6, <=, hz * 1.02);
+}
+
+static QTestState *core_clock_start(const char *machine_options)
+{
+    QTestState *qts = qtest_initf("-machine efr32bg22%s -accel tcg "
+                                  "-icount shift=5,sleep=off -S",
+                                  machine_options);
+    const uint32_t m33_code = 0x100, seq_code = 0x100;
+
+    qtest_writel(qts, 0x00000000, 0x20008000);
+    qtest_writel(qts, 0x00000004, m33_code | 1);
+    core_clock_write_probe(qts, m33_code, m33_code, CORE_CLOCK_M33_RESULT);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    qtest_seq_enable_radio_bus_clocks(qts);
+    /* SYSCLK on HFXO, the radio HCLK prescaler at /2. */
+    qtest_writel(qts, CMU_BASE + CMU_SYSCLKCTRL,
+                 CORE_CLOCK_CMU_SYSCLK_HFXO | CORE_CLOCK_CMU_RHCLK_DIV2);
+    qtest_writel(qts, RAC_BASE + RAC_CTRL, RAC_CTRL_SEQRESET);
+    qtest_writel(qts, SEQRAM_NS_BASE + 0x000, 0x00003e00);
+    qtest_writel(qts, SEQRAM_NS_BASE + 0x004, seq_code | 1);
+    core_clock_write_probe(qts, SEQRAM_NS_BASE + seq_code, seq_code,
+                           CORE_CLOCK_SEQ_RESULT_LOCAL);
+    qtest_writel(qts, RAC_BASE + RAC_CTRL, RAC_CTRL_CPUWAITDIS);
+    qtest_qmp_assert_success(qts, "{'execute':'cont'}");
+    return qts;
+}
+
+/* Both cores at once, each at its own rate: M33 at HCLK = SYSCLK = 38.4 MHz,
+ * the M0+ at SYSCLK / 2 = 19.2 MHz. */
+static void test_core_clocks_per_cpu_rates(void)
+{
+    QTestState *qts = core_clock_start("");
+
+    core_clock_check(qts, CORE_CLOCK_M33_RESULT, CORE_CLOCK_M33_CPI,
+                     CORE_CLOCK_HFXO_HZ);
+    core_clock_check(qts, CORE_CLOCK_SEQ_RESULT, CORE_CLOCK_SEQ_CPI,
+                     CORE_CLOCK_HFXO_HZ / 2);
+    qtest_quit(qts);
+}
+
+/*
+ * RADIOCLKCTRL.EN clear stops the M0+ with its state kept (silicon,
+ * SS7.73); setting it again resumes it.  The sequencer counts in SEQRAM.
+ */
+static void test_core_clocks_radio_clock_stops_seq(void)
+{
+    static const uint16_t counter[] = {
+        0, /* ldr r0, =SEQ_SPARE0 (patched below) */
+        THUMB16_LDR_R1_R0, THUMB16_ADDS_R1_1, THUMB16_STR_R1_R0,
+        0xe7fbu, /* b to the load */
+        THUMB16_BRANCH_SELF,
+    };
+    uint16_t insn[G_N_ELEMENTS(counter)];
+    uint32_t literal = SEQ_SPARE0;
+    QTestState *qts;
+    uint32_t a, b;
+
+    memcpy(insn, counter, sizeof(insn));
+    insn[0] = thumb_ldr_pc(0, 0x100, 0x100 + 2 * G_N_ELEMENTS(insn));
+    qts = qtest_initf("-machine efr32bg22 -accel tcg -icount shift=5,sleep=off "
+                      "-S");
+    qtest_writel(qts, 0x00000000, 0x20008000);
+    qtest_writel(qts, 0x00000004, 0x00000101);
+    qtest_writel(qts, 0x00000100, 0x0000e7fe);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    qtest_seq_enable_radio_bus_clocks(qts);
+    qtest_writel(qts, RAC_BASE + RAC_CTRL, RAC_CTRL_SEQRESET);
+    qtest_writel(qts, SEQRAM_NS_BASE + 0x000, 0x00003e00);
+    qtest_writel(qts, SEQRAM_NS_BASE + 0x004, 0x00000101);
+    for (size_t i = 0; i < G_N_ELEMENTS(insn); i += 2) {
+        qtest_writel(qts, SEQRAM_NS_BASE + 0x100 + 2 * i,
+                     THUMB16_PAIR(insn[i], insn[i + 1]));
+    }
+    qtest_writel(qts, SEQRAM_NS_BASE + 0x100 + 2 * G_N_ELEMENTS(insn),
+                 literal);
+    qtest_writel(qts, SEQRAM_NS_BASE + SEQ_SPARE0, 0);
+    qtest_writel(qts, RAC_BASE + RAC_CTRL, RAC_CTRL_CPUWAITDIS);
+    qtest_qmp_assert_success(qts, "{'execute':'cont'}");
+    g_usleep(20000);
+    qtest_qmp_assert_success(qts, "{'execute':'stop'}");
+    g_assert_cmpuint(qtest_readl(qts, SEQRAM_NS_BASE + SEQ_SPARE0), !=, 0);
+
+    qtest_writel(qts, CMU_BASE + CMU_RADIOCLKCTRL + REGISTER_CLEAR_WINDOW,
+                 CMU_RADIOCLKCTRL_EN);
+    a = qtest_readl(qts, SEQRAM_NS_BASE + SEQ_SPARE0);
+    qtest_qmp_assert_success(qts, "{'execute':'cont'}");
+    g_usleep(20000);
+    qtest_qmp_assert_success(qts, "{'execute':'stop'}");
+    b = qtest_readl(qts, SEQRAM_NS_BASE + SEQ_SPARE0);
+    g_assert_cmpuint(a, ==, b);
+
+    qtest_writel(qts, CMU_BASE + CMU_RADIOCLKCTRL + REGISTER_SET_WINDOW,
+                 CMU_RADIOCLKCTRL_EN);
+    qtest_qmp_assert_success(qts, "{'execute':'cont'}");
+    g_usleep(20000);
+    qtest_qmp_assert_success(qts, "{'execute':'stop'}");
+    g_assert_cmpuint(qtest_readl(qts, SEQRAM_NS_BASE + SEQ_SPARE0), >, b);
+    qtest_quit(qts);
+}
+
+/*
  * A cleared state event releases the next RAC transition ~1.09 us later
  * (owo-open-fw docs/radio-tables.md SS7.72); these TCG tests run in real
  * time, so wait for the state rather than read it once.
@@ -3041,6 +3240,10 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/seq-nvic-ipr-byte-isolation",
                    test_seq_nvic_ipr_byte_isolation);
     qtest_add_func("/efr32bg22/seq-systick-counts", test_seq_systick_counts);
+    qtest_add_func("/efr32bg22/core-clocks-per-cpu-rates",
+                   test_core_clocks_per_cpu_rates);
+    qtest_add_func("/efr32bg22/core-clocks-radio-clock-stops-seq",
+                   test_core_clocks_radio_clock_stops_seq);
     qtest_add_func("/efr32bg22/radio-sequencer-executes-open-code",
                    test_radio_sequencer_executes_open_code);
     qtest_add_func("/efr32bg22/radio-sequencer-release-is-idempotent",

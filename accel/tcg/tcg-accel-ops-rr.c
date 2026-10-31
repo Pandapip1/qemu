@@ -230,10 +230,17 @@ static void *rr_cpu_thread_fn(void *arg)
             /*
              * Run the timers here.  This is much more efficient than
              * waking up the I/O thread and waiting for completion.
+             * With per-CPU clocks, timers run between rounds only.
              */
-            icount_handle_deadline();
-
-            cpu_budget = icount_percpu_budget(cpu_count);
+            if (!icount_cpu_clocks_enabled()) {
+                icount_handle_deadline();
+                cpu_budget = icount_percpu_budget(cpu_count);
+            } else {
+                if (!icount_cpu_clocks_round_active()) {
+                    icount_handle_deadline();
+                }
+                icount_cpu_clocks_round_begin();
+            }
         }
 
         replay_mutex_unlock();
@@ -251,7 +258,11 @@ static void *rr_cpu_thread_fn(void *arg)
             qemu_clock_enable(QEMU_CLOCK_VIRTUAL,
                               (cpu->singlestep_enabled & SSTEP_NOTIMER) == 0);
 
-            if (cpu_can_run(cpu)) {
+            if (cpu_can_run(cpu) && icount_enabled() &&
+                icount_cpu_clocks_enabled() &&
+                (cpu_budget = icount_cpu_clocks_budget(cpu)) == 0) {
+                /* This vCPU has reached the end of the round. */
+            } else if (cpu_can_run(cpu)) {
                 int r;
 
                 bql_unlock();
@@ -285,6 +296,10 @@ static void *rr_cpu_thread_fn(void *arg)
 
         /* Does not need a memory barrier because a spurious wakeup is okay.  */
         qatomic_set(&rr_current_cpu, NULL);
+
+        if (icount_enabled() && icount_cpu_clocks_enabled()) {
+            icount_cpu_clocks_round_end_check();
+        }
 
         if (cpu && cpu->exit_request) {
             qatomic_set_mb(&cpu->exit_request, 0);

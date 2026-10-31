@@ -18,6 +18,7 @@
 #include "hw/sysbus.h"
 #include "hw/arm/armv7m.h"
 #include "sysemu/reset.h"
+#include "sysemu/cpu-timers.h"
 #include "target/arm/cpu.h"
 #include "target/arm/idau.h"
 #include "trace.h"
@@ -598,6 +599,11 @@ struct Efr32Periph
     qemu_irq irq[64];
     qemu_irq seq_irq_state[EFR32_RAC_SEQ_STATE_EVENTS];
     CPUState *seq_cpu;
+    /* Per-CPU clocks: the M33, and both cores' SysTick processor clocks. */
+    CPUState *m33_cpu;
+    Clock *m33_cpuclk;
+    Clock *seq_cpuclk;
+    IcountBusModel bus_model;
     bool seq_released;
     bool synth_running;
     /* A sequencer-driven TX reached completion with the synthesizer off. */
@@ -1984,12 +1990,12 @@ static uint32_t efr32_protimer_counter(Efr32Periph *s)
  * reference chosen by CMU_DPLLREFCLKCTRL; without it HFRCODPLL keeps its
  * 19 MHz reset band.  Oscillator rates are the xg22.dtsi values.
  */
+static uint64_t efr32_hfrcodpll_hz(Efr32Periph *s);
+
 static uint64_t efr32_em01grpa_hz(Efr32Periph *s)
 {
     uint32_t clksel = efr32_register_get(s, EFR32_CMU_BASE +
                                             EFR32_CMU_EM01GRPACLKCTRL) & 0x3u;
-    uint32_t cfg1;
-    uint64_t ref;
 
     switch (clksel) {
     case EFR32_CMU_EM01GRPACLKCTRL_CLKSEL_HFXO:
@@ -1997,8 +2003,15 @@ static uint64_t efr32_em01grpa_hz(Efr32Periph *s)
     case EFR32_CMU_EM01GRPACLKCTRL_CLKSEL_FSRCO:
         return EFR32_FSRCO_HZ;
     default:
-        break;
+        return efr32_hfrcodpll_hz(s);
     }
+}
+
+static uint64_t efr32_hfrcodpll_hz(Efr32Periph *s)
+{
+    uint32_t cfg1;
+    uint64_t ref;
+
     if (!efr32_dpll_enabled(s)) {
         return EFR32_HFRCO_RESET_HZ;
     }
@@ -3589,6 +3602,7 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
              * already running does not reset the auxiliary core. */
             cpu_reset(s->seq_cpu);
             s->seq_released = true;
+            icount_cpu_clocks_wake(s->seq_cpu);
             s->seq_cpu->halted = 0;
             s->seq_cpu->stopped = false;
             s->seq_cpu->start_powered_off = false;
@@ -3719,11 +3733,207 @@ static bool efr32_bus_error(Efr32Periph *s, uint32_t address)
     return gate && (!radio_clock || !(clken1 & gate));
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * Core clocks and bus access costs (owo-open-fw docs/radio-tables.md SS7.73)
+ * ---------------------------------------------------------------------------
+ * Under -icount with per-CPU clocks (icount_cpu_clocks_enable), each core
+ * runs at its own clock and is charged for slow bus accesses.  Silicon, stage
+ * 3 (SYSCLKCTRL = 0x00010402: HFRCODPLL 76.8 MHz, HCLK /1, PCLK /2,
+ * RHCLKPRESC DIV2), each core running a loop while the other was halted,
+ * timed by its own cycle counter and by TIMER1 (HFRCODPLL, calibrated by
+ * packet airtime, SS7.71):
+ *  - M33 DWT.CYCCNT and TIMER1 advance 1:1 (n = 10): HCLK = 76.8 MHz.
+ *  - M0+ SysTick (CLKSOURCE = core) counts exactly half of TIMER1
+ *    (21890 cycles in 43780 ticks, n = 10): 38.4 MHz.  With SYSCLK on HFXO
+ *    it ran at 19.2 MHz and on FSRCO at 9.89 MHz, whatever HCLKPRESC (SS7.73,
+ *    cross-core probes): the M0+ runs at SYSCLK / (RHCLKPRESC + 1).
+ *  - RADIOCLKCTRL.EN = 0 stops the M0+ with its state kept.
+ * At reset SYSCLK is FSRCO, 19.807 MHz (EFR32_FSRCO_MEASURED_HZ).
+ */
+#define EFR32_CMU_SYSCLKCTRL_CLKSEL_HFRCODPLL 2u
+#define EFR32_CMU_SYSCLKCTRL_HCLKPRESC_SHIFT 12
+#define EFR32_CMU_SYSCLKCTRL_HCLKPRESC_MASK 0xfu
+#define EFR32_CMU_SYSCLKCTRL_RHCLKPRESC_SHIFT 16
+#define EFR32_CMU_SYSCLKCTRL_RHCLKPRESC_MASK 0x1u
+/*
+ * Average core cycles per instruction, from real code: a firmware function
+ * called from the debugger at full speed (cycles) and single-stepped
+ * (instructions), n = 6 calls each, warm cache.
+ *  - M33, stage 3 from flash: snprintk 7973 cycles / 4342 insns = 1.84
+ *    (compiled C); memcpy 1.60, memset 1.50, strlen 1.45 (library loops).
+ *    The compiled-C value is used.
+ *  - M0+, the open sequencer's handler code: EFR32_SEQ_CYCLES_PER_INSN_MILLI.
+ */
+#define EFR32_M33_CYCLES_PER_INSN_MILLI 1840u
+#define EFR32_SEQ_CYCLES_PER_INSN_MILLI 2000u
+/*
+ * Exception entry on the M0+ (SysTick reload to the first handler load):
+ * 16 cycles (SS7.73, cross-core probes).  [P] The M33's is not charged.
+ */
+#define EFR32_SEQ_EXCEPTION_ENTRY_MILLICYCLES 16000u
+/*
+ * Bus model: extra cycles of one access beyond an average instruction, in
+ * the accessing core's cycles.  Total cycles per access (loops of 8 copies,
+ * n = 5 + 5, no spread; the cross-core probes found the same):
+ *  - M33 from flash: SRAM 1; SEQRAM 1.88, or 2.38 while the M0+ executes;
+ *    BUFC 1.88; RAC, FRC, SYNTH, MODEM, AGC, CMU, GPIO 3.88; TIMER1 11.88.
+ *  - M0+: SEQRAM load 2, store 2.5; BUFC 3.25; RAC, FRC, SYNTH, MODEM, AGC
+ *    4.25 back to back, EFR32_SEQ_RADIO_EXTRA between other instructions.
+ * The M33 extras are relative to an SRAM access (1 cycle).  [I] Other
+ * peripherals are charged as CMU, other TIMERs as TIMER1.  Not charged (RAM
+ * here): M33 flash data loads (4.5).
+ * Each M33 SEQRAM access while the M0+ executes costs the M0+ 0.9 of its
+ * cycles: SEQRAM has one port and the M33 wins (SS7.73, cross-core probes:
+ * M0+ code 2.8x slower under M33 SEQRAM streaming).
+ */
+#define EFR32_M33_RADIO_EXTRA_MILLICYCLES 2875u
+#define EFR32_M33_BUFC_EXTRA_MILLICYCLES 875u
+#define EFR32_M33_PERIPH_EXTRA_MILLICYCLES 2875u
+#define EFR32_M33_TIMER_EXTRA_MILLICYCLES 10875u
+#define EFR32_M33_SEQRAM_EXTRA_MILLICYCLES 875u
+#define EFR32_M33_SEQRAM_SHARED_EXTRA_MILLICYCLES 1375u
+#define EFR32_SEQ_SEQRAM_STEAL_MILLICYCLES 900u
+#define EFR32_SEQ_RADIO_EXTRA_MILLICYCLES 2250u
+#define EFR32_SEQ_BUFC_EXTRA_MILLICYCLES 1250u
+#define EFR32_TIMER_BLOCKS_END (EFR32_TIMER4_BASE + 0x4000u)
+#define EFR32_BUFC_WINDOW_END (RADIO_BASE + RADIO_SIZE)
+#define EFR32_SEQRAM_NS_BASE 0xb0000000u
+#define EFR32_SEQRAM_S_BASE 0xa0000000u
+#define EFR32_SEQRAM_WINDOW_SIZE 0x8000u
+/*
+ * [I] Longest round of the per-CPU clocks.  Device timers are exact (a
+ * round never passes a deadline); an event one core raises directly for
+ * the other is seen up to this late.
+ */
+#define EFR32_CORE_CLOCK_QUANTUM_NS 500
+
+/* Occupancy classes of the bus model (IcountBusModel target). */
+enum {
+    EFR32_BUS_RADIO,
+    EFR32_BUS_BUFC,
+    EFR32_BUS_SEQRAM,
+    EFR32_BUS_PERIPH,
+    EFR32_BUS_TIMER,
+};
+
+static uint64_t efr32_sysclk_hz(Efr32Periph *s)
+{
+    switch (efr32_register_get(s, EFR32_CMU_BASE + EFR32_CMU_SYSCLKCTRL) &
+            EFR32_CMU_SYSCLKCTRL_CLKSEL_MASK) {
+    case EFR32_CMU_SYSCLKCTRL_CLKSEL_HFXO:
+        return EFR32_HFXO_HZ;
+    case EFR32_CMU_SYSCLKCTRL_CLKSEL_HFRCODPLL:
+        return efr32_hfrcodpll_hz(s);
+    default:
+        /* FSRCO; [P] CLKIN0 (no external clock in this model) likewise. */
+        return EFR32_FSRCO_MEASURED_HZ;
+    }
+}
+
+static void efr32_cpu_clock_set(CPUState *cpu, Clock *clk, uint64_t hz,
+                                uint32_t cycles_per_insn_milli)
+{
+    if (cpu) {
+        icount_set_cpu_clock(cpu, hz, cycles_per_insn_milli);
+    }
+    if (clk && hz && clock_get_hz(clk) != hz) {
+        clock_set_hz(clk, hz);
+        clock_propagate(clk);
+    }
+}
+
+/*
+ * Follow SYSCLKCTRL and the oscillators: HCLK for the M33, SYSCLK /
+ * (RHCLKPRESC + 1) for the M0+, stopped while RADIOCLKCTRL.EN is clear.
+ */
+static void efr32_cpu_clocks_update(Efr32Periph *s)
+{
+    uint32_t ctrl = efr32_register_get(s, EFR32_CMU_BASE +
+                                          EFR32_CMU_SYSCLKCTRL);
+    uint64_t sysclk = efr32_sysclk_hz(s);
+    uint32_t hclk_div = ((ctrl >> EFR32_CMU_SYSCLKCTRL_HCLKPRESC_SHIFT) &
+                         EFR32_CMU_SYSCLKCTRL_HCLKPRESC_MASK) + 1;
+    uint32_t radio_div = ((ctrl >> EFR32_CMU_SYSCLKCTRL_RHCLKPRESC_SHIFT) &
+                          EFR32_CMU_SYSCLKCTRL_RHCLKPRESC_MASK) + 1;
+    bool radio_clock = efr32_register_get(s, EFR32_CMU_BASE +
+                                             EFR32_CMU_RADIOCLKCTRL) &
+                       EFR32_CMU_RADIOCLKCTRL_EN;
+
+    efr32_cpu_clock_set(s->m33_cpu, s->m33_cpuclk, sysclk / hclk_div,
+                        EFR32_M33_CYCLES_PER_INSN_MILLI);
+    efr32_cpu_clock_set(s->seq_cpu, s->seq_cpuclk,
+                        radio_clock ? sysclk / radio_div : 0,
+                        EFR32_SEQ_CYCLES_PER_INSN_MILLI);
+}
+
+/* The M0+ is executing: released, clocked and not sleeping. */
+static bool efr32_seq_executing(Efr32Periph *s)
+{
+    return s->seq_cpu && s->seq_released && !s->seq_cpu->halted &&
+           !s->seq_cpu->icount_clock_stopped;
+}
+
+/*
+ * The bus model's cost table: (master, address, size, direction) -> extra
+ * cycles of the master and an occupancy class.  A structural interconnect
+ * model would replace this function and resolve contention in round_end.
+ */
+static uint64_t efr32_bus_cost(void *opaque, CPUState *master, uint64_t addr,
+                               unsigned size, bool is_write, unsigned *target)
+{
+    Efr32Periph *s = opaque;
+    bool radio = addr >= RADIO_BASE && addr < RADIO_BASE + RADIO_SIZE;
+    bool bufc = addr >= EFR32_BUFC_BASE && addr < EFR32_BUFC_WINDOW_END;
+    uint32_t block;
+
+    if (master == s->seq_cpu) {
+        *target = bufc ? EFR32_BUS_BUFC : EFR32_BUS_RADIO;
+        return bufc ? EFR32_SEQ_BUFC_EXTRA_MILLICYCLES
+                    : EFR32_SEQ_RADIO_EXTRA_MILLICYCLES;
+    }
+    if (master != s->m33_cpu) {
+        *target = ICOUNT_BUS_TARGETS;
+        return 0;
+    }
+    if (addr >= EFR32_SEQRAM_NS_BASE &&
+        addr < EFR32_SEQRAM_NS_BASE + EFR32_SEQRAM_WINDOW_SIZE) {
+        *target = EFR32_BUS_SEQRAM;
+        if (efr32_seq_executing(s)) {
+            icount_charge_cycles(s->seq_cpu,
+                                 EFR32_SEQ_SEQRAM_STEAL_MILLICYCLES);
+            return EFR32_M33_SEQRAM_SHARED_EXTRA_MILLICYCLES;
+        }
+        return EFR32_M33_SEQRAM_EXTRA_MILLICYCLES;
+    }
+    if (radio) {
+        *target = bufc ? EFR32_BUS_BUFC : EFR32_BUS_RADIO;
+        return bufc ? EFR32_M33_BUFC_EXTRA_MILLICYCLES
+                    : EFR32_M33_RADIO_EXTRA_MILLICYCLES;
+    }
+    block = efr32_peripheral_canonical_address(addr) & ~0x3fffu;
+    if (block >= EFR32_TIMER0_BASE && block < EFR32_TIMER_BLOCKS_END) {
+        *target = EFR32_BUS_TIMER;
+        return EFR32_M33_TIMER_EXTRA_MILLICYCLES;
+    }
+    *target = EFR32_BUS_PERIPH;
+    return EFR32_M33_PERIPH_EXTRA_MILLICYCLES;
+}
+
+/* Every CPU access to this device goes through the bus model. */
+static void efr32_bus_access(Efr32Periph *s, uint32_t address, unsigned size,
+                             bool is_write)
+{
+    icount_bus_access(&s->bus_model, current_cpu, address, size, is_write);
+}
+
 static MemTxResult efr32_peripheral_mmio_read(void *opaque, hwaddr offset,
                                               uint64_t *data, unsigned size,
                                               MemTxAttrs attrs)
 {
     Efr32Periph *s = EFR32_PERIPH(opaque);
+
+    efr32_bus_access(s, PERIPH_BASE + offset, size, false);
 
     if (efr32_bus_error(s, PERIPH_BASE + offset)) {
         *data = 0;
@@ -3737,6 +3947,7 @@ static MemTxResult efr32_peripheral_mmio_write(void *opaque, hwaddr offset,
                                                MemTxAttrs attrs)
 {
     Efr32Periph *s = EFR32_PERIPH(opaque);
+    efr32_bus_access(s, PERIPH_BASE + offset, size, true);
     /*
      * TIMER and BURTC answer a gated write with a bus error too (each of
      * 20 debugger writes left the sticky error), and a TIMER rejects writes
@@ -3764,6 +3975,10 @@ static MemTxResult efr32_peripheral_mmio_write(void *opaque, hwaddr offset,
     if (timer0_clock) {
         efr32_timer0_schedule(s);
     }
+    if ((key & ~0x3fffu) == EFR32_CMU_BASE ||
+        (key & ~0x3fffu) == EFR32_DPLL0_BASE) {
+        efr32_cpu_clocks_update(s);
+    }
     return MEMTX_OK;
 }
 static MemTxResult efr32_radio_mmio_read(void *opaque, hwaddr offset,
@@ -3771,6 +3986,8 @@ static MemTxResult efr32_radio_mmio_read(void *opaque, hwaddr offset,
                                          MemTxAttrs attrs)
 {
     Efr32Periph *s = EFR32_PERIPH(opaque);
+
+    efr32_bus_access(s, RADIO_BASE + offset, size, false);
 
     if (efr32_bus_error(s, RADIO_BASE + offset)) {
         *data = 0;
@@ -3784,6 +4001,8 @@ static MemTxResult efr32_radio_mmio_write(void *opaque, hwaddr offset,
                                           MemTxAttrs attrs)
 {
     Efr32Periph *s = EFR32_PERIPH(opaque);
+
+    efr32_bus_access(s, RADIO_BASE + offset, size, true);
 
     if (!efr32_bus_error(s, RADIO_BASE + offset)) {
         efr32_peripheral_write(s, RADIO_BASE + offset, value, size);
@@ -3917,6 +4136,7 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     efr32_rf_medium_reset_radio(s->rf_medium, EFR32_RF_RADIO(s));
     efr32_register_put(s, EFR32_CMU_BASE + EFR32_CMU_SYSCLKCTRL,
                        EFR32_CMU_SYSCLKCTRL_CLKSEL_FSRCO);
+    efr32_cpu_clocks_update(s);
     efr32_register_put(s, EFR32_HFXO_BASE + EFR32_HFXO_CTRL,
                        EFR32_HFXO_CTRL_DISONDEMAND);
     efr32_register_put(s, EFR32_EMU_BASE + EFR32_EMU_STATUS,
@@ -4058,6 +4278,7 @@ struct Efr32Bg22SoCState {
     MemoryRegion seq_radio_alias;
     MemoryRegion devinfo;
     Clock *clk;
+    Clock *seq_clk;
     Clock *protimer_clk;
     Clock *burtc_clk;
     unsigned endpoint_id;
@@ -4066,6 +4287,7 @@ struct Efr32Bg22SoCState {
     Efr32RfMedium *rf_medium;
     Object *idau;
     uint32_t boot_offset;
+    bool core_clocks;
 };
 
 struct Efr32State
@@ -4078,6 +4300,7 @@ struct Efr32State
     uint32_t flash_offset;
     uint32_t flash_overlay_offset;
     uint32_t boot_offset;
+    bool core_clocks;
 };
 #define TYPE_EFR32BG22_MACHINE MACHINE_TYPE_NAME("efr32bg22")
 OBJECT_DECLARE_SIMPLE_TYPE(Efr32State, EFR32BG22_MACHINE)
@@ -4100,6 +4323,7 @@ struct Efr32DualState {
     MemoryRegion peer_radio;
     Efr32RfMedium *rf_medium;
     char *image[2];
+    bool core_clocks;
 };
 
 /* ARMv7M CPUs require an explicit board reset registration. */
@@ -4146,6 +4370,43 @@ static void efr32_initialize_devinfo(MemoryRegion *devinfo)
     value = cpu_to_le32(0x00570100);
     memcpy(contents + 0x814c, &value, sizeof(value));
 }
+
+
+static MemTxResult efr32_seqram_m33_read(void *opaque, hwaddr offset,
+                                         uint64_t *data, unsigned size,
+                                         MemTxAttrs attrs)
+{
+    Efr32Bg22SoCState *s = opaque;
+    uint8_t buf[8];
+    MemTxResult r;
+
+    efr32_bus_access(&s->periph, EFR32_SEQRAM_NS_BASE + offset, size, false);
+    r = address_space_read(&s->periph.dma_as, EFR32_SEQRAM_S_BASE + offset,
+                           attrs, buf, size);
+    *data = ldn_le_p(buf, size);
+    return r;
+}
+
+static MemTxResult efr32_seqram_m33_write(void *opaque, hwaddr offset,
+                                          uint64_t value, unsigned size,
+                                          MemTxAttrs attrs)
+{
+    Efr32Bg22SoCState *s = opaque;
+    uint8_t buf[8];
+
+    efr32_bus_access(&s->periph, EFR32_SEQRAM_NS_BASE + offset, size, true);
+    stn_le_p(buf, size, value);
+    return address_space_write(&s->periph.dma_as, EFR32_SEQRAM_S_BASE + offset,
+                               attrs, buf, size);
+}
+
+static const MemoryRegionOps efr32_seqram_m33_ops = {
+    .read_with_attrs = efr32_seqram_m33_read,
+    .write_with_attrs = efr32_seqram_m33_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {.min_access_size = 1, .max_access_size = 4},
+    .impl = {.min_access_size = 1, .max_access_size = 4},
+};
 
 static void efr32_soc_init(Object *obj)
 {
@@ -4195,6 +4456,8 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
 
     s->clk = clock_new(OBJECT(s), "SYSCLK");
     clock_set_hz(s->clk, 38400000);
+    s->seq_clk = clock_new(OBJECT(s), "HCLKRADIO");
+    clock_set_hz(s->seq_clk, 38400000);
     s->protimer_clk = clock_new(OBJECT(s), "PROTIMERCLK");
     clock_set_hz(s->protimer_clk, 2000000);
     s->burtc_clk = clock_new(OBJECT(s), "BURTCCLK");
@@ -4263,8 +4526,10 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
     memory_region_init_ram(&s->radio_ram, OBJECT(s), radio_ram_name, 0x8000,
                            &error_fatal);
     memory_region_add_subregion(s->memory, 0xa0000000, &s->radio_ram);
-    memory_region_init_alias(&s->radio_ram_ns, OBJECT(s), "efr32.radioram-ns",
-                             &s->radio_ram, 0, 0x8000);
+    /* The M33's non-secure SEQRAM window is an I/O view of the same RAM, so
+     * its accesses reach the bus model (efr32_seqram_m33_ops). */
+    memory_region_init_io(&s->radio_ram_ns, OBJECT(s), &efr32_seqram_m33_ops,
+                          s, "efr32.radioram-ns", 0x8000);
     memory_region_add_subregion(s->memory, 0xb0000000, &s->radio_ram_ns);
 
     /* The BG22 radio sequencer is an asymmetric Cortex-M0-class core.  Its
@@ -4283,7 +4548,7 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
     memory_region_add_subregion(&s->seq_memory, RADIO_BASE,
                                 &s->seq_radio_alias);
     qdev_prop_set_uint32(DEVICE(&s->seq_armv7m), "num-irq", 64);
-    qdev_connect_clock_in(DEVICE(&s->seq_armv7m), "cpuclk", s->clk);
+    qdev_connect_clock_in(DEVICE(&s->seq_armv7m), "cpuclk", s->seq_clk);
     qdev_prop_set_string(DEVICE(&s->seq_armv7m), "cpu-type",
                          ARM_CPU_TYPE_NAME("cortex-m0"));
     object_property_set_link(OBJECT(&s->seq_armv7m), "memory",
@@ -4293,6 +4558,20 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
     }
     s->periph.seq_cpu = CPU(s->seq_armv7m.cpu);
     s->periph.seq_cpu->halted = 1;
+    s->periph.m33_cpu = CPU(s->armv7m.cpu);
+    s->periph.m33_cpuclk = s->clk;
+    s->periph.seq_cpuclk = s->seq_clk;
+    s->periph.bus_model.access = efr32_bus_cost;
+    s->periph.bus_model.opaque = &s->periph;
+    icount_register_bus_model(&s->periph.bus_model);
+    icount_set_cpu_exception_cycles(s->periph.seq_cpu,
+                                    EFR32_SEQ_EXCEPTION_ENTRY_MILLICYCLES);
+    if (s->core_clocks && icount_enabled() &&
+        !icount_cpu_clocks_enable(EFR32_CORE_CLOCK_QUANTUM_NS)) {
+        warn_report_once("efr32bg22: core-clocks needs a fixed -icount shift; "
+                         "both cores share the instruction rate");
+    }
+    efr32_cpu_clocks_update(&s->periph);
     s->periph.seq_released = false;
     for (unsigned state = 0; state < EFR32_RAC_SEQ_STATE_EVENTS; state++) {
         s->periph.seq_irq_state[state] =
@@ -4311,6 +4590,7 @@ static Property efr32_soc_properties[] = {
                      TYPE_EFR32_RF_MEDIUM, Efr32RfMedium *),
     DEFINE_PROP_LINK("idau", Efr32Bg22SoCState, idau, TYPE_IDAU_INTERFACE,
                      Object *),
+    DEFINE_PROP_BOOL("core-clocks", Efr32Bg22SoCState, core_clocks, true),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -4337,6 +4617,8 @@ static void init(MachineState *m)
     object_property_add_child(OBJECT(m), "rf-medium", OBJECT(s->rf_medium));
     object_initialize_child(OBJECT(m), "soc", &s->soc, TYPE_EFR32BG22_SOC);
     s->soc.boot_offset = s->boot_offset;
+    object_property_set_bool(OBJECT(&s->soc), "core-clocks", s->core_clocks,
+                             &error_fatal);
     object_property_set_link(OBJECT(&s->soc), "memory",
                              OBJECT(get_system_memory()), &error_fatal);
     object_property_set_link(OBJECT(&s->soc), "rf-medium", OBJECT(s->rf_medium),
@@ -4406,6 +4688,24 @@ static void flash_overlay_set(Object *o, const char *v, Error **e)
     s->flash_overlay = g_strdup(v);
 }
 
+static bool *efr32_core_clocks_field(Object *o)
+{
+    if (object_dynamic_cast(o, TYPE_EFR32BG22_DUAL_MACHINE)) {
+        return &EFR32BG22_DUAL_MACHINE(o)->core_clocks;
+    }
+    return &EFR32BG22_MACHINE(o)->core_clocks;
+}
+
+static bool efr32_core_clocks_get(Object *o, Error **errp)
+{
+    return *efr32_core_clocks_field(o);
+}
+
+static void efr32_core_clocks_set(Object *o, bool value, Error **errp)
+{
+    *efr32_core_clocks_field(o) = value;
+}
+
 static void efr32_machine_instance_init(Object *obj)
 {
     Efr32State *s = EFR32BG22_MACHINE(obj);
@@ -4422,6 +4722,10 @@ static void efr32_machine_instance_init(Object *obj)
                                    OBJ_PROP_FLAG_READWRITE);
     object_property_add_uint32_ptr(obj, "boot-offset", &s->boot_offset,
                                    OBJ_PROP_FLAG_READWRITE);
+    /* Each core at its own clock under -icount (efr32_cpu_clocks_update). */
+    s->core_clocks = true;
+    object_property_add_bool(obj, "core-clocks", efr32_core_clocks_get,
+                             efr32_core_clocks_set);
 }
 
 static void mc(ObjectClass *o, void *d)
@@ -4466,6 +4770,8 @@ static void dual_init(MachineState *m)
         object_initialize_child(OBJECT(m), name, &s->soc[index],
                                 TYPE_EFR32BG22_SOC);
         s->soc[index].endpoint_id = index;
+        object_property_set_bool(OBJECT(&s->soc[index]), "core-clocks",
+                                 s->core_clocks, &error_fatal);
         object_property_set_link(OBJECT(&s->soc[index]), "memory",
                                  OBJECT(&s->memory[index]), &error_fatal);
         object_property_set_link(OBJECT(&s->soc[index]), "rf-medium",
@@ -4540,6 +4846,15 @@ static void dual_image1_set(Object *o, const char *value, Error **errp)
     s->image[1] = g_strdup(value);
 }
 
+static void efr32_dual_machine_instance_init(Object *obj)
+{
+    Efr32DualState *s = EFR32BG22_DUAL_MACHINE(obj);
+
+    s->core_clocks = true;
+    object_property_add_bool(obj, "core-clocks", efr32_core_clocks_get,
+                             efr32_core_clocks_set);
+}
+
 static void dual_mc(ObjectClass *o, void *d)
 {
     MachineClass *m = MACHINE_CLASS(o);
@@ -4566,6 +4881,7 @@ static const TypeInfo dual_machine_info = {
     .name = TYPE_EFR32BG22_DUAL_MACHINE,
     .parent = TYPE_MACHINE,
     .instance_size = sizeof(Efr32DualState),
+    .instance_init = efr32_dual_machine_instance_init,
     .class_init = dual_mc,
     .interfaces = (InterfaceInfo[]){{TYPE_IDAU_INTERFACE}, {}}};
 static void register_types(void)

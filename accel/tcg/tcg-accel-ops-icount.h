@@ -17,4 +17,10 @@ void icount_process_data(CPUState *cpu);
 
 void icount_handle_interrupt(CPUState *cpu, int mask);
 
+/* Per-CPU clocks: round scheduling for the round-robin thread (BQL held). */
+bool icount_cpu_clocks_round_active(void);
+void icount_cpu_clocks_round_begin(void);
+int64_t icount_cpu_clocks_budget(CPUState *cpu);
+void icount_cpu_clocks_round_end_check(void);
+
 #endif /* TCG_ACCEL_OPS_ICOUNT_H */

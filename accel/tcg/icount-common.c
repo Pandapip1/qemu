@@ -37,6 +37,7 @@
 #include "hw/core/cpu.h"
 #include "sysemu/cpu-timers.h"
 #include "sysemu/cpu-timers-internal.h"
+#include "tcg-accel-ops-icount.h"
 
 /*
  * ICOUNT: Instruction Counter
@@ -50,6 +51,35 @@ static bool icount_sleep = true;
 
 /* Do not count executed instructions */
 ICountMode use_icount = ICOUNT_DISABLED;
+
+/* Per-CPU clocks (icount_cpu_clocks_enable); state protected by the BQL,
+ * with the time fields also written under vm_clock_seqlock. */
+#define FS_PER_NS 1000000ULL
+#define FS_PER_S (FS_PER_NS * NANOSECONDS_PER_SECOND)
+static bool cpu_clocks;
+static bool cpu_clocks_round;
+static int64_t cpu_clocks_quantum_ns;
+/* Virtual time, less qemu_icount_bias, of the last completed round end. */
+static int64_t cpu_clocks_ns;
+/* Absolute virtual times at which the current round started and ends. */
+static int64_t cpu_clocks_round_start;
+static int64_t cpu_clocks_round_end;
+
+static uint64_t cpu_clocks_insn_fs(CPUState *cpu)
+{
+    if (cpu->icount_insn_fs) {
+        return cpu->icount_insn_fs;
+    }
+    /* A vCPU without a clock of its own keeps the global icount rate. */
+    return FS_PER_NS << timers_state.icount_time_shift;
+}
+
+static void cpu_clocks_advance_locked(CPUState *cpu, uint64_t fs)
+{
+    fs += cpu->icount_time_fs;
+    cpu->icount_time_ns += fs / FS_PER_NS;
+    cpu->icount_time_fs = fs % FS_PER_NS;
+}
 
 static void icount_enable_precise(void)
 {
@@ -83,6 +113,9 @@ static void icount_update_locked(CPUState *cpu)
 {
     int64_t executed = icount_get_executed(cpu);
     cpu->icount_budget -= executed;
+    if (cpu_clocks) {
+        cpu_clocks_advance_locked(cpu, executed * cpu_clocks_insn_fs(cpu));
+    }
 
     qatomic_set_i64(&timers_state.qemu_icount,
                     timers_state.qemu_icount + executed);
@@ -120,6 +153,17 @@ static int64_t icount_get_raw_locked(void)
 
 static int64_t icount_get_locked(void)
 {
+    if (cpu_clocks) {
+        CPUState *cpu = current_cpu;
+
+        if (cpu && cpu->running) {
+            /* Inside a vCPU slice: that vCPU's own time. */
+            icount_get_raw_locked();
+            return cpu->icount_time_ns;
+        }
+        return qatomic_read_i64(&timers_state.qemu_icount_bias) +
+            cpu_clocks_ns;
+    }
     int64_t icount = icount_get_raw_locked();
     return qatomic_read_i64(&timers_state.qemu_icount_bias) +
         icount_to_ns(icount);
@@ -514,4 +558,251 @@ void icount_notify_exit(void)
         qemu_cpu_kick(current_cpu);
         qemu_clock_notify(QEMU_CLOCK_VIRTUAL);
     }
+}
+
+/*
+ * Per-CPU clocks.  See include/sysemu/cpu-timers.h for the model; the round
+ * functions below are called by the round-robin vCPU thread with the BQL
+ * held.
+ */
+bool icount_cpu_clocks_enable(int64_t quantum_ns)
+{
+    if (icount_enabled() != ICOUNT_PRECISE || quantum_ns <= 0) {
+        return false;
+    }
+    cpu_clocks_quantum_ns = quantum_ns;
+    cpu_clocks_ns = icount_to_ns(timers_state.qemu_icount);
+    cpu_clocks = true;
+    return true;
+}
+
+bool icount_cpu_clocks_enabled(void)
+{
+    return cpu_clocks;
+}
+
+void icount_set_cpu_clock(CPUState *cpu, uint64_t hz,
+                          uint32_t cycles_per_insn_milli)
+{
+    if (!cpu_clocks || !cycles_per_insn_milli) {
+        return;
+    }
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    if (cpu == current_cpu && cpu->running) {
+        /* Account what ran at the old rate before switching. */
+        icount_update_locked(cpu);
+    }
+    cpu->icount_clock_stopped = !hz;
+    if (hz) {
+        cpu->icount_cycle_fs = FS_PER_S / hz;
+        cpu->icount_insn_fs =
+            cpu->icount_cycle_fs * cycles_per_insn_milli / 1000;
+    }
+    if (cpu->icount_clock_stopped && cpu == current_cpu && cpu->running) {
+        cpu_exit(cpu);
+    }
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
+}
+
+void icount_charge_cycles(CPUState *cpu, uint64_t millicycles)
+{
+    if (!cpu_clocks || !cpu || !cpu->icount_cycle_fs || !millicycles) {
+        return;
+    }
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    cpu_clocks_advance_locked(cpu, cpu->icount_cycle_fs * millicycles / 1000);
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
+}
+
+void icount_set_cpu_exception_cycles(CPUState *cpu, uint64_t millicycles)
+{
+    cpu->icount_exception_millicycles = millicycles;
+}
+
+void icount_charge_exception(CPUState *cpu)
+{
+    icount_charge_cycles(cpu, cpu->icount_exception_millicycles);
+}
+
+static GSList *cpu_clocks_bus_models;
+
+void icount_register_bus_model(IcountBusModel *model)
+{
+    cpu_clocks_bus_models = g_slist_append(cpu_clocks_bus_models, model);
+}
+
+void icount_bus_access(IcountBusModel *model, CPUState *master,
+                       uint64_t addr, unsigned size, bool is_write)
+{
+    unsigned target = 0;
+    uint64_t millicycles;
+
+    if (!cpu_clocks || !master || !model || !model->access) {
+        return;
+    }
+    millicycles = model->access(model->opaque, master, addr, size, is_write,
+                                &target);
+    if (target < ICOUNT_BUS_TARGETS) {
+        master->icount_bus_accesses[target]++;
+    }
+    icount_charge_cycles(master, millicycles);
+}
+
+bool icount_cpu_clocks_round_active(void)
+{
+    return cpu_clocks_round;
+}
+
+static int64_t cpu_clocks_now(void)
+{
+    return qatomic_read_i64(&timers_state.qemu_icount_bias) + cpu_clocks_ns;
+}
+
+/* The next QEMU_CLOCK_VIRTUAL deadline, as an absolute time (or INT64_MAX). */
+static int64_t cpu_clocks_deadline(void)
+{
+    int64_t deadline = qemu_clock_deadline_ns_all(QEMU_CLOCK_VIRTUAL,
+                                                  QEMU_TIMER_ATTR_ALL);
+
+    return deadline < 0 ? INT64_MAX : cpu_clocks_now() + deadline;
+}
+
+/*
+ * Start a round if none is in progress: it ends one quantum from now or at
+ * the next deadline, whichever is first.  vCPUs that sat idle are brought up
+ * to the round start.  Inside a round, a deadline armed since (by a vCPU)
+ * pulls the round end in, so later slices do not run past it.
+ */
+void icount_cpu_clocks_round_begin(void)
+{
+    int64_t now = cpu_clocks_now();
+    int64_t end;
+    CPUState *cpu;
+
+    if (cpu_clocks_round) {
+        end = cpu_clocks_deadline();
+        if (end < cpu_clocks_round_end) {
+            cpu_clocks_round_end = MAX(end, now + 1);
+        }
+        return;
+    }
+    end = MIN(cpu_clocks_deadline(), now + cpu_clocks_quantum_ns);
+    cpu_clocks_round_start = now;
+    cpu_clocks_round_end = MAX(end, now + 1);
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    CPU_FOREACH(cpu) {
+        if (cpu->icount_time_ns < now) {
+            cpu->icount_time_ns = now;
+            cpu->icount_time_fs = 0;
+        }
+    }
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
+    cpu_clocks_round = true;
+}
+
+/* Instructions @cpu may execute before its time reaches the round end. */
+int64_t icount_cpu_clocks_budget(CPUState *cpu)
+{
+    int64_t end = cpu_clocks_deadline();
+    int64_t left_ns;
+    uint64_t left_fs, insn_fs = cpu_clocks_insn_fs(cpu);
+
+    if (end < cpu_clocks_round_end) {
+        cpu_clocks_round_end = MAX(end, cpu_clocks_now() + 1);
+    }
+    if (cpu->icount_clock_stopped) {
+        /* A stopped clock: the vCPU sits out the round. */
+        seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                           &timers_state.vm_clock_lock);
+        if (cpu->icount_time_ns < cpu_clocks_round_end) {
+            cpu->icount_time_ns = cpu_clocks_round_end;
+            cpu->icount_time_fs = 0;
+        }
+        seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                             &timers_state.vm_clock_lock);
+        return 0;
+    }
+    left_ns = cpu_clocks_round_end - cpu->icount_time_ns;
+    if (left_ns <= 0 ||
+        (left_ns == 1 && cpu->icount_time_fs >= FS_PER_NS)) {
+        return 0;
+    }
+    left_fs = (uint64_t)left_ns * FS_PER_NS - cpu->icount_time_fs;
+    return MIN(DIV_ROUND_UP(left_fs, insn_fs), INT32_MAX);
+}
+
+/*
+ * The round is complete once every vCPU has reached its end or cannot run
+ * (idle, stopped, or stopping); virtual time then moves to the round end.
+ */
+void icount_cpu_clocks_round_end_check(void)
+{
+    CPUState *cpu;
+
+    if (!cpu_clocks_round) {
+        return;
+    }
+    CPU_FOREACH(cpu) {
+        if (cpu->stop || cpu_is_stopped(cpu) || cpu->icount_clock_stopped ||
+            cpu->icount_time_ns >= cpu_clocks_round_end) {
+            continue;
+        }
+        if (cpu->halted && !cpu_has_work(cpu)) {
+            continue;
+        }
+        return;
+    }
+    for (GSList *l = cpu_clocks_bus_models; l; l = l->next) {
+        IcountBusModel *model = l->data;
+
+        if (model->round_end) {
+            model->round_end(model->opaque, cpu_clocks_round_start,
+                             cpu_clocks_round_end);
+        }
+    }
+    CPU_FOREACH(cpu) {
+        memset(cpu->icount_bus_accesses, 0, sizeof(cpu->icount_bus_accesses));
+    }
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    cpu_clocks_ns = cpu_clocks_round_end -
+        qatomic_read_i64(&timers_state.qemu_icount_bias);
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
+    cpu_clocks_round = false;
+}
+
+/*
+ * An interrupt is being raised on @cpu.  If @cpu is halted it resumes no
+ * earlier than the time of whoever raised it: the running vCPU's own time,
+ * or the global time for a device timer.
+ */
+void icount_cpu_clocks_wake(CPUState *cpu)
+{
+    int64_t waker;
+
+    if (!cpu_clocks || !cpu->halted || (cpu == current_cpu && cpu->running)) {
+        return;
+    }
+    if (current_cpu && current_cpu->running) {
+        /* Up to date only where the vCPU may do I/O (a device access). */
+        waker = current_cpu->neg.can_do_io ? icount_get()
+                                           : current_cpu->icount_time_ns;
+    } else {
+        waker = cpu_clocks_now();
+    }
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    if (cpu->icount_time_ns < waker) {
+        cpu->icount_time_ns = waker;
+        cpu->icount_time_fs = 0;
+    }
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
 }

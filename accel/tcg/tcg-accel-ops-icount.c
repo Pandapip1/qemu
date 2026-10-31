@@ -128,7 +128,12 @@ void icount_prepare_for_run(CPUState *cpu, int64_t cpu_budget)
 
     replay_mutex_lock();
 
-    cpu->icount_budget = MIN(icount_get_limit(), cpu_budget);
+    if (icount_cpu_clocks_enabled()) {
+        /* Bounded by the round end, which is bounded by the deadline. */
+        cpu->icount_budget = cpu_budget;
+    } else {
+        cpu->icount_budget = MIN(icount_get_limit(), cpu_budget);
+    }
     insns_left = MIN(0xffff, cpu->icount_budget);
     cpu->neg.icount_decr.u16.low = insns_left;
     cpu->icount_extra = cpu->icount_budget - insns_left;
@@ -163,6 +168,7 @@ void icount_handle_interrupt(CPUState *cpu, int mask)
 {
     int old_mask = cpu->interrupt_request;
 
+    icount_cpu_clocks_wake(cpu);
     tcg_handle_interrupt(cpu, mask);
     if (qemu_cpu_is_self(cpu) &&
         !cpu->neg.can_do_io
