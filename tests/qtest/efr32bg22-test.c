@@ -41,6 +41,8 @@ static char *tx_snapshot_trace_path;
 #define MODEM_IF             0x208
 #define MODEM_IEN            0x20c
 #define MODEM_IRCAL          0x228
+#define MODEM_SEQIF          0x24c
+#define MODEM_IF_TXRAMPDONE  (1u << 3)
 #define RFCRC_BASE           0xa8010000
 #define RFCRC_EN             0x004
 #define RFCRC_CTRL           0x008
@@ -67,6 +69,8 @@ static char *tx_snapshot_trace_path;
 #define SYNTH_CMD_SYNTHSTART  (1u << 0)
 #define SYNTH_CMD_SYNTHSTOP   (1u << 1)
 #define RAC_SYEN              0x15c
+#define RAC_PAENCTRL          0x0b4
+#define RAC_PAENCTRL_PARAMP   (1u << 8)
 #define RAC_SEQIF_STATETXWARM (1u << 24)
 #define RAC_SEQIF_STATETXPD   (1u << 26)
 #define RAC_STATUS_STATE_TXPD (10u << 24)
@@ -174,6 +178,8 @@ static uint16_t thumb_b(uint32_t insn_addr, uint32_t target_addr)
 #define RAC_SEQIF_STATECHANGESEQ (1u << 0)
 #define RAC_SEQIF_STATERXSEARCH (1u << 18)
 #define RAC_SEQIF_STATETX     (1u << 25)
+#define RAC_SEQIF_STATESHUTDOWN (1u << 29)
+#define RAC_SEQIEN            0x02c
 #define SEQRAM_NS_BASE         0xb0000000
 #define SEQ_SPARE0             0x4fe0
 #define DCDC_BASE             0x40094000
@@ -2046,6 +2052,82 @@ static void test_seq_systick_counts(void)
 }
 
 /*
+ * A released sequencer gates RAC on every state event it enables: on silicon
+ * a TXEN issued in SHUTDOWN was held while SEQIF.STATESHUTDOWN stayed set
+ * with SEQIEN enabling it, and clearing that bit alone released the
+ * transmission (owo-open-fw docs/radio-tables.md SS7.69).
+ */
+static void test_seq_unacked_state_event_holds_txen(void)
+{
+    static const uint16_t idle[] = { THUMB16_BRANCH_SELF, THUMB16_BRANCH_SELF };
+    QTestState *qts = seq_release_with_program(idle, 2, NULL, 0);
+
+    qtest_writel(qts, RAC_BASE + RAC_SEQIEN + REGISTER_SET_WINDOW,
+                 RAC_SEQIF_STATESHUTDOWN);
+    qtest_writel(qts, RAC_BASE + RAC_CTRL + REGISTER_SET_WINDOW,
+                 RAC_CTRL_FORCEDISABLE);
+    qtest_writel(qts, RAC_BASE + RAC_CTRL + REGISTER_CLEAR_WINDOW,
+                 RAC_CTRL_FORCEDISABLE);
+    g_assert_cmphex(qtest_readl(qts, RAC_BASE + RAC_STATUS) &
+                        RAC_STATUS_STATE_MASK, ==, RAC_STATUS_STATE_SHUTDOWN);
+    g_assert_cmphex(qtest_readl(qts, RAC_BASE + RAC_SEQIF) &
+                        RAC_SEQIF_STATESHUTDOWN, ==, RAC_SEQIF_STATESHUTDOWN);
+
+    qtest_writel(qts, RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+    g_assert_cmphex(qtest_readl(qts, RAC_BASE + RAC_STATUS) &
+                        RAC_STATUS_STATE_MASK, ==, RAC_STATUS_STATE_SHUTDOWN);
+
+    /* Clearing an event that is not pending changes nothing. */
+    qtest_writel(qts, RAC_BASE + RAC_SEQIF + REGISTER_CLEAR_WINDOW,
+                 RAC_SEQIF_STATETX);
+    g_assert_cmphex(qtest_readl(qts, RAC_BASE + RAC_STATUS) &
+                        RAC_STATUS_STATE_MASK, ==, RAC_STATUS_STATE_SHUTDOWN);
+
+    qtest_writel(qts, RAC_BASE + RAC_SEQIF + REGISTER_CLEAR_WINDOW,
+                 RAC_SEQIF_STATESHUTDOWN);
+    g_assert_cmphex(qtest_readl(qts, RAC_BASE + RAC_STATUS) &
+                        RAC_STATUS_STATE_MASK, ==, RAC_STATUS_STATE_TXWARM);
+
+    qtest_quit(qts);
+}
+
+/*
+ * A PA ramp completes some time after RAC.PAENCTRL.PARAMP changes.  The TXPD
+ * ramp-down drops PARAMP, then clears MODEM.SEQIF.TXRAMPDONE, then polls it
+ * (owo-open-fw docs/radio-tables.md SS7.62); that clear must not discard the
+ * ramp still in progress, or the poll never sees completion.
+ */
+static void test_pa_ramp_survives_clear_after_paramp(void)
+{
+    static const uint16_t idle[] = { THUMB16_BRANCH_SELF, THUMB16_BRANCH_SELF };
+    QTestState *qts = seq_release_with_program(idle, 2, NULL, 0);
+
+    qtest_writel(qts, MODEM_BASE + MODEM_SEQIF + REGISTER_CLEAR_WINDOW,
+                 MODEM_IF_TXRAMPDONE);
+    qtest_writel(qts, RAC_BASE + RAC_PAENCTRL + REGISTER_SET_WINDOW,
+                 RAC_PAENCTRL_PARAMP);
+    g_assert_cmphex(qtest_readl(qts, MODEM_BASE + MODEM_SEQIF) &
+                        MODEM_IF_TXRAMPDONE, ==, MODEM_IF_TXRAMPDONE);
+
+    qtest_writel(qts, RAC_BASE + RAC_PAENCTRL + REGISTER_CLEAR_WINDOW,
+                 RAC_PAENCTRL_PARAMP);
+    qtest_writel(qts, MODEM_BASE + MODEM_SEQIF + REGISTER_CLEAR_WINDOW,
+                 MODEM_IF_TXRAMPDONE);
+    g_assert_cmphex(qtest_readl(qts, MODEM_BASE + MODEM_SEQIF) &
+                        MODEM_IF_TXRAMPDONE, ==, MODEM_IF_TXRAMPDONE);
+    g_assert_cmphex(qtest_readl(qts, MODEM_BASE + MODEM_IF) &
+                        MODEM_IF_TXRAMPDONE, ==, MODEM_IF_TXRAMPDONE);
+
+    /* Without a PARAMP change, a clear stays cleared. */
+    qtest_writel(qts, MODEM_BASE + MODEM_SEQIF + REGISTER_CLEAR_WINDOW,
+                 MODEM_IF_TXRAMPDONE);
+    g_assert_cmphex(qtest_readl(qts, MODEM_BASE + MODEM_SEQIF) &
+                        MODEM_IF_TXRAMPDONE, ==, 0);
+
+    qtest_quit(qts);
+}
+
+/*
  * Once sequencer firmware is released, a TX frame only drains while the
  * synthesizer runs (owo-open-fw docs/radio-tables.md SS7.60/SS7.61): on
  * silicon, RAC sat in TX with FRC stalled for as long as RAC.SYEN was clear
@@ -2350,6 +2432,10 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/rac-tx-commands", test_rac_tx_commands);
     qtest_add_func("/efr32bg22/seq-tx-waits-for-synthesizer",
                    test_seq_tx_waits_for_synthesizer);
+    qtest_add_func("/efr32bg22/pa-ramp-survives-clear-after-paramp",
+                   test_pa_ramp_survives_clear_after_paramp);
+    qtest_add_func("/efr32bg22/seq-unacked-state-event-holds-txen",
+                   test_seq_unacked_state_event_holds_txen);
     qtest_add_func("/efr32bg22/frc-wcntcmp0-dynamic-length",
                    test_frc_wcntcmp0_dynamic_length);
     qtest_add_func("/efr32bg22/rac-tx-completion", test_rac_tx_completion);

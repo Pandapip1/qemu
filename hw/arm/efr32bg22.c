@@ -78,7 +78,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
  * live stage-3 board reads 0x0004000F, TXRAMPDONE included (owo-open-fw
  * docs/radio-tables.md SS7.63).  Stock's and the open sequencer's TXPD
  * handlers clear SEQIF.TXRAMPDONE, drop RAC.PAENCTRL.PARAMP and wait for it.
- * The model has no ramp duration, so a PARAMP change completes at once.
+ * Those handlers clear the flag *after* changing PARAMP, then poll: on
+ * silicon the ramp is still running at the clear.  The model has no measured
+ * ramp duration, so a PARAMP change leaves the ramp pending and it completes
+ * at the first later read of MODEM.IF or MODEM.SEQIF; a clear issued in
+ * between cannot discard a ramp that has not finished.
  */
 #define EFR32_RAC_PAENCTRL 0x0b4u
 #define EFR32_RAC_PAENCTRL_PARAMP (1u << 8)
@@ -179,6 +183,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
  */
 #define EFR32_RAC_STATE_TXPD 10u
 #define EFR32_RAC_STATE_SHUTDOWN 13u
+/*
+ * State event n is RAC.SEQIF bit n + 16 (public RAC_S_field.py STATEOFF ..
+ * STATESHUTDOWN) and arrives on the sequencer's IRQn (owo-open-fw
+ * docs/radio-tables.md SS7.63).
+ */
+#define EFR32_RAC_SEQ_STATE_EVENTS 14u
+#define EFR32_RAC_SEQIF_STATE_SHIFT 16u
+#define EFR32_RAC_SEQIF_STATE_EVENTS \
+    (((1u << EFR32_RAC_SEQ_STATE_EVENTS) - 1) << EFR32_RAC_SEQIF_STATE_SHIFT)
+#define efr32_rac_seq_state_flag(state) \
+    (1u << (EFR32_RAC_SEQIF_STATE_SHIFT + (state)))
 
 /* Synthetic model delay, not a measured on-air transmission duration. */
 #define EFR32_RAC_TX_COMPLETION_DELAY_NS 150000
@@ -426,14 +441,16 @@ struct Efr32Periph
     GByteArray *bufc_data[4];
     Efr32RfMedium *rf_medium;
     qemu_irq irq[64];
-    qemu_irq seq_irq_txwarm;
-    qemu_irq seq_irq_tx;
-    qemu_irq seq_irq_txpd;
+    qemu_irq seq_irq_state[EFR32_RAC_SEQ_STATE_EVENTS];
     CPUState *seq_cpu;
     bool seq_released;
     bool synth_running;
     /* A sequencer-driven TX reached completion with the synthesizer off. */
     bool tx_waiting_for_synth;
+    /* RAC.CMD.TXEN accepted while a SEQIEN-enabled state event was pending. */
+    bool txen_held;
+    /* RAC.PAENCTRL.PARAMP changed; TXRAMPDONE not yet latched. */
+    bool pa_ramp_pending;
 };
 
 static uint32_t efr32_register_get(Efr32Periph *s, uint32_t address);
@@ -1040,24 +1057,28 @@ static void efr32_rac_update_irqs(Efr32Periph *s)
     qemu_set_irq(s->irq[38],
                  !!(efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_SEQIF) &
                     efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_SEQIEN)));
-    if (s->seq_irq_txwarm) {
-        qemu_set_irq(s->seq_irq_txwarm,
-                     !!(efr32_register_get(s, EFR32_RAC_BASE +
-                                              EFR32_RAC_SEQIF) &
-                        (1u << 24)));
+    for (unsigned state = 0; state < EFR32_RAC_SEQ_STATE_EVENTS; state++) {
+        if (s->seq_irq_state[state]) {
+            qemu_set_irq(s->seq_irq_state[state],
+                         !!(efr32_register_get(s, EFR32_RAC_BASE +
+                                                  EFR32_RAC_SEQIF) &
+                            efr32_rac_seq_state_flag(state)));
+        }
     }
-    if (s->seq_irq_tx) {
-        qemu_set_irq(s->seq_irq_tx,
-                     !!(efr32_register_get(s, EFR32_RAC_BASE +
-                                              EFR32_RAC_SEQIF) &
-                        (1u << 25)));
-    }
-    if (s->seq_irq_txpd) {
-        qemu_set_irq(s->seq_irq_txpd,
-                     !!(efr32_register_get(s, EFR32_RAC_BASE +
-                                              EFR32_RAC_SEQIF) &
-                        (1u << 26)));
-    }
+}
+
+/*
+ * A released sequencer gates the RAC: silicon held a TXEN in SHUTDOWN, and
+ * stayed in RX2RX, while that state's SEQIF event was enabled in SEQIEN but
+ * not yet cleared; clearing it from the debugger released the transition at
+ * once (owo-open-fw docs/radio-tables.md SS7.69).
+ */
+static bool efr32_rac_seq_events_pending(Efr32Periph *s)
+{
+    return s->seq_released &&
+           (efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_SEQIF) &
+            efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_SEQIEN) &
+            EFR32_RAC_SEQIF_STATE_EVENTS);
 }
 
 static void efr32_rac_set_state(Efr32Periph *s, uint32_t state)
@@ -1075,30 +1096,8 @@ static void efr32_rac_set_state(Efr32Periph *s, uint32_t state)
     efr32_register_put(s, EFR32_RAC_BASE + EFR32_RAC_IF,
                        efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_IF) |
                            1);
-    switch (state)
-    {
-    case EFR32_RAC_STATE_OFF:
-        sequence_flag = 1u << 16;
-        break;
-    case EFR32_RAC_STATE_RXSEARCH:
-        sequence_flag = 1u << 18;
-        break;
-    case EFR32_RAC_STATE_TXWARM:
-        sequence_flag = 1u << 24;
-        break;
-    case EFR32_RAC_STATE_TX:
-        sequence_flag = 1u << 25;
-        break;
-    case EFR32_RAC_STATE_TXPD:
-        sequence_flag = 1u << 26;
-        break;
-    case EFR32_RAC_STATE_SHUTDOWN:
-        /* SHUTDOWN has no dedicated SEQIF completion bit. */
-        sequence_flag = 0;
-        break;
-    default:
-        g_assert_not_reached();
-    }
+    /* Every state, SHUTDOWN included, latches its own event (SS7.69). */
+    sequence_flag = efr32_rac_seq_state_flag(state);
     efr32_register_put(s, EFR32_RAC_BASE + EFR32_RAC_SEQIF,
                        efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_SEQIF) |
                            sequence_flag | 1u);
@@ -1969,6 +1968,19 @@ static void efr32_timer4_set_counter(Efr32Periph *s, uint32_t value)
     efr32_timer4_schedule_compare(s);
 }
 
+static void efr32_pa_ramp_complete(Efr32Periph *s)
+{
+    s->pa_ramp_pending = false;
+    efr32_register_put(s, EFR32_MODEM_BASE + EFR32_MODEM_IF,
+                       efr32_register_get(s, EFR32_MODEM_BASE +
+                                             EFR32_MODEM_IF) |
+                           EFR32_MODEM_IF_TXRAMPDONE);
+    efr32_register_put(s, EFR32_MODEM_BASE + EFR32_MODEM_SEQIF,
+                       efr32_register_get(s, EFR32_MODEM_BASE +
+                                             EFR32_MODEM_SEQIF) |
+                           EFR32_MODEM_IF_TXRAMPDONE);
+}
+
 static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
 {
     uint32_t ipversion;
@@ -1981,6 +1993,11 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
 
     if (efr32_radio_ipversion(address, &ipversion)) {
         return ipversion;
+    }
+    if (s->pa_ramp_pending &&
+        (address == EFR32_MODEM_BASE + EFR32_MODEM_IF ||
+         address == EFR32_MODEM_BASE + EFR32_MODEM_SEQIF)) {
+        efr32_pa_ramp_complete(s);
     }
     if (offset == 0x004 && efr32_radio_bus_clock(address) &&
         !efr32_radio_en_accessible(s, address)) {
@@ -2311,14 +2328,7 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         ((old ^ next) & EFR32_RAC_PAENCTRL_PARAMP))
     {
         efr32_register_put(s, register_address, next);
-        efr32_register_put(s, EFR32_MODEM_BASE + EFR32_MODEM_IF,
-                           efr32_register_get(s, EFR32_MODEM_BASE +
-                                                 EFR32_MODEM_IF) |
-                               EFR32_MODEM_IF_TXRAMPDONE);
-        efr32_register_put(s, EFR32_MODEM_BASE + EFR32_MODEM_SEQIF,
-                           efr32_register_get(s, EFR32_MODEM_BASE +
-                                                 EFR32_MODEM_SEQIF) |
-                               EFR32_MODEM_IF_TXRAMPDONE);
+        s->pa_ramp_pending = true;
         return;
     }
     if (register_address == EFR32_SYNTH_BASE + EFR32_SYNTH_CMD)
@@ -2359,6 +2369,7 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
              */
             efr32_rf_medium_withdraw_active_tx(s->rf_medium,
                                                 EFR32_RF_RADIO(s));
+            s->txen_held = false;
             efr32_rac_set_state(s, EFR32_RAC_STATE_OFF);
         }
         else if (next & EFR32_RAC_CMD_TXEN)
@@ -2374,7 +2385,10 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
              */
             efr32_rf_medium_withdraw_active_tx(s->rf_medium,
                                                 EFR32_RF_RADIO(s));
-            if (s->seq_released) {
+            if (efr32_rac_seq_events_pending(s)) {
+                /* Held until the sequencer clears the pending event. */
+                s->txen_held = true;
+            } else if (s->seq_released) {
                 /* Silicon first wakes sequencer IRQ8 in TXWARM.  The open
                  * auxiliary firmware acknowledges STATETXWARM before the
                  * hardware advances to TX/IRQ9. */
@@ -2561,6 +2575,7 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
          * a cancelled transmission into RXDONE.
          */
         efr32_rf_medium_withdraw_active_tx(s->rf_medium, EFR32_RF_RADIO(s));
+        s->txen_held = false;
         efr32_rac_set_state(s, EFR32_RAC_STATE_SHUTDOWN);
     }
 
@@ -2620,8 +2635,14 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         uint32_t seqif = efr32_register_get(s, EFR32_RAC_BASE +
                                                EFR32_RAC_SEQIF);
 
-        if (s->seq_released && s->rac_state == EFR32_RAC_STATE_TXWARM &&
-            !(seqif & (1u << 24))) {
+        if (efr32_rac_seq_events_pending(s)) {
+            /* Every enabled state event must be cleared first. */
+        } else if (s->txen_held) {
+            s->txen_held = false;
+            efr32_rac_set_state(s, EFR32_RAC_STATE_TXWARM);
+        } else if (s->seq_released && s->rac_state == EFR32_RAC_STATE_TXWARM &&
+                   !(seqif & efr32_rac_seq_state_flag(
+                                 EFR32_RAC_STATE_TXWARM))) {
             /* Clearing STATETXWARM is the first proof that the released
              * private core accepted this launch.  Publish no frame before
              * that handshake: real silicon can remain in TXWARM/SHUTDOWN
@@ -2629,10 +2650,10 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
             efr32_rac_capture_tx_snapshot(s);
             efr32_rac_set_state(s, EFR32_RAC_STATE_TX);
         } else if (s->seq_released && s->rac_state == EFR32_RAC_STATE_TX &&
-                   !(seqif & (1u << 25))) {
+                   !(seqif & efr32_rac_seq_state_flag(EFR32_RAC_STATE_TX))) {
             efr32_rac_schedule_tx_completion(s);
         } else if (s->seq_released && s->rac_state == EFR32_RAC_STATE_TXPD &&
-                   !(seqif & (1u << 26))) {
+                   !(seqif & efr32_rac_seq_state_flag(EFR32_RAC_STATE_TXPD))) {
             efr32_rac_set_state(s, EFR32_RAC_STATE_OFF);
         }
         efr32_rac_update_irqs(s);
@@ -2804,15 +2825,12 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     s->burtc_running = false;
     s->burtc_irq_asserted = false;
     qemu_set_irq(s->irq[18], 0);
-    if (s->seq_irq_txwarm) {
-        qemu_set_irq(s->seq_irq_txwarm, 0);
+    for (unsigned state = 0; state < EFR32_RAC_SEQ_STATE_EVENTS; state++) {
+        if (s->seq_irq_state[state]) {
+            qemu_set_irq(s->seq_irq_state[state], 0);
+        }
     }
-    if (s->seq_irq_tx) {
-        qemu_set_irq(s->seq_irq_tx, 0);
-    }
-    if (s->seq_irq_txpd) {
-        qemu_set_irq(s->seq_irq_txpd, 0);
-    }
+    s->txen_held = false;
     timer_del(s->burtc_compare_timer);
     s->timer2_running = false;
     s->timer2_count = 0;
@@ -2844,6 +2862,7 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     s->rx_offer_pending = false;
     s->synth_running = false;
     efr32_register_put(s, EFR32_SYNTH_BASE + EFR32_SYNTH_STATUS, 0);
+    s->pa_ramp_pending = false;
     efr32_rf_medium_reset_radio(s->rf_medium, EFR32_RF_RADIO(s));
     efr32_register_put(s, EFR32_CMU_BASE + EFR32_CMU_SYSCLKCTRL,
                        EFR32_CMU_SYSCLKCTRL_CLKSEL_FSRCO);
@@ -3211,10 +3230,10 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
     s->periph.seq_cpu = CPU(s->seq_armv7m.cpu);
     s->periph.seq_cpu->halted = 1;
     s->periph.seq_released = false;
-    s->periph.seq_irq_txwarm =
-        qdev_get_gpio_in(DEVICE(&s->seq_armv7m), 8);
-    s->periph.seq_irq_tx = qdev_get_gpio_in(DEVICE(&s->seq_armv7m), 9);
-    s->periph.seq_irq_txpd = qdev_get_gpio_in(DEVICE(&s->seq_armv7m), 10);
+    for (unsigned state = 0; state < EFR32_RAC_SEQ_STATE_EVENTS; state++) {
+        s->periph.seq_irq_state[state] =
+            qdev_get_gpio_in(DEVICE(&s->seq_armv7m), state);
+    }
     memory_region_init_ram(&s->devinfo, OBJECT(s), devinfo_name, 0x10000,
                            &error_fatal);
     memory_region_add_subregion(s->memory, 0x0fe00000, &s->devinfo);
