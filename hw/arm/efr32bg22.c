@@ -402,9 +402,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_HFXO_STATUS_HWREQ (1u << 17)
 #define EFR32_HFXO_STATUS_ISWARM (1u << 19)
 #define EFR32_HFXO_STATUS_FSMLOCK (1u << 30)
-#define EFR32_HFXO_READY_STATUS \
-    (EFR32_HFXO_STATUS_RDY | EFR32_HFXO_STATUS_COREBIASOPTRDY | \
-     EFR32_HFXO_STATUS_ENS | EFR32_HFXO_STATUS_HWREQ | EFR32_HFXO_STATUS_ISWARM)
 
 /* EFR32BG22 DPLL0, used by Zephyr's CMU_DPLLLock() startup sequence. */
 #define EFR32_DPLL0_BASE 0x4001c000u
@@ -563,23 +560,37 @@ struct Efr32Periph
     Clock *protimer_clk;
     ptimer_state *protimer_counter;
     Clock *burtc_clk;
-    ptimer_state *burtc_counter;
-    bool burtc_running;
+    /* BURTC: CNT = base + edges since cnt_edge while running (see below). */
+    bool burtc_run;
     bool burtc_irq_asserted;
-    QEMUTimer *burtc_compare_timer;
-    uint32_t timer2_count;
-    int64_t timer2_last_ns;
-    bool timer2_running;
-    uint32_t timer4_count;
-    int64_t timer4_last_ns;
-    bool timer4_running;
-    QEMUTimer *timer4_compare_timer;
-    /* TIMER0 counts base_count + elapsed ticks since base_ns while counting. */
-    uint32_t timer0_base_count;
-    int64_t timer0_base_ns;
-    bool timer0_running;
-    uint32_t timer0_pending_flags;
-    QEMUTimer *timer0_event_timer;
+    uint32_t burtc_cnt_base;
+    int64_t burtc_cnt_edge;
+    int64_t burtc_last_edge;
+    uint32_t burtc_comp;
+    int64_t burtc_en_busy_until;
+    struct {
+        bool valid;
+        uint32_t value;
+        int64_t edge;
+    } burtc_pend[3];
+    QEMUTimer *burtc_timer;
+    /* TIMERn counts base_count + elapsed ticks since base_ns while counting. */
+    struct {
+        bool running;
+        uint32_t base_count;
+        int64_t base_ns;
+        uint32_t pending_flags;
+        int64_t sync_until_ns;
+        QEMUTimer *event;
+    } timers[5];
+    /* Oscillator request / enable instants, -1 while off. */
+    int64_t hfxo_request_ns;
+    int64_t lfxo_request_ns;
+    int64_t lfrco_request_ns;
+    int64_t lfrco_off_ns;
+    int64_t dpll_enable_ns;
+    int64_t dpll_off_ns;
+    QEMUTimer *dpll_lock_timer;
     QEMUTimer *rac_tx_timer;
     QEMUTimer *rac_rx_timer;
     GByteArray *bufc_data[4];
@@ -661,14 +672,6 @@ static void efr32_protimer_update_irq(Efr32Periph *s)
                                           EFR32_PROTIMER_BASE + EFR32_PROTIMER_IEN);
 
     qemu_set_irq(s->irq[36], !!(pending & enabled));
-}
-
-static void efr32_timer4_update_irq(Efr32Periph *s)
-{
-    uint32_t pending = efr32_register_get(s, EFR32_TIMER4_BASE + EFR32_TIMER_IF);
-    uint32_t enabled = efr32_register_get(s, EFR32_TIMER4_BASE + EFR32_TIMER_IEN);
-
-    qemu_set_irq(s->irq[11], !!(pending & enabled));
 }
 
 static void efr32_frc_raise(Efr32Periph *s, uint32_t flags)
@@ -1953,14 +1956,6 @@ static void efr32_protimer_clock_update(void *opaque, ClockEvent event)
     ptimer_transaction_commit(s->protimer_counter);
 }
 
-static void efr32_burtc_clock_update(void *opaque, ClockEvent event)
-{
-    Efr32Periph *s = EFR32_PERIPH(opaque);
-
-    ptimer_transaction_begin(s->burtc_counter);
-    ptimer_set_period_from_clock(s->burtc_counter, s->burtc_clk, 1);
-    ptimer_transaction_commit(s->burtc_counter);
-}
 
 /*
  * RAIL_GetTime reads PROTIMER +0x020. The public RAIL API documents its
@@ -1979,246 +1974,6 @@ static void efr32_burtc_clock_update(void *opaque, ClockEvent event)
 static uint32_t efr32_protimer_counter(Efr32Periph *s)
 {
     return UINT32_MAX - ptimer_get_count(s->protimer_counter);
-}
-
-static bool efr32_burtc_enabled(Efr32Periph *s)
-{
-    return efr32_register_get(s, EFR32_BURTC_BASE + EFR32_BURTC_EN) &
-           EFR32_BURTC_EN_EN;
-}
-
-static uint32_t efr32_burtc_counter(Efr32Periph *s)
-{
-    return UINT32_MAX - ptimer_get_count(s->burtc_counter);
-}
-
-static void efr32_burtc_update_irq(Efr32Periph *s)
-{
-    uint32_t pending = efr32_register_get(s, EFR32_BURTC_BASE + EFR32_BURTC_IF);
-    uint32_t enabled = efr32_register_get(s, EFR32_BURTC_BASE + EFR32_BURTC_IEN);
-    bool asserted = !!(pending & enabled);
-
-    /* xG22.dtsi and the part header both assign BURTC to external IRQ 18. */
-    if (s->burtc_irq_asserted != asserted) {
-        trace_efr32bg22_burtc_irq(s->endpoint_id,
-                                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
-                                  asserted, pending, enabled);
-        s->burtc_irq_asserted = asserted;
-    }
-    qemu_set_irq(s->irq[18], asserted);
-}
-
-static void efr32_burtc_schedule_compare(Efr32Periph *s)
-{
-    uint64_t ticks;
-    int64_t deadline;
-    uint32_t counter;
-    uint32_t compare;
-
-    timer_del(s->burtc_compare_timer);
-    if (!s->burtc_running || !efr32_burtc_enabled(s)) {
-        return;
-    }
-
-    /* CNT counts up modulo 2^32.  Schedule this COMP match once; IF latches
-     * until the guest clears it, exactly as the one-shot Zephyr alarm uses it. */
-    counter = efr32_burtc_counter(s);
-    compare = efr32_register_get(s, EFR32_BURTC_BASE + EFR32_BURTC_COMP);
-    ticks = (uint32_t)(compare - counter);
-    if (ticks == 0) {
-        /*
-         * COMP is an edge in the free-running 32-bit counter.  If software
-         * programs the current value, its next match is after a complete
-         * wrap, not on the next counter tick.  In particular, the Zephyr
-         * driver's cancel path clears IF and writes COMP = 0; treating that
-         * reset-state equality as an immediate event would relatch a stale
-         * pending bit after a successful cancellation.
-         */
-        ticks = UINT64_C(1) << 32;
-    }
-    trace_efr32bg22_burtc_compare_program(s->endpoint_id,
-                                           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
-                                           counter, compare, ticks);
-    deadline = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-               ((int64_t)ticks * NANOSECONDS_PER_SECOND + 32768 - 1) / 32768;
-    timer_mod(s->burtc_compare_timer, deadline);
-}
-
-static void efr32_burtc_compare_expired(void *opaque)
-{
-    Efr32Periph *s = EFR32_PERIPH(opaque);
-
-    if (!s->burtc_running || !efr32_burtc_enabled(s)) {
-        return;
-    }
-    trace_efr32bg22_burtc_compare_expire(s->endpoint_id,
-                                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
-                                          efr32_burtc_counter(s),
-                                          efr32_register_get(s, EFR32_BURTC_BASE +
-                                                             EFR32_BURTC_COMP));
-    efr32_register_put(s, EFR32_BURTC_BASE + EFR32_BURTC_IF,
-                       efr32_register_get(s, EFR32_BURTC_BASE + EFR32_BURTC_IF) |
-                           (1u << 1)); /* BURTC_IF_COMP */
-    efr32_burtc_update_irq(s);
-}
-
-static void efr32_burtc_update_running(Efr32Periph *s)
-{
-    ptimer_transaction_begin(s->burtc_counter);
-    if (s->burtc_running && efr32_burtc_enabled(s)) {
-        ptimer_run(s->burtc_counter, 0);
-    } else {
-        ptimer_stop(s->burtc_counter);
-    }
-    ptimer_transaction_commit(s->burtc_counter);
-    efr32_burtc_schedule_compare(s);
-}
-
-static void efr32_burtc_set_counter(Efr32Periph *s, uint32_t value)
-{
-    bool run = s->burtc_running && efr32_burtc_enabled(s);
-
-    ptimer_transaction_begin(s->burtc_counter);
-    ptimer_stop(s->burtc_counter);
-    ptimer_set_count(s->burtc_counter, UINT32_MAX - value);
-    if (run) {
-        ptimer_run(s->burtc_counter, 0);
-    }
-    ptimer_transaction_commit(s->burtc_counter);
-    efr32_burtc_schedule_compare(s);
-}
-
-static bool efr32_timer4_enabled(Efr32Periph *s)
-{
-    return efr32_register_get(s, EFR32_TIMER4_BASE + EFR32_TIMER_EN) &
-           EFR32_TIMER_EN_EN;
-}
-
-static bool efr32_timer2_enabled(Efr32Periph *s)
-{
-    return efr32_register_get(s, EFR32_TIMER2_BASE + EFR32_TIMER_EN) &
-           EFR32_TIMER_EN_EN;
-}
-
-/* TIMER2 is the stock startup timer; like TIMER4 it is a 16-bit 38.4 MHz
- * up-counter.  No TIMER2 compare source is characterized yet. */
-static void efr32_timer2_update_counter(Efr32Periph *s)
-{
-    int64_t now;
-    uint64_t ticks;
-    uint32_t top;
-    uint64_t period;
-
-    if (!s->timer2_running || !efr32_timer2_enabled(s)) {
-        return;
-    }
-
-    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    ticks = ((uint64_t)(now - s->timer2_last_ns) * EFR32_TIMER_HZ) /
-            NANOSECONDS_PER_SECOND;
-    if (!ticks) {
-        return;
-    }
-
-    top = efr32_register_get(s, EFR32_TIMER2_BASE + EFR32_TIMER_TOP) & 0xffff;
-    period = (uint64_t)top + 1;
-    s->timer2_count = (s->timer2_count + ticks) % period;
-    s->timer2_last_ns += (ticks * NANOSECONDS_PER_SECOND) / EFR32_TIMER_HZ;
-}
-
-static void efr32_timer2_set_counter(Efr32Periph *s, uint32_t value)
-{
-    uint32_t top = efr32_register_get(s, EFR32_TIMER2_BASE + EFR32_TIMER_TOP) & 0xffff;
-
-    s->timer2_count = value % ((uint64_t)top + 1);
-    s->timer2_last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-}
-
-/* TIMER4 is a 16-bit up-counter, clocked from a dedicated 38.4 MHz source. */
-static void efr32_timer4_update_counter(Efr32Periph *s)
-{
-    int64_t now;
-    uint64_t ticks;
-    uint32_t top;
-    uint64_t period;
-
-    if (!s->timer4_running || !efr32_timer4_enabled(s)) {
-        return;
-    }
-
-    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    ticks = ((uint64_t)(now - s->timer4_last_ns) * EFR32_TIMER_HZ) /
-            NANOSECONDS_PER_SECOND;
-    if (!ticks) {
-        return;
-    }
-
-    top = efr32_register_get(s, EFR32_TIMER4_BASE + EFR32_TIMER_TOP) & 0xffff;
-    period = (uint64_t)top + 1;
-    s->timer4_count = (s->timer4_count + ticks) % period;
-    s->timer4_last_ns += (ticks * NANOSECONDS_PER_SECOND) / EFR32_TIMER_HZ;
-}
-
-static uint32_t efr32_timer4_counter(Efr32Periph *s)
-{
-    efr32_timer4_update_counter(s);
-    return s->timer4_count;
-}
-
-static void efr32_timer4_schedule_compare(Efr32Periph *s)
-{
-    uint32_t top;
-    uint32_t compare;
-    uint64_t period;
-    uint64_t ticks;
-    int64_t delay_ns;
-
-    timer_del(s->timer4_compare_timer);
-    if (!s->timer4_running || !efr32_timer4_enabled(s)) {
-        return;
-    }
-
-    efr32_timer4_update_counter(s);
-    top = efr32_register_get(s, EFR32_TIMER4_BASE + EFR32_TIMER_TOP) & 0xffff;
-    compare = efr32_register_get(s, EFR32_TIMER4_BASE + EFR32_TIMER_CC0_OC) & 0xffff;
-    period = (uint64_t)top + 1;
-    compare %= period;
-    ticks = (compare + period - s->timer4_count) % period;
-    if (!ticks) {
-        ticks = period;
-    }
-    delay_ns = (ticks * NANOSECONDS_PER_SECOND + EFR32_TIMER_HZ - 1) /
-               EFR32_TIMER_HZ;
-    timer_mod(s->timer4_compare_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay_ns);
-}
-
-static void efr32_timer4_compare_expired(void *opaque)
-{
-    Efr32Periph *s = EFR32_PERIPH(opaque);
-
-    if (!s->timer4_running || !efr32_timer4_enabled(s)) {
-        return;
-    }
-    efr32_timer4_update_counter(s);
-    efr32_register_put(s, EFR32_TIMER4_BASE + EFR32_TIMER_IF,
-                       efr32_register_get(s, EFR32_TIMER4_BASE + EFR32_TIMER_IF) |
-                           EFR32_TIMER_IF_CC0);
-    efr32_timer4_update_irq(s);
-    efr32_timer4_schedule_compare(s);
-}
-
-static uint32_t efr32_timer0_reg(Efr32Periph *s, uint32_t offset)
-{
-    return efr32_register_get(s, EFR32_TIMER0_BASE + offset);
-}
-
-static bool efr32_timer0_counting(Efr32Periph *s)
-{
-    /* Only CFG.MODE = UP (0) is modelled. */
-    return s->timer0_running &&
-           (efr32_timer0_reg(s, EFR32_TIMER_EN) & EFR32_TIMER_EN_EN) &&
-           !(efr32_timer0_reg(s, EFR32_TIMER_CFG) & EFR32_TIMER_CFG_MODE_MASK);
 }
 
 /*
@@ -2261,103 +2016,925 @@ static uint64_t efr32_em01grpa_hz(Efr32Periph *s)
     return ref * (((cfg1 >> 16) & 0xfffu) + 1) / ((cfg1 & 0xfffu) + 1);
 }
 
-static uint32_t efr32_timer0_hz(Efr32Periph *s)
+
+static bool efr32_hfxo_hw_requested(Efr32Periph *s);
+
+/* HFXO on: FORCEEN or an on-demand consumer (SYSCLK, EM01GRPA, DPLL ref). */
+static bool efr32_hfxo_requested(Efr32Periph *s)
 {
-    uint32_t presc = (efr32_timer0_reg(s, EFR32_TIMER_CFG) &
+    return (efr32_register_get(s, EFR32_HFXO_BASE + EFR32_HFXO_CTRL) &
+            EFR32_HFXO_CTRL_FORCEEN) || efr32_hfxo_hw_requested(s);
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Timers and oscillators, timed from silicon.
+ *
+ * Every latency below was measured on a BG22 (BGM220 explorer kit) running
+ * from SRAM after stage 3 had configured its clocks (HCLK = EM01GRPACLK =
+ * HFRCODPLL 76.8 MHz locked to HFXO, PCLK = HCLK / 2, BURTC on LFXO), with
+ * DWT.CYCCNT and PRS -> TIMER1 input capture as the timebase; see owo-open-fw
+ * docs/radio-tables.md (timer findings) for each method, sample count and
+ * range.  "[I]" marks a rule inferred from the measured ones rather than
+ * measured itself; "UNMEASURED" marks a placeholder.
+ * ---------------------------------------------------------------------------
+ */
+
+/* HCLK of the measurement setup: HFRCODPLL locked at 76.8 MHz. */
+#define EFR32_MEASURE_HCLK_HZ 76800000ULL
+/* FSRCO against HFXO: 19.804-19.811 MHz (n = 8, 1 ms windows). */
+#define EFR32_FSRCO_MEASURED_HZ 19807000ULL
+
+/*
+ * HFXO cold start with stage 3's own configuration, CMU_DPLLLock() entry,
+ * FORCEEN -> STATUS bits, timed in FSRCO cycles (n = 3): ENS 25, RDY
+ * 5455-5480, COREBIASOPTRDY 5663-5665.  The restart from a warm crystal could
+ * not be measured (the radio holds HWREQ), so it reuses the cold numbers.
+ */
+#define EFR32_HFXO_ENS_FSRCO_CYCLES 25ULL
+#define EFR32_HFXO_RDY_FSRCO_CYCLES 5455ULL
+#define EFR32_HFXO_COREBIASOPTRDY_FSRCO_CYCLES 5663ULL
+
+/*
+ * DPLL0 relock with the HFXO reference running: EN -> STATUS.RDY and IF.LOCK
+ * after 11588 HFXO cycles every time (n = 16).  EN = 0 -> STATUS.ENS clear
+ * after 38-41 HFXO cycles (n = 16).  STATUS bit 31 is the configuration LOCK
+ * bit: 0 on running stage 3 (STATUS = 0x3).  [I] With the reference still
+ * starting, the lock is counted from the reference's RDY.  UNMEASURED: the
+ * time to ENS after EN, modelled as immediate; an LFXO-referenced lock, given
+ * the HFXO figure.
+ */
+#define EFR32_DPLL_LOCK_HFXO_CYCLES 11588ULL
+#define EFR32_DPLL_ENS_CLEAR_HFXO_CYCLES 41ULL
+
+/*
+ * LFXO: STATUS.RDY follows STATUS.ENS by CFG.TIMEOUT LFXO cycles; with stage
+ * 3's CYCLES4K that measured 124.6-125.4 ms (n = 5, debugger polling, about
+ * 0.45 ms resolution) against 125.0 ms for 4096 cycles.  ENS was already set
+ * at the first poll after the enable, 0.41-0.54 ms later: UNMEASURED below
+ * that bound, so it is immediate here.  The TIMEOUT encodings are
+ * efr32bg22_lfxo.h's CYCLES2 ... CYCLES32K.
+ */
+#define EFR32_LFXO_BASE 0x40020000u
+#define EFR32_LFXO_CTRL 0x004u
+#define EFR32_LFXO_CFG 0x008u
+#define EFR32_LFXO_STATUS 0x010u
+#define EFR32_LFXO_CTRL_FORCEEN (1u << 0)
+#define EFR32_LFXO_CFG_TIMEOUT_SHIFT 8
+#define EFR32_LFXO_CFG_TIMEOUT_MASK 0x700u
+#define EFR32_LFXO_CFG_RESET 0x00000701u /* efr32bg22_lfxo.h: TIMEOUT 32K */
+#define EFR32_OSC_STATUS_RDY (1u << 0)
+#define EFR32_OSC_STATUS_ENS (1u << 16)
+
+static const uint32_t efr32_lfxo_timeout_cycles[] = {
+    2, 256, 1024, 2048, 4096, 8192, 16384, 32768,
+};
+
+/*
+ * LFRCO: FORCEEN -> ENS 46-47, RDY 16048-16049 HCLK cycles; FORCEEN clear ->
+ * ENS clear 51-65 HCLK cycles (n = 4 each).
+ */
+#define EFR32_LFRCO_BASE 0x40024000u
+#define EFR32_LFRCO_CTRL 0x004u
+#define EFR32_LFRCO_STATUS 0x008u
+#define EFR32_LFRCO_CTRL_FORCEEN (1u << 0)
+#define EFR32_LFRCO_ENS_HCLK_CYCLES 47ULL
+#define EFR32_LFRCO_RDY_HCLK_CYCLES 16049ULL
+#define EFR32_LFRCO_ENS_CLEAR_HCLK_CYCLES 65ULL
+
+#define EFR32_CMU_EM23GRPACLKCTRL 0x140u
+#define EFR32_CMU_EM4GRPACLKCTRL 0x160u
+#define EFR32_CMU_LFCLKSEL_LFRCO 1u
+#define EFR32_CMU_LFCLKSEL_LFXO 2u
+#define EFR32_CMU_LFCLKSEL_ULFRCO 3u
+#define EFR32_CMU_LFCLKSEL_MASK 0x3u
+#define EFR32_ULFRCO_HZ 1000ULL /* xg22.dtsi ulfrco clock-frequency */
+
+static int64_t efr32_cycles_ns(uint64_t cycles, uint64_t hz)
+{
+    return muldiv64_round_up(cycles, NANOSECONDS_PER_SECOND, hz);
+}
+
+static uint32_t efr32_cmu_get(Efr32Periph *s, uint32_t offset)
+{
+    return efr32_register_get(s, EFR32_CMU_BASE + offset);
+}
+
+/* Requests that hold an oscillator on; FORCEEN or an on-demand consumer. */
+static bool efr32_hfxo_hw_requested(Efr32Periph *s)
+{
+    return (efr32_cmu_get(s, EFR32_CMU_SYSCLKCTRL) &
+            EFR32_CMU_SYSCLKCTRL_CLKSEL_MASK) ==
+               EFR32_CMU_SYSCLKCTRL_CLKSEL_HFXO ||
+           (efr32_cmu_get(s, EFR32_CMU_EM01GRPACLKCTRL) & 0x3u) ==
+               EFR32_CMU_EM01GRPACLKCTRL_CLKSEL_HFXO ||
+           (efr32_dpll_enabled(s) &&
+            (efr32_cmu_get(s, EFR32_CMU_DPLLREFCLKCTRL) & 0x3u) ==
+                EFR32_CMU_DPLLREFCLKCTRL_CLKSEL_HFXO);
+}
+
+static bool efr32_lfxo_requested(Efr32Periph *s)
+{
+    return (efr32_register_get(s, EFR32_LFXO_BASE + EFR32_LFXO_CTRL) &
+            EFR32_LFXO_CTRL_FORCEEN) ||
+           (efr32_cmu_get(s, EFR32_CMU_EM4GRPACLKCTRL) &
+            EFR32_CMU_LFCLKSEL_MASK) == EFR32_CMU_LFCLKSEL_LFXO ||
+           (efr32_cmu_get(s, EFR32_CMU_EM23GRPACLKCTRL) &
+            EFR32_CMU_LFCLKSEL_MASK) == EFR32_CMU_LFCLKSEL_LFXO ||
+           (efr32_dpll_enabled(s) &&
+            (efr32_cmu_get(s, EFR32_CMU_DPLLREFCLKCTRL) & 0x3u) ==
+                EFR32_CMU_DPLLREFCLKCTRL_CLKSEL_LFXO);
+}
+
+static bool efr32_burtc_enabled(Efr32Periph *s);
+
+static bool efr32_lfrco_requested(Efr32Periph *s)
+{
+    return (efr32_register_get(s, EFR32_LFRCO_BASE + EFR32_LFRCO_CTRL) &
+            EFR32_LFRCO_CTRL_FORCEEN) ||
+           ((efr32_cmu_get(s, EFR32_CMU_EM4GRPACLKCTRL) &
+             EFR32_CMU_LFCLKSEL_MASK) == EFR32_CMU_LFCLKSEL_LFRCO &&
+            efr32_burtc_enabled(s));
+}
+
+static int64_t efr32_hfxo_ready_ns(Efr32Periph *s)
+{
+    return s->hfxo_request_ns +
+           efr32_cycles_ns(EFR32_HFXO_RDY_FSRCO_CYCLES, EFR32_FSRCO_MEASURED_HZ);
+}
+
+static int64_t efr32_lfxo_ready_ns(Efr32Periph *s)
+{
+    uint32_t cfg = efr32_register_get(s, EFR32_LFXO_BASE + EFR32_LFXO_CFG);
+    uint32_t timeout = (cfg & EFR32_LFXO_CFG_TIMEOUT_MASK) >>
+                       EFR32_LFXO_CFG_TIMEOUT_SHIFT;
+
+    return s->lfxo_request_ns +
+           efr32_cycles_ns(efr32_lfxo_timeout_cycles[timeout], EFR32_LFXO_HZ);
+}
+
+static int64_t efr32_dpll_lock_ns(Efr32Periph *s)
+{
+    int64_t from = s->dpll_enable_ns;
+    uint32_t ref = efr32_cmu_get(s, EFR32_CMU_DPLLREFCLKCTRL) & 0x3u;
+
+    if (ref == EFR32_CMU_DPLLREFCLKCTRL_CLKSEL_HFXO && s->hfxo_request_ns >= 0) {
+        from = MAX(from, efr32_hfxo_ready_ns(s));
+    } else if (ref == EFR32_CMU_DPLLREFCLKCTRL_CLKSEL_LFXO &&
+               s->lfxo_request_ns >= 0) {
+        from = MAX(from, efr32_lfxo_ready_ns(s));
+    }
+    return from + efr32_cycles_ns(EFR32_DPLL_LOCK_HFXO_CYCLES, EFR32_HFXO_HZ);
+}
+
+static void efr32_dpll_lock_expired(void *opaque)
+{
+    Efr32Periph *s = EFR32_PERIPH(opaque);
+
+    if (s->dpll_enable_ns < 0) {
+        return;
+    }
+    efr32_register_put(s, EFR32_DPLL0_BASE + EFR32_DPLL_IF,
+                       efr32_register_get(s, EFR32_DPLL0_BASE + EFR32_DPLL_IF) |
+                           EFR32_DPLL_IF_LOCK);
+}
+
+/* Track request edges; called after every register write and at reset. */
+static void efr32_osc_update(Efr32Periph *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    bool hfxo = efr32_hfxo_requested(s);
+    bool lfxo = efr32_lfxo_requested(s);
+    bool lfrco = efr32_lfrco_requested(s);
+    bool dpll = efr32_dpll_enabled(s);
+
+    if (hfxo && s->hfxo_request_ns < 0) {
+        s->hfxo_request_ns = now;
+    } else if (!hfxo) {
+        s->hfxo_request_ns = -1;
+    }
+    if (lfxo && s->lfxo_request_ns < 0) {
+        s->lfxo_request_ns = now;
+    } else if (!lfxo) {
+        s->lfxo_request_ns = -1;
+    }
+    if (lfrco && s->lfrco_request_ns < 0) {
+        s->lfrco_request_ns = now;
+    } else if (!lfrco && s->lfrco_request_ns >= 0) {
+        s->lfrco_request_ns = -1;
+        s->lfrco_off_ns = now;
+    }
+    if (dpll && s->dpll_enable_ns < 0) {
+        s->dpll_enable_ns = now;
+        timer_mod(s->dpll_lock_timer, efr32_dpll_lock_ns(s));
+    } else if (!dpll && s->dpll_enable_ns >= 0) {
+        s->dpll_enable_ns = -1;
+        s->dpll_off_ns = now;
+        timer_del(s->dpll_lock_timer);
+    }
+}
+
+static uint32_t efr32_hfxo_status(Efr32Periph *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t el;
+    uint32_t status = 0;
+
+    if (s->hfxo_request_ns < 0) {
+        return 0;
+    }
+    el = now - s->hfxo_request_ns;
+    if (el >= efr32_cycles_ns(EFR32_HFXO_ENS_FSRCO_CYCLES,
+                              EFR32_FSRCO_MEASURED_HZ)) {
+        status |= EFR32_HFXO_STATUS_ENS;
+    }
+    if (el >= efr32_cycles_ns(EFR32_HFXO_RDY_FSRCO_CYCLES,
+                              EFR32_FSRCO_MEASURED_HZ)) {
+        status |= EFR32_HFXO_STATUS_RDY;
+    }
+    if (el >= efr32_cycles_ns(EFR32_HFXO_COREBIASOPTRDY_FSRCO_CYCLES,
+                              EFR32_FSRCO_MEASURED_HZ)) {
+        status |= EFR32_HFXO_STATUS_COREBIASOPTRDY;
+    }
+    /*
+     * Running stage 3 (no FORCEEN) reads 0x40030003: HWREQ, and no ISWARM;
+     * FORCEEN alone reads 0x40010003, without HWREQ.
+     */
+    if (efr32_hfxo_hw_requested(s)) {
+        status |= EFR32_HFXO_STATUS_HWREQ;
+    }
+    if (s->hfxo_fsm_locked) {
+        status |= EFR32_HFXO_STATUS_FSMLOCK;
+    }
+    return status;
+}
+
+static uint32_t efr32_dpll_status(Efr32Periph *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (s->dpll_enable_ns < 0) {
+        return s->dpll_off_ns >= 0 &&
+               now - s->dpll_off_ns <
+                   efr32_cycles_ns(EFR32_DPLL_ENS_CLEAR_HFXO_CYCLES,
+                                   EFR32_HFXO_HZ) ? EFR32_DPLL_STATUS_ENS : 0;
+    }
+    return EFR32_DPLL_STATUS_ENS |
+           (now >= efr32_dpll_lock_ns(s) ? EFR32_DPLL_STATUS_RDY : 0);
+}
+
+static uint32_t efr32_lfxo_status(Efr32Periph *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (s->lfxo_request_ns < 0) {
+        return 0;
+    }
+    return EFR32_OSC_STATUS_ENS |
+           (now >= efr32_lfxo_ready_ns(s) ? EFR32_OSC_STATUS_RDY : 0);
+}
+
+static uint32_t efr32_lfrco_status(Efr32Periph *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t el;
+    uint32_t status = 0;
+
+    if (s->lfrco_request_ns < 0) {
+        return s->lfrco_off_ns >= 0 &&
+               now - s->lfrco_off_ns <
+                   efr32_cycles_ns(EFR32_LFRCO_ENS_CLEAR_HCLK_CYCLES,
+                                   EFR32_MEASURE_HCLK_HZ) ? EFR32_OSC_STATUS_ENS
+                                                          : 0;
+    }
+    el = now - s->lfrco_request_ns;
+    if (el >= efr32_cycles_ns(EFR32_LFRCO_ENS_HCLK_CYCLES,
+                              EFR32_MEASURE_HCLK_HZ)) {
+        status |= EFR32_OSC_STATUS_ENS;
+    }
+    if (el >= efr32_cycles_ns(EFR32_LFRCO_RDY_HCLK_CYCLES,
+                              EFR32_MEASURE_HCLK_HZ)) {
+        status |= EFR32_OSC_STATUS_RDY;
+    }
+    return status;
+}
+
+/*
+ * ------------------------------------------------------------------ BURTC
+ *
+ * The counter advances on edges of the clock CMU.EM4GRPACLKCTRL selects
+ * (LFRCO/LFXO at the board's 32.768 kHz, ULFRCO at 1 kHz), on a grid fixed at
+ * time zero: the LF oscillators run across a system reset.
+ *
+ * Measured (BURTC on LFXO, DIV1, writes phase-swept across the LF period):
+ *  - COMP, CNT, CMD.START and CMD.STOP writes take effect at the third LF
+ *    edge after the write (n = 64 COMP, 32 CNT, 32 START, 32 STOP);
+ *    SYNCBUSY.<reg> is set until then; COMP and CNT read their old values
+ *    meanwhile.
+ *  - The effective edge itself still runs on the old state: STOP lets that
+ *    edge count (CNT advanced by 3 after the write), START does not (the
+ *    first increment is the fourth edge), a written CNT is what reads at
+ *    that edge.
+ *  - IF.COMP sets on the edge where CNT advances from COMP to COMP + 1, and
+ *    NVIC pending with it (n = 72).  COMP = CNT + d written at any phase
+ *    fires for d >= 3 and waits for the 2^32 wrap for d <= 2 (n = 8 phases
+ *    per d); a COMP rewritten while CNT reads COMP - k still fires the old
+ *    match for k <= 2 and not for k >= 3 (n = 8 per k).  Both follow from
+ *    the two rules above: the comparison on an edge uses the COMP that was
+ *    effective before it.
+ *  - EN: SYNCBUSY.EN clears 5.12-5.87 LF periods after EN is set (n = 8,
+ *    phase swept) and 3.50 after it is cleared (n = 8, one phase), at the
+ *    sixth / fourth falling edge after the write.  [I] that the grid of
+ *    these completions is the falling one: no LF phase reference was
+ *    available while the counter was stopped.  CNT survives EN = 0 -> 1 and
+ *    the counter does not run again until START.
+ *  - The counter and its LF clock keep running with CLKEN0.BURTC cleared
+ *    (100 of 100 ticks, n = 3).
+ * [I] CFG.CNTPRESC divides the count by 2^n while the synchronizers keep the
+ * undivided LF edges.  UNMEASURED: PRECNT, a second write to a register
+ * whose sync is still pending (the later write replaces it here), writes
+ * while EN = 0 (synchronized the same way here), counting before the
+ * selected oscillator reports RDY (not gated here).
+ */
+#define EFR32_BURTC_SYNCBUSY 0x028u
+#define EFR32_BURTC_SYNCBUSY_START (1u << 0)
+#define EFR32_BURTC_SYNCBUSY_STOP (1u << 1)
+#define EFR32_BURTC_SYNCBUSY_CNT (1u << 3)
+#define EFR32_BURTC_SYNCBUSY_COMP (1u << 4)
+#define EFR32_BURTC_SYNCBUSY_EN (1u << 5)
+#define EFR32_BURTC_IF_COMP (1u << 1)
+#define EFR32_BURTC_CFG_MASK 0xf3u
+#define EFR32_BURTC_CFG_CNTPRESC_SHIFT 4
+#define EFR32_BURTC_CFG_CNTPRESC_MASK 0xf0u
+#define EFR32_BURTC_IRQ 18
+#define EFR32_BURTC_SYNC_EDGES 3
+#define EFR32_BURTC_EN_SET_FALLING_EDGES 6
+#define EFR32_BURTC_EN_CLR_FALLING_EDGES 4
+
+enum { EFR32_BURTC_PEND_CMD, EFR32_BURTC_PEND_CNT, EFR32_BURTC_PEND_COMP,
+       EFR32_BURTC_PEND_COUNT };
+
+static const uint32_t efr32_burtc_pend_busy[EFR32_BURTC_PEND_COUNT] = {
+    [EFR32_BURTC_PEND_CNT] = EFR32_BURTC_SYNCBUSY_CNT,
+    [EFR32_BURTC_PEND_COMP] = EFR32_BURTC_SYNCBUSY_COMP,
+};
+
+static bool efr32_burtc_enabled(Efr32Periph *s)
+{
+    return efr32_register_get(s, EFR32_BURTC_BASE + EFR32_BURTC_EN) &
+           EFR32_BURTC_EN_EN;
+}
+
+static uint64_t efr32_burtc_hz(Efr32Periph *s)
+{
+    switch (efr32_cmu_get(s, EFR32_CMU_EM4GRPACLKCTRL) &
+            EFR32_CMU_LFCLKSEL_MASK) {
+    case EFR32_CMU_LFCLKSEL_LFRCO:
+    case EFR32_CMU_LFCLKSEL_LFXO:
+        return clock_get_hz(s->burtc_clk);
+    case EFR32_CMU_LFCLKSEL_ULFRCO:
+        return EFR32_ULFRCO_HZ;
+    default:
+        return 0;
+    }
+}
+
+/* Index of the last LF rising edge at or before @t. */
+static int64_t efr32_burtc_edge_at(Efr32Periph *s, int64_t t)
+{
+    return muldiv64(t, efr32_burtc_hz(s), NANOSECONDS_PER_SECOND);
+}
+
+static int64_t efr32_burtc_edge_ns(Efr32Periph *s, int64_t edge)
+{
+    return muldiv64_round_up(edge, NANOSECONDS_PER_SECOND, efr32_burtc_hz(s));
+}
+
+/* Time of the @n-th LF falling edge strictly after @t. */
+static int64_t efr32_burtc_falling_ns(Efr32Periph *s, int64_t t, unsigned n)
+{
+    uint64_t hz2 = efr32_burtc_hz(s) * 2;
+    int64_t half = muldiv64(t, hz2, NANOSECONDS_PER_SECOND);
+
+    half += (half & 1) ? 2 : 1; /* first odd half-period index after t */
+    half += 2 * (int64_t)(n - 1);
+    return muldiv64_round_up(half, NANOSECONDS_PER_SECOND, hz2);
+}
+
+static uint32_t efr32_burtc_div(Efr32Periph *s)
+{
+    return 1u << ((efr32_register_get(s, EFR32_BURTC_BASE + EFR32_BURTC_CFG) &
+                   EFR32_BURTC_CFG_CNTPRESC_MASK) >>
+                  EFR32_BURTC_CFG_CNTPRESC_SHIFT);
+}
+
+static bool efr32_burtc_counting(Efr32Periph *s)
+{
+    return s->burtc_run && efr32_burtc_enabled(s);
+}
+
+static uint32_t efr32_burtc_cnt_at(Efr32Periph *s, int64_t edge)
+{
+    if (!efr32_burtc_counting(s) || edge <= s->burtc_cnt_edge) {
+        return s->burtc_cnt_base;
+    }
+    return s->burtc_cnt_base +
+           (uint32_t)((edge - s->burtc_cnt_edge) / efr32_burtc_div(s));
+}
+
+/* Restart the count's linear segment at @edge. */
+static void efr32_burtc_rebase(Efr32Periph *s, int64_t edge)
+{
+    s->burtc_cnt_base = efr32_burtc_cnt_at(s, edge);
+    s->burtc_cnt_edge = edge;
+}
+
+/* The next edge after burtc_last_edge where CNT advances out of COMP. */
+static int64_t efr32_burtc_match_edge(Efr32Periph *s)
+{
+    uint64_t div = efr32_burtc_div(s);
+    uint32_t d;
+    int64_t m;
+
+    if (!efr32_burtc_counting(s)) {
+        return INT64_MAX;
+    }
+    d = s->burtc_comp - s->burtc_cnt_base;
+    m = s->burtc_cnt_edge + ((int64_t)d + 1) * (int64_t)div;
+    while (m <= s->burtc_last_edge) {
+        m += (INT64_C(1) << 32) * (int64_t)div;
+    }
+    return m;
+}
+
+static void efr32_burtc_update_irq(Efr32Periph *s)
+{
+    uint32_t pending = efr32_register_get(s, EFR32_BURTC_BASE + EFR32_BURTC_IF);
+    uint32_t enabled = efr32_register_get(s, EFR32_BURTC_BASE + EFR32_BURTC_IEN);
+    bool asserted = !!(pending & enabled);
+
+    if (s->burtc_irq_asserted != asserted) {
+        trace_efr32bg22_burtc_irq(s->endpoint_id,
+                                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                                  asserted, pending, enabled);
+        s->burtc_irq_asserted = asserted;
+    }
+    qemu_set_irq(s->irq[EFR32_BURTC_IRQ], asserted);
+}
+
+static int64_t efr32_burtc_next_op_edge(Efr32Periph *s)
+{
+    int64_t e = INT64_MAX;
+
+    for (int i = 0; i < EFR32_BURTC_PEND_COUNT; i++) {
+        if (s->burtc_pend[i].valid) {
+            e = MIN(e, s->burtc_pend[i].edge);
+        }
+    }
+    return e;
+}
+
+/* Apply every edge up to now in order, then arm for the next one. */
+static void efr32_burtc_process(Efr32Periph *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t k, next;
+
+    timer_del(s->burtc_timer);
+    if (!efr32_burtc_hz(s)) {
+        return;
+    }
+    k = efr32_burtc_edge_at(s, now);
+    for (;;) {
+        int64_t e_op = efr32_burtc_next_op_edge(s);
+        int64_t e_m = efr32_burtc_match_edge(s);
+        int64_t e = MIN(e_op, e_m);
+
+        if (e > k) {
+            break;
+        }
+        if (e_m == e) {
+            uint32_t flags = efr32_register_get(s, EFR32_BURTC_BASE +
+                                                   EFR32_BURTC_IF);
+
+            efr32_register_put(s, EFR32_BURTC_BASE + EFR32_BURTC_IF,
+                               flags | EFR32_BURTC_IF_COMP);
+            trace_efr32bg22_burtc_compare_expire(s->endpoint_id, now,
+                                                 efr32_burtc_cnt_at(s, e),
+                                                 s->burtc_comp);
+        }
+        if (e_op == e) {
+            efr32_burtc_rebase(s, e);
+            for (int i = 0; i < EFR32_BURTC_PEND_COUNT; i++) {
+                if (!s->burtc_pend[i].valid || s->burtc_pend[i].edge != e) {
+                    continue;
+                }
+                s->burtc_pend[i].valid = false;
+                switch (i) {
+                case EFR32_BURTC_PEND_CMD:
+                    s->burtc_run = s->burtc_pend[i].value ==
+                                   EFR32_BURTC_CMD_START;
+                    break;
+                case EFR32_BURTC_PEND_CNT:
+                    s->burtc_cnt_base = s->burtc_pend[i].value;
+                    break;
+                case EFR32_BURTC_PEND_COMP:
+                    s->burtc_comp = s->burtc_pend[i].value;
+                    break;
+                }
+            }
+        }
+        s->burtc_last_edge = e;
+    }
+    efr32_burtc_update_irq(s);
+    /* Arm last: see the -icount sleep=off note on timers armed in callbacks. */
+    next = MIN(efr32_burtc_next_op_edge(s), efr32_burtc_match_edge(s));
+    if (next != INT64_MAX) {
+        timer_mod(s->burtc_timer, efr32_burtc_edge_ns(s, next));
+    }
+}
+
+static void efr32_burtc_timer_expired(void *opaque)
+{
+    efr32_burtc_process(EFR32_PERIPH(opaque));
+}
+
+static void efr32_burtc_pend(Efr32Periph *s, int which, uint32_t value)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    efr32_burtc_process(s);
+    s->burtc_pend[which].valid = true;
+    s->burtc_pend[which].value = value;
+    s->burtc_pend[which].edge = efr32_burtc_edge_at(s, now) +
+                                EFR32_BURTC_SYNC_EDGES;
+    trace_efr32bg22_burtc_compare_program(s->endpoint_id, now,
+                                          efr32_burtc_cnt_at(s,
+                                              efr32_burtc_edge_at(s, now)),
+                                          value, EFR32_BURTC_SYNC_EDGES);
+    efr32_burtc_process(s);
+}
+
+static uint32_t efr32_burtc_counter(Efr32Periph *s)
+{
+    efr32_burtc_process(s);
+    return efr32_burtc_cnt_at(s, efr32_burtc_edge_at(s,
+                              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)));
+}
+
+static uint32_t efr32_burtc_comp(Efr32Periph *s)
+{
+    efr32_burtc_process(s);
+    return s->burtc_comp;
+}
+
+static uint32_t efr32_burtc_syncbusy(Efr32Periph *s)
+{
+    uint32_t busy = 0;
+
+    efr32_burtc_process(s);
+    for (int i = 0; i < EFR32_BURTC_PEND_COUNT; i++) {
+        if (!s->burtc_pend[i].valid) {
+            continue;
+        }
+        busy |= i == EFR32_BURTC_PEND_CMD
+                    ? (s->burtc_pend[i].value == EFR32_BURTC_CMD_START
+                           ? EFR32_BURTC_SYNCBUSY_START
+                           : EFR32_BURTC_SYNCBUSY_STOP)
+                    : efr32_burtc_pend_busy[i];
+    }
+    if (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) < s->burtc_en_busy_until) {
+        busy |= EFR32_BURTC_SYNCBUSY_EN;
+    }
+    return busy;
+}
+
+static uint32_t efr32_burtc_status(Efr32Periph *s)
+{
+    efr32_burtc_process(s);
+    return efr32_burtc_counting(s) ? EFR32_BURTC_STATUS_RUNNING : 0;
+}
+
+/* Returns true when the write was fully handled. */
+static bool efr32_burtc_write(Efr32Periph *s, uint32_t offset, uint32_t old,
+                              uint32_t next)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    switch (offset) {
+    case EFR32_BURTC_CMD:
+        if (next & EFR32_BURTC_CMD_STOP) {
+            efr32_burtc_pend(s, EFR32_BURTC_PEND_CMD, EFR32_BURTC_CMD_STOP);
+        } else if (next & EFR32_BURTC_CMD_START) {
+            efr32_burtc_pend(s, EFR32_BURTC_PEND_CMD, EFR32_BURTC_CMD_START);
+        }
+        return true;
+    case EFR32_BURTC_CNT:
+        efr32_burtc_pend(s, EFR32_BURTC_PEND_CNT, next);
+        return true;
+    case EFR32_BURTC_COMP:
+        efr32_burtc_pend(s, EFR32_BURTC_PEND_COMP, next);
+        return true;
+    case EFR32_BURTC_STATUS:
+    case EFR32_BURTC_SYNCBUSY:
+        return true; /* generated */
+    case EFR32_BURTC_EN:
+        next &= EFR32_BURTC_EN_EN;
+        efr32_burtc_process(s);
+        efr32_burtc_rebase(s, efr32_burtc_edge_at(s, now));
+        if (next != (old & EFR32_BURTC_EN_EN) && efr32_burtc_hz(s)) {
+            s->burtc_en_busy_until =
+                efr32_burtc_falling_ns(s, now,
+                                       next ? EFR32_BURTC_EN_SET_FALLING_EDGES
+                                            : EFR32_BURTC_EN_CLR_FALLING_EDGES);
+        }
+        efr32_register_put(s, EFR32_BURTC_BASE + offset, next);
+        efr32_burtc_process(s);
+        return true;
+    case EFR32_BURTC_CFG:
+        efr32_burtc_process(s);
+        efr32_burtc_rebase(s, efr32_burtc_edge_at(s, now));
+        efr32_register_put(s, EFR32_BURTC_BASE + offset,
+                           next & EFR32_BURTC_CFG_MASK);
+        efr32_burtc_process(s);
+        return true;
+    case EFR32_BURTC_IF:
+    case EFR32_BURTC_IEN:
+        efr32_register_put(s, EFR32_BURTC_BASE + offset, next & 0x3u);
+        efr32_burtc_update_irq(s);
+        return true;
+    case EFR32_BURTC_PRECNT:
+        efr32_register_put(s, EFR32_BURTC_BASE + offset, next & 0x7fffu);
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void efr32_burtc_reset(Efr32Periph *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    timer_del(s->burtc_timer);
+    s->burtc_run = false;
+    s->burtc_irq_asserted = false;
+    s->burtc_cnt_base = 0;
+    s->burtc_comp = UINT32_MAX;
+    s->burtc_en_busy_until = 0;
+    memset(s->burtc_pend, 0, sizeof(s->burtc_pend));
+    s->burtc_cnt_edge = efr32_burtc_edge_at(s, now);
+    s->burtc_last_edge = s->burtc_cnt_edge;
+}
+
+static void efr32_burtc_clock_update(void *opaque, ClockEvent event)
+{
+    /* The rate is read where it is used. */
+}
+
+/*
+ * ------------------------------------------------------------- TIMER0-4
+ *
+ * One IP, five instances: TIMER0 is 32 bits wide, TIMER1-4 16 bits
+ * (TIMERn_CNTWIDTH); each counts EM01GRPACLK / (CFG.PRESC + 1).  Only
+ * CFG.MODE = UP and CC output compare are modelled.
+ *
+ * Measured (TIMER0 and TIMER1 at 76.8 MHz, CPU at the same clock):
+ *  - PRESC = 0, 1, 3, 9 count exactly 1/(PRESC + 1) of HCLK (n = 4).
+ *  - CMD.START and CMD.STOP act on the timer clock at the bus write, within
+ *    +-1 cycle: a TOP = K overflow comes K + 10 TIMER1 ticks after a PRS
+ *    software pulse issued one store earlier, the store spacing itself being
+ *    10 (n = 32, K = 4..32); a START...STOP pair counts exactly the TIMER1
+ *    ticks between their pulses (n = 16).  STATUS.SYNCBUSY stays set for 38
+ *    HCLK cycles after a CMD write (n = 8).
+ *  - An output compare fires on the tick where CNT advances out of OC: OC
+ *    written equal to CNT fires at the end of that tick, OC = CNT + 1 one
+ *    tick later, START with CNT == OC after one tick, OC behind CNT not
+ *    until the wrap (PRESC = 1023, n = 6 / 6 / 6 / 4).  An OC write at full
+ *    rate is effective within the 26-cycle read/write/read window that
+ *    brackets it (threshold at OC = CNT + 19, n = 4 per value).
+ *  - NVIC pending is seen in the same poll as IF (n = 16).
+ *  - EN = 0: writes to CTRL, CMD, TOP, TOPB, CNT, CCn_CTRL, CCn_OC, CCn_OCB
+ *    and DTCTRL are bus errors and their reads return 0, values retained;
+ *    EN = 1: writes to CFG, CCn_CFG and DTCFG are bus errors (TIMER1 from
+ *    the debugger, one write each; TIMER0 CC0_CTRL and CMD from the CPU,
+ *    precise BusFault).  EN_SET followed by CMD.START in the next store
+ *    starts the timer.
+ *  - The counter keeps counting with its CLKEN bit cleared (n = 3).
+ * UNMEASURED: the SYNCBUSY window after writes other than CMD; the effect of
+ * EN = 0 on a running timer, kept running here.
+ */
+#define EFR32_TIMER_COUNT 5
+#define EFR32_TIMER1_BASE 0x4004c000u
+#define EFR32_TIMER3_BASE 0x40054000u
+#define EFR32_TIMER_CTRL 0x008u
+#define EFR32_TIMER_TOPB 0x020u
+#define EFR32_TIMER_CC_CTRL(n) (0x064u + 0x20u * (n))
+#define EFR32_TIMER_CC_OCB(n) (0x070u + 0x20u * (n))
+#define EFR32_TIMER_DTCFG 0x0e0u
+#define EFR32_TIMER_DTCTRL 0x0ecu
+#define EFR32_TIMER_STATUS_SYNCBUSY (1u << 6)
+#define EFR32_TIMER_CMD_SYNC_HCLK_CYCLES 38ULL
+#define EFR32_TIMER_TOP_RESET 0xffffu
+
+static const struct {
+    uint32_t base;
+    int irq;
+    uint32_t width_mask;
+    uint32_t clken_offset;
+    uint32_t clken_bit;
+} efr32_timers[EFR32_TIMER_COUNT] = {
+    { EFR32_TIMER0_BASE, 7, UINT32_MAX, EFR32_CMU_CLKEN0, 1u << 4 },
+    { EFR32_TIMER1_BASE, 8, 0xffffu, EFR32_CMU_CLKEN0, 1u << 5 },
+    { EFR32_TIMER2_BASE, 9, 0xffffu, EFR32_CMU_CLKEN0, 1u << 6 },
+    { EFR32_TIMER3_BASE, 10, 0xffffu, EFR32_CMU_CLKEN0, 1u << 7 },
+    { EFR32_TIMER4_BASE, 11, 0xffffu, EFR32_CMU_CLKEN1, 1u << 18 },
+};
+
+#define EFR32_CMU_CLKEN0_BURTC (1u << 29)
+
+static int efr32_timer_index(uint32_t address)
+{
+    uint32_t block = address & ~0x3fffu;
+
+    for (int i = 0; i < EFR32_TIMER_COUNT; i++) {
+        if (block == efr32_timers[i].base) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static uint32_t efr32_timer_reg(Efr32Periph *s, int i, uint32_t offset)
+{
+    return efr32_register_get(s, efr32_timers[i].base + offset);
+}
+
+static bool efr32_timer_enabled(Efr32Periph *s, int i)
+{
+    return efr32_timer_reg(s, i, EFR32_TIMER_EN) & EFR32_TIMER_EN_EN;
+}
+
+static bool efr32_timer_counting(Efr32Periph *s, int i)
+{
+    return s->timers[i].running && efr32_timer_enabled(s, i) &&
+           !(efr32_timer_reg(s, i, EFR32_TIMER_CFG) & EFR32_TIMER_CFG_MODE_MASK);
+}
+
+static bool efr32_timer_sync_reg(uint32_t offset)
+{
+    switch (offset) {
+    case EFR32_TIMER_CTRL:
+    case EFR32_TIMER_CMD:
+    case EFR32_TIMER_TOP:
+    case EFR32_TIMER_TOPB:
+    case EFR32_TIMER_CNT:
+    case EFR32_TIMER_DTCTRL:
+        return true;
+    default:
+        for (unsigned n = 0; n < EFR32_TIMER0_CHANNELS; n++) {
+            if (offset == EFR32_TIMER_CC_CTRL(n) ||
+                offset == EFR32_TIMER_CC_OC(n) ||
+                offset == EFR32_TIMER_CC_OCB(n)) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+static bool efr32_timer_config_reg(uint32_t offset)
+{
+    if (offset == EFR32_TIMER_CFG || offset == EFR32_TIMER_DTCFG) {
+        return true;
+    }
+    for (unsigned n = 0; n < EFR32_TIMER0_CHANNELS; n++) {
+        if (offset == EFR32_TIMER_CC_CFG(n)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool efr32_timer_clock_gated(Efr32Periph *s, uint32_t block)
+{
+    int i = efr32_timer_index(block);
+
+    if (i >= 0) {
+        return !(efr32_cmu_get(s, efr32_timers[i].clken_offset) &
+                 efr32_timers[i].clken_bit);
+    }
+    if (block == EFR32_BURTC_BASE) {
+        return !(efr32_cmu_get(s, EFR32_CMU_CLKEN0) & EFR32_CMU_CLKEN0_BURTC);
+    }
+    return false;
+}
+
+/* A write the TIMER IP answers with a bus error in its current EN state. */
+static bool efr32_timer_write_rejected(Efr32Periph *s, uint32_t address)
+{
+    int i = efr32_timer_index(address);
+    uint32_t offset = address & 0xfffu;
+
+    if (i < 0) {
+        return false;
+    }
+    return efr32_timer_enabled(s, i) ? efr32_timer_config_reg(offset)
+                                     : efr32_timer_sync_reg(offset);
+}
+
+static uint64_t efr32_timer_hz(Efr32Periph *s, int i)
+{
+    uint32_t presc = (efr32_timer_reg(s, i, EFR32_TIMER_CFG) &
                       EFR32_TIMER_CFG_PRESC_MASK) >> EFR32_TIMER_CFG_PRESC_SHIFT;
 
     return efr32_em01grpa_hz(s) / (presc + 1);
 }
 
-static uint64_t efr32_timer0_period(Efr32Periph *s)
+static uint64_t efr32_timer_period(Efr32Periph *s, int i)
 {
-    return (uint64_t)efr32_timer0_reg(s, EFR32_TIMER_TOP) + 1;
+    return (uint64_t)(efr32_timer_reg(s, i, EFR32_TIMER_TOP) &
+                      efr32_timers[i].width_mask) + 1;
 }
 
-/* Ticks counted since timer0_base_ns. */
-static uint64_t efr32_timer0_elapsed(Efr32Periph *s, int64_t now)
+static uint64_t efr32_timer_elapsed(Efr32Periph *s, int i, int64_t now)
 {
-    if (!efr32_timer0_counting(s) || now <= s->timer0_base_ns) {
+    if (!efr32_timer_counting(s, i) || now <= s->timers[i].base_ns) {
         return 0;
     }
-    return muldiv64(now - s->timer0_base_ns, efr32_timer0_hz(s),
+    return muldiv64(now - s->timers[i].base_ns, efr32_timer_hz(s, i),
                     NANOSECONDS_PER_SECOND);
 }
 
-static uint32_t efr32_timer0_counter(Efr32Periph *s)
+static uint32_t efr32_timer_counter(Efr32Periph *s, int i)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-    return ((uint64_t)s->timer0_base_count + efr32_timer0_elapsed(s, now)) %
-           efr32_timer0_period(s);
+    return ((uint64_t)s->timers[i].base_count +
+            efr32_timer_elapsed(s, i, now)) % efr32_timer_period(s, i);
 }
 
-static void efr32_timer0_update_irq(Efr32Periph *s)
+static void efr32_timer_update_irq(Efr32Periph *s, int i)
 {
-    uint32_t pending = efr32_timer0_reg(s, EFR32_TIMER_IF);
-    uint32_t enabled = efr32_timer0_reg(s, EFR32_TIMER_IEN);
+    uint32_t pending = efr32_timer_reg(s, i, EFR32_TIMER_IF);
+    uint32_t enabled = efr32_timer_reg(s, i, EFR32_TIMER_IEN);
 
-    qemu_set_irq(s->irq[EFR32_TIMER0_IRQ], !!(pending & enabled));
+    qemu_set_irq(s->irq[efr32_timers[i].irq], !!(pending & enabled));
 }
 
-/*
- * Freeze the current count as the new base.  Call before any write that
- * changes how the counter advances (EN, CMD, CFG, TOP, CNT).
- */
+/* Freeze the current count as the new base before a rate or state change. */
+static void efr32_timer_rebase(Efr32Periph *s, int i)
+{
+    s->timers[i].base_count = efr32_timer_counter(s, i);
+    s->timers[i].base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+}
+
 static void efr32_timer0_rebase(Efr32Periph *s)
 {
-    s->timer0_base_count = efr32_timer0_counter(s);
-    s->timer0_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    for (int i = 0; i < EFR32_TIMER_COUNT; i++) {
+        efr32_timer_rebase(s, i);
+    }
 }
 
 /*
- * Schedule the next counter value that raises a flag: a CCn match in
- * output-compare mode (CNT becomes OC) or an overflow (CNT wraps from TOP
- * to 0).  A target equal to the current count is a full period away.
+ * Schedule the next tick that raises a flag.  CC channel n and overflow both
+ * fire on the tick where CNT advances out of their value (OC, TOP), so that
+ * value is ((value - CNT) mod period) + 1 ticks away.
  */
-static void efr32_timer0_schedule(Efr32Periph *s)
+static void efr32_timer_schedule(Efr32Periph *s, int i)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    uint64_t period = efr32_timer0_period(s);
-    uint64_t elapsed;
-    uint64_t count;
-    uint64_t best = UINT64_MAX;
+    uint64_t period = efr32_timer_period(s, i);
+    uint64_t elapsed, count, best = UINT64_MAX;
     uint32_t flags = 0;
-    uint64_t target_ticks;
-    int64_t when;
 
-    timer_del(s->timer0_event_timer);
-    s->timer0_pending_flags = 0;
-    if (!efr32_timer0_counting(s)) {
+    timer_del(s->timers[i].event);
+    s->timers[i].pending_flags = 0;
+    if (!efr32_timer_counting(s, i)) {
         return;
     }
-
-    elapsed = efr32_timer0_elapsed(s, now);
-    count = ((uint64_t)s->timer0_base_count + elapsed) % period;
+    elapsed = efr32_timer_elapsed(s, i, now);
+    count = ((uint64_t)s->timers[i].base_count + elapsed) % period;
     for (int n = -1; n < (int)EFR32_TIMER0_CHANNELS; n++) {
-        uint64_t value;
-        uint64_t ticks;
+        uint64_t value, ticks;
         uint32_t flag;
 
         if (n < 0) {
-            value = 0;
+            value = period - 1;
             flag = EFR32_TIMER_IF_OF;
         } else {
-            if ((efr32_timer0_reg(s, EFR32_TIMER_CC_CFG(n)) &
+            if ((efr32_timer_reg(s, i, EFR32_TIMER_CC_CFG(n)) &
                  EFR32_TIMER_CC_CFG_MODE_MASK) !=
                 EFR32_TIMER_CC_CFG_MODE_OUTPUTCOMPARE) {
                 continue;
             }
-            value = efr32_timer0_reg(s, EFR32_TIMER_CC_OC(n));
+            value = efr32_timer_reg(s, i, EFR32_TIMER_CC_OC(n)) &
+                    efr32_timers[i].width_mask;
             if (value >= period) {
                 continue; /* never reached below TOP */
             }
             flag = EFR32_TIMER_IF_CC(n);
         }
-        ticks = (value + period - count) % period;
-        if (ticks == 0) {
-            ticks = period;
-        }
+        ticks = (value + period - count) % period + 1;
         if (ticks < best) {
             best = ticks;
             flags = flag;
@@ -2365,104 +2942,149 @@ static void efr32_timer0_schedule(Efr32Periph *s)
             flags |= flag;
         }
     }
-
-    target_ticks = elapsed + best;
-    when = s->timer0_base_ns +
-           muldiv64_round_up(target_ticks, NANOSECONDS_PER_SECOND,
-                             efr32_timer0_hz(s));
-    s->timer0_pending_flags = flags;
-    timer_mod(s->timer0_event_timer, when);
+    s->timers[i].pending_flags = flags;
+    timer_mod(s->timers[i].event,
+              s->timers[i].base_ns +
+                  muldiv64_round_up(elapsed + best, NANOSECONDS_PER_SECOND,
+                                    efr32_timer_hz(s, i)));
 }
 
-static void efr32_timer0_event(void *opaque)
+static void efr32_timer0_schedule(Efr32Periph *s)
 {
-    Efr32Periph *s = EFR32_PERIPH(opaque);
-    uint32_t flags = s->timer0_pending_flags;
+    for (int i = 0; i < EFR32_TIMER_COUNT; i++) {
+        efr32_timer_schedule(s, i);
+    }
+}
 
-    if (!efr32_timer0_counting(s)) {
+static void efr32_timer_event(Efr32Periph *s, int i)
+{
+    uint32_t flags = s->timers[i].pending_flags;
+
+    if (!efr32_timer_counting(s, i)) {
         return;
     }
-    efr32_register_put(s, EFR32_TIMER0_BASE + EFR32_TIMER_IF,
-                       efr32_timer0_reg(s, EFR32_TIMER_IF) | flags);
-    trace_efr32bg22_timer0_event(s->endpoint_id,
-                                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
-                                 efr32_timer0_counter(s), flags);
-    efr32_timer0_update_irq(s);
-    efr32_timer0_schedule(s);
+    efr32_register_put(s, efr32_timers[i].base + EFR32_TIMER_IF,
+                       efr32_timer_reg(s, i, EFR32_TIMER_IF) | flags);
+    if (i == 0) {
+        trace_efr32bg22_timer0_event(s->endpoint_id,
+                                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                                     efr32_timer_counter(s, i), flags);
+    }
+    efr32_timer_update_irq(s, i);
+    efr32_timer_schedule(s, i);
 }
 
-/*
- * Returns true when the write was fully handled.
- *
- * CMD, CNT and STATUS are not stored in the register file (strobe / read-only
- * generated), so they used to return before the tracepoint and the trace could
- * not show a CMD.START write at all.  They now take the same exit path and are
- * traced; only efr32_register_put()/efr32_timer0_update_irq() are skipped for
- * them, exactly as before.  No semantics change.
- */
-static bool efr32_timer0_write(Efr32Periph *s, uint32_t register_address,
-                               uint32_t next)
-{
-    uint32_t offset = register_address & 0xfff;
-    /* true for the registers that are traced but never stored. */
-    bool strobe = false;
+static void efr32_timer0_expired(void *opaque) { efr32_timer_event(EFR32_PERIPH(opaque), 0); }
+static void efr32_timer1_expired(void *opaque) { efr32_timer_event(EFR32_PERIPH(opaque), 1); }
+static void efr32_timer2_expired(void *opaque) { efr32_timer_event(EFR32_PERIPH(opaque), 2); }
+static void efr32_timer3_expired(void *opaque) { efr32_timer_event(EFR32_PERIPH(opaque), 3); }
+static void efr32_timer4_expired(void *opaque) { efr32_timer_event(EFR32_PERIPH(opaque), 4); }
 
-    efr32_timer0_rebase(s);
+static QEMUTimerCB *const efr32_timer_callbacks[EFR32_TIMER_COUNT] = {
+    efr32_timer0_expired, efr32_timer1_expired, efr32_timer2_expired,
+    efr32_timer3_expired, efr32_timer4_expired,
+};
+
+/* Generated and EN-gated reads; returns false for plain register reads. */
+static bool efr32_timer_read(Efr32Periph *s, uint32_t address, uint32_t *value)
+{
+    int i = efr32_timer_index(address);
+    uint32_t offset = address & 0xfffu;
+
+    if (i < 0) {
+        return false;
+    }
+    if (!efr32_timer_enabled(s, i) && efr32_timer_sync_reg(offset)) {
+        *value = 0;
+        return true;
+    }
+    switch (offset) {
+    case EFR32_TIMER_CNT:
+        *value = efr32_timer_counter(s, i);
+        return true;
+    case EFR32_TIMER_STATUS:
+        *value = (efr32_timer_counting(s, i) ? EFR32_TIMER_STATUS_RUNNING : 0) |
+                 (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) <
+                          s->timers[i].sync_until_ns
+                      ? EFR32_TIMER_STATUS_SYNCBUSY : 0);
+        return true;
+    case EFR32_TIMER_CMD:
+        *value = 0;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void efr32_timer_write(Efr32Periph *s, uint32_t register_address,
+                              uint32_t next)
+{
+    int i = efr32_timer_index(register_address);
+    uint32_t offset = register_address & 0xfffu;
+    uint32_t width = efr32_timers[i].width_mask;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    efr32_timer_rebase(s, i);
     switch (offset) {
     case EFR32_TIMER_CMD:
         if (next & EFR32_TIMER_CMD_STOP) {
-            s->timer0_running = false;
+            s->timers[i].running = false;
         } else if (next & EFR32_TIMER_CMD_START) {
-            s->timer0_running = true;
+            s->timers[i].running = true;
         }
-        efr32_timer0_rebase(s);
-        efr32_timer0_schedule(s);
-        strobe = true; /* CMD is write-only strobes. */
+        if (next & (EFR32_TIMER_CMD_STOP | EFR32_TIMER_CMD_START)) {
+            s->timers[i].sync_until_ns =
+                now + efr32_cycles_ns(EFR32_TIMER_CMD_SYNC_HCLK_CYCLES,
+                                      EFR32_MEASURE_HCLK_HZ);
+        }
         break;
     case EFR32_TIMER_CNT:
-        s->timer0_base_count = next % efr32_timer0_period(s);
-        efr32_timer0_schedule(s);
-        strobe = true;
+        s->timers[i].base_count = (next & width) % efr32_timer_period(s, i);
         break;
     case EFR32_TIMER_STATUS:
-        strobe = true; /* generated from EN and CMD state */
         break;
     case EFR32_TIMER_EN:
-        next &= EFR32_TIMER_EN_EN;
+        efr32_register_put(s, register_address, next & EFR32_TIMER_EN_EN);
         break;
     case EFR32_TIMER_CFG:
-        next &= EFR32_TIMER_CFG_MASK;
+        efr32_register_put(s, register_address, next & EFR32_TIMER_CFG_MASK);
         break;
     case EFR32_TIMER_IF:
     case EFR32_TIMER_IEN:
-        next &= EFR32_TIMER_IF_MASK;
+        efr32_register_put(s, register_address, next & EFR32_TIMER_IF_MASK);
+        break;
+    case EFR32_TIMER_TOP:
+        efr32_register_put(s, register_address, next & width);
+        s->timers[i].base_count %= efr32_timer_period(s, i);
         break;
     default:
+        efr32_register_put(s, register_address,
+                           efr32_timer_sync_reg(offset) &&
+                           offset != EFR32_TIMER_CTRL &&
+                           offset != EFR32_TIMER_DTCTRL ? next & width : next);
         break;
     }
-    if (!strobe) {
-        efr32_register_put(s, register_address, next);
-        if (offset == EFR32_TIMER_TOP) {
-            s->timer0_base_count %= efr32_timer0_period(s);
-        }
-        efr32_timer0_schedule(s);
+    efr32_timer_schedule(s, i);
+    if (i == 0) {
+        trace_efr32bg22_timer0_write(s->endpoint_id, now, offset, next,
+                                     efr32_timer_counter(s, i));
     }
-    trace_efr32bg22_timer0_write(s->endpoint_id,
-                                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
-                                 offset, next, efr32_timer0_counter(s));
-    if (!strobe) {
-        efr32_timer0_update_irq(s);
-    }
-    return true;
+    efr32_timer_update_irq(s, i);
 }
 
-static void efr32_timer4_set_counter(Efr32Periph *s, uint32_t value)
+static void efr32_timers_reset(Efr32Periph *s)
 {
-    uint32_t top = efr32_register_get(s, EFR32_TIMER4_BASE + EFR32_TIMER_TOP) & 0xffff;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-    s->timer4_count = value % ((uint64_t)top + 1);
-    s->timer4_last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    efr32_timer4_schedule_compare(s);
+    for (int i = 0; i < EFR32_TIMER_COUNT; i++) {
+        timer_del(s->timers[i].event);
+        s->timers[i].running = false;
+        s->timers[i].base_count = 0;
+        s->timers[i].base_ns = now;
+        s->timers[i].pending_flags = 0;
+        s->timers[i].sync_until_ns = 0;
+        qemu_set_irq(s->irq[efr32_timers[i].irq], 0);
+    }
 }
 
 static void efr32_pa_ramp_complete(Efr32Periph *s)
@@ -2554,20 +3176,13 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
     if (address == 0x4001000c || address == 0x40018004 || address == 0x40028008)
         return 0x00010001;
     if (address == EFR32_HFXO_BASE + EFR32_HFXO_STATUS)
-    {
-        if (!efr32_hfxo_enabled(s))
-        {
-            return 0;
-        }
-        return EFR32_HFXO_READY_STATUS |
-               (s->hfxo_fsm_locked ? EFR32_HFXO_STATUS_FSMLOCK : 0);
-    }
+        return efr32_hfxo_status(s);
     if (address == EFR32_DPLL0_BASE + EFR32_DPLL_STATUS)
-    {
-        return efr32_dpll_enabled(s) ? EFR32_DPLL_STATUS_RDY |
-                                       EFR32_DPLL_STATUS_ENS |
-                                       EFR32_DPLL_STATUS_LOCK : 0;
-    }
+        return efr32_dpll_status(s);
+    if (address == EFR32_LFXO_BASE + EFR32_LFXO_STATUS)
+        return efr32_lfxo_status(s);
+    if (address == EFR32_LFRCO_BASE + EFR32_LFRCO_STATUS)
+        return efr32_lfrco_status(s);
     if (address == EFR32_DCDC_BASE + EFR32_DCDC_IF)
         return efr32_register_get(s, EFR32_DCDC_BASE + EFR32_DCDC_CTRL) & 1
                    ? EFR32_DCDC_IF_REGULATION
@@ -2581,24 +3196,18 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
     if (address == EFR32_BURTC_BASE + EFR32_BURTC_CNT)
         return efr32_burtc_counter(s);
     if (address == EFR32_BURTC_BASE + EFR32_BURTC_STATUS)
-        return s->burtc_running && efr32_burtc_enabled(s) ?
-                   EFR32_BURTC_STATUS_RUNNING : 0;
-    if (address == EFR32_TIMER2_BASE + EFR32_TIMER_CNT) {
-        efr32_timer2_update_counter(s);
-        return s->timer2_count;
+        return efr32_burtc_status(s);
+    if (address == EFR32_BURTC_BASE + EFR32_BURTC_SYNCBUSY)
+        return efr32_burtc_syncbusy(s);
+    if (address == EFR32_BURTC_BASE + EFR32_BURTC_COMP)
+        return efr32_burtc_comp(s);
+    {
+        uint32_t timer_value;
+
+        if (efr32_timer_read(s, address, &timer_value)) {
+            return timer_value;
+        }
     }
-    if (address == EFR32_TIMER2_BASE + EFR32_TIMER_STATUS)
-        return s->timer2_running && efr32_timer2_enabled(s) ?
-                   EFR32_TIMER_STATUS_RUNNING : 0;
-    if (address == EFR32_TIMER0_BASE + EFR32_TIMER_CNT)
-        return efr32_timer0_counter(s);
-    if (address == EFR32_TIMER0_BASE + EFR32_TIMER_STATUS)
-        return efr32_timer0_counting(s) ? EFR32_TIMER_STATUS_RUNNING : 0;
-    if (address == EFR32_TIMER4_BASE + EFR32_TIMER_CNT)
-        return efr32_timer4_counter(s);
-    if (address == EFR32_TIMER4_BASE + EFR32_TIMER_STATUS)
-        return s->timer4_running && efr32_timer4_enabled(s) ?
-                   EFR32_TIMER_STATUS_RUNNING : 0;
     if (address == EFR32_RAC_BASE + EFR32_RAC_STATUS)
         return efr32_rac_status(s);
     if (address == EFR32_RAC_BASE + EFR32_RAC_STIMER)
@@ -2655,7 +3264,6 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
              mask = size == 4 ? UINT32_MAX : ((1u << (size * 8)) - 1) << shift,
              next = (old & ~mask) | (((uint32_t)value << shift) & mask);
     bool hfxo_was_enabled = efr32_hfxo_enabled(s);
-    bool dpll_was_enabled = efr32_dpll_enabled(s);
     int usart_index = efr32_usart_index(register_address);
     uint32_t ipversion;
 
@@ -2723,109 +3331,15 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         return;
     }
 
-    if ((register_address & ~0x3fffu) == EFR32_BURTC_BASE) {
-        uint32_t burtc_offset = register_address & 0xfff;
-
-        switch (burtc_offset) {
-        case EFR32_BURTC_CMD:
-            if (next & EFR32_BURTC_CMD_STOP) {
-                s->burtc_running = false;
-            } else if (next & EFR32_BURTC_CMD_START) {
-                s->burtc_running = true;
-            }
-            efr32_burtc_update_running(s);
-            return;
-        case EFR32_BURTC_CNT:
-            efr32_burtc_set_counter(s, next);
-            return;
-        case EFR32_BURTC_STATUS:
-            return; /* status is generated from EN and CMD state. */
-        case EFR32_BURTC_EN:
-            next &= EFR32_BURTC_EN_EN;
-            break;
-        case EFR32_BURTC_CFG:
-            next &= 0xf3;
-            break;
-        case EFR32_BURTC_IF:
-        case EFR32_BURTC_IEN:
-            next &= 0x3;
-            break;
-        case EFR32_BURTC_PRECNT:
-            next &= 0x7fff;
-            break;
-        default:
-            break;
-        }
-    }
-
-    if ((register_address & ~0x3fffu) == EFR32_TIMER0_BASE &&
-        efr32_timer0_write(s, register_address, next)) {
+    if ((register_address & ~0x3fffu) == EFR32_BURTC_BASE &&
+        efr32_burtc_write(s, register_address & 0xfffu, old, next)) {
+        efr32_osc_update(s);
         return;
     }
 
-    if ((register_address & ~0x3fffu) == EFR32_TIMER4_BASE) {
-        uint32_t timer_offset = register_address & 0xfff;
-
-        efr32_timer4_update_counter(s);
-        switch (timer_offset) {
-        case EFR32_TIMER_CMD:
-            if (next & EFR32_TIMER_CMD_STOP) {
-                s->timer4_running = false;
-                timer_del(s->timer4_compare_timer);
-            } else if (next & EFR32_TIMER_CMD_START) {
-                s->timer4_running = true;
-                s->timer4_last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-                efr32_timer4_schedule_compare(s);
-            }
-            return; /* CMD is write-only strobes. */
-        case EFR32_TIMER_CNT:
-            efr32_timer4_set_counter(s, next & 0xffff);
-            return;
-        case EFR32_TIMER_STATUS:
-            return; /* status is generated from EN and CMD state. */
-        case EFR32_TIMER_EN:
-            next &= EFR32_TIMER_EN_EN;
-            break;
-        case EFR32_TIMER_TOP:
-        case EFR32_TIMER_CC0_OC:
-            next &= 0xffff;
-            break;
-        case EFR32_TIMER_IF:
-        case EFR32_TIMER_IEN:
-            next &= EFR32_TIMER_IF_CC0;
-            break;
-        default:
-            break;
-        }
-    }
-
-    if ((register_address & ~0x3fffu) == EFR32_TIMER2_BASE) {
-        uint32_t timer_offset = register_address & 0xfff;
-
-        efr32_timer2_update_counter(s);
-        switch (timer_offset) {
-        case EFR32_TIMER_CMD:
-            if (next & EFR32_TIMER_CMD_STOP) {
-                s->timer2_running = false;
-            } else if (next & EFR32_TIMER_CMD_START) {
-                s->timer2_running = true;
-                s->timer2_last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-            }
-            return; /* CMD is write-only strobes. */
-        case EFR32_TIMER_CNT:
-            efr32_timer2_set_counter(s, next & 0xffff);
-            return;
-        case EFR32_TIMER_STATUS:
-            return; /* status is generated from EN and CMD state. */
-        case EFR32_TIMER_EN:
-            next &= EFR32_TIMER_EN_EN;
-            break;
-        case EFR32_TIMER_TOP:
-            next &= 0xffff;
-            break;
-        default:
-            break;
-        }
+    if (efr32_timer_index(register_address) >= 0) {
+        efr32_timer_write(s, register_address, next);
+        return;
     }
 
     if (register_address == EFR32_RAC_BASE + EFR32_RAC_PAENCTRL &&
@@ -3009,49 +3523,12 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         efr32_rac_set_state(s, EFR32_RAC_STATE_SHUTDOWN);
     }
 
-    if (register_address == EFR32_BURTC_BASE + EFR32_BURTC_EN) {
-        efr32_burtc_update_running(s);
-    }
-    if (register_address == EFR32_BURTC_BASE + EFR32_BURTC_COMP) {
-        efr32_burtc_schedule_compare(s);
-    }
-    if (register_address == EFR32_BURTC_BASE + EFR32_BURTC_IF ||
-        register_address == EFR32_BURTC_BASE + EFR32_BURTC_IEN) {
-        efr32_burtc_update_irq(s);
-    }
-    if (register_address == EFR32_TIMER4_BASE + EFR32_TIMER_EN) {
-        if (efr32_timer4_enabled(s)) {
-            s->timer4_last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-        }
-        efr32_timer4_schedule_compare(s);
-    }
-    if (register_address == EFR32_TIMER2_BASE + EFR32_TIMER_EN &&
-        efr32_timer2_enabled(s)) {
-        s->timer2_last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    }
-    if (register_address == EFR32_TIMER4_BASE + EFR32_TIMER_TOP ||
-        register_address == EFR32_TIMER4_BASE + EFR32_TIMER_CC0_OC) {
-        efr32_timer4_schedule_compare(s);
-    }
-    if (register_address == EFR32_TIMER4_BASE + EFR32_TIMER_IF ||
-        register_address == EFR32_TIMER4_BASE + EFR32_TIMER_IEN) {
-        efr32_timer4_update_irq(s);
-    }
-
     /*
-     * The public CMU_DPLLLock() path clears DPLL.IF then enables DPLL0 and
-     * polls for LOCK or a LOCKFAIL flag.  This model has no analog loop or
-     * reference-clock timing, so an enable transition completes immediately
-     * and deterministically with the documented successful-lock state.
+     * CMU_DPLLLock() clears DPLL.IF, enables DPLL0 and polls for LOCK; the
+     * lock, IF.LOCK and STATUS.RDY come after the measured lock time
+     * (efr32_osc_update, efr32_dpll_lock_ns).
      */
-    if (register_address == EFR32_DPLL0_BASE + EFR32_DPLL_EN &&
-        !dpll_was_enabled && efr32_dpll_enabled(s))
-    {
-        efr32_register_put(s, EFR32_DPLL0_BASE + EFR32_DPLL_IF,
-                           efr32_register_get(s, EFR32_DPLL0_BASE +
-                                              EFR32_DPLL_IF) |
-                               EFR32_DPLL_IF_LOCK);
-    }
+    efr32_osc_update(s);
 
     /* A new HFXO request starts a fresh lock sequence. */
     if ((register_address == EFR32_HFXO_BASE + EFR32_HFXO_CTRL ||
@@ -3224,6 +3701,9 @@ static bool efr32_bus_error(Efr32Periph *s, uint32_t address)
         EFR32_CMU_RADIOCLKCTRL_EN;
     uint32_t gate;
 
+    if (efr32_timer_clock_gated(s, block)) {
+        return true;
+    }
     if (block == EFR32_SYSCFG_BASE) {
         return !(efr32_register_get(s, EFR32_CMU_BASE + EFR32_CMU_CLKEN0) &
                  EFR32_CMU_CLKEN0_SYSCFG);
@@ -3257,6 +3737,17 @@ static MemTxResult efr32_peripheral_mmio_write(void *opaque, hwaddr offset,
                                                MemTxAttrs attrs)
 {
     Efr32Periph *s = EFR32_PERIPH(opaque);
+    /*
+     * TIMER and BURTC answer a gated write with a bus error too (each of
+     * 20 debugger writes left the sticky error), and a TIMER rejects writes
+     * that its EN state forbids (efr32_timer_write_rejected).
+     */
+    if (efr32_timer_clock_gated(s, efr32_peripheral_canonical_address(
+                                       PERIPH_BASE + offset) & ~0x3fffu) ||
+        efr32_timer_write_rejected(s, efr32_peripheral_canonical_address(
+                                          PERIPH_BASE + offset))) {
+        return MEMTX_ERROR;
+    }
     if (efr32_bus_error(s, PERIPH_BASE + offset)) {
         return MEMTX_OK;
     }
@@ -3346,16 +3837,14 @@ static void efr32_periph_init(Object *o)
     s->burtc_clk = qdev_init_clock_in(DEVICE(o), "burtcclk",
                                       efr32_burtc_clock_update, s,
                                       ClockUpdate);
-    s->burtc_counter = ptimer_init(efr32_free_running_counter_expired, s,
-                                   PTIMER_POLICY_NO_IMMEDIATE_RELOAD |
-                                   PTIMER_POLICY_NO_COUNTER_ROUND_DOWN |
-                                   PTIMER_POLICY_TRIGGER_ONLY_ON_DECREMENT);
-    s->burtc_compare_timer =
-        timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_burtc_compare_expired, s);
-    s->timer4_compare_timer =
-        timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_timer4_compare_expired, s);
-    s->timer0_event_timer =
-        timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_timer0_event, s);
+    s->burtc_timer =
+        timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_burtc_timer_expired, s);
+    for (int i = 0; i < EFR32_TIMER_COUNT; i++) {
+        s->timers[i].event = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                          efr32_timer_callbacks[i], s);
+    }
+    s->dpll_lock_timer =
+        timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_dpll_lock_expired, s);
     s->rac_tx_timer =
         timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_rac_tx_complete, s);
     s->rac_rx_timer =
@@ -3396,40 +3885,26 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     s->usart_tx_enabled[1] = false;
     s->usart_tx_complete[0] = false;
     s->usart_tx_complete[1] = false;
-    s->burtc_running = false;
-    s->burtc_irq_asserted = false;
-    qemu_set_irq(s->irq[18], 0);
+    qemu_set_irq(s->irq[EFR32_BURTC_IRQ], 0);
     for (unsigned state = 0; state < EFR32_RAC_SEQ_STATE_EVENTS; state++) {
         if (s->seq_irq_state[state]) {
             qemu_set_irq(s->seq_irq_state[state], 0);
         }
     }
-    timer_del(s->burtc_compare_timer);
-    s->timer2_running = false;
-    s->timer2_count = 0;
-    s->timer2_last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    s->timer4_running = false;
-    s->timer4_count = 0;
-    s->timer4_last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    timer_del(s->timer4_compare_timer);
-    s->timer0_running = false;
-    s->timer0_base_count = 0;
-    s->timer0_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    s->timer0_pending_flags = 0;
-    timer_del(s->timer0_event_timer);
-    qemu_set_irq(s->irq[EFR32_TIMER0_IRQ], 0);
+    efr32_timers_reset(s);
+    timer_del(s->dpll_lock_timer);
+    s->hfxo_request_ns = -1;
+    s->lfxo_request_ns = -1;
+    s->lfrco_request_ns = -1;
+    s->lfrco_off_ns = -1;
+    s->dpll_enable_ns = -1;
+    s->dpll_off_ns = -1;
     ptimer_transaction_begin(s->protimer_counter);
     ptimer_stop(s->protimer_counter);
     ptimer_set_period_from_clock(s->protimer_counter, s->protimer_clk, 1);
     ptimer_set_limit(s->protimer_counter, UINT32_MAX, 1);
     ptimer_run(s->protimer_counter, 0);
     ptimer_transaction_commit(s->protimer_counter);
-    ptimer_transaction_begin(s->burtc_counter);
-    ptimer_stop(s->burtc_counter);
-    ptimer_set_period_from_clock(s->burtc_counter, s->burtc_clk, 1);
-    ptimer_set_limit(s->burtc_counter, UINT32_MAX, 1);
-    ptimer_set_count(s->burtc_counter, UINT32_MAX);
-    ptimer_transaction_commit(s->burtc_counter);
     efr32_rac_cancel_tx_completion(s);
     timer_del(s->rac_rx_timer);
     efr32_rac_cancel_turnaround(s);
@@ -3454,9 +3929,17 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
      * integration default is UINT32_MAX until guest software programs COMP.
      */
     efr32_register_put(s, EFR32_BURTC_BASE + EFR32_BURTC_COMP, UINT32_MAX);
-    efr32_register_put(s, EFR32_TIMER2_BASE + EFR32_TIMER_TOP, 0xffff);
-    efr32_register_put(s, EFR32_TIMER4_BASE + EFR32_TIMER_TOP, 0xffff);
-    efr32_register_put(s, EFR32_TIMER0_BASE + EFR32_TIMER_TOP, 0xffff);
+    for (int i = 0; i < EFR32_TIMER_COUNT; i++) {
+        efr32_register_put(s, efr32_timers[i].base + EFR32_TIMER_TOP,
+                           EFR32_TIMER_TOP_RESET);
+    }
+    efr32_register_put(s, EFR32_CMU_BASE + EFR32_CMU_EM23GRPACLKCTRL,
+                       EFR32_CMU_LFCLKSEL_LFRCO);
+    efr32_register_put(s, EFR32_CMU_BASE + EFR32_CMU_EM4GRPACLKCTRL,
+                       EFR32_CMU_LFCLKSEL_LFRCO);
+    efr32_register_put(s, EFR32_LFXO_BASE + EFR32_LFXO_CFG,
+                       EFR32_LFXO_CFG_RESET);
+    efr32_burtc_reset(s);
     efr32_register_put(s, EFR32_CMU_BASE + EFR32_CMU_EM01GRPACLKCTRL,
                        EFR32_CMU_EM01GRPACLKCTRL_CLKSEL_HFRCODPLL);
     efr32_register_put(s, EFR32_AGC_BASE + EFR32_AGC_RSSI, 0x8000);
@@ -3483,10 +3966,12 @@ static void efr32_periph_finalize(Object *obj)
     timer_free(s->rac_ack_timer);
     g_clear_pointer(&s->rx_frame, g_bytes_unref);
     timer_free(s->rac_tx_timer);
-    timer_free(s->burtc_compare_timer);
-    timer_free(s->timer4_compare_timer);
+    timer_free(s->burtc_timer);
+    for (int i = 0; i < EFR32_TIMER_COUNT; i++) {
+        timer_free(s->timers[i].event);
+    }
+    timer_free(s->dpll_lock_timer);
     ptimer_free(s->protimer_counter);
-    ptimer_free(s->burtc_counter);
     for (unsigned channel = 0; channel < G_N_ELEMENTS(s->bufc_data); channel++) {
         g_byte_array_unref(s->bufc_data[channel]);
     }

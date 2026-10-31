@@ -197,7 +197,8 @@ static uint16_t thumb_b(uint32_t insn_addr, uint32_t target_addr)
 #define HFXO_CTRL             0x028
 #define HFXO_CMD              0x050
 #define HFXO_STATUS           0x058
-#define HFXO_STATUS_READY     0x000b0003
+/* RDY, COREBIASOPTRDY, ENS, HWREQ: running stage 3 reads 0x40030003. */
+#define HFXO_STATUS_READY     0x00030003
 #define HFXO_STATUS_FSMLOCK   (1u << 30)
 #define HFXO_CTRL_DISONDEMAND (1u << 1)
 #define CMU_BASE              0x40008000
@@ -209,6 +210,10 @@ static uint16_t thumb_b(uint32_t insn_addr, uint32_t target_addr)
 #define CMU_CLKEN1_RADIO_BLOCKS 0x87fu
 #define CMU_CLKEN0            0x064
 #define CMU_CLKEN0_SYSCFG     (1u << 16)
+/* efr32bg22_cmu.h: TIMER0-3 are CLKEN0 bits 4-7, BURTC bit 29, TIMER4 CLKEN1 18. */
+#define CMU_CLKEN0_TIMERS     (0xfu << 4)
+#define CMU_CLKEN0_BURTC      (1u << 29)
+#define CMU_CLKEN1_TIMER4     (1u << 18)
 #define CMU_CLKEN1_RDMAILBOX0 (1u << 8)
 #define CMU_CLKEN1_RDMAILBOX1 (1u << 9)
 #define SYSCFG_BASE           0x4007c000
@@ -229,7 +234,26 @@ static uint16_t thumb_b(uint32_t insn_addr, uint32_t target_addr)
 #define DPLL_STATUS           0x018
 #define DPLL_EN_EN            (1u << 0)
 #define DPLL_IF_LOCK          (1u << 0)
-#define DPLL_STATUS_READY_LOCKED 0x80000003
+#define DPLL_STATUS_RDY       (1u << 0)
+#define DPLL_STATUS_ENS       (1u << 1)
+#define HFXO_STATUS_RDY       (1u << 0)
+#define HFXO_STATUS_COREBIASOPTRDY (1u << 1)
+#define HFXO_STATUS_ENS       (1u << 16)
+/* Cold start in FSRCO cycles at 19.807 MHz: ENS 25, RDY 5455, COREBIAS 5663. */
+#define HFXO_ENS_NS           1263
+#define HFXO_RDY_NS           275408
+#define HFXO_COREBIASOPT_NS   285910
+/* DPLL relock: 11588 HFXO cycles. */
+#define DPLL_LOCK_NS          301771
+#define LFXO_BASE             0x40020000
+#define LFXO_STATUS           0x010
+#define LFXO_CTRL             0x004
+#define OSC_STATUS_RDY        (1u << 0)
+#define OSC_STATUS_ENS        (1u << 16)
+/* TIMEOUT = 4K LFXO cycles. */
+#define LFXO_RDY_4K_NS        125000000
+#define LFXO_CFG              0x008
+#define LFXO_CFG_TIMEOUT_4K   (4u << 8)
 #define USART0_BASE           0x4005c000
 #define USART0_NONSECURE_BASE 0x5005c000
 #define USART1_BASE           0x40060000
@@ -260,6 +284,8 @@ static uint16_t thumb_b(uint32_t insn_addr, uint32_t target_addr)
 #define TIMER4_NS_BASE          0x50058000
 #define TIMER2_BASE             0x40050000
 #define TIMER2_NS_BASE          0x50050000
+#define TIMER1_BASE             0x4004c000
+#define TIMER3_BASE             0x40054000
 #define TIMER_EN                0x030
 #define TIMER_CMD               0x00c
 #define TIMER_STATUS            0x010
@@ -364,6 +390,10 @@ static void reset_with_radio_clocks(void)
 {
     qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
     enable_radio_bus_clocks();
+    /* TIMERn and BURTC fault while their CMU bus clock is off. */
+    writel(CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+           CMU_CLKEN0_TIMERS | CMU_CLKEN0_BURTC);
+    writel(CMU_BASE + CMU_CLKEN1 + REGISTER_SET_WINDOW, CMU_CLKEN1_TIMER4);
 }
 
 static void test_bgm220_module_identity(void)
@@ -395,6 +425,38 @@ static void test_register_aliases(void)
     g_assert_cmphex(readl(address), ==, 0x11);
 }
 
+/* One BURTC clock period at the board's 32.768 kHz, rounded up. */
+#define LF_PERIOD_NS          30518
+/* Writes to CNT, COMP and CMD take effect at the third LF edge after them. */
+#define BURTC_SYNC_EDGES      3
+#define BURTC_SYNCBUSY        0x028
+#define BURTC_SYNCBUSY_START  (1u << 0)
+#define BURTC_SYNCBUSY_STOP   (1u << 1)
+#define BURTC_SYNCBUSY_CNT    (1u << 3)
+#define BURTC_SYNCBUSY_COMP   (1u << 4)
+#define BURTC_SYNCBUSY_EN     (1u << 5)
+
+static void clock_run(int64_t ns)
+{
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    qtest_clock_step(global_qtest, ns);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+}
+
+static void burtc_edges(int64_t edges)
+{
+    clock_run(edges * LF_PERIOD_NS);
+}
+
+/* Step to just after the next LF edge, so later steps count whole edges. */
+static void burtc_align(void)
+{
+    uint64_t now = qtest_clock_step(global_qtest, 0);
+    uint64_t next = (now * 32768 / 1000000000 + 1) * 1000000000 / 32768 + 1;
+
+    clock_run(next - now);
+}
+
 static void test_burtc_counter_contract(void)
 {
     uint32_t stopped;
@@ -409,22 +471,45 @@ static void test_burtc_counter_contract(void)
     g_assert_cmphex(readl(BURTC_BASE + BURTC_CFG), ==, 0x03);
 
     writel(BURTC_BASE + BURTC_EN + REGISTER_SET_WINDOW, BURTC_EN_EN);
+    burtc_align();
     writel(BURTC_BASE + BURTC_CNT, 0x11223344);
+    /* CNT reads its old value until the write has synchronized. */
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_CNT), ==, 0);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_SYNCBUSY) & BURTC_SYNCBUSY_CNT,
+                    ==, BURTC_SYNCBUSY_CNT);
+    burtc_edges(BURTC_SYNC_EDGES - 1);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_CNT), ==, 0);
+    burtc_edges(1);
     g_assert_cmphex(readl(BURTC_BASE + BURTC_CNT), ==, 0x11223344);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_SYNCBUSY) & BURTC_SYNCBUSY_CNT,
+                    ==, 0);
+
     writel(BURTC_BASE + BURTC_CMD, BURTC_CMD_START);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_STATUS), ==, 0);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_SYNCBUSY), ==,
+                    BURTC_SYNCBUSY_START | BURTC_SYNCBUSY_EN);
+    burtc_edges(BURTC_SYNC_EDGES);
     g_assert_cmphex(readl(BURTC_BASE + BURTC_STATUS), ==,
                     BURTC_STATUS_RUNNING);
-    qtest_clock_step(global_qtest, 1000000);
-    g_assert_cmpuint(readl(BURTC_BASE + BURTC_CNT), >, 0x11223344);
+    /* START's own edge does not count; the next one does. */
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_CNT), ==, 0x11223344);
+    burtc_edges(1);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_CNT), ==, 0x11223345);
 
+    /* STOP: the counter still counts the three edges up to and with it. */
     writel(BURTC_BASE + BURTC_CMD + REGISTER_SET_WINDOW, BURTC_CMD_STOP);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_STATUS), ==,
+                    BURTC_STATUS_RUNNING);
+    burtc_edges(BURTC_SYNC_EDGES);
     g_assert_cmphex(readl(BURTC_BASE + BURTC_STATUS), ==, 0);
     stopped = readl(BURTC_BASE + BURTC_CNT);
-    qtest_clock_step(global_qtest, 1000000);
+    g_assert_cmphex(stopped, ==, 0x11223345 + BURTC_SYNC_EDGES);
+    clock_run(1000000);
     g_assert_cmphex(readl(BURTC_BASE + BURTC_CNT), ==, stopped);
 
     writel(BURTC_BASE + BURTC_EN + REGISTER_CLEAR_WINDOW, BURTC_EN_EN);
     writel(BURTC_BASE + BURTC_CMD, BURTC_CMD_START);
+    burtc_edges(BURTC_SYNC_EDGES);
     g_assert_cmphex(readl(BURTC_BASE + BURTC_STATUS), ==, 0);
 }
 
@@ -442,6 +527,7 @@ static void test_burtc_register_aliases(void)
     writel(BURTC_BASE + BURTC_EN + REGISTER_SET_WINDOW, BURTC_EN_EN);
     g_assert_cmphex(readl(BURTC_BASE + BURTC_EN), ==, BURTC_EN_EN);
     writel(BURTC_BASE + BURTC_CMD, BURTC_CMD_START);
+    burtc_edges(BURTC_SYNC_EDGES);
     g_assert_cmphex(readl(BURTC_BASE + BURTC_STATUS), ==,
                     BURTC_STATUS_RUNNING);
 
@@ -471,22 +557,23 @@ static void test_burtc_register_aliases(void)
     g_assert_cmphex(readl(BURTC_BASE + BURTC_IEN), ==, 0);
 }
 
-/* The Zephyr counter driver uses COMP as a one-shot alarm and dispatches
- * only enabled pending flags from its IRQ 18 handler. */
+/* IF.COMP sets on the edge where CNT advances out of COMP. */
 static void test_burtc_compare_pending(void)
 {
     reset_with_radio_clocks();
 
     writel(BURTC_BASE + BURTC_EN + REGISTER_SET_WINDOW, BURTC_EN_EN);
+    burtc_align();
     writel(BURTC_BASE + BURTC_CNT, 10);
     writel(BURTC_BASE + BURTC_IF + REGISTER_CLEAR_WINDOW, BURTC_IF_COMP);
     writel(BURTC_BASE + BURTC_COMP, 42);
     writel(BURTC_BASE + BURTC_IEN + REGISTER_SET_WINDOW, BURTC_IF_COMP);
     writel(BURTC_BASE + BURTC_CMD, BURTC_CMD_START);
-    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
-    qtest_clock_step(global_qtest, 2 * 1000 * 1000);
-    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
-
+    /* Synced at edge 3 with CNT = 10; CNT leaves 42 at edge 3 + 33. */
+    burtc_edges(BURTC_SYNC_EDGES + 32);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_CNT), ==, 42);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_IF) & BURTC_IF_COMP, ==, 0);
+    burtc_edges(1);
     g_assert_cmphex(readl(BURTC_BASE + BURTC_IF) & BURTC_IF_COMP, ==,
                     BURTC_IF_COMP);
     writel(BURTC_BASE + BURTC_IF + REGISTER_CLEAR_WINDOW, BURTC_IF_COMP);
@@ -494,27 +581,76 @@ static void test_burtc_compare_pending(void)
 }
 
 /*
- * A compare equal to the current free-running count is the next-wrap edge,
- * rather than an immediate event.  Zephyr's counter cancel path writes
- * COMP = 0 after clearing IF, so this also keeps cancellation from creating
- * a spurious pending flag at reset count zero.
+ * COMP = CNT + d on a running counter fires for d >= 3 and waits for the
+ * 2^32 wrap for d <= 2 (silicon, every LF phase).
  */
-static void test_burtc_current_compare_waits_for_wrap(void)
+static bool burtc_compare_fires(uint32_t lead)
+{
+    uint32_t cnt;
+
+    reset_with_radio_clocks();
+    writel(BURTC_BASE + BURTC_EN + REGISTER_SET_WINDOW, BURTC_EN_EN);
+    writel(BURTC_BASE + BURTC_CMD, BURTC_CMD_START);
+    burtc_edges(BURTC_SYNC_EDGES + 5);
+    clock_run(LF_PERIOD_NS / 2);
+    cnt = readl(BURTC_BASE + BURTC_CNT);
+    writel(BURTC_BASE + BURTC_COMP, cnt + lead);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_COMP), ==, UINT32_MAX);
+    burtc_edges(lead + 8);
+    return readl(BURTC_BASE + BURTC_IF) & BURTC_IF_COMP;
+}
+
+static void test_burtc_compare_lead(void)
+{
+    g_assert_false(burtc_compare_fires(0));
+    g_assert_false(burtc_compare_fires(1));
+    g_assert_false(burtc_compare_fires(2));
+    g_assert_true(burtc_compare_fires(3));
+    g_assert_true(burtc_compare_fires(6));
+}
+
+/* A rewritten COMP still fires its old match up to two edges ahead. */
+static bool burtc_retarget_cancels(uint32_t edges_ahead)
+{
+    uint32_t target;
+
+    reset_with_radio_clocks();
+    writel(BURTC_BASE + BURTC_EN + REGISTER_SET_WINDOW, BURTC_EN_EN);
+    writel(BURTC_BASE + BURTC_CMD, BURTC_CMD_START);
+    burtc_edges(BURTC_SYNC_EDGES + 2);
+    clock_run(LF_PERIOD_NS / 2);
+    target = readl(BURTC_BASE + BURTC_CNT) + 10;
+    writel(BURTC_BASE + BURTC_COMP, target);
+    while (readl(BURTC_BASE + BURTC_CNT) != target - edges_ahead) {
+        burtc_edges(1);
+    }
+    writel(BURTC_BASE + BURTC_COMP, target + 1000);
+    burtc_edges(10);
+    return !(readl(BURTC_BASE + BURTC_IF) & BURTC_IF_COMP);
+}
+
+static void test_burtc_retarget_window(void)
+{
+    g_assert_false(burtc_retarget_cancels(0));
+    g_assert_false(burtc_retarget_cancels(2));
+    g_assert_true(burtc_retarget_cancels(3));
+}
+
+/* SYNCBUSY.EN: the sixth falling LF edge after EN = 1. */
+static void test_burtc_en_sync(void)
 {
     reset_with_radio_clocks();
-
+    burtc_align();
     writel(BURTC_BASE + BURTC_EN + REGISTER_SET_WINDOW, BURTC_EN_EN);
-    writel(BURTC_BASE + BURTC_CNT, 10);
-    writel(BURTC_BASE + BURTC_IF + REGISTER_CLEAR_WINDOW, BURTC_IF_COMP);
-    writel(BURTC_BASE + BURTC_COMP, 10);
-    writel(BURTC_BASE + BURTC_IEN + REGISTER_SET_WINDOW, BURTC_IF_COMP);
-    writel(BURTC_BASE + BURTC_CMD, BURTC_CMD_START);
-    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
-    qtest_clock_step(global_qtest, 2 * 1000 * 1000);
-    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
-
-    g_assert_cmphex(readl(BURTC_BASE + BURTC_IF) & BURTC_IF_COMP, ==, 0);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_SYNCBUSY), ==,
+                    BURTC_SYNCBUSY_EN);
+    burtc_edges(5);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_SYNCBUSY), ==,
+                    BURTC_SYNCBUSY_EN);
+    burtc_edges(1);
+    g_assert_cmphex(readl(BURTC_BASE + BURTC_SYNCBUSY), ==, 0);
 }
+
 
 /* TIMER4 is Zephyr's 16-bit 38.4 MHz scheduling counter on this part. */
 static void test_timer4_counter_and_aliases(void)
@@ -522,13 +658,12 @@ static void test_timer4_counter_and_aliases(void)
     uint32_t stopped;
 
     reset_with_radio_clocks();
-    g_assert_cmphex(readl(TIMER4_BASE + TIMER_TOP), ==, 0xffff);
-
     writel(TIMER4_NS_BASE + TIMER_EN + REGISTER_SET_WINDOW, TIMER_EN_EN);
+    g_assert_cmphex(readl(TIMER4_BASE + TIMER_TOP), ==, 0xffff);
     writel(TIMER4_NS_BASE + TIMER_TOP, 0xffff);
     writel(TIMER4_NS_BASE + TIMER_CNT, 0x1200);
     writel(TIMER4_NS_BASE + TIMER_CMD, TIMER_CMD_START);
-    g_assert_cmphex(readl(TIMER4_BASE + TIMER_STATUS), ==,
+    g_assert_cmphex((readl(TIMER4_BASE + TIMER_STATUS) & TIMER_STATUS_RUNNING), ==,
                     TIMER_STATUS_RUNNING);
 
     qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
@@ -537,13 +672,13 @@ static void test_timer4_counter_and_aliases(void)
     g_assert_cmpuint(readl(TIMER4_BASE + TIMER_CNT), >, 0x1200);
 
     writel(TIMER4_BASE + TIMER_CMD + REGISTER_SET_WINDOW, TIMER_CMD_STOP);
-    g_assert_cmphex(readl(TIMER4_NS_BASE + TIMER_STATUS), ==, 0);
+    g_assert_cmphex((readl(TIMER4_NS_BASE + TIMER_STATUS) & TIMER_STATUS_RUNNING), ==, 0);
     stopped = readl(TIMER4_BASE + TIMER_CNT);
     qtest_clock_step(global_qtest, 1000);
     g_assert_cmphex(readl(TIMER4_BASE + TIMER_CNT), ==, stopped);
 
     writel(TIMER4_NS_BASE + TIMER_EN + REGISTER_CLEAR_WINDOW, TIMER_EN_EN);
-    g_assert_cmphex(readl(TIMER4_BASE + TIMER_STATUS), ==, 0);
+    g_assert_cmphex((readl(TIMER4_BASE + TIMER_STATUS) & TIMER_STATUS_RUNNING), ==, 0);
 }
 
 /* The retained stock image starts TIMER2 during application bring-up. */
@@ -552,13 +687,12 @@ static void test_timer2_counter_and_aliases(void)
     uint32_t stopped;
 
     reset_with_radio_clocks();
-    g_assert_cmphex(readl(TIMER2_BASE + TIMER_TOP), ==, 0xffff);
-
     writel(TIMER2_NS_BASE + TIMER_EN + REGISTER_SET_WINDOW, TIMER_EN_EN);
+    g_assert_cmphex(readl(TIMER2_BASE + TIMER_TOP), ==, 0xffff);
     writel(TIMER2_NS_BASE + TIMER_TOP, 0xffff);
     writel(TIMER2_NS_BASE + TIMER_CNT, 0x1200);
     writel(TIMER2_NS_BASE + TIMER_CMD, TIMER_CMD_START);
-    g_assert_cmphex(readl(TIMER2_BASE + TIMER_STATUS), ==,
+    g_assert_cmphex((readl(TIMER2_BASE + TIMER_STATUS) & TIMER_STATUS_RUNNING), ==,
                     TIMER_STATUS_RUNNING);
 
     qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
@@ -567,13 +701,13 @@ static void test_timer2_counter_and_aliases(void)
     g_assert_cmpuint(readl(TIMER2_BASE + TIMER_CNT), >, 0x1200);
 
     writel(TIMER2_BASE + TIMER_CMD + REGISTER_SET_WINDOW, TIMER_CMD_STOP);
-    g_assert_cmphex(readl(TIMER2_NS_BASE + TIMER_STATUS), ==, 0);
+    g_assert_cmphex((readl(TIMER2_NS_BASE + TIMER_STATUS) & TIMER_STATUS_RUNNING), ==, 0);
     stopped = readl(TIMER2_BASE + TIMER_CNT);
     qtest_clock_step(global_qtest, 1000);
     g_assert_cmphex(readl(TIMER2_BASE + TIMER_CNT), ==, stopped);
 
     writel(TIMER2_NS_BASE + TIMER_EN + REGISTER_CLEAR_WINDOW, TIMER_EN_EN);
-    g_assert_cmphex(readl(TIMER2_BASE + TIMER_STATUS), ==, 0);
+    g_assert_cmphex((readl(TIMER2_BASE + TIMER_STATUS) & TIMER_STATUS_RUNNING), ==, 0);
 }
 
 static void timer0_step(int64_t ns)
@@ -587,14 +721,14 @@ static void timer0_step(int64_t ns)
 static void test_timer0_32bit_count_prescale_overflow(void)
 {
     reset_with_radio_clocks();
-    g_assert_cmphex(readl(TIMER0_BASE + TIMER_TOP), ==, 0xffff);
     writel(CMU_BASE_ADDR + CMU_EM01GRPACLKCTRL, CMU_EM01GRPACLK_HFXO);
 
     writel(TIMER0_NS_BASE + TIMER_EN + REGISTER_SET_WINDOW, TIMER_EN_EN);
+    g_assert_cmphex(readl(TIMER0_BASE + TIMER_TOP), ==, 0xffff);
     writel(TIMER0_NS_BASE + TIMER_TOP, 0xffffffff);
     writel(TIMER0_NS_BASE + TIMER_CNT, 0xffffff00);
     writel(TIMER0_NS_BASE + TIMER_CMD, TIMER_CMD_START);
-    g_assert_cmphex(readl(TIMER0_BASE + TIMER_STATUS), ==,
+    g_assert_cmphex((readl(TIMER0_BASE + TIMER_STATUS) & TIMER_STATUS_RUNNING), ==,
                     TIMER_STATUS_RUNNING);
 
     /* 10 us at 38.4 MHz is exactly 384 ticks: past the 32-bit wrap. */
@@ -603,13 +737,15 @@ static void test_timer0_32bit_count_prescale_overflow(void)
     g_assert_cmphex(readl(TIMER0_BASE + TIMER_IF) & TIMER_IF_OF, ==,
                     TIMER_IF_OF);
 
-    /* PRESC = 3 divides by four from the current count. */
+    /* PRESC = 3 divides by four from the current count; CFG needs EN = 0. */
+    writel(TIMER0_BASE + TIMER_EN, 0);
     writel(TIMER0_BASE + TIMER_CFG, 3u << TIMER_CFG_PRESC_SHIFT);
+    writel(TIMER0_BASE + TIMER_EN, TIMER_EN_EN);
     timer0_step(10000);
     g_assert_cmphex(readl(TIMER0_BASE + TIMER_CNT), ==, 0x80 + 96);
 
     writel(TIMER0_BASE + TIMER_CMD + REGISTER_SET_WINDOW, TIMER_CMD_STOP);
-    g_assert_cmphex(readl(TIMER0_NS_BASE + TIMER_STATUS), ==, 0);
+    g_assert_cmphex((readl(TIMER0_NS_BASE + TIMER_STATUS) & TIMER_STATUS_RUNNING), ==, 0);
     timer0_step(10000);
     g_assert_cmphex(readl(TIMER0_BASE + TIMER_CNT), ==, 0x80 + 96);
 }
@@ -620,10 +756,10 @@ static void test_timer0_cc_output_compare(void)
     reset_with_radio_clocks();
     writel(CMU_BASE_ADDR + CMU_EM01GRPACLKCTRL, CMU_EM01GRPACLK_HFXO);
 
-    writel(TIMER0_NS_BASE + TIMER_EN, TIMER_EN_EN);
-    writel(TIMER0_NS_BASE + TIMER_TOP, 0xffffffff);
     writel(TIMER0_NS_BASE + TIMER_CC_CFG(0), TIMER_CC_CFG_OUTPUTCOMPARE);
     writel(TIMER0_NS_BASE + TIMER_CC_CFG(1), TIMER_CC_CFG_OUTPUTCOMPARE);
+    writel(TIMER0_NS_BASE + TIMER_EN, TIMER_EN_EN);
+    writel(TIMER0_NS_BASE + TIMER_TOP, 0xffffffff);
     writel(TIMER0_NS_BASE + TIMER_CC_OC(0), 1000);
     writel(TIMER0_NS_BASE + TIMER_CC_OC(1), 2000);
     /* CC2 is left in OFF mode: its OC value must not raise a flag. */
@@ -632,8 +768,8 @@ static void test_timer0_cc_output_compare(void)
     writel(TIMER0_NS_BASE + TIMER_CNT, 0);
     writel(TIMER0_NS_BASE + TIMER_CMD, TIMER_CMD_START);
 
-    /* 1000 ticks are 26041.67 ns. */
-    timer0_step(26041);
+    /* CNT leaves 1000 after 1001 ticks, 26067.71 ns. */
+    timer0_step(26067);
     g_assert_cmphex(readl(TIMER0_BASE + TIMER_IF), ==, 0);
     timer0_step(1);
     g_assert_cmphex(readl(TIMER0_BASE + TIMER_IF), ==, TIMER_IF_CC(0));
@@ -678,6 +814,9 @@ static void test_timer4_cc0_compare_pending(void)
 {
     reset_with_radio_clocks();
 
+    /* CC0 compares only in OUTPUTCOMPARE mode, set while EN = 0. */
+    writel(CMU_BASE_ADDR + CMU_EM01GRPACLKCTRL, CMU_EM01GRPACLK_HFXO);
+    writel(TIMER4_NS_BASE + TIMER_CC_CFG(0), TIMER_CC_CFG_OUTPUTCOMPARE);
     writel(TIMER4_NS_BASE + TIMER_EN + REGISTER_SET_WINDOW, TIMER_EN_EN);
     writel(TIMER4_NS_BASE + TIMER_TOP, 0xffff);
     writel(TIMER4_NS_BASE + TIMER_CNT, 10);
@@ -727,7 +866,7 @@ static void test_system_reset_clears_radio_timer_state(void)
     g_assert_cmphex(readl(BURTC_BASE + BURTC_STATUS), ==, 0);
     g_assert_cmphex(readl(BURTC_BASE + BURTC_IF), ==, 0);
     g_assert_cmphex(readl(BURTC_BASE + BURTC_IEN), ==, 0);
-    g_assert_cmphex(readl(TIMER4_BASE + TIMER_STATUS), ==, 0);
+    g_assert_cmphex((readl(TIMER4_BASE + TIMER_STATUS) & TIMER_STATUS_RUNNING), ==, 0);
     g_assert_cmphex(readl(TIMER4_BASE + TIMER_IF), ==, 0);
     g_assert_cmphex(readl(TIMER4_BASE + TIMER_IEN), ==, 0);
     g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_IF), ==, 0);
@@ -759,15 +898,28 @@ static void test_dpll_lock(void)
     g_assert_cmphex(readl(DPLL0_BASE + DPLL_CFG), ==, 0x47);
     g_assert_cmphex(readl(DPLL0_BASE + DPLL_CFG1), ==, 0x0fff0fff);
 
+    /* HFXO already running, as for the measured relock. */
+    writel(HFXO_NONSECURE_BASE + HFXO_CTRL + REGISTER_SET_WINDOW, 1);
+    timer0_step(HFXO_COREBIASOPT_NS);
+    writel(CMU_BASE_ADDR + CMU_DPLLREFCLKCTRL, 1);
     writel(DPLL0_NONSECURE_BASE + DPLL_IF + REGISTER_CLEAR_WINDOW, 7);
     writel(DPLL0_NONSECURE_BASE + DPLL_EN + REGISTER_SET_WINDOW,
            DPLL_EN_EN);
+    /* ENS at once, RDY and IF.LOCK after the lock; bit 31 stays clear. */
+    g_assert_cmphex(readl(DPLL0_BASE + DPLL_STATUS), ==, DPLL_STATUS_ENS);
+    timer0_step(DPLL_LOCK_NS - 1);
+    g_assert_cmphex(readl(DPLL0_NONSECURE_BASE + DPLL_IF) & 7, ==, 0);
+    timer0_step(1);
     g_assert_cmphex(readl(DPLL0_BASE + DPLL_STATUS), ==,
-                    DPLL_STATUS_READY_LOCKED);
+                    DPLL_STATUS_ENS | DPLL_STATUS_RDY);
     g_assert_cmphex(readl(DPLL0_NONSECURE_BASE + DPLL_IF) & 7, ==,
                     DPLL_IF_LOCK);
 
+    /* ENS drops 41 HFXO cycles after EN = 0. */
     writel(DPLL0_BASE + DPLL_EN + REGISTER_CLEAR_WINDOW, DPLL_EN_EN);
+    g_assert_cmphex(readl(DPLL0_NONSECURE_BASE + DPLL_STATUS), ==,
+                    DPLL_STATUS_ENS);
+    timer0_step(1068);
     g_assert_cmphex(readl(DPLL0_NONSECURE_BASE + DPLL_STATUS), ==, 0);
 }
 
@@ -1145,30 +1297,55 @@ static void test_hfxo_ready_status(void)
     g_assert_cmphex(readl(HFXO_BASE + HFXO_CTRL), ==, HFXO_CTRL_DISONDEMAND);
     g_assert_cmphex(readl(HFXO_NONSECURE_BASE + HFXO_STATUS), ==, 0);
 
+    /* FORCEEN alone: ENS, RDY, COREBIASOPTRDY in turn, no HWREQ. */
     writel(HFXO_NONSECURE_BASE + HFXO_CTRL + REGISTER_SET_WINDOW, 1);
     g_assert_cmphex(readl(HFXO_NONSECURE_BASE + HFXO_STATUS), ==,
-                    HFXO_STATUS_READY | HFXO_STATUS_FSMLOCK);
+                    HFXO_STATUS_FSMLOCK);
+    timer0_step(HFXO_ENS_NS);
     g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==,
-                    HFXO_STATUS_READY | HFXO_STATUS_FSMLOCK);
+                    HFXO_STATUS_ENS | HFXO_STATUS_FSMLOCK);
+    timer0_step(HFXO_RDY_NS - HFXO_ENS_NS);
+    g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==,
+                    HFXO_STATUS_ENS | HFXO_STATUS_RDY | HFXO_STATUS_FSMLOCK);
+    timer0_step(HFXO_COREBIASOPT_NS - HFXO_RDY_NS);
+    g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==,
+                    HFXO_STATUS_ENS | HFXO_STATUS_RDY |
+                    HFXO_STATUS_COREBIASOPTRDY | HFXO_STATUS_FSMLOCK);
 
     writel(HFXO_NONSECURE_BASE + HFXO_CMD, 1u << 1);
-    g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==, HFXO_STATUS_READY);
+    g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS) & HFXO_STATUS_FSMLOCK, ==,
+                    0);
 
-    /* Re-enable without reading disabled STATUS: a fresh lock must start. */
+    /* A new request restarts both the oscillator and the FSM lock. */
     writel(HFXO_NONSECURE_BASE + HFXO_CTRL + REGISTER_CLEAR_WINDOW, 1);
     writel(HFXO_NONSECURE_BASE + HFXO_CTRL + REGISTER_SET_WINDOW, 1);
-    g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==,
-                    HFXO_STATUS_READY | HFXO_STATUS_FSMLOCK);
+    g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==, HFXO_STATUS_FSMLOCK);
 
-    writel(HFXO_BASE + HFXO_CMD, 1u << 1);
+    /* A hardware consumer (SYSCLK) reads HWREQ. */
     writel(HFXO_BASE + HFXO_CTRL + REGISTER_CLEAR_WINDOW, 1);
     writel(CMU_BASE + CMU_SYSCLKCTRL, 3);
+    timer0_step(HFXO_COREBIASOPT_NS);
     g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==,
                     HFXO_STATUS_READY | HFXO_STATUS_FSMLOCK);
 
     reset_with_radio_clocks();
     g_assert_cmphex(readl(HFXO_BASE + HFXO_CTRL), ==, HFXO_CTRL_DISONDEMAND);
     g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==, 0);
+}
+
+/* LFXO: RDY follows ENS by CFG.TIMEOUT LFXO cycles. */
+static void test_lfxo_ready_timeout(void)
+{
+    reset_with_radio_clocks();
+    writel(LFXO_BASE + LFXO_CFG, LFXO_CFG_TIMEOUT_4K | 1);
+    g_assert_cmphex(readl(LFXO_BASE + LFXO_STATUS), ==, 0);
+    writel(LFXO_BASE + LFXO_CTRL + REGISTER_SET_WINDOW, 1);
+    g_assert_cmphex(readl(LFXO_BASE + LFXO_STATUS), ==, OSC_STATUS_ENS);
+    timer0_step(LFXO_RDY_4K_NS - 1);
+    g_assert_cmphex(readl(LFXO_BASE + LFXO_STATUS), ==, OSC_STATUS_ENS);
+    timer0_step(1);
+    g_assert_cmphex(readl(LFXO_BASE + LFXO_STATUS), ==,
+                    OSC_STATUS_ENS | OSC_STATUS_RDY);
 }
 
 static void test_bufc_data_port(void)
@@ -1535,6 +1712,7 @@ static void test_protimer_counter_is_independent_from_burtc(void)
     writel(BURTC_BASE + BURTC_EN, BURTC_EN_EN);
     writel(BURTC_BASE + BURTC_CNT, 0x12345678);
     writel(BURTC_BASE + BURTC_CMD, BURTC_CMD_START);
+    burtc_edges(BURTC_SYNC_EDGES);
     g_assert_cmphex(readl(BURTC_BASE + BURTC_STATUS), ==,
                     BURTC_STATUS_RUNNING);
 
@@ -1980,6 +2158,153 @@ static void test_gated_bus_clock_faults_and_drops(void)
     g_assert_true(m33_load_faults(BUFC_BASE + BUFC_CH0, setup_no_clocks));
     g_assert_true(m33_load_faults(RADIO_HOLE_BASE, setup_radio_clocks));
 }
+
+/*
+ * An output compare fires on the tick where CNT advances out of OC, so OC
+ * equal to the count at START fires after one tick, not after a wrap.
+ */
+static void test_timer0_compare_equal_fires_next_tick(void)
+{
+    reset_with_radio_clocks();
+    writel(CMU_BASE_ADDR + CMU_EM01GRPACLKCTRL, CMU_EM01GRPACLK_HFXO);
+    writel(TIMER0_NS_BASE + TIMER_CC_CFG(0), TIMER_CC_CFG_OUTPUTCOMPARE);
+    writel(TIMER0_NS_BASE + TIMER_EN, TIMER_EN_EN);
+    writel(TIMER0_NS_BASE + TIMER_TOP, 0xffffffff);
+    writel(TIMER0_NS_BASE + TIMER_CNT, 10);
+    writel(TIMER0_NS_BASE + TIMER_CC_OC(0), 10);
+    writel(TIMER0_NS_BASE + TIMER_CMD, TIMER_CMD_START);
+    /* One tick at 38.4 MHz is 26.04 ns. */
+    timer0_step(26);
+    g_assert_cmphex(readl(TIMER0_BASE + TIMER_IF), ==, 0);
+    timer0_step(1);
+    g_assert_cmphex(readl(TIMER0_BASE + TIMER_IF), ==, TIMER_IF_CC(0));
+}
+
+#define TIMER_STATUS_SYNCBUSY (1u << 6)
+#define TIMER_CMD_SYNC_NS     495 /* 38 HCLK cycles at 76.8 MHz */
+
+static void test_timer_cmd_syncbusy(void)
+{
+    reset_with_radio_clocks();
+    writel(TIMER1_BASE + TIMER_EN, TIMER_EN_EN);
+    writel(TIMER1_BASE + TIMER_CMD, TIMER_CMD_START);
+    g_assert_cmphex(readl(TIMER1_BASE + TIMER_STATUS), ==,
+                    TIMER_STATUS_RUNNING | TIMER_STATUS_SYNCBUSY);
+    timer0_step(TIMER_CMD_SYNC_NS);
+    g_assert_cmphex(readl(TIMER1_BASE + TIMER_STATUS), ==,
+                    TIMER_STATUS_RUNNING);
+}
+
+/* EN = 0 reads SYNC registers as zero and keeps their values. */
+static void test_timer_sync_registers_read_zero_when_disabled(void)
+{
+    reset_with_radio_clocks();
+    g_assert_cmphex(readl(TIMER3_BASE + TIMER_TOP), ==, 0);
+    writel(TIMER3_BASE + TIMER_EN, TIMER_EN_EN);
+    g_assert_cmphex(readl(TIMER3_BASE + TIMER_TOP), ==, 0xffff);
+    writel(TIMER3_BASE + TIMER_TOP, 0x1234);
+    writel(TIMER3_BASE + TIMER_EN, 0);
+    g_assert_cmphex(readl(TIMER3_BASE + TIMER_TOP), ==, 0);
+    writel(TIMER3_BASE + TIMER_EN, TIMER_EN_EN);
+    g_assert_cmphex(readl(TIMER3_BASE + TIMER_TOP), ==, 0x1234);
+}
+
+static void setup_timer_clocks(QTestState *qts)
+{
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_TIMERS | CMU_CLKEN0_BURTC);
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN1 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN1_TIMER4);
+}
+
+static void setup_timer_clocks_enabled_timer1(QTestState *qts)
+{
+    setup_timer_clocks(qts);
+    qtest_writel(qts, TIMER1_BASE + TIMER_EN, TIMER_EN_EN);
+}
+
+/* A store that should fault: r0 = address; str r1, [r0]; marker. */
+static bool m33_store_faults(uint32_t address, void (*setup)(QTestState *qts))
+{
+    const uint32_t code = 0x100, handler = 0x180, result = 0x20000000;
+    const uint32_t fault_marker = 0xfa0170ffu, stored_marker_bit = 1u << 31;
+    uint16_t insn[8], hinsn[6];
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel tcg -S");
+    uint32_t outcome;
+    size_t i;
+
+    qtest_writel(qts, 0x00000000, 0x20008000);
+    qtest_writel(qts, 0x00000004, code | 1);
+    qtest_writel(qts, 0x00000008, handler | 1);
+    qtest_writel(qts, 0x0000000c, handler | 1);
+    insn[0] = thumb_ldr_pc(0, code + 0, code + 16);
+    insn[1] = thumb_str_imm(1, 0, 0);
+    insn[2] = thumb_ldr_pc(2, code + 4, code + 20);
+    insn[3] = thumb_ldr_pc(3, code + 6, code + 24);
+    insn[4] = thumb_str_imm(3, 2, 0);
+    insn[5] = THUMB16_BRANCH_SELF;
+    insn[6] = THUMB16_BRANCH_SELF;
+    insn[7] = THUMB16_BRANCH_SELF;
+    for (i = 0; i < 8; i += 2) {
+        qtest_writel(qts, code + 2 * i, THUMB16_PAIR(insn[i], insn[i + 1]));
+    }
+    qtest_writel(qts, code + 16, address);
+    qtest_writel(qts, code + 20, result);
+    qtest_writel(qts, code + 24, stored_marker_bit);
+    hinsn[0] = thumb_ldr_pc(2, handler + 0, handler + 12);
+    hinsn[1] = thumb_ldr_pc(1, handler + 2, handler + 16);
+    hinsn[2] = thumb_str_imm(1, 2, 0);
+    hinsn[3] = THUMB16_BRANCH_SELF;
+    hinsn[4] = THUMB16_BRANCH_SELF;
+    hinsn[5] = THUMB16_BRANCH_SELF;
+    for (i = 0; i < 6; i += 2) {
+        qtest_writel(qts, handler + 2 * i,
+                     THUMB16_PAIR(hinsn[i], hinsn[i + 1]));
+    }
+    qtest_writel(qts, handler + 12, result);
+    qtest_writel(qts, handler + 16, fault_marker);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    qtest_writel(qts, result, 0);
+    setup(qts);
+    qtest_qmp_assert_success(qts, "{'execute':'cont'}");
+    for (unsigned attempt = 0; attempt < 1000; attempt++) {
+        if (qtest_readl(qts, result)) {
+            break;
+        }
+        g_usleep(1000);
+    }
+    qtest_qmp_assert_success(qts, "{'execute':'stop'}");
+    outcome = qtest_readl(qts, result);
+    qtest_quit(qts);
+    g_assert(outcome == fault_marker || outcome == stored_marker_bit);
+    return outcome == fault_marker;
+}
+
+/*
+ * TIMERn and BURTC fault on any access while their CMU clock is off; a
+ * TIMER faults SYNC-register writes while EN = 0 and CONFIG-register writes
+ * while EN = 1.
+ */
+static void test_timer_bus_faults(void)
+{
+    g_assert_true(m33_load_faults(TIMER0_BASE + TIMER_CFG, setup_no_clocks));
+    g_assert_true(m33_load_faults(TIMER4_BASE + TIMER_CFG, setup_no_clocks));
+    g_assert_true(m33_load_faults(BURTC_BASE + BURTC_CNT, setup_no_clocks));
+    g_assert_false(m33_load_faults(TIMER0_BASE + TIMER_CFG,
+                                   setup_timer_clocks));
+    g_assert_false(m33_load_faults(BURTC_BASE + BURTC_CNT,
+                                   setup_timer_clocks));
+    g_assert_true(m33_store_faults(TIMER2_BASE + TIMER_CFG, setup_no_clocks));
+    g_assert_true(m33_store_faults(TIMER1_BASE + TIMER_CMD,
+                                   setup_timer_clocks));
+    g_assert_false(m33_store_faults(TIMER1_BASE + TIMER_CFG,
+                                    setup_timer_clocks));
+    g_assert_true(m33_store_faults(TIMER1_BASE + TIMER_CFG,
+                                   setup_timer_clocks_enabled_timer1));
+    g_assert_false(m33_store_faults(TIMER1_BASE + TIMER_CMD,
+                                    setup_timer_clocks_enabled_timer1));
+}
+
 
 static QTestState *seq_release_with_program(const uint16_t *insns,
                                             size_t n_insns,
@@ -2576,8 +2901,17 @@ int main(int argc, char **argv)
                    test_burtc_register_aliases);
     qtest_add_func("/efr32bg22/burtc-compare-pending",
                    test_burtc_compare_pending);
-    qtest_add_func("/efr32bg22/burtc-current-compare-waits-for-wrap",
-                   test_burtc_current_compare_waits_for_wrap);
+    qtest_add_func("/efr32bg22/burtc-compare-lead", test_burtc_compare_lead);
+    qtest_add_func("/efr32bg22/burtc-retarget-window",
+                   test_burtc_retarget_window);
+    qtest_add_func("/efr32bg22/burtc-en-sync", test_burtc_en_sync);
+    qtest_add_func("/efr32bg22/timer0-compare-equal-fires-next-tick",
+                   test_timer0_compare_equal_fires_next_tick);
+    qtest_add_func("/efr32bg22/timer-cmd-syncbusy", test_timer_cmd_syncbusy);
+    qtest_add_func("/efr32bg22/timer-sync-registers-read-zero-when-disabled",
+                   test_timer_sync_registers_read_zero_when_disabled);
+    qtest_add_func("/efr32bg22/timer-bus-faults", test_timer_bus_faults);
+    qtest_add_func("/efr32bg22/lfxo-ready-timeout", test_lfxo_ready_timeout);
     qtest_add_func("/efr32bg22/timer4-counter-and-aliases",
                    test_timer4_counter_and_aliases);
     qtest_add_func("/efr32bg22/timer2-counter-and-aliases",
