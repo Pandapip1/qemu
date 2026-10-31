@@ -11,6 +11,7 @@
 #include "qemu/timer.h"
 #include "hw/boards.h"
 #include "hw/arm/efr32-rf-medium.h"
+#include "hw/arm/efr32-usart.h"
 #include "hw/ptimer.h"
 #include "hw/qdev-clock.h"
 #include "hw/qdev-properties.h"
@@ -603,6 +604,8 @@ struct Efr32Periph
     CPUState *m33_cpu;
     Clock *m33_cpuclk;
     Clock *seq_cpuclk;
+    /* PCLK = HCLK / (PCLKPRESC + 1): the USARTs' clock. */
+    Clock *pclk;
     IcountBusModel bus_model;
     bool seq_released;
     bool synth_running;
@@ -3756,6 +3759,9 @@ static bool efr32_bus_error(Efr32Periph *s, uint32_t address)
 #define EFR32_CMU_SYSCLKCTRL_HCLKPRESC_MASK 0xfu
 #define EFR32_CMU_SYSCLKCTRL_RHCLKPRESC_SHIFT 16
 #define EFR32_CMU_SYSCLKCTRL_RHCLKPRESC_MASK 0x1u
+/* efr32bg22_cmu.h: _CMU_SYSCLKCTRL_PCLKPRESC_SHIFT/_MASK. */
+#define EFR32_CMU_SYSCLKCTRL_PCLKPRESC_SHIFT 10
+#define EFR32_CMU_SYSCLKCTRL_PCLKPRESC_MASK 0x1u
 /*
  * Core cycles per instruction, from real code: a firmware function called
  * from the debugger at full speed (cycles) and single-stepped
@@ -3878,6 +3884,10 @@ static void efr32_cpu_clocks_update(Efr32Periph *s)
     efr32_cpu_clock_set(s->seq_cpu, s->seq_cpuclk,
                         radio_clock ? sysclk / radio_div : 0,
                         EFR32_SEQ_CYCLES_PER_INSN_MILLI);
+    efr32_cpu_clock_set(NULL, s->pclk,
+                        sysclk / hclk_div /
+                        (((ctrl >> EFR32_CMU_SYSCLKCTRL_PCLKPRESC_SHIFT) &
+                          EFR32_CMU_SYSCLKCTRL_PCLKPRESC_MASK) + 1), 0);
 }
 
 /* The M0+ is executing: released, clocked and not sleeping. */
@@ -4294,6 +4304,7 @@ struct Efr32Bg22SoCState {
     Clock *seq_clk;
     Clock *protimer_clk;
     Clock *burtc_clk;
+    Clock *pclk;
     unsigned endpoint_id;
 
     MemoryRegion *memory;
@@ -4431,6 +4442,25 @@ static void efr32_soc_init(Object *obj)
     object_initialize_child(obj, "periph", &s->periph, TYPE_EFR32_PERIPH);
 }
 
+/* efr32bg22c224f512im40.h IRQn_Type. */
+#define EFR32_USART0_RX_IRQ 13
+#define EFR32_USART0_TX_IRQ 14
+#define EFR32_USART1_RX_IRQ 15
+#define EFR32_USART1_TX_IRQ 16
+
+/*
+ * USART0/1 (the dual machine's SoC n takes
+ * -serial 2n and 2n+1 unless a chardev "socN.usartM" claims the port).
+ */
+static const Efr32UsartConfig efr32_usarts[] = {
+    {.name = "usart0", .index = 0, .base = EFR32_USART0_BASE,
+     .ns_offset = PERIPH_NONSECURE_OFFSET, .rx_irq = EFR32_USART0_RX_IRQ,
+     .tx_irq = EFR32_USART0_TX_IRQ},
+    {.name = "usart1", .index = 1, .base = EFR32_USART1_BASE,
+     .ns_offset = PERIPH_NONSECURE_OFFSET, .rx_irq = EFR32_USART1_RX_IRQ,
+     .tx_irq = EFR32_USART1_TX_IRQ},
+};
+
 static void efr32_soc_realize(DeviceState *dev, Error **errp)
 {
     Efr32Bg22SoCState *s = EFR32BG22_SOC(dev);
@@ -4475,6 +4505,7 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
     clock_set_hz(s->protimer_clk, 2000000);
     s->burtc_clk = clock_new(OBJECT(s), "BURTCCLK");
     clock_set_hz(s->burtc_clk, 32768);
+    s->pclk = clock_new(OBJECT(s), "PCLK");
 
     memory_region_init_ram(&s->flash, OBJECT(s), flash_name, FLASH_SIZE,
                            &error_fatal);
@@ -4574,6 +4605,7 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
     s->periph.m33_cpu = CPU(s->armv7m.cpu);
     s->periph.m33_cpuclk = s->clk;
     s->periph.seq_cpuclk = s->seq_clk;
+    s->periph.pclk = s->pclk;
     if (s->core_clocks && icount_enabled() &&
         !icount_cpu_clocks_enable(EFR32_CORE_CLOCK_QUANTUM_NS)) {
         warn_report_once("efr32bg22: core-clocks needs a fixed -icount shift; "
@@ -4589,6 +4621,13 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
                                     EFR32_M33_EXCEPTION_ENTRY_MILLICYCLES);
     efr32_cpu_clocks_update(&s->periph);
     s->periph.seq_released = false;
+    for (unsigned i = 0; i < G_N_ELEMENTS(efr32_usarts); i++) {
+        Efr32UsartConfig usart = efr32_usarts[i];
+
+        usart.serial_index = s->endpoint_id * G_N_ELEMENTS(efr32_usarts) + i;
+        efr32_usart_create(OBJECT(s), s->memory, nvic, s->pclk,
+                           &s->periph.bus_model, &usart);
+    }
     for (unsigned state = 0; state < EFR32_RAC_SEQ_STATE_EVENTS; state++) {
         s->periph.seq_irq_state[state] =
             qdev_get_gpio_in(DEVICE(&s->seq_armv7m), state);
