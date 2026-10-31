@@ -5,6 +5,7 @@
  */
 #include "qemu/osdep.h"
 #include "libqtest-single.h"
+#include "qemu/bswap.h"
 
 static char *tx_snapshot_trace_path;
 
@@ -1993,34 +1994,31 @@ static void test_rac_masks(void)
 }
 
 /*
- * The recovered M33-side protocol uses endpoint data plus FLAGS bit 1.  QEMU
- * retains the guest data register but deliberately has no peer endpoint, so
- * neither secure nor non-secure FLAGS reads may manufacture a doorbell.
- * This is a known, recorded divergence from real silicon, not an absence of
- * one: bit 0 of this same register gates a real M33-side RAIL calibration
- * busy-wait on real hardware (owo-open-fw docs/radio-tables.md SS7.5.4,
- * lockstepped directly), which this model cannot reproduce. Not fixed here
- * because there is no emulated M0+ peer to ever clear a real latch -- see
- * the matching comment in hw/arm/efr32bg22.c.
+ * RDMAILBOX IF is a latch with the usual SET/CLR aliases: the stock M0+
+ * posts on mailbox 0 with IF_SET and waits for the M33 to clear the flag,
+ * and the M33 posts on mailbox 1 for the M0+ (hw/arm/efr32bg22.c).  Message
+ * pointers keep their value.
  */
-static void test_rfmailbox_no_peer(void)
+static void test_rfmailbox_flags_latch(void)
 {
     attribute_radio_nonsecure();
     /* Each mailbox endpoint has its own CMU bus clock (SS7.72). */
     writel(CMU_BASE + CMU_CLKEN1 + REGISTER_SET_WINDOW,
            CMU_CLKEN1_RDMAILBOX0 | CMU_CLKEN1_RDMAILBOX1);
     writel(RFMAILBOX_C_BASE + RFMAILBOX_NS_OFFSET + RFMAILBOX_DATA, 0x3412);
-    g_assert_cmphex(readl(RFMAILBOX_C_BASE + RFMAILBOX_DATA), ==, 0);
     g_assert_cmphex(readl(RFMAILBOX_C_BASE + RFMAILBOX_NS_OFFSET +
                           RFMAILBOX_DATA), ==, 0x3412);
 
     writel(RFMAILBOX_C_BASE + RFMAILBOX_NS_OFFSET + RFMAILBOX_FLAGS +
                REGISTER_SET_WINDOW,
            1u << 1);
-    g_assert_cmphex(readl(RFMAILBOX_C_BASE + RFMAILBOX_FLAGS), ==, 0);
+    g_assert_cmphex(readl(RFMAILBOX_C_BASE + RFMAILBOX_NS_OFFSET +
+                          RFMAILBOX_FLAGS), ==, 1u << 1);
+    writel(RFMAILBOX_C_BASE + RFMAILBOX_NS_OFFSET + RFMAILBOX_FLAGS +
+               REGISTER_CLEAR_WINDOW,
+           1u << 1);
     g_assert_cmphex(readl(RFMAILBOX_C_BASE + RFMAILBOX_NS_OFFSET +
                           RFMAILBOX_FLAGS), ==, 0);
-    g_assert_cmphex(readl(RFMAILBOX_B_BASE + RFMAILBOX_FLAGS), ==, 0);
     attribute_radio_secure();
 }
 
@@ -2037,13 +2035,13 @@ static void test_rfmailbox_no_peer(void)
  * SRAM, or stores a marker from its HardFault handler.  @setup runs after the
  * reset, before the core starts.  Returns true if the load faulted.
  */
-static bool m33_load_faults(uint32_t address,
-                            void (*setup)(QTestState *qts))
+static bool m33_load_faults_on(const char *machine, uint32_t address,
+                               void (*setup)(QTestState *qts))
 {
     const uint32_t code = 0x100, handler = 0x180, result = 0x20000000;
     const uint32_t fault_marker = 0xfa0170ffu, loaded_marker_bit = 1u << 31;
     uint16_t insn[8], hinsn[6];
-    QTestState *qts = qtest_initf("-machine efr32bg22 -accel tcg -S");
+    QTestState *qts = qtest_initf("-machine %s -accel tcg -S", machine);
     uint32_t outcome;
     size_t i;
 
@@ -2097,8 +2095,244 @@ static bool m33_load_faults(uint32_t address,
     return outcome == fault_marker;
 }
 
+static bool m33_load_faults(uint32_t address,
+                            void (*setup)(QTestState *qts))
+{
+    return m33_load_faults_on("efr32bg22", address, setup);
+}
+
 static void setup_no_clocks(QTestState *qts)
 {
+}
+
+/*
+ * Part identity from DEVINFO/USERDATA page images: an EFR32BG22C222F352GM40
+ * (public part header: FLASH_SIZE 0x58000) in the BGM220PC22WGA2 module
+ * (public datasheet: 352 KB flash, 32 KB RAM).  The pages are synthetic:
+ * only the public identity words are set.
+ */
+#define PART_DEVINFO_PART       0x004
+#define PART_DEVINFO_MSIZE      0x00c
+#define PART_C222F352_PART      0x021608ae /* BG, family 22, device 2222 */
+#define PART_C222F352_MSIZE     0x00200160 /* 32 KB SRAM, 352 KB flash */
+#define PART_C222F352_FLASH_END 0x58000
+#define DEVINFO_OFFSET          0x8000
+#define INFO_PAGE_SIZE          0x400
+#define SYSCFG_CHIPREV          0x014
+#define SYSCFG_CHIPREV_BG22     (53u << 6)
+#define MSC_WRITECTRL           0x00c
+#define MSC_WRITECTRL_WREN      (1u << 0)
+#define MSC_WRITECMD            0x010
+#define MSC_WRITECMD_ERASEPAGE  (1u << 1)
+#define MSC_ADDRB               0x014
+#define MSC_WDATA               0x018
+#define MSC_STATUS_LOCKED       (1u << 1)
+#define MSC_STATUS_INVADDR      (1u << 2)
+#define MSC_IF                  0x020
+#define MSC_IF_ERASE            (1u << 0)
+#define MSC_IF_WRITE            (1u << 1)
+#define MSC_MISCLOCKWORD        0x040
+#define MSC_MISCLOCKWORD_UDLOCK (1u << 4)
+#define MSC_PAGELOCK1           0x124
+#define FLASH_PAGE_SIZE         0x2000
+
+static gchar *part_devinfo_path;
+static gchar *part_userdata_path;
+
+static void part_write_pages(void)
+{
+    uint8_t devinfo[INFO_PAGE_SIZE], userdata[INFO_PAGE_SIZE / 4];
+
+    memset(devinfo, 0xff, sizeof(devinfo));
+    stl_le_p(devinfo + PART_DEVINFO_PART, PART_C222F352_PART);
+    stl_le_p(devinfo + PART_DEVINFO_MSIZE, PART_C222F352_MSIZE);
+    memcpy(devinfo + DEVINFO_MODULENAME0 - DEVINFO_OFFSET, "BGM220PC22WGA2",
+           14);
+    for (size_t i = 0; i < sizeof(userdata); i++) {
+        userdata[i] = i;
+    }
+    part_devinfo_path = g_strdup_printf("%s/efr32bg22-devinfo-%u.bin",
+                                        g_get_tmp_dir(), g_random_int());
+    part_userdata_path = g_strdup_printf("%s/efr32bg22-userdata-%u.bin",
+                                         g_get_tmp_dir(), g_random_int());
+    g_assert(g_file_set_contents(part_devinfo_path, (char *)devinfo,
+                                 sizeof(devinfo), NULL));
+    g_assert(g_file_set_contents(part_userdata_path, (char *)userdata,
+                                 sizeof(userdata), NULL));
+}
+
+static gchar *part_machine(void)
+{
+    return g_strdup_printf("efr32bg22,devinfo=%s,userdata=%s",
+                           part_devinfo_path, part_userdata_path);
+}
+
+/* The 352 KB part: identity pages, flash end, MSC and CHIPREV. */
+static void test_part_352k_identity(void)
+{
+    g_autofree gchar *machine = part_machine();
+    QTestState *qts = qtest_initf("-machine %s -accel tcg -S", machine);
+    uint32_t last = PART_C222F352_FLASH_END - 4;
+
+    g_assert_cmphex(qtest_readl(qts, DEVINFO_BASE + DEVINFO_OFFSET +
+                                         PART_DEVINFO_MSIZE),
+                    ==, PART_C222F352_MSIZE);
+    g_assert_cmphex(qtest_readl(qts, DEVINFO_BASE + DEVINFO_MODULENAME0),
+                    ==, 0x324d4742); /* "BGM2" */
+    /* USERDATA: the image, erased beyond its end. */
+    g_assert_cmphex(qtest_readl(qts, DEVINFO_BASE + 4), ==, 0x07060504);
+    g_assert_cmphex(qtest_readl(qts, DEVINFO_BASE + INFO_PAGE_SIZE / 4), ==,
+                    UINT32_MAX);
+
+    /* The family the boot code leaves in CHIPREV follows DEVINFO.PART. */
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_SYSCFG);
+    g_assert_cmphex(qtest_readl(qts, SYSCFG_BASE + SYSCFG_CHIPREV), ==,
+                    SYSCFG_CHIPREV_BG22);
+
+    /* MSC: ADDRB past the flash end is INVADDR; the last page is valid. */
+    qtest_writel(qts, MSC_BASE + MSC_WRITECTRL, MSC_WRITECTRL_WREN);
+    qtest_writel(qts, MSC_BASE + MSC_ADDRB, PART_C222F352_FLASH_END);
+    g_assert_cmphex(qtest_readl(qts, MSC_BASE + MSC_STATUS) &
+                    MSC_STATUS_INVADDR, ==, MSC_STATUS_INVADDR);
+    qtest_writel(qts, MSC_BASE + MSC_ADDRB, last - 4);
+    g_assert_cmphex(qtest_readl(qts, MSC_BASE + MSC_STATUS) &
+                    MSC_STATUS_INVADDR, ==, 0);
+    /* Program: only 1 -> 0, ADDRB advances by a word. */
+    qtest_writel(qts, MSC_BASE + MSC_WRITECMD, MSC_WRITECMD_ERASEPAGE);
+    g_assert_cmphex(qtest_readl(qts, last), ==, UINT32_MAX);
+    qtest_writel(qts, MSC_BASE + MSC_WDATA, 0x12345678);
+    g_assert_cmphex(qtest_readl(qts, MSC_BASE + MSC_ADDRB), ==, last);
+    qtest_writel(qts, MSC_BASE + MSC_WDATA, 0xff00ff00);
+    g_assert_cmphex(qtest_readl(qts, last - 4), ==, 0x12345678);
+    g_assert_cmphex(qtest_readl(qts, last), ==, 0xff00ff00);
+    g_assert_cmphex(qtest_readl(qts, MSC_BASE + MSC_IF) &
+                    (MSC_IF_ERASE | MSC_IF_WRITE), ==,
+                    MSC_IF_ERASE | MSC_IF_WRITE);
+    /* A locked page is refused with STATUS.LOCKED. */
+    qtest_writel(qts, MSC_BASE + MSC_PAGELOCK1,
+                 1u << (last / FLASH_PAGE_SIZE - 32));
+    qtest_writel(qts, MSC_BASE + MSC_ADDRB, last);
+    qtest_writel(qts, MSC_BASE + MSC_WRITECMD, MSC_WRITECMD_ERASEPAGE);
+    g_assert_cmphex(qtest_readl(qts, last), ==, 0xff00ff00);
+    g_assert_cmphex(qtest_readl(qts, MSC_BASE + MSC_STATUS) &
+                    MSC_STATUS_LOCKED, ==, MSC_STATUS_LOCKED);
+    /* USERDATA needs MISCLOCKWORD.UDLOCKBIT clear (reset value 1). */
+    qtest_writel(qts, MSC_BASE + MSC_ADDRB, DEVINFO_BASE);
+    qtest_writel(qts, MSC_BASE + MSC_WDATA, 0);
+    g_assert_cmphex(qtest_readl(qts, DEVINFO_BASE), ==, 0x03020100);
+    qtest_writel(qts, MSC_BASE + MSC_MISCLOCKWORD + REGISTER_CLEAR_WINDOW,
+                 MSC_MISCLOCKWORD_UDLOCK);
+    qtest_writel(qts, MSC_BASE + MSC_ADDRB, DEVINFO_BASE);
+    qtest_writel(qts, MSC_BASE + MSC_WDATA, 0);
+    g_assert_cmphex(qtest_readl(qts, DEVINFO_BASE), ==, 0);
+    qtest_quit(qts);
+}
+
+/* RM SS4.2.1.2: an access to an unassigned address is a bus fault. */
+static void test_part_352k_flash_end_faults(void)
+{
+    g_autofree gchar *machine = part_machine();
+
+    g_assert_false(m33_load_faults_on(machine, PART_C222F352_FLASH_END - 4,
+                                      setup_no_clocks));
+    g_assert_true(m33_load_faults_on(machine, PART_C222F352_FLASH_END,
+                                     setup_no_clocks));
+    /* The default module keeps its 512 KB. */
+    g_assert_false(m33_load_faults(PART_C222F352_FLASH_END, setup_no_clocks));
+}
+
+/*
+ * RTCC (RM SS15.3): CMD.START runs CNT at the LF clock (LFRCO, 32.768 kHz
+ * on this board, CNTPRESC DIV1); an output-compare channel sets IF.CCn when
+ * CNT reaches OCVALUE.
+ */
+#define RTCC_BASE             0x48000000
+#define RTCC_EN               0x004
+#define RTCC_CMD              0x00c
+#define RTCC_CMD_START        (1u << 0)
+#define RTCC_STATUS           0x010
+#define RTCC_IF               0x014
+#define RTCC_IF_CC1           (1u << 6)
+#define RTCC_CNT              0x020
+#define RTCC_CC1_CTRL         0x03c
+#define RTCC_CC1_OCVALUE      0x040
+#define RTCC_CC_OUTPUTCOMPARE 0x2
+
+static void test_rtcc_counts_and_compares(void)
+{
+    uint32_t cnt;
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    writel(RTCC_BASE + RTCC_EN, 1);
+    writel(RTCC_BASE + RTCC_CMD, RTCC_CMD_START);
+    g_assert_cmphex(readl(RTCC_BASE + RTCC_STATUS), ==, 1);
+    clock_run(100 * LF_PERIOD_NS);
+    cnt = readl(RTCC_BASE + RTCC_CNT);
+    g_assert_cmpuint(cnt, >=, 99);
+    g_assert_cmpuint(cnt, <=, 101);
+    writel(RTCC_BASE + RTCC_CC1_CTRL, RTCC_CC_OUTPUTCOMPARE);
+    writel(RTCC_BASE + RTCC_CC1_OCVALUE, cnt + 10);
+    clock_run(8 * LF_PERIOD_NS);
+    g_assert_cmphex(readl(RTCC_BASE + RTCC_IF) & RTCC_IF_CC1, ==, 0);
+    clock_run(3 * LF_PERIOD_NS);
+    g_assert_cmphex(readl(RTCC_BASE + RTCC_IF) & RTCC_IF_CC1, ==,
+                    RTCC_IF_CC1);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    enable_radio_bus_clocks();
+}
+
+/*
+ * IADC single conversion of a board input (machine "analog" property):
+ * PD02 at 968 mV against VDDX (3300 mV), gain 1, 12-bit right-aligned.
+ */
+#define IADC_BASE             0x4a004000
+#define IADC_CMD              0x00c
+#define IADC_STATUS           0x014
+#define IADC_STATUS_FIFODV    (1u << 8)
+#define IADC_IF               0x024
+#define IADC_IF_SINGLEDONE    (1u << 9)
+#define IADC_CFG0             0x048
+#define IADC_CFG0_VDDX_GAIN1  0x00032000
+#define IADC_SINGLEFIFODATA   0x074
+#define IADC_SINGLE           0x098
+#define IADC_SINGLE_PD02_GND  0x0000b200
+
+static void test_iadc_single_conversion(void)
+{
+    QTestState *qts = qtest_initf("-machine efr32bg22,analog=PD02=968 "
+                                  "-accel tcg -S");
+
+    qtest_writel(qts, IADC_BASE + IADC_CFG0, IADC_CFG0_VDDX_GAIN1);
+    qtest_writel(qts, IADC_BASE + IADC_SINGLE, IADC_SINGLE_PD02_GND);
+    qtest_writel(qts, IADC_BASE + IADC_CMD, 1);
+    g_assert_cmphex(qtest_readl(qts, IADC_BASE + IADC_STATUS) &
+                    IADC_STATUS_FIFODV, ==, IADC_STATUS_FIFODV);
+    g_assert_cmphex(qtest_readl(qts, IADC_BASE + IADC_IF) &
+                    IADC_IF_SINGLEDONE, ==, IADC_IF_SINGLEDONE);
+    /* 968 / 3300 * 4095 = 1201.2 */
+    g_assert_cmpuint(qtest_readl(qts, IADC_BASE + IADC_SINGLEFIFODATA), ==,
+                     1201);
+    g_assert_cmphex(qtest_readl(qts, IADC_BASE + IADC_STATUS) &
+                    IADC_STATUS_FIFODV, ==, 0);
+    qtest_quit(qts);
+}
+
+/* EMU.RSTCAUSE: POR after power-up, cleared by EMU_CMD.RSTCAUSECLR. */
+#define EMU_CMD               0x070
+#define EMU_CMD_RSTCAUSECLR   (1u << 17)
+#define EMU_RSTCAUSE          0x094
+#define EMU_RSTCAUSE_POR      (1u << 0)
+
+static void test_emu_rstcause(void)
+{
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel tcg -S");
+
+    g_assert_cmphex(qtest_readl(qts, EMU_BASE + EMU_RSTCAUSE), ==,
+                    EMU_RSTCAUSE_POR);
+    qtest_writel(qts, EMU_BASE + EMU_CMD, EMU_CMD_RSTCAUSECLR);
+    g_assert_cmphex(qtest_readl(qts, EMU_BASE + EMU_RSTCAUSE), ==, 0);
+    qtest_quit(qts);
 }
 
 static void setup_radio_clocks(QTestState *qts)
@@ -3084,6 +3318,7 @@ int main(int argc, char **argv)
     gchar *qemu_args;
 
     g_test_init(&argc, &argv, NULL);
+    part_write_pages();
     tx_snapshot_trace_path = g_strdup_printf(
         "%s/efr32bg22-tx-snapshot-%u.trace", g_get_tmp_dir(), g_random_int());
     qemu_args = g_strdup_printf(
@@ -3167,6 +3402,14 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/dcdc-regulation", test_dcdc_regulation);
     qtest_add_func("/efr32bg22/emu-status-reset", test_emu_status_reset);
     qtest_add_func("/efr32bg22/msc-status-reset", test_msc_status_reset);
+    qtest_add_func("/efr32bg22/part-352k-identity", test_part_352k_identity);
+    qtest_add_func("/efr32bg22/part-352k-flash-end-faults",
+                   test_part_352k_flash_end_faults);
+    qtest_add_func("/efr32bg22/rtcc-counts-and-compares",
+                   test_rtcc_counts_and_compares);
+    qtest_add_func("/efr32bg22/iadc-single-conversion",
+                   test_iadc_single_conversion);
+    qtest_add_func("/efr32bg22/emu-rstcause", test_emu_rstcause);
     qtest_add_func("/efr32bg22/hfxo-ready-status", test_hfxo_ready_status);
     qtest_add_func("/efr32bg22/bufc-data-port", test_bufc_data_port);
     qtest_add_func("/efr32bg22/bufc-packet-channels-are-independent",
@@ -3231,7 +3474,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/rac-software-rx-enable",
                    test_rac_software_rx_enable);
     qtest_add_func("/efr32bg22/rac-masks", test_rac_masks);
-    qtest_add_func("/efr32bg22/rfmailbox-no-peer", test_rfmailbox_no_peer);
+    qtest_add_func("/efr32bg22/rfmailbox-flags-latch",
+                   test_rfmailbox_flags_latch);
     qtest_add_func("/efr32bg22/gated-bus-clock-faults-and-drops",
                    test_gated_bus_clock_faults_and_drops);
     qtest_add_func("/efr32bg22/seq-sleeping-follows-wfi",
@@ -3255,6 +3499,8 @@ int main(int argc, char **argv)
     result = g_test_run();
     qtest_end();
     g_unlink(tx_snapshot_trace_path);
+    g_unlink(part_devinfo_path);
+    g_unlink(part_userdata_path);
     g_free(tx_snapshot_trace_path);
     return result;
 }
