@@ -51,6 +51,11 @@ typedef struct Efr32RfTxMetadata {
     uint8_t buffer_channel;
     /* SYNTH.CHSP.CHSP captured with the channel-0 staging snapshot. */
     uint8_t channel;
+    /*
+     * Virtual time at which the frame's first preamble bit leaves the
+     * transmitter.  A receiver derives sync and end-of-frame times from it.
+     */
+    int64_t air_start_ns;
 } Efr32RfTxMetadata;
 
 typedef struct Efr32RfTxSnapshot Efr32RfTxSnapshot;
@@ -63,6 +68,8 @@ typedef struct Efr32RfTxSnapshot Efr32RfTxSnapshot;
  */
 typedef struct Efr32RfRxMetadata {
     uint8_t buffer_channel;
+    /* The transmitter's Efr32RfTxMetadata.air_start_ns. */
+    int64_t air_start_ns;
 } Efr32RfRxMetadata;
 
 typedef struct Efr32RfRxDeliveryRequest Efr32RfRxDeliveryRequest;

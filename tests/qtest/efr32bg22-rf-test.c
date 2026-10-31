@@ -79,12 +79,58 @@ static char *rf_trace_path;
 #define FRC_TRAILRXDATA_CRCOK    (1u << 1)
 /* [I] Trailer octet bit 7: CRC passed (SS7.66); the medium has no errors. */
 #define FRC_TRAILER_CRCOK        0x80u
-/* The model's synthetic TX duration and received-frame duration. */
-#define MODEL_FRAME_NS           150000
-/* TX starts ~3 us after STATERX2TX is acknowledged (SS7.68). */
-#define RX2TX_TX_START_NS        3000
+/*
+ * Model timing (SS7.71/SS7.72): TX entry to exit is 0.65 us + preamble and
+ * access address + (PDU + CRC) octets at 8 us + 0.9 us; a peer's EOF is
+ * 9.45 us after the transmitter's last bit; frame detection 3.5 us after the
+ * access address arrives; RXFRAME exit 3.3 us after EOF; transitions follow
+ * a cleared state event by 1.09 us.
+ */
+#define OCTET_NS                 8000
+#define TX_ENTRY_TO_AIR_NS       650
+#define SYNC_NS                  (5 * OCTET_NS)
+#define CRC_OCTETS               3
+#define FRAMESENT_TO_TX_EXIT_NS  900
+#define FRAMESENT_TO_PEER_EOF_NS 9450
+#define SYNC_TO_FRAMEDET_NS      3500
+#define EOF_TO_RX_EXIT_NS        3300
+#define ACK_TO_TRANSITION_NS     1090
+#define MODEL_TX_NS(pdu)         (TX_ENTRY_TO_AIR_NS + SYNC_NS + \
+                                  ((pdu) + CRC_OCTETS) * OCTET_NS + \
+                                  FRAMESENT_TO_TX_EXIT_NS)
+/* Legacy TXEN: TX entry at TXEN. */
+#define MODEL_RX_DETECT_NS       (TX_ENTRY_TO_AIR_NS + SYNC_NS + \
+                                  FRAMESENT_TO_PEER_EOF_NS + \
+                                  SYNC_TO_FRAMEDET_NS)
+#define MODEL_RX_EOF_NS(pdu)     (TX_ENTRY_TO_AIR_NS + SYNC_NS + \
+                                  ((pdu) + CRC_OCTETS) * OCTET_NS + \
+                                  FRAMESENT_TO_PEER_EOF_NS)
+#define MODEL_LONG_WAIT_NS       1000000
+#define STATUS_MEASURED_BITS     (RAC_STATUS_RXENS | RAC_STATUS_TXENS | \
+                                  RAC_STATUS_DEMODENS | RAC_STATUS_SEQACTIVE | \
+                                  RAC_STATUS_RXMASK_SWRXEN)
+#define RAC_STATUS_DEMODENS      (1u << 29)
+#define RAC_STATE_RXWARM         1u
+#define RAC_STATE_SHUTDOWN       13u
+#define RAC_SR0                  0x040
+#define CMU_CLKEN1_RAC           (1u << 5)
+#define CMU_CLKEN1_BUFC          (1u << 11)
 /* RAC.STIMER: ~4.8 ticks/us (SS7.66). */
 #define STIMER_TEST_INTERVAL_NS  10000
+#define SYNTH_STATUS             0x008
+#define SYNTH_STATUS_INLOCK      (1u << 0)
+#define SYNTH_STATUS_IFFREQEN    (1u << 1)
+#define SYNTH_CMD_SYNTHSTOP      (1u << 1)
+#define SYNTH_CMD_ENABLEIF       (1u << 2)
+#define SYNTH_CMD_DISABLEIF      (1u << 3)
+#define SYNTH_LOCK_NS            8900
+#define MODEM_BASE               0xa8014000
+#define MODEM_SEQIF              0x24c
+#define MODEM_IF_TXRAMPDONE      (1u << 3)
+#define RAC_PAENCTRL             0x0b4
+#define RAC_PAENCTRL_PARAMP      (1u << 8)
+#define PA_RAMP_UP_NS            440
+#define PA_RAMP_DOWN_NS          3960
 #define STIMER_TICKS_IN_INTERVAL 48
 
 static uint64_t peer(uint32_t address)
@@ -93,6 +139,35 @@ static uint64_t peer(uint32_t address)
         return EFR32BG22_PEER_RADIO_BASE + (address - RADIO_BASE);
     }
     return EFR32BG22_PEER_PERIPH_BASE + (address - 0x40000000);
+}
+
+/*
+ * Every radio block and BUFC answers with a bus error while its CMU clocks
+ * are off (owo-open-fw docs/radio-tables.md SS7.72); start both SoCs with
+ * them on.
+ */
+#define CMU_BASE                 0x40008000
+#define CMU_CLKEN1               0x068
+#define CMU_RADIOCLKCTRL         0x280
+#define CMU_RADIOCLKCTRL_EN      (1u << 0)
+#define CMU_CLKEN1_RADIO_BLOCKS  0x7ffu
+
+static void rf_enable_radio_clocks(void)
+{
+    const uint64_t cmu[] = { CMU_BASE, peer(CMU_BASE) };
+
+    for (size_t i = 0; i < G_N_ELEMENTS(cmu); i++) {
+        qtest_writel(global_qtest, cmu[i] + CMU_RADIOCLKCTRL + 0x1000,
+                     CMU_RADIOCLKCTRL_EN);
+        qtest_writel(global_qtest, cmu[i] + CMU_CLKEN1 + 0x1000,
+                     CMU_CLKEN1_RADIO_BLOCKS);
+    }
+}
+
+static void rf_reset_with_clocks(void)
+{
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    rf_enable_radio_clocks();
 }
 
 /*
@@ -202,7 +277,7 @@ static void test_tx_offer_requires_matching_synth_channel(void)
     const uint32_t source_tx_channel = BUFC_BASE + BUFC_CH0;
     const uint64_t peer_rx_channel = peer(BUFC_BASE + BUFC_CH1);
 
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    rf_reset_with_clocks();
     qtest_writel(global_qtest, peer_rx_channel + BUFC_CMD, 1);
     qtest_writel(global_qtest, peer_rx_channel, 0);
     /* Silicon's working RAIL path leaves CHCTRL zero and selects the physical
@@ -247,7 +322,7 @@ static void test_tx_offer_requires_matching_synth_channel(void)
                         ==, payload[index]);
     }
 
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    rf_reset_with_clocks();
 }
 
 /*
@@ -761,7 +836,7 @@ static void test_system_reset_with_deferred_offer(void)
     qtest_writel(global_qtest, RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
 
     /* Reset before the deferred receiver handoff gets a virtual-clock turn. */
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    rf_reset_with_clocks();
 
     qtest_writel(global_qtest, peer(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW),
                  FRC_IF_RXDONE);
@@ -1029,7 +1104,7 @@ static void test_bidirectional_rac_txen_after_rx(void)
     const uint64_t peer_rx_channel = peer(BUFC_BASE + BUFC_CH1);
 
     /* Keep this bilateral transaction independent from preceding qtests. */
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    rf_reset_with_clocks();
 
     qtest_writel(global_qtest, FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW,
                  FRC_IF_TXDONE | FRC_IF_RXDONE);
@@ -1168,11 +1243,12 @@ static uint32_t rf_state(uint64_t rac)
     return (rf_status(rac) & RAC_STATUS_STATE_MASK) >> RAC_STATUS_STATE_SHIFT;
 }
 
-/* qtest stands in for the released sequencer's state-event handlers. */
+/* Wait out the ~1.09 us between clearing a state event and the transition. */
 static void rf_ack(uint64_t rac, uint32_t state)
 {
     qtest_writel(global_qtest, rac + RAC_SEQIF + REGISTER_CLEAR_WINDOW,
                  RAC_SEQIF_STATE(state));
+    rf_step(ACK_TO_TRANSITION_NS);
 }
 
 /*
@@ -1196,25 +1272,157 @@ static void rf_stage_tx(uint64_t tx_channel, const uint8_t *bytes,
     }
 }
 
+/* From OFF to RXSEARCH through RXWARM, as on silicon (SS7.72). */
+static void rf_start_rx(uint64_t rac)
+{
+    qtest_writel(global_qtest, rac + RAC_RXENSRCEN + REGISTER_SET_WINDOW,
+                 RAC_RXENSRCEN_SWRXEN);
+    g_assert_cmpuint(rf_state(rac), ==, RAC_STATE_RXWARM);
+    rf_ack(rac, RAC_STATE_RXWARM);
+    g_assert_cmpuint(rf_state(rac), ==, RAC_STATE_RXSEARCH);
+}
+
+/*
+ * Receive-side state machine, as measured from the debugger with the M0+
+ * parked (SS7.72): SWRXEN takes OFF to RXWARM and each state waits for its
+ * own event to be cleared, whether or not SEQIEN enables it; RXWARM goes on
+ * to RXSEARCH even if the source was withdrawn; withdrawing SWRXEN alone ends
+ * RXSEARCH in RXPD; RXDIS does too, even with SWRXEN still asserted, after
+ * which OFF re-enters RXWARM; RXDIS in RXWARM or RXPD does nothing.
+ */
+static void test_released_rx_state_machine(void)
+{
+    const uint64_t rac = RAC_BASE;
+
+    rf_reset_with_clocks();
+    rf_release_sequencer(rac, SYNTH_BASE);
+
+    qtest_writel(global_qtest, rac + RAC_RXENSRCEN + REGISTER_SET_WINDOW,
+                 RAC_RXENSRCEN_SWRXEN);
+    g_assert_cmpuint(rf_state(rac), ==, RAC_STATE_RXWARM);
+    /* Stock's 0x91400002 less SEQSLEEPING: RXENS, SEQACTIVE, RXMASK. */
+    g_assert_cmphex(rf_status(rac) & STATUS_MEASURED_BITS, ==,
+                    RAC_STATUS_RXENS | RAC_STATUS_SEQACTIVE |
+                    RAC_STATUS_RXMASK_SWRXEN);
+    qtest_writel(global_qtest, rac + RAC_CMD, RAC_CMD_RXDIS);
+    qtest_writel(global_qtest, rac + RAC_RXENSRCEN + REGISTER_CLEAR_WINDOW,
+                 RAC_RXENSRCEN_SWRXEN);
+    rf_step(MODEL_LONG_WAIT_NS);
+    g_assert_cmpuint(rf_state(rac), ==, RAC_STATE_RXWARM);
+    rf_ack(rac, RAC_STATE_RXWARM);
+    g_assert_cmpuint(rf_state(rac), ==, RAC_STATE_RXSEARCH);
+    /* 0x32400000 less SEQSLEEPING: DEMODENS, SEQACTIVE. */
+    g_assert_cmphex(rf_status(rac) & STATUS_MEASURED_BITS, ==,
+                    RAC_STATUS_DEMODENS | RAC_STATUS_SEQACTIVE);
+    rf_ack(rac, RAC_STATE_RXSEARCH);
+    g_assert_cmpuint(rf_state(rac), ==, RAC_STATE_RXPD);
+    qtest_writel(global_qtest, rac + RAC_CMD, RAC_CMD_RXDIS);
+    qtest_writel(global_qtest, rac + RAC_CMD, RAC_CMD_TXDIS);
+    g_assert_cmpuint(rf_state(rac), ==, RAC_STATE_RXPD);
+    rf_ack(rac, RAC_STATE_RXPD);
+    g_assert_cmpuint(rf_state(rac), ==, RAC_STATE_OFF);
+    g_assert_cmphex(rf_status(rac) & RAC_STATUS_SEQACTIVE, ==,
+                    RAC_STATUS_SEQACTIVE);
+    rf_ack(rac, RAC_STATE_OFF);
+    g_assert_cmphex(rf_status(rac) & RAC_STATUS_SEQACTIVE, ==, 0);
+
+    /* RXDIS with the source still asserted: RXPD, then back into RX. */
+    rf_start_rx(rac);
+    rf_ack(rac, RAC_STATE_RXSEARCH);
+    qtest_writel(global_qtest, rac + RAC_CMD, RAC_CMD_RXDIS);
+    g_assert_cmpuint(rf_state(rac), ==, RAC_STATE_RXPD);
+    rf_ack(rac, RAC_STATE_RXPD);
+    g_assert_cmpuint(rf_state(rac), ==, RAC_STATE_RXWARM);
+
+    /* Holding needs no SEQIEN enable. */
+    qtest_writel(global_qtest, rac + RAC_SEQIEN, 0);
+    rf_step(MODEL_LONG_WAIT_NS);
+    g_assert_cmpuint(rf_state(rac), ==, RAC_STATE_RXWARM);
+
+    rf_reset_with_clocks();
+}
+
+/*
+ * TX-side commands (SS7.72): TXEN latches TXENS (0x58400000 in TXWARM);
+ * TXDIS in TXWARM only withdraws it, so the acknowledgement leads to TXPD;
+ * TXDIS in TX ends it at once even with STATETX uncleared, into TX2RX when
+ * SWRXEN is asserted; FORCEDISABLE goes to SHUTDOWN at once, whose
+ * acknowledgement reaches OFF, where the radio stays until it is released.
+ */
+static void test_released_tx_disables(void)
+{
+    const uint64_t rac = RAC_BASE;
+
+    rf_reset_with_clocks();
+    rf_release_sequencer(rac, SYNTH_BASE);
+
+    qtest_writel(global_qtest, rac + RAC_CMD, RAC_CMD_TXEN);
+    g_assert_cmpuint(rf_state(rac), ==, RAC_STATE_TXWARM);
+    g_assert_cmphex(rf_status(rac) & STATUS_MEASURED_BITS, ==,
+                    RAC_STATUS_TXENS | RAC_STATUS_SEQACTIVE);
+    qtest_writel(global_qtest, rac + RAC_CMD, RAC_CMD_TXDIS);
+    g_assert_cmpuint(rf_state(rac), ==, RAC_STATE_TXWARM);
+    g_assert_cmphex(rf_status(rac) & RAC_STATUS_TXENS, ==, 0);
+    rf_ack(rac, RAC_STATE_TXWARM);
+    g_assert_cmpuint(rf_state(rac), ==, RAC_STATE_TXPD);
+    rf_ack(rac, RAC_STATE_TXPD);
+    rf_ack(rac, RAC_STATE_OFF);
+
+    qtest_writel(global_qtest, rac + RAC_CMD, RAC_CMD_TXEN);
+    rf_ack(rac, RAC_STATE_TXWARM);
+    g_assert_cmpuint(rf_state(rac), ==, RAC_STATE_TX);
+    g_assert_cmphex(rf_status(rac) & RAC_STATUS_TXENS, ==, 0);
+    /* RXDIS in TX does nothing. */
+    qtest_writel(global_qtest, rac + RAC_CMD, RAC_CMD_RXDIS);
+    g_assert_cmpuint(rf_state(rac), ==, RAC_STATE_TX);
+    qtest_writel(global_qtest, rac + RAC_CMD, RAC_CMD_TXDIS);
+    g_assert_cmpuint(rf_state(rac), ==, RAC_STATE_TXPD);
+    rf_ack(rac, RAC_STATE_TX);
+    rf_ack(rac, RAC_STATE_TXPD);
+    rf_ack(rac, RAC_STATE_OFF);
+
+    qtest_writel(global_qtest, rac + RAC_CMD, RAC_CMD_TXEN);
+    qtest_writel(global_qtest, rac + RAC_RXENSRCEN + REGISTER_SET_WINDOW,
+                 RAC_RXENSRCEN_SWRXEN);
+    rf_ack(rac, RAC_STATE_TXWARM);
+    rf_ack(rac, RAC_STATE_TX);
+    qtest_writel(global_qtest, rac + RAC_CMD, RAC_CMD_TXDIS);
+    g_assert_cmpuint(rf_state(rac), ==, RAC_STATE_TX2RX);
+    rf_ack(rac, RAC_STATE_TX2RX);
+    g_assert_cmpuint(rf_state(rac), ==, RAC_STATE_RXSEARCH);
+    rf_ack(rac, RAC_STATE_RXSEARCH);
+
+    qtest_writel(global_qtest, rac + RAC_CTRL + REGISTER_SET_WINDOW,
+                 RAC_CTRL_FORCEDISABLE);
+    g_assert_cmpuint(rf_state(rac), ==, RAC_STATE_SHUTDOWN);
+    rf_ack(rac, RAC_STATE_SHUTDOWN);
+    g_assert_cmpuint(rf_state(rac), ==, RAC_STATE_OFF);
+    rf_ack(rac, RAC_STATE_OFF);
+    rf_step(MODEL_LONG_WAIT_NS);
+    g_assert_cmpuint(rf_state(rac), ==, RAC_STATE_OFF);
+    qtest_writel(global_qtest, rac + RAC_CTRL + REGISTER_CLEAR_WINDOW,
+                 RAC_CTRL_FORCEDISABLE);
+    g_assert_cmpuint(rf_state(rac), ==, RAC_STATE_RXWARM);
+
+    rf_reset_with_clocks();
+}
+
 /*
  * A released sequencer's TX that ends with an RX source asserted turns around
- * through TX2RX into RXSEARCH, as stock and stage 3 do (SS7.63); SWRXEN set
- * during TX is a pending request (RAC.STATUS.RXENS with RXMASK bit 1, stock's
- * 0x89400002), not an immediate change of state.  RXDIS takes a receive state
- * through RXPD only once SWRXEN is withdrawn (SS7.63).
+ * through TX2RX into RXSEARCH (SS7.63).  The frame lasts the measured
+ * TX-entry-to-exit time for its length (SS7.71/SS7.72).
  */
 static void test_released_tx_turns_around_to_rx(void)
 {
     const uint8_t frame[] = { 0x40, 0x01, 0x5a };
 
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    rf_reset_with_clocks();
     rf_release_sequencer(RAC_BASE, SYNTH_BASE);
     qtest_writel(global_qtest, FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW,
                  FRC_IF_TXDONE);
     rf_stage_tx(BUFC_BASE + BUFC_CH0, frame, sizeof(frame));
 
     qtest_writel(global_qtest, RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
-    g_assert_cmpuint(rf_state(RAC_BASE), ==, RAC_STATE_TXWARM);
     qtest_writel(global_qtest, RAC_BASE + RAC_RXENSRCEN + REGISTER_SET_WINDOW,
                  RAC_RXENSRCEN_SWRXEN);
     g_assert_cmpuint(rf_state(RAC_BASE), ==, RAC_STATE_TXWARM);
@@ -1223,44 +1431,36 @@ static void test_released_tx_turns_around_to_rx(void)
     g_assert_cmphex(rf_status(RAC_BASE) &
                         (RAC_STATUS_RXENS | RAC_STATUS_RXMASK_SWRXEN |
                          RAC_STATUS_TXENS | RAC_STATUS_SEQACTIVE),
-                    ==, RAC_STATUS_RXENS | RAC_STATUS_RXMASK_SWRXEN);
+                    ==, RAC_STATUS_RXENS | RAC_STATUS_RXMASK_SWRXEN |
+                        RAC_STATUS_SEQACTIVE);
     rf_ack(RAC_BASE, RAC_STATE_TX);
 
-    rf_step(MODEL_FRAME_NS);
+    rf_step(MODEL_TX_NS(sizeof(frame)) - ACK_TO_TRANSITION_NS - 1);
+    g_assert_cmpuint(rf_state(RAC_BASE), ==, RAC_STATE_TX);
+    g_assert_cmphex(qtest_readl(global_qtest, FRC_BASE + FRC_IF) &
+                        FRC_IF_TXDONE, ==, 0);
+    rf_step(1);
     g_assert_cmphex(qtest_readl(global_qtest, FRC_BASE + FRC_IF) &
                         FRC_IF_TXDONE, ==, FRC_IF_TXDONE);
     g_assert_cmpuint(rf_state(RAC_BASE), ==, RAC_STATE_TX2RX);
-    rf_step(MODEL_FRAME_NS);
+    rf_step(MODEL_LONG_WAIT_NS);
     g_assert_cmpuint(rf_state(RAC_BASE), ==, RAC_STATE_TX2RX);
     rf_ack(RAC_BASE, RAC_STATE_TX2RX);
     g_assert_cmpuint(rf_state(RAC_BASE), ==, RAC_STATE_RXSEARCH);
 
-    /* With the source still asserted, RXDIS leaves the radio receiving. */
-    qtest_writel(global_qtest, RAC_BASE + RAC_CMD, RAC_CMD_RXDIS);
-    g_assert_cmpuint(rf_state(RAC_BASE), ==, RAC_STATE_RXSEARCH);
-    qtest_writel(global_qtest, RAC_BASE + RAC_RXENSRCEN + REGISTER_CLEAR_WINDOW,
-                 RAC_RXENSRCEN_SWRXEN);
-    qtest_writel(global_qtest, RAC_BASE + RAC_CMD, RAC_CMD_RXDIS);
-    g_assert_cmpuint(rf_state(RAC_BASE), ==, RAC_STATE_RXPD);
-    g_assert_cmphex(rf_status(RAC_BASE) & RAC_STATUS_RXENS, ==, 0);
-    /* The open driver's TXDIS after RXDIS does not cut the power-down. */
-    qtest_writel(global_qtest, RAC_BASE + RAC_CMD, RAC_CMD_TXDIS);
-    g_assert_cmpuint(rf_state(RAC_BASE), ==, RAC_STATE_RXPD);
-    rf_ack(RAC_BASE, RAC_STATE_RXPD);
-    g_assert_cmpuint(rf_state(RAC_BASE), ==, RAC_STATE_OFF);
-
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    rf_reset_with_clocks();
 }
 
 /*
- * The receive half of a scan exchange on a released sequencer (SS7.65-7.68):
- * an offered frame puts the receiver in RXFRAME; the sequencer withdraws
- * SWRXEN and issues TXEN (RAC.STATUS TXENS without RXENS or SEQACTIVE, as in
- * stock's 0x63400000); at frame end FRC has written header, length, payload
- * and the TRAILRXDATA.CRCOK trailer to BUFC channel 1, RXDONE is raised and
- * the RAC holds RX2TX until STATERX2TX is acknowledged.  RAC.STIMER counts
- * ~4.8 ticks/us from the RX2TX entry, and TX starts ~3 us after the
- * acknowledgement.
+ * The receive half of a scan exchange on a released sequencer (SS7.65-7.72):
+ * the frame is detected 3.5 us after its access address arrives ([I]) and the
+ * receiver enters RXFRAME; the sequencer withdraws SWRXEN and issues TXEN
+ * (TXENS without RXENS, stock's 0x63400000); EOF comes the measured 9.45 us
+ * after the transmitter's last bit, with header, length, payload and the
+ * TRAILRXDATA.CRCOK trailer in BUFC channel 1 and RXDONE raised; 3.3 us
+ * later the RAC is in RX2TX, held until STATERX2TX is cleared.  RAC.STIMER
+ * counts ~4.8 ticks/us from the RX2TX entry; TX follows the clear by the
+ * ack latency, without TXWARM.
  */
 static void test_released_rx_frame_turns_around_to_tx(void)
 {
@@ -1270,7 +1470,7 @@ static void test_released_rx_frame_turns_around_to_tx(void)
     const uint64_t peer_rx_channel = peer(BUFC_BASE + BUFC_CH1);
     const uint64_t source_rx_channel = BUFC_BASE + BUFC_CH1;
 
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    rf_reset_with_clocks();
     rf_release_sequencer(peer_rac, peer(SYNTH_BASE));
     qtest_writel(global_qtest, peer(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW),
                  FRC_IF_RXDONE | FRC_IF_TXDONE);
@@ -1280,41 +1480,40 @@ static void test_released_rx_frame_turns_around_to_tx(void)
                  FRC_TRAILRXDATA_CRCOK);
     qtest_writel(global_qtest, peer_rx_channel + BUFC_CMD, 1);
     qtest_writel(global_qtest, peer_rx_channel, 0);
-    qtest_writel(global_qtest, peer_rac + RAC_RXENSRCEN + REGISTER_SET_WINDOW,
-                 RAC_RXENSRCEN_SWRXEN);
-    g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RXSEARCH);
+    rf_start_rx(peer_rac);
+    rf_ack(peer_rac, RAC_STATE_RXSEARCH);
 
     /* The legacy source transmits the request at once. */
     rf_stage_tx(BUFC_BASE + BUFC_CH0, request, sizeof(request));
     qtest_writel(global_qtest, RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+    rf_step(MODEL_RX_DETECT_NS - 1);
+    g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RXSEARCH);
     rf_step(1);
     g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RXFRAME);
-    g_assert_cmphex(qtest_readl(global_qtest, peer(FRC_BASE + FRC_IF)) &
-                        FRC_IF_RXDONE, ==, 0);
-    g_assert_cmphex(qtest_readl(global_qtest, peer_rx_channel + BUFC_STATUS) &
-                        0x1fff, ==, 0);
 
     /* The sequencer's RXFRAME handler requests the response. */
     qtest_writel(global_qtest, peer_rac + RAC_RXENSRCEN + REGISTER_CLEAR_WINDOW,
                  RAC_RXENSRCEN_SWRXEN);
     qtest_writel(global_qtest, peer_rac + RAC_CMD, RAC_CMD_TXEN);
     g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RXFRAME);
-    g_assert_cmphex(rf_status(peer_rac) &
-                        (RAC_STATUS_TXENS | RAC_STATUS_RXENS |
-                         RAC_STATUS_SEQACTIVE),
-                    ==, RAC_STATUS_TXENS);
-    rf_ack(peer_rac, RAC_STATE_RXSEARCH);
+    g_assert_cmphex(rf_status(peer_rac) & STATUS_MEASURED_BITS, ==,
+                    RAC_STATUS_TXENS | RAC_STATUS_DEMODENS |
+                    RAC_STATUS_SEQACTIVE);
     rf_ack(peer_rac, RAC_STATE_RXFRAME);
+    g_assert_cmphex(rf_status(peer_rac) & STATUS_MEASURED_BITS, ==,
+                    RAC_STATUS_TXENS | RAC_STATUS_DEMODENS);
     rf_stage_tx(peer(BUFC_BASE + BUFC_CH0), response, sizeof(response));
-
-    /* The source listens for the response through the legacy path. */
     qtest_writel(global_qtest, source_rx_channel + BUFC_CMD, 1);
     qtest_writel(global_qtest, source_rx_channel, 0);
 
-    rf_step(MODEL_FRAME_NS - 1);
+    rf_step(MODEL_RX_EOF_NS(sizeof(request)) - MODEL_RX_DETECT_NS -
+            ACK_TO_TRANSITION_NS - 1);
+    g_assert_cmphex(qtest_readl(global_qtest, peer(FRC_BASE + FRC_IF)) &
+                        FRC_IF_RXDONE, ==, 0);
+    rf_step(1);
     g_assert_cmphex(qtest_readl(global_qtest, peer(FRC_BASE + FRC_IF)) &
                         FRC_IF_RXDONE, ==, FRC_IF_RXDONE);
-    g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RX2TX);
+    g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RXFRAME);
     g_assert_cmphex(qtest_readl(global_qtest, peer_rx_channel + BUFC_STATUS) &
                         0x1fff, ==, sizeof(request) + 1);
     qtest_writel(global_qtest, peer_rx_channel + BUFC_READOFFSET, 0);
@@ -1325,6 +1524,8 @@ static void test_released_rx_frame_turns_around_to_tx(void)
     }
     g_assert_cmphex(qtest_readl(global_qtest, peer_rx_channel + BUFC_READDATA),
                     ==, FRC_TRAILER_CRCOK);
+    rf_step(EOF_TO_RX_EXIT_NS);
+    g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RX2TX);
 
     /* Held in RX2TX, counting STIMER from its entry. */
     rf_step(STIMER_TEST_INTERVAL_NS);
@@ -1333,16 +1534,16 @@ static void test_released_rx_frame_turns_around_to_tx(void)
                      STIMER_TICKS_IN_INTERVAL);
     qtest_writel(global_qtest, RAC_BASE + RAC_RXENSRCEN + REGISTER_SET_WINDOW,
                  RAC_RXENSRCEN_SWRXEN);
-    rf_ack(peer_rac, RAC_STATE_RX2TX);
-    rf_step(RX2TX_TX_START_NS - 1);
+    qtest_writel(global_qtest, peer_rac + RAC_SEQIF + REGISTER_CLEAR_WINDOW,
+                 RAC_SEQIF_STATE(RAC_STATE_RX2TX));
+    rf_step(ACK_TO_TRANSITION_NS - 1);
     g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RX2TX);
     rf_step(1);
     g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_TX);
     g_assert_cmphex(rf_status(peer_rac) & RAC_STATUS_TXENS, ==, 0);
-    /* A state change restarts STIMER. */
     g_assert_cmpuint(qtest_readl(global_qtest, peer_rac + RAC_STIMER), ==, 0);
 
-    /* The response reaches the source; no TXWARM was passed through. */
+    /* The response reaches the legacy source through its instant path. */
     rf_step(1);
     g_assert_cmphex(qtest_readl(global_qtest, FRC_BASE + FRC_IF) &
                         FRC_IF_RXDONE, ==, FRC_IF_RXDONE);
@@ -1354,14 +1555,14 @@ static void test_released_rx_frame_turns_around_to_tx(void)
     }
 
     rf_ack(peer_rac, RAC_STATE_TX);
-    rf_step(MODEL_FRAME_NS);
+    rf_step(MODEL_TX_NS(sizeof(response)));
     g_assert_cmphex(qtest_readl(global_qtest, peer(FRC_BASE + FRC_IF)) &
                         FRC_IF_TXDONE, ==, FRC_IF_TXDONE);
     g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_TXPD);
     rf_ack(peer_rac, RAC_STATE_TXPD);
     g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_OFF);
 
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    rf_reset_with_clocks();
 }
 
 /* Deliver one legacy-source frame to a released receiver in RXSEARCH. */
@@ -1372,57 +1573,53 @@ static void rf_offer_frame_to_released_peer(void)
 
     qtest_writel(global_qtest, peer(BUFC_BASE + BUFC_CH1 + BUFC_CMD), 1);
     qtest_writel(global_qtest, peer(BUFC_BASE + BUFC_CH1), 0);
-    qtest_writel(global_qtest, peer_rac + RAC_RXENSRCEN + REGISTER_SET_WINDOW,
-                 RAC_RXENSRCEN_SWRXEN);
+    rf_start_rx(peer_rac);
     rf_ack(peer_rac, RAC_STATE_RXSEARCH);
     rf_stage_tx(BUFC_BASE + BUFC_CH0, frame, sizeof(frame));
     qtest_writel(global_qtest, RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
-    rf_step(1);
+    rf_step(MODEL_RX_DETECT_NS);
     g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RXFRAME);
 }
 
 /*
  * Frame-end alternatives on a released receiver.  A TXEN latched while SWRXEN
  * is still asserted does not turn the RAC around -- it returns to receive
- * through RX2RX (SS7.65, SS7.69); with no request at all it powers down.  A
- * frame end, like any transition, waits while a SEQIEN-enabled state event is
- * uncleared (SS7.69), though FRC's RXDONE is not held.
+ * through RX2RX (SS7.65, SS7.69); with no request at all it powers down.  The
+ * frame-driven exit waits for RXFRAME's own event, though RXDONE does not.
  */
 static void test_released_rx_frame_end_alternatives(void)
 {
     const uint64_t peer_rac = peer(RAC_BASE);
 
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    rf_reset_with_clocks();
     rf_release_sequencer(peer_rac, peer(SYNTH_BASE));
 
-    /* TXEN with SWRXEN still asserted: back to RXSEARCH via RX2RX. */
     rf_offer_frame_to_released_peer();
     qtest_writel(global_qtest, peer_rac + RAC_CMD, RAC_CMD_TXEN);
     g_assert_cmphex(rf_status(peer_rac) & RAC_STATUS_TXENS, ==,
                     RAC_STATUS_TXENS);
     rf_ack(peer_rac, RAC_STATE_RXFRAME);
-    rf_step(MODEL_FRAME_NS);
+    rf_step(MODEL_LONG_WAIT_NS);
     g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RX2RX);
     g_assert_cmphex(rf_status(peer_rac) & RAC_STATUS_TXENS, ==, 0);
     rf_ack(peer_rac, RAC_STATE_RX2RX);
     g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RXSEARCH);
+    rf_ack(peer_rac, RAC_STATE_RXSEARCH);
     qtest_writel(global_qtest, peer_rac + RAC_RXENSRCEN + REGISTER_CLEAR_WINDOW,
                  RAC_RXENSRCEN_SWRXEN);
-    qtest_writel(global_qtest, peer_rac + RAC_CMD, RAC_CMD_RXDIS);
+    g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RXPD);
     rf_ack(peer_rac, RAC_STATE_RXPD);
-    g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_OFF);
     rf_ack(peer_rac, RAC_STATE_OFF);
-    rf_step(MODEL_FRAME_NS);
+    g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_OFF);
+    rf_step(MODEL_LONG_WAIT_NS);
 
-    /* No request, and STATERXFRAME enabled but unacknowledged: held. */
-    qtest_writel(global_qtest, peer_rac + RAC_SEQIEN,
-                 RAC_SEQIF_STATE(RAC_STATE_RXFRAME));
+    /* No request, and STATERXFRAME left uncleared: the exit is held. */
+    qtest_writel(global_qtest, peer(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW),
+                 FRC_IF_RXDONE);
     rf_offer_frame_to_released_peer();
     qtest_writel(global_qtest, peer_rac + RAC_RXENSRCEN + REGISTER_CLEAR_WINDOW,
                  RAC_RXENSRCEN_SWRXEN);
-    qtest_writel(global_qtest, peer(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW),
-                 FRC_IF_RXDONE);
-    rf_step(MODEL_FRAME_NS);
+    rf_step(MODEL_LONG_WAIT_NS);
     g_assert_cmphex(qtest_readl(global_qtest, peer(FRC_BASE + FRC_IF)) &
                         FRC_IF_RXDONE, ==, FRC_IF_RXDONE);
     g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RXFRAME);
@@ -1431,11 +1628,84 @@ static void test_released_rx_frame_end_alternatives(void)
     rf_ack(peer_rac, RAC_STATE_RXPD);
     g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_OFF);
 
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    rf_reset_with_clocks();
+}
+
+/*
+ * Bus clock gating (SS7.72): each CLKEN1 bit gates exactly one radio block
+ * and CLKEN1.BUFC gates nothing visible; a gated write is dropped.
+ */
+static void test_radio_block_clock_gates(void)
+{
+    rf_reset_with_clocks();
+    qtest_writel(global_qtest, RAC_BASE + RAC_SR0, 0x11111111);
+    qtest_writel(global_qtest, CMU_BASE + CMU_CLKEN1 + REGISTER_CLEAR_WINDOW,
+                 CMU_CLKEN1_RAC);
+    qtest_writel(global_qtest, RAC_BASE + RAC_SR0, 0x22222222);
+    /* BUFC stays accessible with CLKEN1.BUFC clear. */
+    qtest_writel(global_qtest, CMU_BASE + CMU_CLKEN1 + REGISTER_CLEAR_WINDOW,
+                 CMU_CLKEN1_BUFC);
+    qtest_writel(global_qtest, BUFC_BASE + BUFC_CH0 + BUFC_ADDR, 0x20000040);
+    g_assert_cmphex(qtest_readl(global_qtest, BUFC_BASE + BUFC_CH0 + BUFC_ADDR),
+                    ==, 0x20000040);
+    qtest_writel(global_qtest, CMU_BASE + CMU_CLKEN1 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN1_RAC);
+    g_assert_cmphex(qtest_readl(global_qtest, RAC_BASE + RAC_SR0), ==,
+                    0x11111111);
+    rf_reset_with_clocks();
+}
+
+/*
+ * Measured analog latencies (SS7.72): SYNTH.STATUS.INLOCK 8.9 us after
+ * SYNTHSTART, never with the IF path enabled (IFFREQEN instead); MODEM
+ * TXRAMPDONE 0.44 us after PARAMP is set and 3.96 us after it is cleared.
+ */
+static void test_synth_lock_and_pa_ramp_timing(void)
+{
+    rf_reset_with_clocks();
+    qtest_writel(global_qtest, RAC_BASE + RAC_SYEN, RAC_SYEN_STOCK_TX);
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_CMD,
+                 SYNTH_CMD_DISABLEIF | SYNTH_CMD_SYNTHSTART);
+    rf_step(SYNTH_LOCK_NS - 1);
+    g_assert_cmphex(qtest_readl(global_qtest, SYNTH_BASE + SYNTH_STATUS) &
+                        SYNTH_STATUS_INLOCK, ==, 0);
+    rf_step(1);
+    g_assert_cmphex(qtest_readl(global_qtest, SYNTH_BASE + SYNTH_STATUS) &
+                        SYNTH_STATUS_INLOCK, ==, SYNTH_STATUS_INLOCK);
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_CMD,
+                 SYNTH_CMD_SYNTHSTOP | SYNTH_CMD_ENABLEIF);
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_CMD, SYNTH_CMD_SYNTHSTART);
+    rf_step(SYNTH_LOCK_NS * 2);
+    g_assert_cmphex(qtest_readl(global_qtest, SYNTH_BASE + SYNTH_STATUS) &
+                        (SYNTH_STATUS_INLOCK | SYNTH_STATUS_IFFREQEN), ==,
+                    SYNTH_STATUS_IFFREQEN);
+
+    qtest_writel(global_qtest, MODEM_BASE + MODEM_SEQIF + REGISTER_CLEAR_WINDOW,
+                 MODEM_IF_TXRAMPDONE);
+    qtest_writel(global_qtest, RAC_BASE + RAC_PAENCTRL + REGISTER_SET_WINDOW,
+                 RAC_PAENCTRL_PARAMP);
+    rf_step(PA_RAMP_UP_NS - 1);
+    g_assert_cmphex(qtest_readl(global_qtest, MODEM_BASE + MODEM_SEQIF) &
+                        MODEM_IF_TXRAMPDONE, ==, 0);
+    rf_step(1);
+    g_assert_cmphex(qtest_readl(global_qtest, MODEM_BASE + MODEM_SEQIF) &
+                        MODEM_IF_TXRAMPDONE, ==, MODEM_IF_TXRAMPDONE);
+    qtest_writel(global_qtest, RAC_BASE + RAC_PAENCTRL + REGISTER_CLEAR_WINDOW,
+                 RAC_PAENCTRL_PARAMP);
+    qtest_writel(global_qtest, MODEM_BASE + MODEM_SEQIF + REGISTER_CLEAR_WINDOW,
+                 MODEM_IF_TXRAMPDONE);
+    rf_step(PA_RAMP_DOWN_NS - 1);
+    g_assert_cmphex(qtest_readl(global_qtest, MODEM_BASE + MODEM_SEQIF) &
+                        MODEM_IF_TXRAMPDONE, ==, 0);
+    rf_step(1);
+    g_assert_cmphex(qtest_readl(global_qtest, MODEM_BASE + MODEM_SEQIF) &
+                        MODEM_IF_TXRAMPDONE, ==, MODEM_IF_TXRAMPDONE);
+    rf_reset_with_clocks();
 }
 
 int main(int argc, char **argv)
 {
+
     int result;
     gchar *qemu_args;
 
@@ -1446,6 +1716,7 @@ int main(int argc, char **argv)
                                 "-trace enable=efr32bg22_*,file=%s",
                                 rf_trace_path);
     qtest_start(qemu_args);
+    rf_enable_radio_clocks();
     g_free(qemu_args);
     qtest_add_func("/efr32bg22/rf/peer-bufc-dma-address-space",
                    test_peer_bufc_dma_uses_peer_address_space);
@@ -1487,6 +1758,14 @@ int main(int argc, char **argv)
                    test_released_rx_frame_turns_around_to_tx);
     qtest_add_func("/efr32bg22/rf/released-rx-frame-end-alternatives",
                    test_released_rx_frame_end_alternatives);
+    qtest_add_func("/efr32bg22/rf/released-rx-state-machine",
+                   test_released_rx_state_machine);
+    qtest_add_func("/efr32bg22/rf/released-tx-disables",
+                   test_released_tx_disables);
+    qtest_add_func("/efr32bg22/rf/radio-block-clock-gates",
+                   test_radio_block_clock_gates);
+    qtest_add_func("/efr32bg22/rf/synth-lock-and-pa-ramp-timing",
+                   test_synth_lock_and_pa_ramp_timing);
     result = g_test_run();
     qtest_end();
     g_unlink(rf_trace_path);

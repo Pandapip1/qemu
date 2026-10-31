@@ -207,6 +207,19 @@ static uint16_t thumb_b(uint32_t insn_addr, uint32_t target_addr)
 #define CMU_RADIOCLKCTRL      0x280
 #define CMU_RADIOCLKCTRL_EN   (1u << 0)
 #define CMU_CLKEN1_RADIO_BLOCKS 0x87fu
+#define CMU_CLKEN0            0x064
+#define CMU_CLKEN0_SYSCFG     (1u << 16)
+#define CMU_CLKEN1_RDMAILBOX0 (1u << 8)
+#define CMU_CLKEN1_RDMAILBOX1 (1u << 9)
+#define SYSCFG_BASE           0x4007c000
+#define SYSCFG_ROOTDATA1      0x604
+#define CMU_CLKEN1_RAC        (1u << 5)
+#define CMU_CLKEN1_BUFC       (1u << 11)
+/* Unassigned radio window: a bus error whatever the enables (SS7.72). */
+#define RADIO_HOLE_BASE       0xa8008000
+#define RAC_STATUS_SEQSLEEPING (1u << 22)
+#define THUMB16_WFI           0xbf30u
+#define THUMB16_BRANCH_BACK_ONE 0xe7fdu
 #define DPLL0_BASE            0x4001c000
 #define DPLL0_NONSECURE_BASE  0x5001c000
 #define DPLL_EN               0x004
@@ -326,12 +339,31 @@ static void attribute_radio_secure(void)
 #define DEVINFO_MODULENAME0   0x8130
 #define DEVINFO_MODULEINFO    0x814c
 
+static void qtest_seq_enable_radio_bus_clocks(QTestState *qts)
+{
+    qtest_writel(qts, CMU_BASE + CMU_RADIOCLKCTRL + REGISTER_SET_WINDOW,
+                 CMU_RADIOCLKCTRL_EN);
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN1 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN1_RADIO_BLOCKS);
+}
+
 static void enable_radio_bus_clocks(void)
 {
     writel(CMU_BASE + CMU_RADIOCLKCTRL + REGISTER_SET_WINDOW,
            CMU_RADIOCLKCTRL_EN);
     writel(CMU_BASE + CMU_CLKEN1 + REGISTER_SET_WINDOW,
            CMU_CLKEN1_RADIO_BLOCKS);
+}
+
+/*
+ * Every radio block, BUFC and SYSCFG answer with a bus error while their CMU
+ * clocks are off (owo-open-fw docs/radio-tables.md SS7.72), as on silicon.
+ * Tests that are not about clock gating start from a reset with them on.
+ */
+static void reset_with_radio_clocks(void)
+{
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    enable_radio_bus_clocks();
 }
 
 static void test_bgm220_module_identity(void)
@@ -367,7 +399,7 @@ static void test_burtc_counter_contract(void)
 {
     uint32_t stopped;
 
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
     /* The LL ticker uses the driver's COMP-backed top-value API. */
     g_assert_cmphex(readl(BURTC_BASE + BURTC_COMP), ==, UINT32_MAX);
 
@@ -405,7 +437,7 @@ static void test_burtc_counter_contract(void)
  */
 static void test_burtc_register_aliases(void)
 {
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
 
     writel(BURTC_BASE + BURTC_EN + REGISTER_SET_WINDOW, BURTC_EN_EN);
     g_assert_cmphex(readl(BURTC_BASE + BURTC_EN), ==, BURTC_EN_EN);
@@ -443,7 +475,7 @@ static void test_burtc_register_aliases(void)
  * only enabled pending flags from its IRQ 18 handler. */
 static void test_burtc_compare_pending(void)
 {
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
 
     writel(BURTC_BASE + BURTC_EN + REGISTER_SET_WINDOW, BURTC_EN_EN);
     writel(BURTC_BASE + BURTC_CNT, 10);
@@ -469,7 +501,7 @@ static void test_burtc_compare_pending(void)
  */
 static void test_burtc_current_compare_waits_for_wrap(void)
 {
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
 
     writel(BURTC_BASE + BURTC_EN + REGISTER_SET_WINDOW, BURTC_EN_EN);
     writel(BURTC_BASE + BURTC_CNT, 10);
@@ -489,7 +521,7 @@ static void test_timer4_counter_and_aliases(void)
 {
     uint32_t stopped;
 
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
     g_assert_cmphex(readl(TIMER4_BASE + TIMER_TOP), ==, 0xffff);
 
     writel(TIMER4_NS_BASE + TIMER_EN + REGISTER_SET_WINDOW, TIMER_EN_EN);
@@ -519,7 +551,7 @@ static void test_timer2_counter_and_aliases(void)
 {
     uint32_t stopped;
 
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
     g_assert_cmphex(readl(TIMER2_BASE + TIMER_TOP), ==, 0xffff);
 
     writel(TIMER2_NS_BASE + TIMER_EN + REGISTER_SET_WINDOW, TIMER_EN_EN);
@@ -554,7 +586,7 @@ static void timer0_step(int64_t ns)
 /* TIMER0 is 32-bit (TIMER0_CNTWIDTH = 0x20) and counts HFXO / (PRESC + 1). */
 static void test_timer0_32bit_count_prescale_overflow(void)
 {
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
     g_assert_cmphex(readl(TIMER0_BASE + TIMER_TOP), ==, 0xffff);
     writel(CMU_BASE_ADDR + CMU_EM01GRPACLKCTRL, CMU_EM01GRPACLK_HFXO);
 
@@ -585,7 +617,7 @@ static void test_timer0_32bit_count_prescale_overflow(void)
 /* Each output-compare channel flags only when CNT reaches its own OC. */
 static void test_timer0_cc_output_compare(void)
 {
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
     writel(CMU_BASE_ADDR + CMU_EM01GRPACLKCTRL, CMU_EM01GRPACLK_HFXO);
 
     writel(TIMER0_NS_BASE + TIMER_EN, TIMER_EN_EN);
@@ -624,7 +656,7 @@ static void test_timer0_cc_output_compare(void)
  */
 static void test_timer0_follows_em01grpaclk_dpll(void)
 {
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
 
     writel(CMU_BASE_ADDR + CMU_DPLLREFCLKCTRL, 1); /* HFXO reference */
     writel(DPLL0_BASE_ADDR + DPLL_CFG1, (3839u << 16) | 1919u);
@@ -644,7 +676,7 @@ static void test_timer0_follows_em01grpaclk_dpll(void)
 
 static void test_timer4_cc0_compare_pending(void)
 {
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
 
     writel(TIMER4_NS_BASE + TIMER_EN + REGISTER_SET_WINDOW, TIMER_EN_EN);
     writel(TIMER4_NS_BASE + TIMER_TOP, 0xffff);
@@ -670,7 +702,7 @@ static void test_timer4_cc0_compare_pending(void)
  */
 static void test_system_reset_clears_radio_timer_state(void)
 {
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
 
     writel(BURTC_BASE + BURTC_EN, BURTC_EN_EN);
     writel(BURTC_BASE + BURTC_CNT, 10);
@@ -687,7 +719,7 @@ static void test_system_reset_clears_radio_timer_state(void)
     writel(PROTIMER_NS_BASE + PROTIMER_IF, 0x02000010);
     writel(PROTIMER_NS_BASE + PROTIMER_IEN, 0x00000010);
 
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
     qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
     qtest_clock_step(global_qtest, 2 * 1000 * 1000);
     qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
@@ -704,7 +736,7 @@ static void test_system_reset_clears_radio_timer_state(void)
 
 static void test_cmu_nonsecure_alias(void)
 {
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
     g_assert_cmphex(readl(CMU_BASE + CMU_SYSCLKCTRL) & 7, ==, 1);
     g_assert_cmphex(readl(CMU_NONSECURE_BASE + CMU_SYSCLKCTRL) & 7, ==, 1);
 
@@ -718,7 +750,7 @@ static void test_cmu_nonsecure_alias(void)
 /* Zephyr CMU_DPLLLock() clears IF, enables DPLL0, then polls LOCK/FAIL. */
 static void test_dpll_lock(void)
 {
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
     g_assert_cmphex(readl(DPLL0_BASE + DPLL_STATUS), ==, 0);
     g_assert_cmphex(readl(DPLL0_NONSECURE_BASE + DPLL_IF) & 7, ==, 0);
 
@@ -742,7 +774,7 @@ static void test_dpll_lock(void)
 /* Zephyr's USART_Tx() polls TXBL, then writes TXDATA through this sequence. */
 static void test_usart_tx_polling(void)
 {
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
 
     g_assert_cmphex(readl(USART0_BASE + USART_STATUS), ==,
                     USART_STATUS_TXBL);
@@ -937,7 +969,7 @@ static void test_radio_enable_masks(void)
         RAC_BASE,
     };
 
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
     enable_radio_bus_clocks();
     for (size_t i = 0; i < G_N_ELEMENTS(blocks); i++) {
         writel(blocks[i] + 0x004, UINT32_MAX);
@@ -976,7 +1008,7 @@ static void test_radio_ipversions(void)
         { RAC_BASE, 1 },
     };
 
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
     for (size_t i = 0; i < G_N_ELEMENTS(blocks); i++) {
         uint32_t secure = blocks[i].base + RADIO_IPVERSION;
         uint32_t nonsecure = secure + RADIO_NONSECURE_ALIAS;
@@ -1010,7 +1042,7 @@ static void test_frc_status_is_read_only(void)
     uint32_t secure = FRC_BASE + FRC_STATUS;
     uint32_t nonsecure = secure + RADIO_NONSECURE_ALIAS;
 
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
     g_assert_cmphex(readl(secure), ==, 0);
     writel(secure, UINT32_MAX);
     g_assert_cmphex(readl(secure), ==, 0);
@@ -1027,7 +1059,7 @@ static void test_radio_nonsecure_alias(void)
     uint32_t secure_address = FRC_BASE + FRC_WHITEPOLY;
     uint32_t nonsecure_address = secure_address + RADIO_NONSECURE_ALIAS;
 
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
     writel(secure_address, 0x1234);
     writel(nonsecure_address, UINT32_MAX); /* inactive alias is WI */
     g_assert_cmphex(readl(secure_address), ==, 0x1234);
@@ -1060,7 +1092,7 @@ static void test_stock_setup_aliases(void)
 
 static void test_rac_enable_requires_dependency_order(void)
 {
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
     enable_radio_bus_clocks();
 
     writel(RAC_BASE + RAC_EN, 1);
@@ -1071,7 +1103,7 @@ static void test_rac_enable_requires_dependency_order(void)
     g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK,
                     ==, RAC_STATUS_STATE_SHUTDOWN);
 
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
     enable_radio_bus_clocks();
     writel(BUFC_BASE + BUFC_EN, 1);
     writel(PROTIMER_BASE + PROTIMER_EN, 1);
@@ -1082,7 +1114,7 @@ static void test_rac_enable_requires_dependency_order(void)
 
 static void test_dcdc_regulation(void)
 {
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
     g_assert_cmphex(readl(DCDC_NONSECURE_BASE + DCDC_IF) & DCDC_IF_REGULATION,
                     ==, 0);
 
@@ -1108,7 +1140,7 @@ static void test_msc_status_reset(void)
 
 static void test_hfxo_ready_status(void)
 {
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
     g_assert_cmphex(readl(CMU_BASE + CMU_SYSCLKCTRL) & 7, ==, 1);
     g_assert_cmphex(readl(HFXO_BASE + HFXO_CTRL), ==, HFXO_CTRL_DISONDEMAND);
     g_assert_cmphex(readl(HFXO_NONSECURE_BASE + HFXO_STATUS), ==, 0);
@@ -1134,7 +1166,7 @@ static void test_hfxo_ready_status(void)
     g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==,
                     HFXO_STATUS_READY | HFXO_STATUS_FSMLOCK);
 
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
     g_assert_cmphex(readl(HFXO_BASE + HFXO_CTRL), ==, HFXO_CTRL_DISONDEMAND);
     g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS), ==, 0);
 }
@@ -1464,13 +1496,13 @@ static void test_protimer_counter(void)
     qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
     g_assert_cmphex(readl(PROTIMER_NS_BASE + PROTIMER_COUNTER), ==, before + 2);
 
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
     g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_COUNTER), ==, 0);
 }
 
 static void test_protimer_counter_is_independent_from_radio_setup(void)
 {
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
 
     /*
      * Stock setup derives state from these inputs, but does not establish
@@ -1491,7 +1523,7 @@ static void test_protimer_counter_is_independent_from_burtc(void)
 {
     uint32_t before;
 
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
     before = readl(PROTIMER_BASE + PROTIMER_COUNTER);
 
     qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
@@ -1499,7 +1531,7 @@ static void test_protimer_counter_is_independent_from_burtc(void)
     qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
     g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_COUNTER), ==, before + 2);
 
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
     writel(BURTC_BASE + BURTC_EN, BURTC_EN_EN);
     writel(BURTC_BASE + BURTC_CNT, 0x12345678);
     writel(BURTC_BASE + BURTC_CMD, BURTC_CMD_START);
@@ -1573,15 +1605,28 @@ static void test_frc_wcntcmp0_dynamic_length(void)
     g_assert_cmphex(readl(FRC_BASE + FRC_WCNTCMP0), ==, 0xd);
 }
 
+/*
+ * A frame's TX lasts its airtime plus the measured anchors (owo-open-fw
+ * docs/radio-tables.md SS7.71/SS7.72): 0.65 us from TX entry to the first
+ * preamble bit, 40 us of preamble and access address, 8 us per PDU and CRC
+ * octet, and 0.9 us from the last bit to leaving TX.
+ */
+#define TX_TIMING_PDU_OCTETS 2u
+#define TX_TIMING_NS (650 + 40000 + (TX_TIMING_PDU_OCTETS + 3) * 8000 + 900)
+
 static void test_rac_tx_completion(void)
 {
     writel(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW, FRC_IF_TXDONE);
+    writel(BUFC_BASE + BUFC_CH0 + BUFC_CMD, 1);
+    for (unsigned i = 0; i < TX_TIMING_PDU_OCTETS; i++) {
+        writel(BUFC_BASE + BUFC_CH0 + BUFC_WRITEDATA, i);
+    }
     writel(RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
     qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
-    clock_step(149999);
+    clock_step(TX_TIMING_NS - 1);
     qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
 
-    /* QEMU's synthetic completion must not become visible before 150 us. */
+    /* The frame is not over before its airtime and anchors have passed. */
     g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK, ==,
                     RAC_STATUS_STATE_TX);
     g_assert_cmphex(readl(FRC_BASE + FRC_IF) & FRC_IF_TXDONE, ==, 0);
@@ -1648,7 +1693,7 @@ static void test_system_reset_cancels_tx_completion(void)
     g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK, ==,
                     RAC_STATUS_STATE_TX);
 
-    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    reset_with_radio_clocks();
     qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
     clock_step(150001);
     qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
@@ -1783,6 +1828,9 @@ static void test_rac_masks(void)
 static void test_rfmailbox_no_peer(void)
 {
     attribute_radio_nonsecure();
+    /* Each mailbox endpoint has its own CMU bus clock (SS7.72). */
+    writel(CMU_BASE + CMU_CLKEN1 + REGISTER_SET_WINDOW,
+           CMU_CLKEN1_RDMAILBOX0 | CMU_CLKEN1_RDMAILBOX1);
     writel(RFMAILBOX_C_BASE + RFMAILBOX_NS_OFFSET + RFMAILBOX_DATA, 0x3412);
     g_assert_cmphex(readl(RFMAILBOX_C_BASE + RFMAILBOX_DATA), ==, 0);
     g_assert_cmphex(readl(RFMAILBOX_C_BASE + RFMAILBOX_NS_OFFSET +
@@ -1796,6 +1844,169 @@ static void test_rfmailbox_no_peer(void)
                           RFMAILBOX_FLAGS), ==, 0);
     g_assert_cmphex(readl(RFMAILBOX_B_BASE + RFMAILBOX_FLAGS), ==, 0);
     attribute_radio_secure();
+}
+
+/*
+ * With its CMU bus clock off, a radio-subsystem mailbox, scratchpad, PRORTC
+ * or SYSCFG access is a bus error for reads and a dropped write: measured on
+ * silicon by gating each CLKEN bit alone (owo-open-fw docs/radio-tables.md
+ * SS7.72).  The M33 below loads SYSCFG.ROOTDATA1 with CLKEN0.SYSCFG clear and
+ * must take the (escalated) HardFault; the dropped write is checked by
+ * re-enabling the clock.
+ */
+/*
+ * Boot an image-less M33 that loads one word from @address and stores it to
+ * SRAM, or stores a marker from its HardFault handler.  @setup runs after the
+ * reset, before the core starts.  Returns true if the load faulted.
+ */
+static bool m33_load_faults(uint32_t address,
+                            void (*setup)(QTestState *qts))
+{
+    const uint32_t code = 0x100, handler = 0x180, result = 0x20000000;
+    const uint32_t fault_marker = 0xfa0170ffu, loaded_marker_bit = 1u << 31;
+    uint16_t insn[8], hinsn[6];
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel tcg -S");
+    uint32_t outcome;
+    size_t i;
+
+    /* Vector table: SP, reset, NMI, HardFault. */
+    qtest_writel(qts, 0x00000000, 0x20008000);
+    qtest_writel(qts, 0x00000004, code | 1);
+    qtest_writel(qts, 0x00000008, handler | 1);
+    qtest_writel(qts, 0x0000000c, handler | 1);
+    /* r0 = address; r1 = *r0; r2 = result; r3 = marker bit; str r3; b . */
+    insn[0] = thumb_ldr_pc(0, code + 0, code + 16);
+    insn[1] = thumb_ldr_imm(1, 0, 0);
+    insn[2] = thumb_ldr_pc(2, code + 4, code + 20);
+    insn[3] = thumb_ldr_pc(3, code + 6, code + 24);
+    insn[4] = thumb_str_imm(3, 2, 0);
+    insn[5] = THUMB16_BRANCH_SELF;
+    insn[6] = THUMB16_BRANCH_SELF;
+    insn[7] = THUMB16_BRANCH_SELF;
+    for (i = 0; i < 8; i += 2) {
+        qtest_writel(qts, code + 2 * i, THUMB16_PAIR(insn[i], insn[i + 1]));
+    }
+    qtest_writel(qts, code + 16, address);
+    qtest_writel(qts, code + 20, result);
+    qtest_writel(qts, code + 24, loaded_marker_bit);
+    /* Handler: r2 = result; r1 = marker; *r2 = r1; b . */
+    hinsn[0] = thumb_ldr_pc(2, handler + 0, handler + 12);
+    hinsn[1] = thumb_ldr_pc(1, handler + 2, handler + 16);
+    hinsn[2] = thumb_str_imm(1, 2, 0);
+    hinsn[3] = THUMB16_BRANCH_SELF;
+    hinsn[4] = THUMB16_BRANCH_SELF;
+    hinsn[5] = THUMB16_BRANCH_SELF;
+    for (i = 0; i < 6; i += 2) {
+        qtest_writel(qts, handler + 2 * i,
+                     THUMB16_PAIR(hinsn[i], hinsn[i + 1]));
+    }
+    qtest_writel(qts, handler + 12, result);
+    qtest_writel(qts, handler + 16, fault_marker);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    qtest_writel(qts, result, 0);
+    setup(qts);
+    qtest_qmp_assert_success(qts, "{'execute':'cont'}");
+    for (unsigned attempt = 0; attempt < 1000; attempt++) {
+        if (qtest_readl(qts, result)) {
+            break;
+        }
+        g_usleep(1000);
+    }
+    qtest_qmp_assert_success(qts, "{'execute':'stop'}");
+    outcome = qtest_readl(qts, result);
+    qtest_quit(qts);
+    g_assert(outcome == fault_marker || outcome == loaded_marker_bit);
+    return outcome == fault_marker;
+}
+
+static void setup_no_clocks(QTestState *qts)
+{
+}
+
+static void setup_radio_clocks(QTestState *qts)
+{
+    qtest_seq_enable_radio_bus_clocks(qts);
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_SYSCFG);
+}
+
+static void setup_radio_clocks_but_rac(QTestState *qts)
+{
+    setup_radio_clocks(qts);
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN1 + REGISTER_CLEAR_WINDOW,
+                 CMU_CLKEN1_RAC);
+}
+
+static void setup_radio_clocks_but_bufc(QTestState *qts)
+{
+    setup_radio_clocks(qts);
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN1 + REGISTER_CLEAR_WINDOW,
+                 CMU_CLKEN1_BUFC);
+}
+
+/*
+ * Bus clock gating, as measured on silicon by gating one CMU enable at a time
+ * from the debugger (owo-open-fw docs/radio-tables.md SS7.72): a read of a
+ * gated SYSCFG or radio block is a bus error, which the M33 takes as an
+ * (escalated) HardFault; a gated write is dropped; CLKEN1.BUFC gates nothing
+ * visible; the window at 0xa8008000 faults whatever the enables.
+ */
+static void test_gated_bus_clock_faults_and_drops(void)
+{
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel tcg -S");
+
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_SYSCFG);
+    qtest_writel(qts, SYSCFG_BASE + SYSCFG_ROOTDATA1, 0x12345678);
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_CLEAR_WINDOW,
+                 CMU_CLKEN0_SYSCFG);
+    qtest_writel(qts, SYSCFG_BASE + SYSCFG_ROOTDATA1, 0xcafef00d);
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_SYSCFG);
+    g_assert_cmphex(qtest_readl(qts, SYSCFG_BASE + SYSCFG_ROOTDATA1), ==,
+                    0x12345678);
+    qtest_quit(qts);
+
+    g_assert_true(m33_load_faults(SYSCFG_BASE + SYSCFG_ROOTDATA1,
+                                  setup_no_clocks));
+    g_assert_false(m33_load_faults(SYSCFG_BASE + SYSCFG_ROOTDATA1,
+                                   setup_radio_clocks));
+    g_assert_true(m33_load_faults(RAC_BASE + RAC_STATUS,
+                                  setup_radio_clocks_but_rac));
+    g_assert_false(m33_load_faults(RAC_BASE + RAC_STATUS,
+                                   setup_radio_clocks));
+    g_assert_false(m33_load_faults(BUFC_BASE + BUFC_CH0,
+                                   setup_radio_clocks_but_bufc));
+    g_assert_true(m33_load_faults(BUFC_BASE + BUFC_CH0, setup_no_clocks));
+    g_assert_true(m33_load_faults(RADIO_HOLE_BASE, setup_radio_clocks));
+}
+
+static QTestState *seq_release_with_program(const uint16_t *insns,
+                                            size_t n_insns,
+                                            const uint32_t *literals,
+                                            size_t n_literals);
+
+/*
+ * RAC.STATUS.SEQSLEEPING is set while the sequencer core sleeps in WFI and
+ * clear while it runs (silicon: halted or in a handler, SS7.72).
+ */
+static void test_seq_sleeping_follows_wfi(void)
+{
+    static const uint16_t sleeper[] = { THUMB16_WFI, THUMB16_BRANCH_BACK_ONE };
+    static const uint16_t spinner[] = { THUMB16_BRANCH_SELF,
+                                        THUMB16_BRANCH_SELF };
+    QTestState *qts = seq_release_with_program(sleeper, 2, NULL, 0);
+
+    g_usleep(20000);
+    g_assert_cmphex(qtest_readl(qts, RAC_BASE + RAC_STATUS) &
+                        RAC_STATUS_SEQSLEEPING, ==, RAC_STATUS_SEQSLEEPING);
+    qtest_quit(qts);
+
+    qts = seq_release_with_program(spinner, 2, NULL, 0);
+    g_usleep(20000);
+    g_assert_cmphex(qtest_readl(qts, RAC_BASE + RAC_STATUS) &
+                        RAC_STATUS_SEQSLEEPING, ==, 0);
+    qtest_quit(qts);
 }
 
 /* RAIL_StartTx clears RAC.SR0 bit 5 through the Series-2 CLR alias. */
@@ -1875,6 +2086,7 @@ static QTestState *seq_release_with_program(const uint16_t *insns,
     qtest_writel(qts, 0x00000004, 0x00000101);
     qtest_writel(qts, 0x00000100, 0x0000e7fe);
     qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    qtest_seq_enable_radio_bus_clocks(qts);
 
     qtest_writel(qts, RAC_BASE + RAC_CTRL, RAC_CTRL_SEQRESET);
     qtest_writel(qts, SEQRAM_NS_BASE + 0x000, 0x00003e00);
@@ -2052,6 +2264,24 @@ static void test_seq_systick_counts(void)
 }
 
 /*
+ * A cleared state event releases the next RAC transition ~1.09 us later
+ * (owo-open-fw docs/radio-tables.md SS7.72); these TCG tests run in real
+ * time, so wait for the state rather than read it once.
+ */
+static void seq_wait_state(QTestState *qts, uint32_t expected)
+{
+    for (unsigned attempt = 0; attempt < 1000; attempt++) {
+        if ((qtest_readl(qts, RAC_BASE + RAC_STATUS) &
+             RAC_STATUS_STATE_MASK) == expected) {
+            break;
+        }
+        g_usleep(1000);
+    }
+    g_assert_cmphex(qtest_readl(qts, RAC_BASE + RAC_STATUS) &
+                        RAC_STATUS_STATE_MASK, ==, expected);
+}
+
+/*
  * A released sequencer gates RAC on every state event it enables: on silicon
  * a TXEN issued in SHUTDOWN was held while SEQIF.STATESHUTDOWN stayed set
  * with SEQIEN enabling it, and clearing that bit alone released the
@@ -2085,8 +2315,7 @@ static void test_seq_unacked_state_event_holds_txen(void)
 
     qtest_writel(qts, RAC_BASE + RAC_SEQIF + REGISTER_CLEAR_WINDOW,
                  RAC_SEQIF_STATESHUTDOWN);
-    g_assert_cmphex(qtest_readl(qts, RAC_BASE + RAC_STATUS) &
-                        RAC_STATUS_STATE_MASK, ==, RAC_STATUS_STATE_TXWARM);
+    seq_wait_state(qts, RAC_STATUS_STATE_TXWARM);
 
     qtest_quit(qts);
 }
@@ -2149,8 +2378,7 @@ static void test_seq_tx_waits_for_synthesizer(void)
                         RAC_STATUS_STATE_MASK, ==, RAC_STATUS_STATE_TXWARM);
     qtest_writel(qts, RAC_BASE + RAC_SEQIF + REGISTER_CLEAR_WINDOW,
                  RAC_SEQIF_STATETXWARM);
-    g_assert_cmphex(qtest_readl(qts, RAC_BASE + RAC_STATUS) &
-                        RAC_STATUS_STATE_MASK, ==, RAC_STATUS_STATE_TX);
+    seq_wait_state(qts, RAC_STATUS_STATE_TX);
     qtest_writel(qts, RAC_BASE + RAC_SEQIF + REGISTER_CLEAR_WINDOW,
                  RAC_SEQIF_STATETX);
 
@@ -2176,6 +2404,13 @@ static void test_seq_tx_waits_for_synthesizer(void)
 
     qtest_writel(qts, RAC_BASE + RAC_SYEN, syen_stock_tx);
     qtest_writel(qts, SYNTH_BASE + SYNTH_CMD, SYNTH_CMD_SYNTHSTART);
+    /* Lock follows SYNTHSTART by ~8.9 us (SS7.72). */
+    for (unsigned attempt = 0; attempt < 1000; attempt++) {
+        if (qtest_readl(qts, SYNTH_BASE + SYNTH_STATUS) & SYNTH_STATUS_INLOCK) {
+            break;
+        }
+        g_usleep(1000);
+    }
     g_assert_cmphex(qtest_readl(qts, SYNTH_BASE + SYNTH_STATUS) &
                         SYNTH_STATUS_INLOCK, ==, SYNTH_STATUS_INLOCK);
     for (unsigned attempt = 0; attempt < 1000; attempt++) {
@@ -2194,8 +2429,9 @@ static void test_seq_tx_waits_for_synthesizer(void)
                         RAC_SEQIF_STATETXPD, ==, RAC_SEQIF_STATETXPD);
     qtest_writel(qts, RAC_BASE + RAC_SEQIF + REGISTER_CLEAR_WINDOW,
                  RAC_SEQIF_STATETXPD);
-    g_assert_cmphex(qtest_readl(qts, RAC_BASE + RAC_STATUS) &
-                        RAC_STATUS_STATE_MASK, ==, 0);
+    qtest_qmp_assert_success(qts, "{'execute':'cont'}");
+    seq_wait_state(qts, 0);
+    qtest_qmp_assert_success(qts, "{'execute':'stop'}");
 
     /* SYNTHSTOP drops lock again. */
     qtest_writel(qts, SYNTH_BASE + SYNTH_CMD, SYNTH_CMD_SYNTHSTOP);
@@ -2214,6 +2450,7 @@ static void test_radio_sequencer_executes_open_code(void)
     qtest_writel(qts, 0x00000004, 0x00000101);
     qtest_writel(qts, 0x00000100, 0x0000e7fe);
     qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    qtest_seq_enable_radio_bus_clocks(qts);
 
     /* Model the real stage-3 boundary: SEQRAM may retain an unrelated image
      * from an earlier boot.  The M33 asserts the hardware-proven base-register
@@ -2277,6 +2514,7 @@ static void test_radio_sequencer_release_is_idempotent(void)
     qtest_writel(qts, 0x00000004, 0x00000101);
     qtest_writel(qts, 0x00000100, 0x0000e7fe);
     qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    qtest_seq_enable_radio_bus_clocks(qts);
 
     /* Increment SPARE0 once at reset entry, then loop.  A second write of
      * CPUWAITDIS must not restart the already-released sequencer. */
@@ -2325,6 +2563,7 @@ int main(int argc, char **argv)
         "-machine efr32bg22 -S -trace enable=efr32bg22_*,file=%s",
         tx_snapshot_trace_path);
     qtest_start(qemu_args);
+    enable_radio_bus_clocks();
     g_free(qemu_args);
 
 
@@ -2457,6 +2696,10 @@ int main(int argc, char **argv)
                    test_rac_software_rx_enable);
     qtest_add_func("/efr32bg22/rac-masks", test_rac_masks);
     qtest_add_func("/efr32bg22/rfmailbox-no-peer", test_rfmailbox_no_peer);
+    qtest_add_func("/efr32bg22/gated-bus-clock-faults-and-drops",
+                   test_gated_bus_clock_faults_and_drops);
+    qtest_add_func("/efr32bg22/seq-sleeping-follows-wfi",
+                   test_seq_sleeping_follows_wfi);
     qtest_add_func("/efr32bg22/rac-sr0-clear-alias",
                    test_rac_sr0_clear_alias);
     qtest_add_func("/efr32bg22/rac-force-disable", test_rac_force_disable);
