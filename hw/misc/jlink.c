@@ -28,6 +28,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/qdev-properties-system.h"
 #include "hw/misc/swd.h"
+#include "hw/misc/jlink-swd-io.h"
 #include "hw/usb/gadget-host.h"
 
 #define TYPE_JLINK "jlink"
@@ -41,7 +42,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(JLinkState, JLINK)
 #define JL_CMD_SET_TARGET_POWER 0x08
 #define JL_CMD_GET_SPEEDS 0xc0
 #define JL_CMD_SELECT_TIF 0xc7
-#define JL_CMD_HW_IO_V3 0xcf        /* SWD I/O and JTAG I/O version 3 */
+#define JL_CMD_HW_IO_V3 JLINK_CMD_SWD_IO /* SWD I/O, JTAG I/O version 3 */
 #define JL_CMD_CLEAR_RESET 0xdc
 #define JL_CMD_SET_RESET 0xdd
 #define JL_CMD_JTAG_CLEAR_TRST 0xde
@@ -58,9 +59,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(JLinkState, JLINK)
 #define JL_CAP_GET_SPEEDS 9
 #define JL_CAP_SELECT_TIF 17
 #define JL_CAPS_SIZE 4
-#define JL_HW_IO_HEADER 4
 #define JL_HW_STATUS_SIZE 8
-#define JL_IO_STATUS_OK 0
 /* Hardware version encoding: type*10^6 + major*10^4 + minor*10^2 + rev */
 #define JL_HW_VERSION(major, minor) ((major) * 10000 + (minor) * 100)
 /* Speeds: base frequency (Hz) and minimum divider; max = freq / div */
@@ -501,34 +500,25 @@ static size_t jlink_cmd_length(const uint8_t *c, size_t avail)
     case JL_CMD_SET_SPEED:
         return 3;
     case JL_CMD_HW_IO_V3:
-        if (avail < JL_HW_IO_HEADER) {
-            return JL_HW_IO_HEADER;
+        if (avail < JLINK_SWD_IO_HEADER) {
+            return JLINK_SWD_IO_HEADER;
         }
-        return JL_HW_IO_HEADER + 2 * DIV_ROUND_UP(lduw_le_p(c + 2), 8);
+        return jlink_swd_io_cmd_len(lduw_le_p(c + 2));
     default:
         return 0;
     }
 }
 
+/* SWD I/O: the wire format is in include/hw/misc/jlink-swd-io.h */
 static void jlink_hw_io(JLinkState *s, const uint8_t *c)
 {
-    unsigned bits = lduw_le_p(c + 2);
-    unsigned bytes = DIV_ROUND_UP(bits, 8);
-    const uint8_t *dir = c + JL_HW_IO_HEADER;
-    const uint8_t *out = dir + bytes;
-    g_autofree uint8_t *in = g_malloc0(bytes + 1);
+    size_t len = jlink_swd_io_reply_len(lduw_le_p(c + 2));
+    g_autofree uint8_t *in = g_malloc0(len);
 
-    for (unsigned i = 0; i < bits; i++) {
-        bool drive = (dir[i / 8] >> (i % 8)) & 1;
-        bool bit = (out[i / 8] >> (i % 8)) & 1;
-
-        if (s->tif == JL_TIF_SWD &&
-            swd_target_cycle(s->target, drive, bit)) {
-            in[i / 8] |= 1u << (i % 8);
-        }
+    if (s->tif == JL_TIF_SWD) {
+        jlink_swd_io(s->target, c, in);
     }
-    in[bytes] = JL_IO_STATUS_OK;
-    jlink_reply(s, in, bytes + 1);
+    jlink_reply(s, in, len);
 }
 
 static void jlink_execute(JLinkState *s, const uint8_t *c)
