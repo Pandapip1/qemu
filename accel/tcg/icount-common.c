@@ -114,7 +114,14 @@ static void icount_update_locked(CPUState *cpu)
     int64_t executed = icount_get_executed(cpu);
     cpu->icount_budget -= executed;
     if (cpu_clocks) {
-        cpu_clocks_advance_locked(cpu, executed * cpu_clocks_insn_fs(cpu));
+        if (cpu->icount_counts_cycles) {
+            cpu_clocks_advance_locked(cpu, (executed +
+                                            cpu->icount_extra_cycles) *
+                                           cpu->icount_cycle_fs);
+            cpu->icount_extra_cycles = 0;
+        } else {
+            cpu_clocks_advance_locked(cpu, executed * cpu_clocks_insn_fs(cpu));
+        }
     }
 
     qatomic_set_i64(&timers_state.qemu_icount,
@@ -616,6 +623,11 @@ void icount_charge_cycles(CPUState *cpu, uint64_t millicycles)
     cpu_clocks_advance_locked(cpu, cpu->icount_cycle_fs * millicycles / 1000);
     seqlock_write_unlock(&timers_state.vm_clock_seqlock,
                          &timers_state.vm_clock_lock);
+}
+
+void icount_set_cpu_cycle_counting(CPUState *cpu, bool on)
+{
+    cpu->icount_counts_cycles = cpu_clocks && on;
 }
 
 void icount_set_cpu_exception_cycles(CPUState *cpu, uint64_t millicycles)

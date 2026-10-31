@@ -6540,6 +6540,7 @@ static bool trans_B(DisasContext *s, arg_i *a)
     return true;
 }
 
+static void gen_icount_extra_cycles(unsigned cycles);
 static bool trans_B_cond_thumb(DisasContext *s, arg_ci *a)
 {
     /* This has cond from encoding, required to be outside IT block.  */
@@ -6551,6 +6552,9 @@ static bool trans_B_cond_thumb(DisasContext *s, arg_ci *a)
         return true;
     }
     arm_skip_unless(s, a->cond);
+    if (s->icount_cycles) {
+        gen_icount_extra_cycles(1);   /* taken */
+    }
     gen_jmp(s, jmp_diff(s, a->imm));
     return true;
 }
@@ -7520,6 +7524,7 @@ static void arm_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
 
     dc->isar = &cpu->isar;
     dc->condjmp = 0;
+    dc->icount_cycles = cs->icount_counts_cycles;
     dc->pc_save = dc->base.pc_first;
     dc->aarch64 = false;
     dc->thumb = EX_TBFLAG_AM32(tb_flags, THUMB);
@@ -7828,6 +7833,86 @@ static bool thumb_insn_is_unconditional(DisasContext *s, uint32_t insn)
     return false;
 }
 
+/*
+ * Per-CPU icount clocks (CPUState.icount_counts_cycles): a core that counts
+ * cycles rather than instructions takes one cycle per instruction plus the
+ * extra cycles below, from the Cortex-M0+ instruction timings (loads and
+ * stores 2, LDM/STM/PUSH/POP 1 + N and POP {PC} 3 + N, B and taken B<c> 2,
+ * BL 3, BX/BLX and writes to PC 2, MSR/MRS/barriers 3-4).  Device accesses
+ * that cost more are charged by the device's bus model.
+ */
+static void gen_icount_extra_cycles(unsigned cycles)
+{
+    TCGv_i64 t = tcg_temp_new_i64();
+    const intptr_t ofs =
+        (intptr_t)offsetof(ArchCPU, parent_obj.icount_extra_cycles) -
+        (intptr_t)offsetof(ArchCPU, env);
+
+    tcg_gen_ld_i64(t, tcg_env, ofs);
+    tcg_gen_addi_i64(t, t, cycles);
+    tcg_gen_st_i64(t, tcg_env, ofs);
+}
+
+/*
+ * Extra cycles of an Armv6-M instruction known at translation time; *branch
+ * is set for instructions that may leave the TB, whose cycles must be
+ * counted before they execute.
+ */
+static unsigned armv6m_extra_cycles(uint32_t insn, bool is_16bit,
+                                    bool *branch)
+{
+    *branch = false;
+    if (!is_16bit) {
+        if ((insn & 0xf800d000) == 0xf000d000) {        /* BL */
+            *branch = true;
+            return 2;
+        }
+        if ((insn & 0xffe0d000) == 0xf3808000) {        /* MSR */
+            return 3;
+        }
+        if ((insn & 0xffffd000) == 0xf3ef8000) {        /* MRS */
+            return 2;
+        }
+        if ((insn & 0xffffff00) == 0xf3bf8f00) {        /* DSB/DMB/ISB */
+            return 3;
+        }
+        return 0;
+    }
+    switch (insn >> 11) {
+    case 0x09:                                          /* LDR literal */
+    case 0x0a: case 0x0b:                               /* ld/st register */
+    case 0x0c: case 0x0d: case 0x0e: case 0x0f:         /* ld/st word, byte */
+    case 0x10: case 0x11:                               /* ld/st halfword */
+    case 0x12: case 0x13:                               /* ld/st SP-relative */
+        return 1;
+    case 0x18: case 0x19:                               /* STM, LDM */
+        return ctpop8(insn & 0xff);
+    case 0x1c:                                          /* B */
+        *branch = true;
+        return 1;
+    }
+    if ((insn & 0xff00) == 0x4700) {                    /* BX, BLX */
+        *branch = true;
+        return 1;
+    }
+    if ((insn & 0xfc87) == 0x4487 && (insn & 0x0300) != 0x0100) {
+        /* ADD/MOV to PC */
+        *branch = true;
+        return 1;
+    }
+    if ((insn & 0xfe00) == 0xb400) {                    /* PUSH */
+        return ctpop8(insn & 0xff) + ((insn >> 8) & 1);
+    }
+    if ((insn & 0xfe00) == 0xbc00) {                    /* POP */
+        if (insn & 0x100) {
+            *branch = true;
+            return ctpop8(insn & 0xff) + 1 + 2;
+        }
+        return ctpop8(insn & 0xff);
+    }
+    return 0;
+}
+
 static void thumb_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
 {
     DisasContext *dc = container_of(dcbase, DisasContext, base);
@@ -7838,6 +7923,8 @@ static void thumb_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     /* TCG op to rewind to if this turns out to be an invalid ECI state */
     TCGOp *insn_eci_rewind = NULL;
     target_ulong insn_eci_pc_save = -1;
+    unsigned icount_extra = 0;
+    bool icount_branch = false;
 
     /* Misaligned thumb PC is architecturally impossible. */
     assert((dc->base.pc_next & 1) == 0);
@@ -7915,10 +8002,21 @@ static void thumb_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
         }
     }
 
+    if (dc->icount_cycles) {
+        icount_extra = armv6m_extra_cycles(insn, is_16bit, &icount_branch);
+        if (icount_extra && icount_branch) {
+            gen_icount_extra_cycles(icount_extra);
+        }
+    }
     if (is_16bit) {
         disas_thumb_insn(dc, insn);
     } else {
         disas_thumb2_insn(dc, insn);
+    }
+    if (icount_extra && !icount_branch &&
+        dc->base.is_jmp != DISAS_NORETURN) {
+        /* After the access, so an I/O re-execution counts it once. */
+        gen_icount_extra_cycles(icount_extra);
     }
 
     /* Advance the Thumb condexec condition.  */

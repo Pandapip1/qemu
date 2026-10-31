@@ -61,3 +61,6 @@ void icount_bus_access(IcountBusModel *model, CPUState *master,
                        uint64_t addr, unsigned size, bool is_write)
 {
 }
+void icount_set_cpu_cycle_counting(CPUState *cpu, bool on)
+{
+}

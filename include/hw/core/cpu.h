@@ -507,6 +507,12 @@ struct CPUState {
     uint64_t icount_time_fs;
     uint64_t icount_insn_fs;
     uint64_t icount_cycle_fs;
+    /*
+     * The translator counts this vCPU's cycles: one per instruction plus
+     * the extra cycles it adds to icount_extra_cycles (Armv6-M timings).
+     */
+    bool icount_counts_cycles;
+    int64_t icount_extra_cycles;
     /* Extra cycles (x1000) charged on each exception entry. */
     uint64_t icount_exception_millicycles;
     /* The clock is stopped: the vCPU keeps its state and does not run. */

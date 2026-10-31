@@ -3757,21 +3757,31 @@ static bool efr32_bus_error(Efr32Periph *s, uint32_t address)
 #define EFR32_CMU_SYSCLKCTRL_RHCLKPRESC_SHIFT 16
 #define EFR32_CMU_SYSCLKCTRL_RHCLKPRESC_MASK 0x1u
 /*
- * Average core cycles per instruction, from real code: a firmware function
- * called from the debugger at full speed (cycles) and single-stepped
- * (instructions), n = 6 calls each, warm cache.
- *  - M33, stage 3 from flash: snprintk 7973 cycles / 4342 insns = 1.84
- *    (compiled C); memcpy 1.60, memset 1.50, strlen 1.45 (library loops).
- *    The compiled-C value is used.
- *  - M0+, the open sequencer's handler code: EFR32_SEQ_CYCLES_PER_INSN_MILLI.
+ * Core cycles per instruction, from real code: a firmware function called
+ * from the debugger at full speed (cycles) and single-stepped
+ * (instructions), n = 6 calls each, no spread.
+ *  - M33, stage 3 from flash, warm cache: snprintk 7973 cycles / 4342
+ *    insns = 1.84 (compiled C); memcpy 1.60, memset 1.50, strlen 1.45
+ *    (library loops).  The compiled-C average is used.
+ *  - M0+, the open sequencer image: the Armv6-M timings (one cycle, loads
+ *    and stores 2, taken branches 2, BL 3, ...; the translator counts them,
+ *    icount_set_cpu_cycle_counting) plus 3 extra cycles per radio access
+ *    reproduce each function exactly: rx_frontend_stop 61 cycles / 22
+ *    insns, synth_config_tx 112 / 39, efr32_seq_delay 7 cycles per pass.
+ *    A flat average does not: pga_dc_interp (ALU) runs at 1.19 cycles per
+ *    instruction, synth_power_down at 2.5.  The average below only sizes
+ *    the M0+'s slices.
  */
 #define EFR32_M33_CYCLES_PER_INSN_MILLI 1840u
 #define EFR32_SEQ_CYCLES_PER_INSN_MILLI 2000u
 /*
- * Exception entry on the M0+ (SysTick reload to the first handler load):
- * 16 cycles (SS7.73, cross-core probes).  [P] The M33's is not charged.
+ * Exception entry, SysTick reload to the first handler load (SS7.73,
+ * cross-core probes): M0+ 16 cycles; M33 17 (18 from WFI) with its vector
+ * table, handler and stack in SRAM.  [I] The M33 value is used for its
+ * flash-resident vectors too.
  */
 #define EFR32_SEQ_EXCEPTION_ENTRY_MILLICYCLES 16000u
+#define EFR32_M33_EXCEPTION_ENTRY_MILLICYCLES 17000u
 /*
  * Bus model: extra cycles of one access beyond an average instruction, in
  * the accessing core's cycles.  Total cycles per access (loops of 8 copies,
@@ -3779,10 +3789,13 @@ static bool efr32_bus_error(Efr32Periph *s, uint32_t address)
  *  - M33 from flash: SRAM 1; SEQRAM 1.88, or 2.38 while the M0+ executes;
  *    BUFC 1.88; RAC, FRC, SYNTH, MODEM, AGC, CMU, GPIO 3.88; TIMER1 11.88.
  *  - M0+: SEQRAM load 2, store 2.5; BUFC 3.25; RAC, FRC, SYNTH, MODEM, AGC
- *    4.25 back to back, EFR32_SEQ_RADIO_EXTRA between other instructions.
- * The M33 extras are relative to an SRAM access (1 cycle).  [I] Other
- * peripherals are charged as CMU, other TIMERs as TIMER1.  Not charged (RAM
- * here): M33 flash data loads (4.5).
+ *    4.25 back to back.  Between other instructions (the handlers' case:
+ *    literal load, literal load, access) a radio access takes 5 and a BUFC
+ *    load 4.
+ * The M33 extras are relative to an SRAM access (1 cycle), the M0+ extras
+ * to an Armv6-M load or store (2).  [I] Other peripherals are charged as
+ * CMU, other TIMERs as TIMER1.  Not charged (RAM here): M33 flash data loads
+ * (4.5), M0+ SEQRAM stores beyond 2 (2.5 in loops, 2 in the delay loop).
  * Each M33 SEQRAM access while the M0+ executes costs the M0+ 0.9 of its
  * cycles: SEQRAM has one port and the M33 wins (SS7.73, cross-core probes:
  * M0+ code 2.8x slower under M33 SEQRAM streaming).
@@ -3794,8 +3807,8 @@ static bool efr32_bus_error(Efr32Periph *s, uint32_t address)
 #define EFR32_M33_SEQRAM_EXTRA_MILLICYCLES 875u
 #define EFR32_M33_SEQRAM_SHARED_EXTRA_MILLICYCLES 1375u
 #define EFR32_SEQ_SEQRAM_STEAL_MILLICYCLES 900u
-#define EFR32_SEQ_RADIO_EXTRA_MILLICYCLES 2250u
-#define EFR32_SEQ_BUFC_EXTRA_MILLICYCLES 1250u
+#define EFR32_SEQ_RADIO_EXTRA_MILLICYCLES 3000u
+#define EFR32_SEQ_BUFC_EXTRA_MILLICYCLES 2000u
 #define EFR32_TIMER_BLOCKS_END (EFR32_TIMER4_BASE + 0x4000u)
 #define EFR32_BUFC_WINDOW_END (RADIO_BASE + RADIO_SIZE)
 #define EFR32_SEQRAM_NS_BASE 0xb0000000u
@@ -4561,16 +4574,19 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
     s->periph.m33_cpu = CPU(s->armv7m.cpu);
     s->periph.m33_cpuclk = s->clk;
     s->periph.seq_cpuclk = s->seq_clk;
-    s->periph.bus_model.access = efr32_bus_cost;
-    s->periph.bus_model.opaque = &s->periph;
-    icount_register_bus_model(&s->periph.bus_model);
-    icount_set_cpu_exception_cycles(s->periph.seq_cpu,
-                                    EFR32_SEQ_EXCEPTION_ENTRY_MILLICYCLES);
     if (s->core_clocks && icount_enabled() &&
         !icount_cpu_clocks_enable(EFR32_CORE_CLOCK_QUANTUM_NS)) {
         warn_report_once("efr32bg22: core-clocks needs a fixed -icount shift; "
                          "both cores share the instruction rate");
     }
+    s->periph.bus_model.access = efr32_bus_cost;
+    s->periph.bus_model.opaque = &s->periph;
+    icount_register_bus_model(&s->periph.bus_model);
+    icount_set_cpu_cycle_counting(s->periph.seq_cpu, true);
+    icount_set_cpu_exception_cycles(s->periph.seq_cpu,
+                                    EFR32_SEQ_EXCEPTION_ENTRY_MILLICYCLES);
+    icount_set_cpu_exception_cycles(s->periph.m33_cpu,
+                                    EFR32_M33_EXCEPTION_ENTRY_MILLICYCLES);
     efr32_cpu_clocks_update(&s->periph);
     s->periph.seq_released = false;
     for (unsigned state = 0; state < EFR32_RAC_SEQ_STATE_EVENTS; state++) {

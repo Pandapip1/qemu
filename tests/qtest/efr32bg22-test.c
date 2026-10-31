@@ -2592,10 +2592,10 @@ static void test_seq_systick_counts(void)
  * Per-CPU clocks under -icount (owo-open-fw docs/radio-tables.md SS7.73).
  * On silicon the M33 runs at HCLK and the M0+ at SYSCLK / (RHCLKPRESC + 1),
  * each at its own rate while the other runs; firmware code averaged 1.84
- * M33 cycles and 2 M0+ cycles per instruction, and a radio-register access
- * costs extra cycles.  Each core here times a loop with its own SysTick
- * (core cycles) and with RAC.STIMER (4.8 ticks/us of virtual time), both
- * cores at once.
+ * M33 cycles per instruction and M0+ code follows the Armv6-M timings, and
+ * a radio-register access costs extra cycles.  Each core here times a loop
+ * with its own SysTick (core cycles) and with RAC.STIMER (4.8 ticks/us of
+ * virtual time), both cores at once.
  */
 #define CORE_CLOCK_SYSTICK_BASE      0xe000e010u
 #define CORE_CLOCK_SYSTICK_FULL      0x00ffffffu
@@ -2610,7 +2610,7 @@ static void test_seq_systick_counts(void)
 #define CORE_CLOCK_CMU_RHCLK_DIV2    (1u << 16)
 #define CORE_CLOCK_HFXO_HZ           38400000.0
 #define CORE_CLOCK_M33_CPI           1.84
-#define CORE_CLOCK_SEQ_CPI           2.0
+#define CORE_CLOCK_SEQ_LOOP_CYCLES   3.0
 #define THUMB16_SUBS_R3_1            0x3b01u
 #define THUMB16_BNE_BACK_ONE         0xd1fdu  /* bne to the insn before */
 
@@ -2618,8 +2618,8 @@ static void test_seq_systick_counts(void)
  * Write a probe at @code (address as the core sees it: @local) that stores
  * {SysTick before, SysTick after, STIMER before, STIMER after} around
  * CORE_CLOCK_LOOPS iterations of a two-instruction loop.  Between the
- * samples it executes 2 * CORE_CLOCK_LOOPS + 2 instructions, one of them a
- * radio-register load.
+ * SysTick samples it executes 2 * CORE_CLOCK_LOOPS + 2 instructions, one
+ * of them a radio-register load.
  */
 static void core_clock_write_probe(QTestState *qts, uint32_t code,
                                    uint32_t local, uint32_t result)
@@ -2663,10 +2663,10 @@ static void core_clock_write_probe(QTestState *qts, uint32_t code,
 }
 
 static void core_clock_check(QTestState *qts, uint32_t result,
-                             double cpi, double hz)
+                             double expected_cycles, double hz)
 {
     uint32_t c0 = 0, c1, s0, s1;
-    double insns = 2.0 * CORE_CLOCK_LOOPS + 2, cycles, us;
+    double cycles, us;
 
     for (unsigned attempt = 0; attempt < 5000; attempt++) {
         if (qtest_readl(qts, result + 12)) {
@@ -2681,9 +2681,8 @@ static void core_clock_check(QTestState *qts, uint32_t result,
     g_assert_cmpuint(s1, !=, 0);
     cycles = (double)((c0 - c1) & CORE_CLOCK_SYSTICK_FULL);
     us = (double)((s1 - s0) & 0xffffu) / CORE_CLOCK_STIMER_PER_US;
-    /* Average cycles per instruction (the radio load adds a few cycles). */
-    g_assert_cmpfloat(cycles / insns, >=, cpi);
-    g_assert_cmpfloat(cycles / insns, <=, cpi * 1.01);
+    g_assert_cmpfloat(cycles, >=, expected_cycles * 0.99);
+    g_assert_cmpfloat(cycles, <=, expected_cycles * 1.01);
     /* Core clock against virtual time: within STIMER's resolution. */
     g_assert_cmpfloat(cycles / us * 1e6, >=, hz * 0.98);
     g_assert_cmpfloat(cycles / us * 1e6, <=, hz * 1.02);
@@ -2720,9 +2719,13 @@ static void test_core_clocks_per_cpu_rates(void)
 {
     QTestState *qts = core_clock_start("");
 
-    core_clock_check(qts, CORE_CLOCK_M33_RESULT, CORE_CLOCK_M33_CPI,
+    /* M33: the measured firmware average, 1.84 cycles per instruction. */
+    core_clock_check(qts, CORE_CLOCK_M33_RESULT,
+                     CORE_CLOCK_M33_CPI * (2.0 * CORE_CLOCK_LOOPS + 2),
                      CORE_CLOCK_HFXO_HZ);
-    core_clock_check(qts, CORE_CLOCK_SEQ_RESULT, CORE_CLOCK_SEQ_CPI,
+    /* M0+: Armv6-M timings, SUBS 1 + taken BNE 2 per iteration. */
+    core_clock_check(qts, CORE_CLOCK_SEQ_RESULT,
+                     CORE_CLOCK_SEQ_LOOP_CYCLES * CORE_CLOCK_LOOPS,
                      CORE_CLOCK_HFXO_HZ / 2);
     qtest_quit(qts);
 }

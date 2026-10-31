@@ -103,6 +103,14 @@ bool icount_cpu_clocks_enabled(void);
  */
 void icount_set_cpu_clock(CPUState *cpu, uint64_t hz,
                           uint32_t cycles_per_insn_milli);
+/*
+ * icount_set_cpu_cycle_counting: time  by cycles counted per instruction
+ * class by its translator (one cycle per instruction plus the class's extra
+ * cycles) instead of by an average per instruction; the average set by
+ * icount_set_cpu_clock() then only sizes the slices.  Call before the vCPU
+ * runs.  Only the Armv6-M Thumb translator counts cycles.
+ */
+void icount_set_cpu_cycle_counting(CPUState *cpu, bool on);
 /* icount_set_cpu_exception_cycles: cycles each exception entry costs. */
 void icount_set_cpu_exception_cycles(CPUState *cpu, uint64_t millicycles);
 void icount_charge_exception(CPUState *cpu);

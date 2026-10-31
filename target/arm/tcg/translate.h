@@ -57,6 +57,8 @@ typedef struct DisasContext {
      * after decode (ie after any UNDEF checks)
      */
     bool eci_handled;
+    /* Per-CPU icount clocks: charge Armv6-M cycles per instruction. */
+    bool icount_cycles;
     int sctlr_b;
     MemOp be_data;
 #if !defined(CONFIG_USER_ONLY)
