@@ -27,3 +27,8 @@ chr_socket_hangup(void *chrdev, const char *label) "chardev socket hangup %p (%s
 chr_socket_ws_handshake_err(void *chrdev, const char *label, const char *err) "chardev socket websock handshake error %p (%s): %s"
 chr_socket_tls_handshake_err(void *chrdev, const char *label, const char *err) "chardev socket TLS handshake error %p (%s): %s"
 chr_socket_tls_init_err(void *chrdev, const char *label, const char *err) "chardev socket TLS init error %p (%s): %s"
+
+# char-vhci.c
+vhci_created(const char *path, unsigned index) "%s: host controller hci%u"
+vhci_drop(const char *path, unsigned indicator, size_t len) "%s: no host controller, dropped H4 packet 0x%02x of %zu bytes"
+vhci_bad_indicator(const char *path, unsigned indicator) "%s: skipped byte 0x%02x, not an H4 packet indicator"

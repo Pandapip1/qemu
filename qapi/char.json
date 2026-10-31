@@ -503,6 +503,9 @@
 #
 # @ringbuf: memory ring buffer (since 1.6)
 #
+# @vhci: Linux virtual HCI controller (/dev/vhci) fed by the frontend's
+#     H4 byte stream (since 9.2)
+#
 # @memory: synonym for @ringbuf (since 1.5)
 #
 # Features:
@@ -533,6 +536,7 @@
             { 'name': 'dbus', 'if': 'CONFIG_DBUS_DISPLAY' },
             'vc',
             'ringbuf',
+            { 'name': 'vhci', 'if': 'CONFIG_LINUX' },
             { 'name': 'memory', 'features': [ 'deprecated' ] } ] }
 
 ##
@@ -721,6 +725,8 @@
                       'if': 'CONFIG_DBUS_DISPLAY' },
             'vc': 'ChardevVCWrapper',
             'ringbuf': 'ChardevRingbufWrapper',
+            'vhci': { 'type': 'ChardevHostdevWrapper',
+                      'if': 'CONFIG_LINUX' },
             'memory': 'ChardevRingbufWrapper' } }
 
 ##

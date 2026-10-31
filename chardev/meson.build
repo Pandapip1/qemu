@@ -24,6 +24,9 @@ else
       'char-parallel.c',
       'char-pty.c',
     ), util)
+  if host_os == 'linux'
+    chardev_ss.add(files('char-vhci.c'))
+  endif
 endif
 
 chardev_ss = chardev_ss.apply({})
