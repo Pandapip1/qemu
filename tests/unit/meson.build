@@ -50,6 +50,7 @@ tests = {
   'test-fifo': [],
   'test-efr32-rf-medium': [qom,
                             meson.project_source_root() / 'hw/arm/efr32-rf-medium.c'],
+  'test-jlink-swd-io': [qom, meson.project_source_root() / 'hw/misc/swd.c'],
 }
 
 if have_system or have_tools
