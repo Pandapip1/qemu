@@ -27,6 +27,8 @@
 #include "hw/sysbus.h"
 #include "hw/arm/armv7m.h"
 #include "hw/arm/efr32bg22-debug.h"
+#include "hw/arm/efr32bg22.h"
+#include "hw/core/resetcontainer.h"
 #include "sysemu/reset.h"
 #include "sysemu/runstate.h"
 #include "sysemu/cpu-timers.h"
@@ -4236,6 +4238,9 @@ static void efr32_wdog_schedule(Efr32Periph *s)
     timer_mod(s->wdog_timer, warnsel && !s->wdog_warned ? warn_ns : tout_ns);
 }
 
+/* A reset of the part that owns these peripherals (efr32_soc_reset). */
+static void efr32_periph_reset_request(Efr32Periph *s);
+
 static void efr32_wdog_expired(void *opaque)
 {
     Efr32Periph *s = EFR32_PERIPH(opaque);
@@ -4268,7 +4273,7 @@ static void efr32_wdog_expired(void *opaque)
         (s->rstctrl & EFR32_EMU_RSTCTRL_WDOG0RMODE)) {
         s->rstcause |= EFR32_EMU_RSTCAUSE_WDOG0;
         s->wdog_running = false;
-        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        efr32_periph_reset_request(s);
         return;
     }
     /* Reset disabled: the counter wraps and runs on. */
@@ -6499,6 +6504,10 @@ struct Efr32Bg22SoCState {
     /* Sized from DEVINFO.MSIZE at realize, as on silicon. */
     uint32_t flash_size;
     uint32_t sram_size;
+    /* This part asked for a reset (efr32_soc_reset_request). */
+    bool reset_pending;
+    /* Told after each reset of this part (efr32bg22_soc_add_reset_notifier). */
+    NotifierList reset_notifiers;
 };
 
 struct Efr32State
@@ -6559,6 +6568,91 @@ static void efr32_seq_cpu_reset(void *opaque)
 
     cpu_reset(cpu);
     cpu->halted = 1;
+}
+
+/*
+ * Resets that the part raises itself (SYSRESETREQ, WDOG0, M33 Lockup, the
+ * RESETn pin, the DCI device erase) reset that part alone: two chips on a
+ * bench, the dual machine's two SoCs, do not reset each other.  The request
+ * is taken where QEMU takes a system reset (the main loop, all vCPUs
+ * paused), so it lands at the same point in virtual time as before; the
+ * machine's reset hook then resets only the parts that asked
+ * (efr32_machine_reset_socs).  A reset nobody asked for (power-on, QMP
+ * system_reset) still resets the whole machine.
+ */
+static void efr32_soc_reset_request(Efr32Bg22SoCState *s)
+{
+    s->reset_pending = true;
+    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+}
+
+static void efr32_periph_reset_request(Efr32Periph *p)
+{
+    efr32_soc_reset_request(container_of(p, Efr32Bg22SoCState, periph));
+}
+
+void efr32bg22_soc_add_reset_notifier(Object *soc, Notifier *n)
+{
+    notifier_list_add(&EFR32BG22_SOC(soc)->reset_notifiers, n);
+}
+
+/* Inside this SoC's QOM subtree. */
+static bool efr32_soc_owns(Efr32Bg22SoCState *s, Object *obj)
+{
+    for (; obj; obj = obj->parent) {
+        if (obj == OBJECT(s)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Reset one SoC as a system reset resets it: its devices on the system bus
+ * (and so the buses below them) in the system bus's order, through the same
+ * three reset phases, then its two CPUs, as the root reset container orders
+ * them (devices first, then the board's CPU reset handlers).
+ */
+static void efr32_soc_reset(Efr32Bg22SoCState *s, ResetType type)
+{
+    ResettableContainer *rc =
+        RESETTABLE_CONTAINER(object_new(TYPE_RESETTABLE_CONTAINER));
+    BusState *bus = sysbus_get_default();
+    BusChild *kid;
+
+    QTAILQ_FOREACH(kid, &bus->children, sibling) {
+        if (efr32_soc_owns(s, OBJECT(kid->child))) {
+            resettable_container_add(rc, OBJECT(kid->child));
+        }
+    }
+    resettable_reset(OBJECT(rc), type);
+    object_unref(OBJECT(rc));
+    efr32_cpu_reset(s->armv7m.cpu);
+    efr32_seq_cpu_reset(s->seq_armv7m.cpu);
+    notifier_list_notify(&s->reset_notifiers, NULL);
+}
+
+static void efr32_machine_reset_socs(Efr32Bg22SoCState *socs, unsigned n,
+                                     ResetType type)
+{
+    bool requested = false;
+
+    for (unsigned i = 0; i < n; i++) {
+        requested |= socs[i].reset_pending;
+    }
+    if (!requested) {
+        qemu_devices_reset(type);
+        for (unsigned i = 0; i < n; i++) {
+            notifier_list_notify(&socs[i].reset_notifiers, NULL);
+        }
+        return;
+    }
+    for (unsigned i = 0; i < n; i++) {
+        if (socs[i].reset_pending) {
+            socs[i].reset_pending = false;
+            efr32_soc_reset(&socs[i], type);
+        }
+    }
 }
 
 #define EFR32_DEVINFO_MSIZE 0x00cu
@@ -6845,7 +6939,7 @@ static void efr32_soc_sysresetreq(void *opaque, int n, int level)
         s->periph.rstcause |= EFR32_EMU_RSTCAUSE_SYSREQ;
         /* The debug port sees the system reset begin (efr32-dap) */
         efr32bg22_debug_system_reset(OBJECT(s));
-        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        efr32_soc_reset_request(s);
     }
 }
 
@@ -6868,7 +6962,15 @@ static void efr32_soc_nreset(void *opaque, int n, int level)
         s->periph.rstctrl = EFR32_EMU_RSTCTRL_RESET;
     }
     CPU(s->armv7m.cpu)->start_powered_off = level;
-    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    efr32_soc_reset_request(s);
+}
+
+/* The reset that follows a DCI device erase (efr32-dap.c). */
+static void efr32_soc_erase_reset(void *opaque, int n, int level)
+{
+    if (level) {
+        efr32_soc_reset_request(opaque);
+    }
 }
 
 /*
@@ -6885,7 +6987,7 @@ static void efr32_soc_lockup(void *opaque, int n, int level)
 
     if (level && (s->periph.rstctrl & EFR32_EMU_RSTCTRL_LOCKUPRMODE)) {
         s->periph.rstcause |= EFR32_EMU_RSTCAUSE_LOCKUP;
-        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        efr32_soc_reset_request(s);
     }
 }
 
@@ -6921,6 +7023,7 @@ static void efr32_soc_init(Object *obj)
     object_initialize_child(obj, "radio-sequencer", &s->seq_armv7m,
                             TYPE_ARMV7M);
     object_initialize_child(obj, "periph", &s->periph, TYPE_EFR32_PERIPH);
+    notifier_list_init(&s->reset_notifiers);
 }
 
 /* efr32bg22c224f512im40.h IRQn_Type. */
@@ -7081,6 +7184,9 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
                                                            0));
         qdev_connect_gpio_out_named(dap, "nreset", 0,
                                     qemu_allocate_irq(efr32_soc_nreset, s, 0));
+        qdev_connect_gpio_out_named(dap, "erase-reset", 0,
+                                    qemu_allocate_irq(efr32_soc_erase_reset,
+                                                      s, 0));
     }
     efr32_rf_medium_attach(s->rf_medium, EFR32_RF_RADIO(&s->periph), errp);
     if (*errp) {
@@ -7243,6 +7349,18 @@ static bool efr32_fits_flash(Efr32Bg22SoCState *soc, uint32_t offset,
                              gsize n)
 {
     return offset <= soc->flash_size && n <= soc->flash_size - offset;
+}
+
+static void efr32_machine_reset(MachineState *m, ResetType type)
+{
+    efr32_machine_reset_socs(&EFR32BG22_MACHINE(m)->soc, 1, type);
+}
+
+static void efr32_dual_machine_reset(MachineState *m, ResetType type)
+{
+    Efr32DualState *s = EFR32BG22_DUAL_MACHINE(m);
+
+    efr32_machine_reset_socs(s->soc, G_N_ELEMENTS(s->soc), type);
 }
 
 static void init(MachineState *m)
@@ -7443,6 +7561,7 @@ static void mc(ObjectClass *o, void *d)
     i->check = idau;
     m->desc = "Silicon Labs EFR32BG22 (Cortex-M33), native peripherals";
     m->init = init;
+    m->reset = efr32_machine_reset;
     m->valid_cpu_types = cpu;
     m->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-m33");
     m->default_ram_size = EFR32_FLASH_MAX_SIZE;
@@ -7664,6 +7783,7 @@ static void dual_mc(ObjectClass *o, void *d)
     i->check = idau;
     m->desc = "EFR32BG22 dual-MCU RF test topology";
     m->init = dual_init;
+    m->reset = efr32_dual_machine_reset;
     m->valid_cpu_types = cpu;
     m->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-m33");
     m->default_ram_size = 2 * EFR32_FLASH_MAX_SIZE;

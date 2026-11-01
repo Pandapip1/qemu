@@ -78,6 +78,7 @@ struct Efr32DapState {
     /* nRESET pin held low by the probe: the SW-DP does not answer */
     bool nreset_asserted;
     qemu_irq nreset_out;    /* to the SoC: pin reset */
+    qemu_irq erase_reset;   /* to the SoC: the reset after a DCI erase */
     /* Debug port wedged by the radio's clock retiming (efr32-dap.c) */
     bool wedged;
 

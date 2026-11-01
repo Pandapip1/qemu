@@ -258,8 +258,15 @@ static void dci_device_erase(Efr32DapState *s)
         address_space_write(&s->ap0_as, off, attrs, buf,
                             MIN(sizeof(buf), size - off));
     }
-    /* "debug should be available again after a reset" (series2.cfg) */
-    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    /*
+     * "debug should be available again after a reset" (series2.cfg): the
+     * part this port belongs to resets (the SoC wires "erase-reset").
+     */
+    if (qemu_irq_is_connected(s->erase_reset)) {
+        qemu_irq_pulse(s->erase_reset);
+    } else {
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    }
 }
 
 static void dci_execute(Efr32DapState *s)
@@ -803,6 +810,7 @@ static void efr32_dap_init(Object *obj)
     qdev_init_gpio_in_named(DEVICE(obj), dap_sysresetreq, "sysresetreq", 1);
     qdev_init_gpio_in_named(DEVICE(obj), dap_debug_wedge, "debug-wedge", 1);
     qdev_init_gpio_out_named(DEVICE(obj), &s->nreset_out, "nreset", 1);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->erase_reset, "erase-reset", 1);
     memory_region_init(&s->dci_root, obj, "efr32-dci-bus", DCI_BUS_SIZE);
     memory_region_init_io(&s->dci_regs, obj, &dci_ops, s, "efr32-dci",
                           DCI_SIZE);
