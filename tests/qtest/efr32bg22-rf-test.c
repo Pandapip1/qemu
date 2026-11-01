@@ -31,6 +31,9 @@ static char *rf_trace_path;
 #define RAC_STATUS_STATE_RXSEARCH (2u << 24)
 #define SYNTH_BASE               0xa8018000
 #define SYNTH_CHCTRL             0x040
+#define SYNTH_FREQ               0x034
+#define SYNTH_FREQ_2402_MHZ      0x01f46aabu
+#define SYNTH_FREQ_2404_MHZ      0x01f4d555u
 #define SYNTH_CHSP               0x044
 #define BUFC_BASE                0xaa000000
 #define BUFC_CH0                 0x00c
@@ -54,6 +57,10 @@ static char *rf_trace_path;
 #define RAC_SEQIEN               0x02c
 #define RAC_STIMER               0x030
 #define RAC_SYEN                 0x15c
+#define RAC_IFADCDBG             0x0e0
+#define RAC_IFADCDBG_IFADCENCLK  (1u << 1)
+#define RAC_RFPATHEN             0x140
+#define RAC_RFPATHEN_LNAMIXEN    (1u << 1)
 #define RAC_CTRL_CPUWAITDIS      (1u << 26)
 #define RAC_STATUS_STATE_SHIFT   24
 #define RAC_STATUS_SEQACTIVE     (1u << 28)
@@ -280,13 +287,12 @@ static void test_tx_offer_requires_matching_synth_channel(void)
     rf_reset_with_clocks();
     qtest_writel(global_qtest, peer_rx_channel + BUFC_CMD, 1);
     qtest_writel(global_qtest, peer_rx_channel, 0);
-    /* Silicon's working RAIL path leaves CHCTRL zero and selects the physical
-     * 2 MHz channel through CHSP.  A differing CHCTRL must not affect the
-     * modeled medium. */
-    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_CHCTRL, 31);
-    qtest_writel(global_qtest, peer(SYNTH_BASE + SYNTH_CHCTRL), 7);
+    /* The carrier is SYNTH.FREQ (f * 2^19 / 38.4 MHz; SS7.80) with CHCTRL zero, as
+     * silicon's working path programs it; CHSP alone does not move it. */
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_FREQ, SYNTH_FREQ_2402_MHZ);
+    qtest_writel(global_qtest, peer(SYNTH_BASE + SYNTH_FREQ), SYNTH_FREQ_2404_MHZ);
     qtest_writel(global_qtest, SYNTH_BASE + SYNTH_CHSP, 10);
-    qtest_writel(global_qtest, peer(SYNTH_BASE + SYNTH_CHSP), 11);
+    qtest_writel(global_qtest, peer(SYNTH_BASE + SYNTH_CHSP), 10);
     qtest_writel(global_qtest,
                  peer(RAC_BASE + RAC_RXENSRCEN + REGISTER_SET_WINDOW),
                  RAC_RXENSRCEN_SWRXEN);
@@ -305,7 +311,7 @@ static void test_tx_offer_requires_matching_synth_channel(void)
                     ==, 0);
 
     qtest_writel(global_qtest, peer(RAC_BASE + RAC_CMD), RAC_CMD_RXDIS);
-    qtest_writel(global_qtest, peer(SYNTH_BASE + SYNTH_CHSP), 10);
+    qtest_writel(global_qtest, peer(SYNTH_BASE + SYNTH_FREQ), SYNTH_FREQ_2402_MHZ);
     qtest_writel(global_qtest,
                  peer(RAC_BASE + RAC_RXENSRCEN + REGISTER_SET_WINDOW),
                  RAC_RXENSRCEN_SWRXEN);
@@ -1272,12 +1278,27 @@ static void rf_stage_tx(uint64_t tx_channel, const uint8_t *bytes,
     }
 }
 
-/* From OFF to RXSEARCH through RXWARM, as on silicon (SS7.72). */
+/*
+ * From OFF to RXSEARCH through RXWARM, as on silicon (SS7.72), with the
+ * receive chain up as the open sequencer's RXWARM leaves it (SS7.80): the
+ * synthesizer started in IF mode, the LNA/mixer on the RF path, the IF ADC
+ * clocked.  A receiver searching without them detects nothing.
+ */
 static void rf_start_rx(uint64_t rac)
 {
+    const uint64_t synth = rac - RAC_BASE + SYNTH_BASE;
+
     qtest_writel(global_qtest, rac + RAC_RXENSRCEN + REGISTER_SET_WINDOW,
                  RAC_RXENSRCEN_SWRXEN);
     g_assert_cmpuint(rf_state(rac), ==, RAC_STATE_RXWARM);
+    qtest_writel(global_qtest, rac + RAC_SYEN, RAC_SYEN_STOCK_TX);
+    qtest_writel(global_qtest, synth + SYNTH_CMD,
+                 SYNTH_CMD_SYNTHSTOP | SYNTH_CMD_ENABLEIF);
+    qtest_writel(global_qtest, synth + SYNTH_CMD, SYNTH_CMD_SYNTHSTART);
+    qtest_writel(global_qtest, rac + RAC_RFPATHEN + REGISTER_SET_WINDOW,
+                 RAC_RFPATHEN_LNAMIXEN);
+    qtest_writel(global_qtest, rac + RAC_IFADCDBG + REGISTER_SET_WINDOW,
+                 RAC_IFADCDBG_IFADCENCLK);
     rf_ack(rac, RAC_STATE_RXWARM);
     g_assert_cmpuint(rf_state(rac), ==, RAC_STATE_RXSEARCH);
 }
@@ -1462,6 +1483,122 @@ static void test_released_tx_turns_around_to_rx(void)
  * counts ~4.8 ticks/us from the RX2TX entry; TX follows the clear by the
  * ack latency, without TXWARM.
  */
+/*
+ * SYNTH.LOCNTSTATUS.BUSY after LOCNTCTRL.RUN lasts 2^(NUMCYCLE + 1) HFXO
+ * periods (fitted to the silicon calibration stamps, SS7.80): 64 periods,
+ * 1.667 us, at NUMCYCLE 5 and 8 periods, 0.208 us, at NUMCYCLE 2.
+ */
+#define SYNTH_LOCNTCTRL          0x088
+#define SYNTH_LOCNTCTRL_RUN      (1u << 2)
+#define SYNTH_LOCNTSTATUS        0x08c
+#define SYNTH_LOCNTSTATUS_BUSY   (1u << 19)
+
+static void rf_locnt_busy_window(uint32_t numcycle, int64_t busy_ns)
+{
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_LOCNTCTRL,
+                 (numcycle << 4) | SYNTH_LOCNTCTRL_RUN);
+    g_assert_cmphex(qtest_readl(global_qtest, SYNTH_BASE + SYNTH_LOCNTSTATUS) &
+                    SYNTH_LOCNTSTATUS_BUSY, ==, SYNTH_LOCNTSTATUS_BUSY);
+    rf_step(busy_ns - 10);
+    g_assert_cmphex(qtest_readl(global_qtest, SYNTH_BASE + SYNTH_LOCNTSTATUS) &
+                    SYNTH_LOCNTSTATUS_BUSY, ==, SYNTH_LOCNTSTATUS_BUSY);
+    rf_step(20);
+    g_assert_cmphex(qtest_readl(global_qtest, SYNTH_BASE + SYNTH_LOCNTSTATUS) &
+                    SYNTH_LOCNTSTATUS_BUSY, ==, 0);
+}
+
+static void test_locnt_busy_window(void)
+{
+    rf_reset_with_clocks();
+    rf_locnt_busy_window(5, 1667);
+    rf_locnt_busy_window(2, 208);
+}
+
+/*
+ * On silicon a receiver opened from OFF without the RXWARM bring-up reached
+ * RXSEARCH with the synthesizer stopped and the receive chain off, and never
+ * detected a frame (SS7.80): RXSEARCH alone does not receive.
+ */
+static void test_released_rx_chain_off_detects_nothing(void)
+{
+    const uint8_t request[] = { 0xc3, 0x02, 0x11, 0x22 };
+    const uint64_t peer_rac = peer(RAC_BASE);
+    const uint64_t peer_rx_channel = peer(BUFC_BASE + BUFC_CH1);
+
+    rf_reset_with_clocks();
+    qtest_writel(global_qtest, peer_rac + RAC_CTRL, RAC_CTRL_CPUWAITDIS);
+    qtest_writel(global_qtest, peer(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW),
+                 FRC_IF_RXDONE | FRC_IF_TXDONE);
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_CMD, 1);
+    qtest_writel(global_qtest, peer_rx_channel, 0);
+    qtest_writel(global_qtest, peer_rac + RAC_RXENSRCEN + REGISTER_SET_WINDOW,
+                 RAC_RXENSRCEN_SWRXEN);
+    rf_ack(peer_rac, RAC_STATE_RXWARM);
+    rf_ack(peer_rac, RAC_STATE_RXSEARCH);
+    g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RXSEARCH);
+
+    rf_stage_tx(BUFC_BASE + BUFC_CH0, request, sizeof(request));
+    qtest_writel(global_qtest, RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+    rf_step(MODEL_RX_EOF_NS(sizeof(request)) + MODEL_RX_DETECT_NS);
+    g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RXSEARCH);
+    g_assert_cmphex(qtest_readl(global_qtest, peer(FRC_BASE + FRC_IF)) &
+                    FRC_IF_RXDONE, ==, 0);
+}
+
+/*
+ * A received frame that does not fit the RX FIFO (SS7.80, silicon): BUFC.IF
+ * channel 1 overflow, no RXDONE, the RAC held in RXOVERFLOW with no state
+ * event latched until FORCEDISABLE, which takes it to SHUTDOWN.
+ */
+#define BUFC_IF_OFFSET           0x114
+#define BUFC_IF_BUF1OF           (1u << 8)
+#define RAC_STATE_RXOVERFLOW     6
+
+static void test_released_rx_fifo_overflow(void)
+{
+    const uint8_t request[] = { 0xc3, 0x02, 0x11, 0x22 };
+    const uint64_t peer_rac = peer(RAC_BASE);
+    const uint64_t peer_rx_channel = peer(BUFC_BASE + BUFC_CH1);
+
+    rf_reset_with_clocks();
+    rf_release_sequencer(peer_rac, peer(SYNTH_BASE));
+    qtest_writel(global_qtest, peer(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW),
+                 FRC_IF_RXDONE | FRC_IF_TXDONE);
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_CMD, 1);
+    qtest_writel(global_qtest, peer_rx_channel, 0);
+    /* 62 of the default 64 octets already held: the 4-octet frame cannot fit. */
+    for (int i = 0; i < 62; i++) {
+        qtest_writel(global_qtest, peer_rx_channel + BUFC_WRITEDATA, 0);
+    }
+    rf_start_rx(peer_rac);
+    rf_ack(peer_rac, RAC_STATE_RXSEARCH);
+
+    rf_stage_tx(BUFC_BASE + BUFC_CH0, request, sizeof(request));
+    qtest_writel(global_qtest, RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+    rf_step(MODEL_RX_DETECT_NS);
+    g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RXFRAME);
+    qtest_writel(global_qtest, peer_rac + RAC_SEQIF + REGISTER_CLEAR_WINDOW,
+                 UINT32_MAX);
+    rf_step(MODEL_RX_EOF_NS(sizeof(request)) - MODEL_RX_DETECT_NS + 1);
+    g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RXOVERFLOW);
+    g_assert_cmphex(qtest_readl(global_qtest, peer(BUFC_BASE + BUFC_IF_OFFSET)) &
+                    BUFC_IF_BUF1OF, ==, BUFC_IF_BUF1OF);
+    g_assert_cmphex(qtest_readl(global_qtest, peer(FRC_BASE + FRC_IF)) &
+                    FRC_IF_RXDONE, ==, 0);
+    g_assert_cmphex(rf_status(peer_rac) & RAC_STATUS_SEQACTIVE, ==, 0);
+
+    /* RXDIS and withdrawing SWRXEN leave it there. */
+    qtest_writel(global_qtest, peer_rac + RAC_CMD, RAC_CMD_RXDIS);
+    qtest_writel(global_qtest, peer_rac + RAC_RXENSRCEN + REGISTER_CLEAR_WINDOW,
+                 RAC_RXENSRCEN_SWRXEN);
+    rf_step(ACK_TO_TRANSITION_NS * 4);
+    g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RXOVERFLOW);
+
+    qtest_writel(global_qtest, peer_rac + RAC_CTRL + REGISTER_SET_WINDOW,
+                 RAC_CTRL_FORCEDISABLE);
+    g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_SHUTDOWN);
+}
+
 static void test_released_rx_frame_turns_around_to_tx(void)
 {
     const uint8_t request[] = { 0xc3, 0x02, 0x11, 0x22 };
@@ -1754,6 +1891,11 @@ int main(int argc, char **argv)
                    test_bidirectional_rac_txen_after_rx);
     qtest_add_func("/efr32bg22/rf/released-tx-turns-around-to-rx",
                    test_released_tx_turns_around_to_rx);
+    qtest_add_func("/efr32bg22/rf/locnt-busy-window", test_locnt_busy_window);
+    qtest_add_func("/efr32bg22/rf/released-rx-fifo-overflow",
+                   test_released_rx_fifo_overflow);
+    qtest_add_func("/efr32bg22/rf/released-rx-chain-off-detects-nothing",
+                   test_released_rx_chain_off_detects_nothing);
     qtest_add_func("/efr32bg22/rf/released-rx-frame-turns-around-to-tx",
                    test_released_rx_frame_turns_around_to_tx);
     qtest_add_func("/efr32bg22/rf/released-rx-frame-end-alternatives",
