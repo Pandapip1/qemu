@@ -32,6 +32,11 @@ struct SWDTargetClass {
     void (*clock)(SWDTarget *t, bool host_drives, bool host_bit);
     /* Target supply voltage at the debug connector's VTref pin, in mV. */
     uint32_t (*vtref_mv)(SWDTarget *t);
+    /*
+     * The probe drives the debug connector's nRESET pin low (@asserted) or
+     * releases it.  Optional: a target without a reset line leaves it NULL.
+     */
+    void (*set_nreset)(SWDTarget *t, bool asserted);
 };
 
 /* One SWCLK cycle: sample SWDIO, then clock the rising edge. */
@@ -48,6 +53,15 @@ static inline bool swd_target_cycle(SWDTarget *t, bool host_drives,
 static inline uint32_t swd_target_vtref_mv(SWDTarget *t)
 {
     return SWD_TARGET_GET_CLASS(t)->vtref_mv(t);
+}
+
+static inline void swd_target_set_nreset(SWDTarget *t, bool asserted)
+{
+    SWDTargetClass *k = SWD_TARGET_GET_CLASS(t);
+
+    if (k->set_nreset) {
+        k->set_nreset(t, asserted);
+    }
 }
 
 #endif

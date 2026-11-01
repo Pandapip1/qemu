@@ -178,6 +178,66 @@ static void dap_sysresetreq(void *opaque, int n, int level)
     }
 }
 
+/*
+ * The debug-port wedge (silicon, owo-open-fw docs/radio-tables.md SS7.80
+ * and TODO.md, EK, 2026-10-31): an image whose sequencer enabled RAC clock
+ * retiming (XORETIMECTRL and DIGCLKRETIMECTRL ENRETIME, stock's RXSEARCH
+ * limits) left the debug port wedged within milliseconds of every boot:
+ * DPIDR still read 0x6ba02477, but debug power-up, the AHB-AP and the SE's
+ * DCI AP no longer answered.  It came back after every pin reset (the image
+ * enabled retiming again at its first scan window); in the window after
+ * nRESET was released the AHB-AP answered (scratch/silicon-rx/
+ * recover2-fpb3.log: DHCSR halt and an FPB comparator armed on the third
+ * back-to-back attempt, core halted, recovery done).
+ *
+ * The mechanism is unknown.  Modelled is what a probe sees: DPIDR, CTRL/STAT
+ * and the other DP registers still answer; CDBGPWRUPACK/CSYSPWRUPACK never
+ * follow their requests; every AP access, AP0 and AP1 alike, is refused.
+ * [I] The refusal is a FAULT with STICKYERR, as for a powered-down debug
+ * domain; the real ack was not recorded.  [I] Once wedged, the port stays
+ * wedged until a reset (the SoC's RAC is reset with it), whatever the
+ * firmware writes afterwards; unmeasured.  The SoC decides when the wedge
+ * starts (efr32bg22.c, efr32_rac_retime_update).
+ */
+static void dap_debug_wedge(void *opaque, int n, int level)
+{
+    Efr32DapState *s = opaque;
+
+    if (level) {
+        s->wedged = true;
+    }
+}
+
+/*
+ * nRESET held low by the probe: the SW-DP does not answer at all.  OpenOCD
+ * reported "Error connecting DP: cannot read IDR" with nRESET held by the
+ * reset button (scratch/recover-step1.log) and by the J-Link
+ * (recover2-srsttest.log, recover2-auto.log, recover2-fpb2.log,
+ * recover2-fpb3.log), on the EK; docs/hardware-bringup.md: SWD disappears
+ * while reset is asserted.  [I] The DP comes out of the hold as after
+ * power-up: SWJ-DP in JTAG mode, DP registers cleared, so a probe selects
+ * SWD and line-resets again (OpenOCD's dap init does both).
+ */
+static void efr32_dap_set_nreset(SWDTarget *t, bool asserted)
+{
+    Efr32DapState *s = EFR32_DAP(t);
+
+    if (asserted == s->nreset_asserted) {
+        return;
+    }
+    s->nreset_asserted = asserted;
+    if (asserted) {
+        s->phase = EFR32_SWD_JTAG;
+        s->select_shift = 0;
+        s->ones = 0;
+        s->ctrl_stat = 0;
+        s->select = 0;
+        s->rdbuff = 0;
+        s->awaiting_dpidr = false;
+    }
+    qemu_set_irq(s->nreset_out, asserted);
+}
+
 /* --- DCI ------------------------------------------------------------- */
 
 static void dci_respond(Efr32DapState *s, const uint32_t *words, unsigned n)
@@ -397,6 +457,10 @@ static uint32_t dap_ctrl_stat(Efr32DapState *s)
 {
     uint32_t value = s->ctrl_stat;
 
+    /* Wedged: debug power-up no longer answers (dap_debug_wedge) */
+    if (s->wedged) {
+        return value;
+    }
     /* Power and reset acknowledges follow their requests at once */
     if (value & CTRL_CDBGPWRUPREQ) {
         value |= CTRL_CDBGPWRUPACK;
@@ -425,7 +489,8 @@ static unsigned dap_ap_reg(Efr32DapState *s, unsigned a)
 /* An AP access cannot start: FAULT and STICKYERR (ADIv5.2 B4.2.3). */
 static bool dap_ap_unavailable(Efr32DapState *s)
 {
-    if (!(s->ctrl_stat & CTRL_CDBGPWRUPREQ) || dap_ap_blocked(s)) {
+    if (!(s->ctrl_stat & CTRL_CDBGPWRUPREQ) || dap_ap_blocked(s) ||
+        s->wedged) {
         s->ctrl_stat |= CTRL_STICKYERR;
         return true;
     }
@@ -593,6 +658,10 @@ static bool efr32_dap_peek(SWDTarget *t, bool host_drives, bool host_bit)
 {
     Efr32DapState *s = EFR32_DAP(t);
 
+    if (s->nreset_asserted) {
+        /* Held in reset: the target never drives SWDIO */
+        return host_drives ? host_bit : true;
+    }
     if (s->phase == EFR32_SWD_ACK) {
         return (s->ack >> s->bit_index) & 1;
     }
@@ -609,6 +678,9 @@ static void efr32_dap_clock(SWDTarget *t, bool host_drives, bool host_bit)
     bool bit = host_drives ? host_bit : true;
     bool rnw;
 
+    if (s->nreset_asserted) {
+        return;
+    }
     if (!swd_target_drives(s) && host_drives) {
         s->ones = host_bit ? s->ones + 1 : 0;
     }
@@ -716,6 +788,8 @@ static void efr32_dap_reset_hold(Object *obj, ResetType type)
         s->blackout_until_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                                s->sysreset_blackout_ns;
     }
+    /* The wedge does not survive the reset (dap_debug_wedge) */
+    s->wedged = false;
     /* The Secure Engine reboots: its mailbox is empty again */
     s->dci_cmd_words = 0;
     s->dci_resp_len = 0;
@@ -727,6 +801,8 @@ static void efr32_dap_init(Object *obj)
     Efr32DapState *s = EFR32_DAP(obj);
 
     qdev_init_gpio_in_named(DEVICE(obj), dap_sysresetreq, "sysresetreq", 1);
+    qdev_init_gpio_in_named(DEVICE(obj), dap_debug_wedge, "debug-wedge", 1);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->nreset_out, "nreset", 1);
     memory_region_init(&s->dci_root, obj, "efr32-dci-bus", DCI_BUS_SIZE);
     memory_region_init_io(&s->dci_regs, obj, &dci_ops, s, "efr32-dci",
                           DCI_SIZE);
@@ -783,6 +859,7 @@ static void efr32_dap_class_init(ObjectClass *oc, void *data)
     swd->peek = efr32_dap_peek;
     swd->clock = efr32_dap_clock;
     swd->vtref_mv = efr32_dap_vtref_mv;
+    swd->set_nreset = efr32_dap_set_nreset;
 }
 
 static const TypeInfo efr32_dap_types[] = {

@@ -261,16 +261,17 @@ static void mem_write(Swd *s, unsigned ap, uint32_t addr, uint32_t v)
     dp_read(s, DP_CTRL_STAT);
 }
 
-static Swd *swd_start(void)
+static Swd *swd_start_with(const char *extra)
 {
     Swd *s = g_new0(Swd, 1);
     g_autofree char *dir = g_dir_make_tmp("efr32-dap-XXXXXX", NULL);
     g_autofree char *path = g_build_filename(dir, "swd", NULL);
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
 
-    s->qts = qtest_initf("-machine efr32bg22 "
+    s->qts = qtest_initf("-machine efr32bg22 %s "
                          "-chardev socket,id=swd,path=%s,server=on,wait=off "
-                         "-device swd-remote-bitbang,chardev=swd", path);
+                         "-device swd-remote-bitbang,chardev=swd", extra,
+                         path);
     s->fd = socket(AF_UNIX, SOCK_STREAM, 0);
     g_assert_cmpint(s->fd, >=, 0);
     pstrcpy(addr.sun_path, sizeof(addr.sun_path), path);
@@ -282,6 +283,11 @@ static Swd *swd_start(void)
     s->drive = false;   /* the probe has not driven SWDIO yet */
     swd_connect(s);
     return s;
+}
+
+static Swd *swd_start(void)
+{
+    return swd_start_with("");
 }
 
 static void swd_power_up(Swd *s)
@@ -617,6 +623,166 @@ static void test_msc_program(void)
     swd_end(s);
 }
 
+/*
+ * nRESET and the debug-port wedge (owo-open-fw docs/radio-tables.md SS7.80,
+ * scratch/silicon-rx/recover2*.log, scratch/recover-step1.log).
+ */
+#define RBB_SRST_ASSERT 's'     /* 'r' + (TRST << 1 | SRST) */
+#define RBB_SRST_RELEASE 'r'
+#define EMU_RSTCAUSE_PIN (1u << 1)
+#define CMU_BASE 0x40008000
+#define CMU_SYSCLKCTRL 0x070
+#define CMU_SYSCLKCTRL_HFXO 3u
+#define CMU_CLKEN1 0x068
+#define CMU_CLKEN1_RAC (1u << 5)
+#define CMU_RADIOCLKCTRL 0x280
+#define CMU_RADIOCLKCTRL_EN 1u
+#define REGISTER_SET_WINDOW 0x1000
+#define RAC_BASE 0xa8020000
+#define RAC_DIGCLKRETIMECTRL 0x16c
+#define RAC_XORETIMECTRL 0x174
+#define RAC_RETIME_ENRETIME 1u
+
+static void swd_nreset(Swd *s, bool asserted)
+{
+    char c;
+
+    g_string_append_c(s->out, asserted ? RBB_SRST_ASSERT : RBB_SRST_RELEASE);
+    /* The sample's reply proves the probe has acted on the reset byte. */
+    g_string_append_c(s->out, RBB_SAMPLE);
+    swd_flush(s);
+    g_assert_cmpint(read(s->fd, &c, 1), ==, 1);
+    /* qtest round trips let the main loop perform the requested reset. */
+    qtest_readl(s->qts, EMU_RSTCAUSE);
+    qtest_readl(s->qts, EMU_RSTCAUSE);
+}
+
+/* The open image's sequencer enabling RAC clock retiming (SS7.80). */
+static void enable_retime(Swd *s)
+{
+    qtest_writel(s->qts, CMU_BASE + CMU_RADIOCLKCTRL + REGISTER_SET_WINDOW,
+                 CMU_RADIOCLKCTRL_EN);
+    qtest_writel(s->qts, CMU_BASE + CMU_CLKEN1 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN1_RAC);
+    qtest_writel(s->qts, RAC_BASE + RAC_XORETIMECTRL, RAC_RETIME_ENRETIME);
+    qtest_writel(s->qts, RAC_BASE + RAC_DIGCLKRETIMECTRL, RAC_RETIME_ENRETIME);
+}
+
+/* With nRESET held the SW-DP does not answer at all (silicon, EK). */
+static void test_nreset_holds_dp_silent(void)
+{
+    Swd *s = swd_start();
+    uint32_t v = 0;
+
+    swd_power_up(s);
+    qtest_writel(s->qts, EMU_CMD, EMU_CMD_RSTCAUSECLR);
+    swd_nreset(s, true);
+    swd_connect(s);
+    g_assert_cmpuint(swd_transfer(s, false, true, DP_DPIDR, &v), ==,
+                     SWD_NO_ACK);
+    swd_nreset(s, false);
+    swd_connect(s);
+    swd_power_up(s);
+    g_assert_cmphex(mem_read(s, AP_M33, CPUID), ==, EFR32_M33_CPUID);
+    g_assert_true(qtest_readl(s->qts, EMU_RSTCAUSE) & EMU_RSTCAUSE_PIN);
+    swd_end(s);
+}
+
+/*
+ * While nRESET is held the M33 does not run; on release it starts from its
+ * reset vector.  The core counts in SRAM: ldr r0, =counter; loop: ldr r1,
+ * [r0]; adds r1, #1; str r1, [r0]; b loop.
+ */
+#define HOLD_COUNTER (SRAM_BASE + 0x1000)
+
+static uint32_t hold_counter_after(Swd *s, unsigned ms)
+{
+    g_usleep(ms * 1000);
+    return qtest_readl(s->qts, HOLD_COUNTER);
+}
+
+static void test_nreset_holds_core(void)
+{
+    Swd *s = swd_start_with("-accel tcg -S");
+    uint32_t a;
+
+    qtest_writel(s->qts, 0x0, 0x20008000);
+    qtest_writel(s->qts, 0x4, 0x101);
+    qtest_writel(s->qts, 0x100, 0x68014802);    /* ldr r0,[pc,#8]; ldr r1 */
+    qtest_writel(s->qts, 0x104, 0x60013101);    /* adds r1,#1; str r1 */
+    qtest_writel(s->qts, 0x108, 0xbf00e7fb);    /* b loop; nop */
+    qtest_writel(s->qts, 0x10c, HOLD_COUNTER);
+    swd_nreset(s, true);
+    qtest_writel(s->qts, HOLD_COUNTER, 0);
+    qtest_qmp_assert_success(s->qts, "{'execute':'cont'}");
+    g_assert_cmpuint(hold_counter_after(s, 50), ==, 0);
+    swd_nreset(s, false);
+    for (unsigned i = 0; i < 5000 && !qtest_readl(s->qts, HOLD_COUNTER); i++) {
+        g_usleep(1000);
+    }
+    a = qtest_readl(s->qts, HOLD_COUNTER);
+    g_assert_cmpuint(a, !=, 0);
+    g_assert_cmpuint(hold_counter_after(s, 20), !=, a);
+    swd_end(s);
+}
+
+/*
+ * The wedge: DPIDR answers, debug power-up never acknowledges, the AHB-AP
+ * and the DCI AP refuse every access -- and stay so whatever the firmware
+ * does next -- until a pin reset; then the port answers again.
+ */
+static void test_retime_wedges_debug_port(void)
+{
+    Swd *s = swd_start();
+    uint32_t v = 0;
+
+    swd_power_up(s);
+    enable_retime(s);
+    g_assert_cmphex(dp_read(s, DP_DPIDR), ==, EFR32_DPIDR);
+    dp_write(s, DP_CTRL_STAT, CTRL_CSYSPWRUPREQ | CTRL_CDBGPWRUPREQ);
+    v = dp_read(s, DP_CTRL_STAT);
+    g_assert_false(v & CTRL_CDBGPWRUPACK);
+    g_assert_false(v & CTRL_CSYSPWRUPACK);
+    ap_select(s, AP_M33, AP_IDR);
+    g_assert_cmpuint(swd_transfer(s, true, true, AP_IDR, &v), ==,
+                     SWD_ACK_FAULT);
+    dp_write(s, DP_ABORT, ABORT_STKERRCLR);
+    ap_select(s, AP_DCI, AP_IDR);
+    g_assert_cmpuint(swd_transfer(s, true, true, AP_IDR, &v), ==,
+                     SWD_ACK_FAULT);
+    dp_write(s, DP_ABORT, ABORT_STKERRCLR);
+
+    /* Retiming withdrawn: still wedged. */
+    qtest_writel(s->qts, RAC_BASE + RAC_XORETIMECTRL, 0);
+    ap_select(s, AP_M33, AP_IDR);
+    g_assert_cmpuint(swd_transfer(s, true, true, AP_IDR, &v), ==,
+                     SWD_ACK_FAULT);
+    dp_write(s, DP_ABORT, ABORT_STKERRCLR);
+
+    /* Recovery: a J-Link-driven pin reset; attach in the window after it. */
+    swd_nreset(s, true);
+    swd_nreset(s, false);
+    swd_connect(s);
+    swd_power_up(s);
+    g_assert_cmphex(ap_read(s, AP_M33, AP_IDR), ==, EFR32_AHBAP_IDR);
+    mem_write(s, AP_M33, DHCSR, DBGKEY_C_HALT);
+    g_assert_true(wait_dhcsr(s, DHCSR_S_HALT) & DHCSR_S_HALT);
+    swd_end(s);
+}
+
+/* Stock enables retiming with SYSCLK on the HFXO and stays debuggable. */
+static void test_retime_on_hfxo_sysclk_keeps_debug_port(void)
+{
+    Swd *s = swd_start();
+
+    swd_power_up(s);
+    qtest_writel(s->qts, CMU_BASE + CMU_SYSCLKCTRL, CMU_SYSCLKCTRL_HFXO);
+    enable_retime(s);
+    g_assert_cmphex(ap_read(s, AP_M33, AP_IDR), ==, EFR32_AHBAP_IDR);
+    g_assert_true(dp_read(s, DP_CTRL_STAT) & CTRL_CDBGPWRUPACK);
+    swd_end(s);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -633,5 +799,12 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/dap/wdog-frozen-in-debug",
                    test_wdog_frozen_in_debug);
     qtest_add_func("/efr32bg22/dap/wdog-debugrun", test_wdog_debugrun);
+    qtest_add_func("/efr32bg22/dap/nreset-holds-dp-silent",
+                   test_nreset_holds_dp_silent);
+    qtest_add_func("/efr32bg22/dap/nreset-holds-core", test_nreset_holds_core);
+    qtest_add_func("/efr32bg22/dap/retime-wedges-debug-port",
+                   test_retime_wedges_debug_port);
+    qtest_add_func("/efr32bg22/dap/retime-on-hfxo-sysclk-keeps-debug-port",
+                   test_retime_on_hfxo_sysclk_keeps_debug_port);
     return g_test_run();
 }

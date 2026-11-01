@@ -483,6 +483,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_EMU_CMD_RSTCAUSECLR (1u << 17)
 #define EFR32_EMU_RSTCAUSE 0x094u
 #define EFR32_EMU_RSTCAUSE_POR (1u << 0)
+#define EFR32_EMU_RSTCAUSE_PIN (1u << 1)
 #define EFR32_EMU_RSTCAUSE_SYSREQ (1u << 6)
 
 /*
@@ -798,6 +799,8 @@ struct Efr32Periph
     uint32_t iadc_stall;
     /* TIMERn CCm compare/PWM outputs, to the GPIO routes. */
     qemu_irq timer_cc_out[5 * 3];
+    /* To the debug port: RAC clock retiming wedges it (SS7.80) */
+    qemu_irq debug_wedge;
     bool timer_cc_level[5][3];
     QEMUTimer *timer_pwm[5];
     /* TOPB (EFR32_TIMER_BUF_TOPB) and OCBn (bit n) awaiting the overflow. */
@@ -5138,6 +5141,40 @@ static uint64_t efr32_peripheral_read(Efr32Periph *s, uint32_t address,
     return extract32(efr32_peripheral_read_word(s, address & ~3u),
                      (address & 3) * 8, size * 8);
 }
+/*
+ * RAC clock retiming and the debug port (silicon, owo-open-fw
+ * docs/radio-tables.md SS7.80, TODO.md): with XORETIMECTRL.XORETIMEENRETIME
+ * and DIGCLKRETIMECTRL.DIGCLKRETIMEENRETIME (bit 0 of each, public RAC_S
+ * field model) enabled by the open sequencer in its RX tune, with stock's
+ * RXSEARCH limit fields, the EK's debug port wedged within milliseconds of
+ * every boot (efr32-dap.c dap_debug_wedge has what a probe sees).  The
+ * mechanism is unknown.  [I] The trigger is the observed configuration:
+ * both ENRETIME bits set while SYSCLK is not the HFXO -- the open image runs
+ * SYSCLK from HFRCODPLL (76.8 MHz); stock, which clears ENRETIME itself
+ * (fn_0xa76, SS7.7) and so also enables it, runs SYSCLK from the HFXO and
+ * stays debuggable (AP3 captures of stock in RX, SS7.64), and SS7.80 names
+ * that clock as the remaining difference.  The limit fields are not part of
+ * the trigger (only stock's values were tried).  [I] The wedge starts at the
+ * write; "within milliseconds" was not resolved further.
+ */
+#define EFR32_RAC_DIGCLKRETIMECTRL 0x16cu
+#define EFR32_RAC_XORETIMECTRL 0x174u
+#define EFR32_RAC_RETIME_ENRETIME (1u << 0)
+
+static void efr32_rac_retime_update(Efr32Periph *s)
+{
+    bool retime =
+        (efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_DIGCLKRETIMECTRL) &
+         EFR32_RAC_RETIME_ENRETIME) &&
+        (efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_XORETIMECTRL) &
+         EFR32_RAC_RETIME_ENRETIME);
+    bool sysclk_hfxo =
+        (efr32_register_get(s, EFR32_CMU_BASE + EFR32_CMU_SYSCLKCTRL) &
+         EFR32_CMU_SYSCLKCTRL_CLKSEL_MASK) == EFR32_CMU_SYSCLKCTRL_CLKSEL_HFXO;
+
+    qemu_set_irq(s->debug_wedge, retime && !sysclk_hfxo);
+}
+
 static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
                                    uint64_t value, unsigned size)
 {
@@ -5615,6 +5652,13 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
     {
         efr32_bufc_update_threshold(s, channel);
     }
+
+    if (register_address == EFR32_RAC_BASE + EFR32_RAC_DIGCLKRETIMECTRL ||
+        register_address == EFR32_RAC_BASE + EFR32_RAC_XORETIMECTRL ||
+        register_address == EFR32_CMU_BASE + EFR32_CMU_SYSCLKCTRL)
+    {
+        efr32_rac_retime_update(s);
+    }
 }
 /*
  * Bus clock gating, measured on silicon by clearing one CMU enable at a time
@@ -6055,6 +6099,7 @@ static void efr32_periph_init(Object *o)
                                  OBJ_PROP_FLAG_READWRITE);
     qdev_init_gpio_out_named(DEVICE(o), s->timer_cc_out, "timer-cc",
                              ARRAY_SIZE(s->timer_cc_out));
+    qdev_init_gpio_out_named(DEVICE(o), &s->debug_wedge, "debug-wedge", 1);
     s->dpll_lock_timer =
         timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_dpll_lock_expired, s);
     s->rac_tx_timer =
@@ -6618,6 +6663,26 @@ static void efr32_soc_sysresetreq(void *opaque, int n, int level)
 }
 
 /*
+ * The RESETn pin, driven by the debug probe's nRESET (efr32-dap "nreset"):
+ * RM 12.3.x "RESET pin Reset", EMU_RSTCAUSE.PIN (RM 12.5.15 bit 1).  While
+ * the pin is low the part is held in reset: the M33 does not run (the M0+ is
+ * held after any reset until released by the RAC), and the SW-DP does not
+ * answer (efr32-dap.c).  Release starts the part from its reset vector, as
+ * the J-Link SRST pulse on the EK did (one fresh boot banner,
+ * scratch/silicon-rx/recover2-srsttest.log).
+ */
+static void efr32_soc_nreset(void *opaque, int n, int level)
+{
+    Efr32Bg22SoCState *s = opaque;
+
+    if (level) {
+        s->periph.rstcause |= EFR32_EMU_RSTCAUSE_PIN;
+    }
+    CPU(s->armv7m.cpu)->start_powered_off = level;
+    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+}
+
+/*
  * The M0+'s view of the secure peripheral window 0x40000000-0x4fffffff
  * (docs/radio-tables.md SS7.74, measured): no fault, and TIMER1.CNT at
  * 0x4004C024 reads 0 while the same register at 0x5004C024 counts.
@@ -6798,6 +6863,16 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
         DEVICE(object_resolve_path_component(OBJECT(s), "m33-debug")),
         "halted", 0,
         qdev_get_gpio_in_named(DEVICE(&s->periph), "m33-debug-halted", 0));
+    {
+        DeviceState *dap =
+            DEVICE(object_resolve_path_component(OBJECT(s), "dap"));
+
+        qdev_connect_gpio_out_named(DEVICE(&s->periph), "debug-wedge", 0,
+                                    qdev_get_gpio_in_named(dap, "debug-wedge",
+                                                           0));
+        qdev_connect_gpio_out_named(dap, "nreset", 0,
+                                    qemu_allocate_irq(efr32_soc_nreset, s, 0));
+    }
     efr32_rf_medium_attach(s->rf_medium, EFR32_RF_RADIO(&s->periph), errp);
     if (*errp) {
         return;

@@ -575,11 +575,22 @@ static void jlink_execute(JLinkState *s, const uint8_t *c)
     case JL_CMD_HW_IO_V3:
         jlink_hw_io(s, c);
         break;
-    default:
+    case JL_CMD_CLEAR_RESET:
         /*
-         * Reset lines (no nRESET is wired on the EK) and target power (not
-         * advertised): accepted, no reply.
+         * libjaylink jaylink_clear_reset(): nRESET low.  The EK's J-Link OB
+         * drives the target's nRESET: a 100 ms SRST pulse from OpenOCD gave
+         * one fresh boot banner on the VCOM (owo-open-fw
+         * scratch/silicon-rx/recover2-srsttest.log, docs/debug-port-model.md).
          */
+        swd_target_set_nreset(s->target, true);
+        break;
+    case JL_CMD_SET_RESET:
+        /* jaylink_set_reset(): nRESET released (high). */
+        swd_target_set_nreset(s->target, false);
+        break;
+    default:
+        /* TRST (JTAG is not wired) and target power (not advertised):
+         * accepted, no reply. */
         break;
     }
 }

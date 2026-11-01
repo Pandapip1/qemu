@@ -10,8 +10,11 @@
  *   'O' / 'o' the probe drives / releases SWDIO
  *   'c'       sample SWDIO, answered with '0' or '1'
  *   'R'       sample TDO (JTAG; answered '0', JTAG is not wired)
- *   'B' 'b' '0'..'7' 'r'..'u' 'Z' 'z' 'Q'  LEDs, JTAG pins, resets, sleep,
- *             quit: accepted and ignored (no SRST is wired, as on the EK)
+ *   'r'..'u'  resets: 'r' + (TRST << 1 | SRST), 1 = asserted; SRST drives
+ *             the target's nRESET (the EK's J-Link OB drives it too), TRST
+ *             is ignored (JTAG is not wired)
+ *   'B' 'b' '0'..'7' 'Z' 'z' 'Q'  LEDs, JTAG pins, sleep, quit: accepted
+ *             and ignored
  *
  * Copyright (c) 2026 Gavin John
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -36,6 +39,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(SwdRemoteBitbangState, SWD_REMOTE_BITBANG)
 #define RBB_SWDIO_RELEASE 'o'
 #define RBB_SWDIO_READ 'c'
 #define RBB_TDO_READ 'R'
+#define RBB_RESET_FIRST 'r'
+#define RBB_RESET_LAST 'u'
+#define RBB_RESET_SRST (1u << 0)
 #define RBB_REPLY_LOW '0'
 #define RBB_REPLY_HIGH '1'
 #define RBB_RX_CHUNK 4096
@@ -83,6 +89,9 @@ static void rbb_receive(void *opaque, const uint8_t *buf, int size)
                          RBB_REPLY_HIGH : RBB_REPLY_LOW;
         } else if (c == RBB_TDO_READ) {
             reply[n++] = RBB_REPLY_LOW;
+        } else if (c >= RBB_RESET_FIRST && c <= RBB_RESET_LAST) {
+            swd_target_set_nreset(s->target,
+                                  (c - RBB_RESET_FIRST) & RBB_RESET_SRST);
         }
     }
     if (n) {
