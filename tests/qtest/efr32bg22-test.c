@@ -3613,6 +3613,116 @@ static void test_radio_sequencer_release_is_idempotent(void)
     qtest_quit(qts);
 }
 
+/*
+ * RADIOAES (RM 11.4; descriptor format of Silicon Labs'
+ * sli_protocol_crypto_radioaes.c): one AES-ECB block through the
+ * scatter-gather DMA.  Run time on silicon (owo-open-fw docs/crypto.md SS4,
+ * HCLK 76.8 MHz): ECB 1 block 133 cycles = 80 + 55 per block, so the DMA
+ * reports busy for 1042 + 716 ns.  The engine has 128- and 256-bit keys
+ * only (BA411E_HW_CFG_1.g_Keysize = 5 read on silicon): a 192-bit operation
+ * is reported, not computed.
+ */
+#define RADIOAES_BASE          0x44000000
+#define RADIOAES_FETCHADDR     0x000
+#define RADIOAES_PUSHADDR      0x010
+#define RADIOAES_IF            0x028
+#define RADIOAES_CTRL          0x034
+#define RADIOAES_CMD           0x038
+#define RADIOAES_STATUS        0x03c
+#define RADIOAES_HW_CFG_1      0x404
+#define RADIOAES_CTRL_SG       0x3        /* fetcher + pusher scatter-gather */
+#define RADIOAES_CMD_START     0x3        /* start fetcher + pusher */
+#define RADIOAES_STATUS_BUSY   0x3
+#define RADIOAES_IF_STOPPED    0x12       /* FETCHERSTOPPED | PUSHERSTOPPED */
+#define RADIOAES_DESC_STOP     0x1
+#define RADIOAES_TAG_CONFIG    0x11       /* BA411E, configuration, offset 0 */
+#define RADIOAES_TAG_LASTDATA  0x21       /* BA411E, last data */
+#define RADIOAES_MODE_ECB      0x100
+#define RADIOAES_MODE_AES192   0x8
+#define RADIOAES_ECB_1BLOCK_NS (1042 + 716)
+#define AES_SRAM               0x20001000
+#define AES_CFG                (AES_SRAM + 0x000) /* mode, 0, key */
+#define AES_IN                 (AES_SRAM + 0x040)
+#define AES_OUT                (AES_SRAM + 0x080)
+#define AES_FETCH              (AES_SRAM + 0x100) /* two descriptors */
+#define AES_PUSH               (AES_SRAM + 0x120)
+
+static void radioaes_ecb(QTestState *qts, uint32_t mode, const uint8_t *key,
+                         size_t keylen, const uint8_t *in)
+{
+    qtest_writel(qts, AES_CFG, mode);
+    qtest_writel(qts, AES_CFG + 4, 0);
+    qtest_memwrite(qts, AES_CFG + 8, key, keylen);
+    qtest_memwrite(qts, AES_IN, in, 16);
+    qtest_memset(qts, AES_OUT, 0xa5, 16);
+    /* Fetch: the configuration, then the block; push: the block. */
+    qtest_writel(qts, AES_FETCH + 0x0, AES_CFG);
+    qtest_writel(qts, AES_FETCH + 0x4, AES_FETCH + 0x10);
+    qtest_writel(qts, AES_FETCH + 0x8, 8 + keylen);
+    qtest_writel(qts, AES_FETCH + 0xc, RADIOAES_TAG_CONFIG);
+    qtest_writel(qts, AES_FETCH + 0x10, AES_IN);
+    qtest_writel(qts, AES_FETCH + 0x14, RADIOAES_DESC_STOP);
+    qtest_writel(qts, AES_FETCH + 0x18, 16);
+    qtest_writel(qts, AES_FETCH + 0x1c, RADIOAES_TAG_LASTDATA);
+    qtest_writel(qts, AES_PUSH + 0x0, AES_OUT);
+    qtest_writel(qts, AES_PUSH + 0x4, RADIOAES_DESC_STOP);
+    qtest_writel(qts, AES_PUSH + 0x8, 16);
+    qtest_writel(qts, AES_PUSH + 0xc, 0);
+    qtest_writel(qts, RADIOAES_BASE + RADIOAES_FETCHADDR, AES_FETCH);
+    qtest_writel(qts, RADIOAES_BASE + RADIOAES_PUSHADDR, AES_PUSH);
+    qtest_writel(qts, RADIOAES_BASE + RADIOAES_CTRL, RADIOAES_CTRL_SG);
+    qtest_writel(qts, RADIOAES_BASE + RADIOAES_CMD, RADIOAES_CMD_START);
+}
+
+static void test_radioaes_ecb_and_key_sizes(void)
+{
+    /* FIPS-197 Appendix C.1 (AES-128) and C.2 (AES-192). */
+    static const uint8_t key[24] = {
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+    };
+    static const uint8_t plain[16] = {
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+    };
+    static const uint8_t cipher128[16] = {
+        0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30,
+        0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4, 0xc5, 0x5a,
+    };
+    static const uint8_t cipher192[16] = {
+        0xdd, 0xa9, 0x7c, 0xa4, 0x86, 0x4c, 0xdf, 0xe0,
+        0x6e, 0xaf, 0x70, 0xa0, 0xec, 0x0d, 0x71, 0x91,
+    };
+    static const uint8_t zero[16];
+    QTestState *qts = qtest_init("-machine efr32bg22 -accel qtest");
+    uint8_t out[16];
+
+    g_assert_cmphex(qtest_readl(qts, RADIOAES_BASE + RADIOAES_HW_CFG_1), ==,
+                    0x05010127);
+    radioaes_ecb(qts, RADIOAES_MODE_ECB, key, 16, plain);
+    g_assert_cmphex(qtest_readl(qts, RADIOAES_BASE + RADIOAES_STATUS), ==,
+                    RADIOAES_STATUS_BUSY);
+    qtest_clock_step(qts, RADIOAES_ECB_1BLOCK_NS - 1);
+    g_assert_cmphex(qtest_readl(qts, RADIOAES_BASE + RADIOAES_STATUS), ==,
+                    RADIOAES_STATUS_BUSY);
+    qtest_clock_step(qts, 1);
+    g_assert_cmphex(qtest_readl(qts, RADIOAES_BASE + RADIOAES_STATUS), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, RADIOAES_BASE + RADIOAES_IF) &
+                    RADIOAES_IF_STOPPED, ==, RADIOAES_IF_STOPPED);
+    qtest_memread(qts, AES_OUT, out, sizeof(out));
+    g_assert_cmpmem(out, sizeof(out), cipher128, sizeof(cipher128));
+
+    /* No 192-bit keys: nothing computed (the push delivers zeros). */
+    radioaes_ecb(qts, RADIOAES_MODE_ECB | RADIOAES_MODE_AES192, key, 24,
+                 plain);
+    qtest_clock_step(qts, RADIOAES_ECB_1BLOCK_NS);
+    qtest_memread(qts, AES_OUT, out, sizeof(out));
+    g_assert(memcmp(out, cipher192, sizeof(out)) != 0);
+    g_assert_cmpmem(out, sizeof(out), zero, sizeof(zero));
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     int result;
@@ -3649,6 +3759,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/timer-sync-registers-read-zero-when-disabled",
                    test_timer_sync_registers_read_zero_when_disabled);
     qtest_add_func("/efr32bg22/timer-bus-faults", test_timer_bus_faults);
+    qtest_add_func("/efr32bg22/radioaes-ecb-and-key-sizes",
+                   test_radioaes_ecb_and_key_sizes);
     qtest_add_func("/efr32bg22/lfxo-ready-timeout", test_lfxo_ready_timeout);
     qtest_add_func("/efr32bg22/timer4-counter-and-aliases",
                    test_timer4_counter_and_aliases);
