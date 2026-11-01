@@ -6753,7 +6753,14 @@ static void efr32_machine_reset_socs(Efr32Bg22SoCState *socs, unsigned n,
  *   MEMINFO = FLASHPAGESIZE 3 (2^(3 + 10) = 8 KiB); DILEN and UDPAGESIZE
  *             [U] never read (0).
  * Without PART, OpenOCD's flash driver stopped at "Unknown MCU family 0".
+ * OpenOCD reads that family from the byte at DEVINFO + 0x1FE (its Series
+ * 0/1 location, kept for every series; 128 = "EFR32/EFM32 Series-2",
+ * efm32.c).  The suit's page holds 0x80 there, the rest of that area
+ * erased (word 0x1FC reads 0xFF80FFFF); OpenOCD identified the kit on
+ * silicon, so its page has the same byte.
  */
+#define EFR32_DEVINFO_SERIES2_ID 0x1feu
+#define EFR32_DEVINFO_SERIES2_ID_VALUE 0x80u
 #define EFR32_DEVINFO_INFO 0x000u
 #define EFR32_DEVINFO_INFO_DEVINFOREV_SHIFT 24
 #define EFR32_DEVINFO_INFO_PRODREV_SHIFT 16
@@ -6897,6 +6904,7 @@ static bool efr32_soc_load_identity(Efr32Bg22SoCState *s, Error **errp)
                        (EFR32_BGM220_HNA2_PRODREV <<
                         EFR32_DEVINFO_INFO_PRODREV_SHIFT));
         efr32_info_put(devinfo, EFR32_DEVINFO_PART, EFR32_BGM220_HNA2_PART);
+        devinfo[EFR32_DEVINFO_SERIES2_ID] = EFR32_DEVINFO_SERIES2_ID_VALUE;
         efr32_info_put(devinfo, EFR32_DEVINFO_MEMINFO,
                        EFR32_DEVINFO_MEMINFO_FLASHPAGESIZE_8K);
         efr32_info_put(devinfo, EFR32_DEVINFO_MSIZE,

@@ -376,6 +376,9 @@ static void attribute_radio_secure(void)
 #define KIT_DEVINFO_INFO      0x07090000 /* DEVINFOREV 7, PRODREV 9 */
 #define KIT_DEVINFO_PART      0x021608b0 /* BG, family 22, device C224 */
 #define KIT_DEVINFO_MEMINFO   0x00000003 /* 8 KiB flash pages */
+/* OpenOCD's family byte (efm32.c): 128, Series 2, as on the suit. */
+#define DEVINFO_SERIES2_ID    0x81fe
+#define KIT_SERIES2_ID        0x80
 #define SYSCFG_CHIPREV        0x014
 #define SYSCFG_CHIPREV_FAMILY (0x3fu << 6)
 #define SYSCFG_CHIPREV_BG22   (53u << 6)
@@ -428,6 +431,8 @@ static void test_bgm220_module_identity(void)
     g_assert_cmphex(readl(DEVINFO_BASE + DEVINFO_PART), ==, KIT_DEVINFO_PART);
     g_assert_cmphex(readl(DEVINFO_BASE + DEVINFO_MEMINFO), ==,
                     KIT_DEVINFO_MEMINFO);
+    g_assert_cmphex(readb(DEVINFO_BASE + DEVINFO_SERIES2_ID), ==,
+                    KIT_SERIES2_ID);
     /* The family the boot code leaves in CHIPREV follows DEVINFO.PART. */
     writel(CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW, CMU_CLKEN0_SYSCFG);
     g_assert_cmphex(readl(SYSCFG_BASE + SYSCFG_CHIPREV) &
