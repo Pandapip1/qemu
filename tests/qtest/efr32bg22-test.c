@@ -1694,9 +1694,31 @@ static void test_protimer_compare_slot_clear_alias(void)
     g_assert_cmphex(readl(PROTIMER_NS_BASE + PROTIMER_CMP0), ==, 0);
 }
 
+/*
+ * PROTIMER's counter is frozen at 0 until CMD bit 0 starts it, even with
+ * EN = 1 and stock's CTRL value (silicon, SS7.32, SS7.33, SS7.71).
+ */
+#define PROTIMER_CMD_START 1u
+
+static void protimer_start(void)
+{
+    writel(PROTIMER_BASE + PROTIMER_EN, 1);
+    writel(PROTIMER_BASE + PROTIMER_CMD, PROTIMER_CMD_START);
+}
+
 static void test_protimer_counter(void)
 {
-    uint32_t before = readl(PROTIMER_BASE + PROTIMER_COUNTER);
+    uint32_t before;
+
+    reset_with_radio_clocks();
+    writel(PROTIMER_BASE + PROTIMER_EN, 1);
+    writel(PROTIMER_BASE + PROTIMER_CTRL, 0x00011102);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(1001);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_COUNTER), ==, 0);
+    protimer_start();
+    before = readl(PROTIMER_BASE + PROTIMER_COUNTER);
 
     attribute_radio_nonsecure();
     g_assert_cmphex(readl(PROTIMER_NS_BASE + PROTIMER_COUNTER), ==, before);
@@ -1725,6 +1747,7 @@ static void test_protimer_counter_is_independent_from_radio_setup(void)
     writel(CMU_BASE + CMU_SYSCLKCTRL, 3);
     writel(RADIO_RAM_NS_BASE + RADIO_RAM_RHCLKPRESC, 1u << 16);
     writel(PROTIMER_BASE + PROTIMER_CTRL, 0x00011102);
+    protimer_start();
 
     qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
     clock_step(1001);
@@ -1737,6 +1760,7 @@ static void test_protimer_counter_is_independent_from_burtc(void)
     uint32_t before;
 
     reset_with_radio_clocks();
+    protimer_start();
     before = readl(PROTIMER_BASE + PROTIMER_COUNTER);
 
     qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
@@ -1745,6 +1769,7 @@ static void test_protimer_counter_is_independent_from_burtc(void)
     g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_COUNTER), ==, before + 2);
 
     reset_with_radio_clocks();
+    protimer_start();
     writel(BURTC_BASE + BURTC_EN, BURTC_EN_EN);
     writel(BURTC_BASE + BURTC_CNT, 0x12345678);
     writel(BURTC_BASE + BURTC_CMD, BURTC_CMD_START);

@@ -2354,6 +2354,27 @@ static uint32_t efr32_protimer_counter(Efr32Periph *s)
 }
 
 /*
+ * The counter does not run from reset (silicon, owo-open-fw
+ * docs/radio-tables.md): it read 0 and frozen with EN = 1 and CTRL = 0 on
+ * live stage 3 (SS7.32, SS7.71), and still 0 after CTRL alone was poked to
+ * stock's 0x00011102 (SS7.32).  Stock's sequence EN, CTRL 0x00011102,
+ * +0x030 0x1233, +0x038 0x80015558, CMD = 1 started it (SS7.33:
+ * 0xb980, then 0x1031a2 about 450 ms later).  [I] CMD bit 0 is the start:
+ * the one write of that sequence that is a command (stock pairs CMD = 1
+ * with enabling the PROTIMER IRQ, SS7.9); nothing here stops it again.
+ */
+#define EFR32_PROTIMER_CMD_START (1u << 0)
+
+static void efr32_protimer_command(Efr32Periph *s, uint32_t command)
+{
+    if (command & EFR32_PROTIMER_CMD_START) {
+        ptimer_transaction_begin(s->protimer_counter);
+        ptimer_run(s->protimer_counter, 0);
+        ptimer_transaction_commit(s->protimer_counter);
+    }
+}
+
+/*
  * EM01GRPACLK, which clocks TIMER0 (xg22.dtsi: CLOCK_BRANCH_EM01GRPACLK).
  * CMU_EM01GRPACLKCTRL.CLKSEL resets to HFRCODPLL and selects HFXO (2) or
  * FSRCO (3) otherwise (efr32bg22_cmu.h).  A locked DPLL runs HFRCODPLL at
@@ -5669,6 +5690,9 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
     {
         efr32_protimer_update_irq(s);
     }
+    if (register_address == EFR32_PROTIMER_BASE + EFR32_PROTIMER_CMD) {
+        efr32_protimer_command(s, next);
+    }
 
     if (register_address == EFR32_AGC_BASE + EFR32_AGC_IF ||
         register_address == EFR32_AGC_BASE + EFR32_AGC_IEN)
@@ -6198,7 +6222,7 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     ptimer_stop(s->protimer_counter);
     ptimer_set_period_from_clock(s->protimer_counter, s->protimer_clk, 1);
     ptimer_set_limit(s->protimer_counter, UINT32_MAX, 1);
-    ptimer_run(s->protimer_counter, 0);
+    /* Stopped at 0 until started (efr32_protimer_command). */
     ptimer_transaction_commit(s->protimer_counter);
     efr32_rac_cancel_tx_completion(s);
     timer_del(s->rac_rx_timer);
