@@ -1982,6 +1982,16 @@ static void efr32_rac_rx_handoff(void *opaque)
             efr32_rf_rx_delivery_request_free(request);
             return;
         }
+        /*
+         * TODO(per-channel receive): on silicon the open image's receive is
+         * channel-dependent -- CRC-ok ch37 77 %, ch38 1 %, ch39 0 %, frames
+         * failing part-way with a correct header (owo-open-fw
+         * docs/radio-tables.md SS7.80) -- while stock receives on all three.
+         * The cause is being root-caused on silicon (CPU on the 76.8 MHz
+         * DPLL vs stock's 38.4 MHz HFXO is the remaining difference).  The
+         * model receives every channel; once the cause is known, its
+         * register condition belongs here, next to the receive-chain check.
+         */
         if (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >
             metadata->air_start_ns + EFR32_RF_FRAMESENT_TO_PEER_EOF_NS) {
             /*
