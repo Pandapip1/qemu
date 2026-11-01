@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "qemu/osdep.h"
+#include <math.h>
 #include "qemu/units.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
@@ -1718,6 +1719,78 @@ static void efr32_rac_tx_complete(void *opaque)
 }
 
 /*
+ * The demodulator's sample rate follows the channel (owo-open-fw
+ * docs/radio-tables.md SS7.83, silicon).  The IF ADC samples at f_LO / 2^9
+ * with RAC.IFADCTRIM0.IFADCENHALFMODE (1M PHY) and f_LO / 2^8 without, f_LO =
+ * f_RF + f_IF on the high side (SYNTH.IFFREQ.LOSIDE), and MODEM.SRCCHF
+ * converts that to the demodulator's fixed rate: SRCRATIO1 / 2^7 (when
+ * SRCENABLE1) x SRCRATIO2 / 2^14 = f_ADC / f_SRC_OUT, with f_SRC_OUT 4 MHz in
+ * half mode and 8 MHz otherwise (what each PHY table's own 2402 MHz SRCCHF
+ * gives).  Stock recomputes SRCCHF for every channel; with the 2402 MHz value
+ * left on 2426 and 2480 MHz (1 % and 3.2 % rate error) silicon decoded the
+ * header and failed the CRC of nearly every frame (ch38 0/48, ch39 0/6 frames
+ * from a close transmitter; 2402 MHz 42/49).  [I] Modelled as a timing
+ * drift: a frame whose accumulated drift over its 8 x (octets + 3 CRC octets)
+ * symbols exceeds half a symbol is delivered with CRCOK clear (the bytes
+ * themselves are kept).  The threshold is inferred; the model does not model
+ * the demodulator's timing tracking, the frequency error of a wrong
+ * MODEM.DIGMIXCTRL, or Coded symbols.  An SRCCHF without SRCENABLE2 (reset
+ * value, register-level tests) is not checked.
+ */
+#define EFR32_SYNTH_IFFREQ 0x038u
+#define EFR32_SYNTH_IFFREQ_IFFREQ_MASK 0x000fffffu
+#define EFR32_SYNTH_IFFREQ_LOSIDE (1u << 20)
+#define EFR32_RAC_IFADCTRIM0 0x0e4u
+#define EFR32_RAC_IFADCTRIM0_IFADCENHALFMODE (1u << 1)
+#define EFR32_MODEM_SRCCHF 0x0ecu
+#define EFR32_MODEM_SRCCHF_SRCRATIO1_MASK 0xffu
+#define EFR32_MODEM_SRCCHF_SRCENABLE1 (1u << 11)
+#define EFR32_MODEM_SRCCHF_SRCRATIO2_SHIFT 12
+#define EFR32_MODEM_SRCCHF_SRCRATIO2_MASK 0x7fffu
+#define EFR32_MODEM_SRCCHF_SRCENABLE2 (1u << 27)
+#define EFR32_MODEM_SRCRATIO1_ONE (1u << 7)
+#define EFR32_MODEM_SRCRATIO2_ONE (1u << 14)
+#define EFR32_IFADC_LO_DIVIDER_HALF_MODE 512.0
+#define EFR32_IFADC_LO_DIVIDER_FULL 256.0
+#define EFR32_MODEM_SRC_OUT_HZ_HALF_MODE 4e6
+#define EFR32_MODEM_SRC_OUT_HZ_FULL 8e6
+#define EFR32_RF_CRC_OCTETS 3
+#define EFR32_RX_DRIFT_LIMIT_SYMBOLS 0.5
+
+static bool efr32_rx_demod_rate_drift_fails(Efr32Periph *s, gsize length)
+{
+    uint32_t srcchf = efr32_register_get(s, EFR32_MODEM_BASE + EFR32_MODEM_SRCCHF);
+    uint32_t iffreq_reg = efr32_register_get(s, EFR32_SYNTH_BASE + EFR32_SYNTH_IFFREQ);
+    uint64_t freq = efr32_register_get(s, EFR32_SYNTH_BASE + EFR32_SYNTH_FREQ) &
+                    EFR32_SYNTH_FREQ_MASK;
+    uint64_t iffreq = iffreq_reg & EFR32_SYNTH_IFFREQ_IFFREQ_MASK;
+    bool half = efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_IFADCTRIM0) &
+                EFR32_RAC_IFADCTRIM0_IFADCENHALFMODE;
+    double lo_hz, adc_hz, expected, ratio, error;
+
+    if (!(srcchf & EFR32_MODEM_SRCCHF_SRCENABLE2) || freq == 0) {
+        return false;
+    }
+    lo_hz = (double)((iffreq_reg & EFR32_SYNTH_IFFREQ_LOSIDE) ? freq + iffreq
+                                                               : freq - iffreq) *
+            EFR32_HFXO_HZ / (double)(1u << EFR32_SYNTH_FREQ_FRACTION_BITS);
+    adc_hz = lo_hz / (half ? EFR32_IFADC_LO_DIVIDER_HALF_MODE
+                           : EFR32_IFADC_LO_DIVIDER_FULL);
+    expected = adc_hz / (half ? EFR32_MODEM_SRC_OUT_HZ_HALF_MODE
+                              : EFR32_MODEM_SRC_OUT_HZ_FULL);
+    ratio = (double)((srcchf >> EFR32_MODEM_SRCCHF_SRCRATIO2_SHIFT) &
+                     EFR32_MODEM_SRCCHF_SRCRATIO2_MASK) /
+            EFR32_MODEM_SRCRATIO2_ONE;
+    if (srcchf & EFR32_MODEM_SRCCHF_SRCENABLE1) {
+        ratio *= (double)(srcchf & EFR32_MODEM_SRCCHF_SRCRATIO1_MASK) /
+                 EFR32_MODEM_SRCRATIO1_ONE;
+    }
+    error = fabs(ratio / expected - 1.0);
+    return error * 8.0 * (double)(length + EFR32_RF_CRC_OCTETS) >
+           EFR32_RX_DRIFT_LIMIT_SYMBOLS;
+}
+
+/*
  * A received frame, in three timed steps (efr32_rac_rx_handoff sets the
  * times): RXFRAME entry at frame detection, EOF -- FRC has written header,
  * length, payload and the TRAILRXDATA-selected trailer to BUFC RX channel 1,
@@ -1807,7 +1880,9 @@ static void efr32_rac_rx_frame_end(void *opaque)
     if (efr32_register_get(s, EFR32_FRC_BASE + EFR32_FRC_TRAILRXDATA) &
         EFR32_FRC_TRAILRXDATA_CRCOK) {
         efr32_bufc_write_data_port(s, EFR32_RF_RX_BUFC_CHANNEL,
-                                   EFR32_FRC_TRAILER_CRCOK, false);
+                                   efr32_rx_demod_rate_drift_fails(s, length)
+                                       ? 0 : EFR32_FRC_TRAILER_CRCOK,
+                                   false);
     }
     g_clear_pointer(&s->rx_frame, g_bytes_unref);
     trace_efr32bg22_rf_rx_handoff(s->endpoint_id, now, length);
