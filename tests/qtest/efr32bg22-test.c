@@ -214,6 +214,7 @@ static uint16_t thumb_b(uint32_t insn_addr, uint32_t target_addr)
 /* efr32bg22_cmu.h: TIMER0-3 are CLKEN0 bits 4-7, BURTC bit 29, TIMER4 CLKEN1 18. */
 #define CMU_CLKEN0_TIMERS     (0xfu << 4)
 #define CMU_CLKEN0_BURTC      (1u << 29)
+#define CMU_CLKEN0_RTCC       (1u << 30)   /* RM 8.5.10 */
 #define CMU_CLKEN1_TIMER4     (1u << 18)
 #define CMU_CLKEN1_RDMAILBOX0 (1u << 8)
 #define CMU_CLKEN1_RDMAILBOX1 (1u << 9)
@@ -317,6 +318,7 @@ static uint16_t thumb_b(uint32_t insn_addr, uint32_t target_addr)
 #define CMU_DPLLREFCLKCTRL      0x100
 #define CMU_EM01GRPACLKCTRL     0x120
 #define CMU_EM01GRPACLK_HFXO    2
+#define CMU_EM01GRPACLK_FSRCO   3
 #define DPLL0_BASE_ADDR         0x4001c000
 #define DPLL_EN                 0x004
 #define DPLL_CFG1               0x00c
@@ -810,6 +812,16 @@ static void test_timer0_follows_em01grpaclk_dpll(void)
     writel(CMU_BASE_ADDR + CMU_EM01GRPACLKCTRL, CMU_EM01GRPACLK_HFXO);
     timer0_step(10000);
     g_assert_cmphex(readl(TIMER0_BASE + TIMER_CNT), ==, 768 + 384);
+
+    /*
+     * On FSRCO it counts at the measured 19.807 MHz (SS7.73), not the
+     * nominal 20 MHz: 1980 counts in 100 us, where 20 MHz would give 2000.
+     */
+    writel(CMU_BASE_ADDR + CMU_EM01GRPACLKCTRL, CMU_EM01GRPACLK_FSRCO);
+    writel(TIMER0_NS_BASE + TIMER_CNT, 0);
+    timer0_step(100000);
+    g_assert_cmpuint(readl(TIMER0_BASE + TIMER_CNT), >=, 1980);
+    g_assert_cmpuint(readl(TIMER0_BASE + TIMER_CNT), <=, 1981);
 }
 
 static void test_timer4_cc0_compare_pending(void)
@@ -2278,6 +2290,7 @@ static void test_rtcc_counts_and_compares(void)
     uint32_t cnt;
 
     qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    writel(CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW, CMU_CLKEN0_RTCC);
     writel(RTCC_BASE + RTCC_EN, 1);
     writel(RTCC_BASE + RTCC_CMD, RTCC_CMD_START);
     g_assert_cmphex(readl(RTCC_BASE + RTCC_STATUS), ==, 1);
@@ -2465,6 +2478,12 @@ static void setup_timer_clocks(QTestState *qts)
                  CMU_CLKEN1_TIMER4);
 }
 
+static void setup_rtcc_clock(QTestState *qts)
+{
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_RTCC);
+}
+
 static void setup_timer_clocks_enabled_timer1(QTestState *qts)
 {
     setup_timer_clocks(qts);
@@ -2542,6 +2561,9 @@ static void test_timer_bus_faults(void)
                                    setup_timer_clocks));
     g_assert_false(m33_load_faults(BURTC_BASE + BURTC_CNT,
                                    setup_timer_clocks));
+    /* RTCC likewise with CLKEN0.RTCC (silicon, SS7.73). */
+    g_assert_true(m33_load_faults(RTCC_BASE + RTCC_CNT, setup_no_clocks));
+    g_assert_false(m33_load_faults(RTCC_BASE + RTCC_CNT, setup_rtcc_clock));
     g_assert_true(m33_store_faults(TIMER2_BASE + TIMER_CFG, setup_no_clocks));
     g_assert_true(m33_store_faults(TIMER1_BASE + TIMER_CMD,
                                    setup_timer_clocks));

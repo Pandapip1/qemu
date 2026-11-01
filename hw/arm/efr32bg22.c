@@ -426,7 +426,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 /* Oscillator rates from xg22.dtsi. */
 #define EFR32_HFXO_HZ 38400000ULL
 #define EFR32_LFXO_HZ 32768ULL
-#define EFR32_FSRCO_HZ 20000000ULL
+/* FSRCO against HFXO on silicon: 19.804-19.811 MHz (n = 8, 1 ms windows;
+ * owo-open-fw docs/radio-tables.md SS7.73); xg22.dtsi says 20 MHz. */
+#define EFR32_FSRCO_MEASURED_HZ 19807000ULL
 #define EFR32_HFRCO_RESET_HZ 19000000ULL
 #define EFR32_HFXO_BASE 0x4000c000u
 #define EFR32_HFXO_CTRL 0x028u
@@ -2350,7 +2352,7 @@ static uint64_t efr32_em01grpa_hz(Efr32Periph *s)
     case EFR32_CMU_EM01GRPACLKCTRL_CLKSEL_HFXO:
         return EFR32_HFXO_HZ;
     case EFR32_CMU_EM01GRPACLKCTRL_CLKSEL_FSRCO:
-        return EFR32_FSRCO_HZ;
+        return EFR32_FSRCO_MEASURED_HZ; /* SS7.73, not the nominal 20 MHz */
     default:
         return efr32_hfrcodpll_hz(s);
     }
@@ -2404,8 +2406,6 @@ static bool efr32_hfxo_requested(Efr32Periph *s)
 
 /* HCLK of the measurement setup: HFRCODPLL locked at 76.8 MHz. */
 #define EFR32_MEASURE_HCLK_HZ 76800000ULL
-/* FSRCO against HFXO: 19.804-19.811 MHz (n = 8, 1 ms windows). */
-#define EFR32_FSRCO_MEASURED_HZ 19807000ULL
 
 /*
  * HFXO cold start with stage 3's own configuration, CMU_DPLLLock() entry,
@@ -3144,6 +3144,8 @@ static const struct {
 };
 
 #define EFR32_CMU_CLKEN0_BURTC (1u << 29)
+#define EFR32_CMU_CLKEN0_RTCC (1u << 30)
+#define EFR32_RTCC_BASE 0x48000000u
 
 static int efr32_timer_index(uint32_t address)
 {
@@ -3226,6 +3228,15 @@ static bool efr32_timer_clock_gated(Efr32Periph *s, uint32_t block)
     }
     if (block == EFR32_BURTC_BASE) {
         return !(efr32_cmu_get(s, EFR32_CMU_CLKEN0) & EFR32_CMU_CLKEN0_BURTC);
+    }
+    /*
+     * RTCC with CLKEN0.RTCC (RM 8.5.10 bit 30) clear: a read is a bus error
+     * (silicon, owo-open-fw docs/radio-tables.md SS7.73, debugger AP), and a
+     * CPU load right after CLKEN0_SET does not fault.  [I] A gated write
+     * faults as TIMER1/TIMER2 CFG and PRS SWLEVEL writes measured there do.
+     */
+    if (block == EFR32_RTCC_BASE) {
+        return !(efr32_cmu_get(s, EFR32_CMU_CLKEN0) & EFR32_CMU_CLKEN0_RTCC);
     }
     return false;
 }
@@ -3665,7 +3676,6 @@ static void efr32_pa_ramp_complete(Efr32Periph *s)
  * modelled: CNTTICK = CCV0MATCH, COMPBASE = PRECNT, CCV1TOP, input
  * capture, PRS outputs, LOCK; the timing of every edge is unmeasured.
  */
-#define EFR32_RTCC_BASE 0x48000000u
 #define EFR32_RTCC_IRQ 12
 #define EFR32_RTCC_EN 0x004u
 #define EFR32_RTCC_EN_EN (1u << 0)
@@ -6537,6 +6547,20 @@ static bool efr32_soc_load_identity(Efr32Bg22SoCState *s, Error **errp)
     return true;
 }
 
+/*
+ * The M33's (and the debugger's) SEQRAM window: RADIOCLKCTRL.EN cleared made
+ * SEQRAM at 0xb0000000 fault like every radio window and BUFC (silicon,
+ * owo-open-fw docs/radio-tables.md SS7.72); a gated write is dropped, as the
+ * radio windows' are.  The M0+'s own SEQRAM view is not affected: the M0+
+ * stops while RADIOCLKCTRL.EN is clear (SS7.73).
+ */
+static bool efr32_seqram_gated(Efr32Bg22SoCState *s)
+{
+    return !(efr32_register_get(&s->periph,
+                                EFR32_CMU_BASE + EFR32_CMU_RADIOCLKCTRL) &
+             EFR32_CMU_RADIOCLKCTRL_EN);
+}
+
 static MemTxResult efr32_seqram_m33_read(void *opaque, hwaddr offset,
                                          uint64_t *data, unsigned size,
                                          MemTxAttrs attrs)
@@ -6545,6 +6569,10 @@ static MemTxResult efr32_seqram_m33_read(void *opaque, hwaddr offset,
     uint8_t buf[8];
     MemTxResult r;
 
+    if (efr32_seqram_gated(s)) {
+        *data = 0;
+        return MEMTX_ERROR;
+    }
     efr32_bus_access(&s->periph, EFR32_SEQRAM_NS_BASE + offset, size, false);
     r = address_space_read(&s->periph.dma_as, EFR32_SEQRAM_S_BASE + offset,
                            attrs, buf, size);
@@ -6559,6 +6587,9 @@ static MemTxResult efr32_seqram_m33_write(void *opaque, hwaddr offset,
     Efr32Bg22SoCState *s = opaque;
     uint8_t buf[8];
 
+    if (efr32_seqram_gated(s)) {
+        return MEMTX_ERROR;
+    }
     efr32_bus_access(&s->periph, EFR32_SEQRAM_NS_BASE + offset, size, true);
     stn_le_p(buf, size, value);
     return address_space_write(&s->periph.dma_as, EFR32_SEQRAM_S_BASE + offset,

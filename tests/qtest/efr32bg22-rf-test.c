@@ -1859,6 +1859,27 @@ static void test_radio_block_clock_gates(void)
 }
 
 /*
+ * RADIOCLKCTRL.EN clear makes the M33's SEQRAM window (0xb0000000) fault
+ * like the radio windows and BUFC (SS7.72): a read is a bus error, a write
+ * is dropped, and the RAM keeps its contents.
+ */
+#define SEQRAM_NS_WORD           0xb0001000u
+
+static void test_seqram_radio_clock_gate(void)
+{
+    rf_reset_with_clocks();
+    qtest_writel(global_qtest, SEQRAM_NS_WORD, 0x5eed0001);
+    qtest_writel(global_qtest, CMU_BASE + CMU_RADIOCLKCTRL +
+                 REGISTER_CLEAR_WINDOW, CMU_RADIOCLKCTRL_EN);
+    g_assert_cmphex(qtest_readl(global_qtest, SEQRAM_NS_WORD), ==, 0);
+    qtest_writel(global_qtest, SEQRAM_NS_WORD, 0x5eed0002);
+    qtest_writel(global_qtest, CMU_BASE + CMU_RADIOCLKCTRL +
+                 REGISTER_SET_WINDOW, CMU_RADIOCLKCTRL_EN);
+    g_assert_cmphex(qtest_readl(global_qtest, SEQRAM_NS_WORD), ==, 0x5eed0001);
+    rf_reset_with_clocks();
+}
+
+/*
  * Measured analog latencies (SS7.72): SYNTH.STATUS.INLOCK 8.9 us after
  * SYNTHSTART, never with the IF path enabled (IFFREQEN instead); MODEM
  * TXRAMPDONE 0.44 us after PARAMP is set and 3.96 us after it is cleared.
@@ -1974,6 +1995,8 @@ int main(int argc, char **argv)
                    test_released_tx_disables);
     qtest_add_func("/efr32bg22/rf/radio-block-clock-gates",
                    test_radio_block_clock_gates);
+    qtest_add_func("/efr32bg22/rf/seqram-radio-clock-gate",
+                   test_seqram_radio_clock_gate);
     qtest_add_func("/efr32bg22/rf/synth-lock-and-pa-ramp-timing",
                    test_synth_lock_and_pa_ramp_timing);
     result = g_test_run();
