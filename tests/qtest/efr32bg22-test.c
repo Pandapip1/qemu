@@ -2558,25 +2558,81 @@ static QTestState *seq_release_with_program(const uint16_t *insns,
                                             size_t n_insns,
                                             const uint32_t *literals,
                                             size_t n_literals);
+static void seq_load_and_release(QTestState *qts, const uint16_t *insns,
+                                 size_t n_insns, const uint32_t *literals,
+                                 size_t n_literals);
+
+/*
+ * Virtual-time checkpoint for TCG tests: under -icount sleep=off virtual time
+ * advances only with executed instructions, so a fixed M33 countdown marks
+ * the same virtual instant on every run, whatever the host load.  The M33
+ * counts SEQ_CHECKPOINT_LOOPS two-instruction iterations (about 0.5-1 ms of
+ * virtual time at HCLK) and then stores 1 to SEQ_CHECKPOINT_MARKER.
+ */
+#define SEQ_CHECKPOINT_LOOPS   10000u
+#define SEQ_CHECKPOINT_MARKER  0x20001000u
+#define SEQ_CHECKPOINT_CODE    0x00000100u
+#define SEQ_THUMB16_SUBS_R3_1  0x3b01u
+#define SEQ_THUMB16_BNE_BACK_ONE 0xd1fdu
+
+static QTestState *seq_release_at_checkpoint(const uint16_t *insns,
+                                             size_t n_insns)
+{
+    const uint32_t code = SEQ_CHECKPOINT_CODE;
+    const uint32_t literals = code + 16;
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel tcg "
+                                  "-icount shift=5,sleep=off -S");
+    uint16_t m33[8];
+    size_t i;
+
+    m33[0] = thumb_ldr_pc(0, code + 0, literals + 0);  /* marker address */
+    m33[1] = thumb_ldr_pc(3, code + 2, literals + 4);  /* loop count */
+    m33[2] = SEQ_THUMB16_SUBS_R3_1;
+    m33[3] = SEQ_THUMB16_BNE_BACK_ONE;
+    m33[4] = thumb_movs_imm8(1, 1);
+    m33[5] = thumb_str_imm(1, 0, 0);
+    m33[6] = THUMB16_BRANCH_SELF;
+    m33[7] = THUMB16_BRANCH_SELF;
+    qtest_writel(qts, 0x00000000, 0x20008000);
+    qtest_writel(qts, 0x00000004, code | 1);
+    for (i = 0; i < G_N_ELEMENTS(m33); i += 2) {
+        qtest_writel(qts, code + 2 * i, THUMB16_PAIR(m33[i], m33[i + 1]));
+    }
+    qtest_writel(qts, literals + 0, SEQ_CHECKPOINT_MARKER);
+    qtest_writel(qts, literals + 4, SEQ_CHECKPOINT_LOOPS);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    qtest_writel(qts, SEQ_CHECKPOINT_MARKER, 0);
+    seq_load_and_release(qts, insns, n_insns, NULL, 0);
+    /* Real time only bounds a hung QEMU; the outcome is fixed by icount. */
+    for (unsigned attempt = 0; attempt < 60000; attempt++) {
+        if (qtest_readl(qts, SEQ_CHECKPOINT_MARKER)) {
+            break;
+        }
+        g_usleep(1000);
+    }
+    qtest_qmp_assert_success(qts, "{'execute':'stop'}");
+    g_assert_cmpuint(qtest_readl(qts, SEQ_CHECKPOINT_MARKER), ==, 1);
+    return qts;
+}
 
 /*
  * RAC.STATUS.SEQSLEEPING is set while the sequencer core sleeps in WFI and
- * clear while it runs (silicon: halted or in a handler, SS7.72).
+ * clear while it runs (silicon: halted or in a handler, SS7.72).  Read at a
+ * virtual-time checkpoint, not after a real-time sleep: a loaded host used
+ * to read it before the M0+ had reached its WFI.
  */
 static void test_seq_sleeping_follows_wfi(void)
 {
     static const uint16_t sleeper[] = { THUMB16_WFI, THUMB16_BRANCH_BACK_ONE };
     static const uint16_t spinner[] = { THUMB16_BRANCH_SELF,
                                         THUMB16_BRANCH_SELF };
-    QTestState *qts = seq_release_with_program(sleeper, 2, NULL, 0);
+    QTestState *qts = seq_release_at_checkpoint(sleeper, 2);
 
-    g_usleep(20000);
     g_assert_cmphex(qtest_readl(qts, RAC_BASE + RAC_STATUS) &
                         RAC_STATUS_SEQSLEEPING, ==, RAC_STATUS_SEQSLEEPING);
     qtest_quit(qts);
 
-    qts = seq_release_with_program(spinner, 2, NULL, 0);
-    g_usleep(20000);
+    qts = seq_release_at_checkpoint(spinner, 2);
     g_assert_cmphex(qtest_readl(qts, RAC_BASE + RAC_STATUS) &
                         RAC_STATUS_SEQSLEEPING, ==, 0);
     qtest_quit(qts);
@@ -2645,13 +2701,7 @@ static QTestState *seq_release_with_program(const uint16_t *insns,
                                             const uint32_t *literals,
                                             size_t n_literals)
 {
-    const uint32_t code_base = SEQRAM_NS_BASE + 0x100;
-    QTestState *qts;
-    size_t i;
-
-    g_assert_cmpuint(n_insns % 2, ==, 0);
-
-    qts = qtest_initf("-machine efr32bg22 -accel tcg -S");
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel tcg -S");
 
     /* Keep the image-less application M33 in a valid idle loop while TCG
      * executes the independently released auxiliary core. */
@@ -2659,6 +2709,19 @@ static QTestState *seq_release_with_program(const uint16_t *insns,
     qtest_writel(qts, 0x00000004, 0x00000101);
     qtest_writel(qts, 0x00000100, 0x0000e7fe);
     qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    seq_load_and_release(qts, insns, n_insns, literals, n_literals);
+    return qts;
+}
+
+/* Load the sequencer program after the M33 reset, release AP3, 'cont'. */
+static void seq_load_and_release(QTestState *qts, const uint16_t *insns,
+                                 size_t n_insns, const uint32_t *literals,
+                                 size_t n_literals)
+{
+    const uint32_t code_base = SEQRAM_NS_BASE + 0x100;
+    size_t i;
+
+    g_assert_cmpuint(n_insns % 2, ==, 0);
     qtest_seq_enable_radio_bus_clocks(qts);
 
     qtest_writel(qts, RAC_BASE + RAC_CTRL, RAC_CTRL_SEQRESET);
@@ -2678,7 +2741,6 @@ static QTestState *seq_release_with_program(const uint16_t *insns,
 
     qtest_writel(qts, RAC_BASE + RAC_CTRL, RAC_CTRL_CPUWAITDIS);
     qtest_qmp_assert_success(qts, "{'execute':'cont'}");
-    return qts;
 }
 
 /*
