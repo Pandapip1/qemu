@@ -6577,8 +6577,36 @@ static void efr32_seq_cpu_reset(void *opaque)
 /*
  * Default identity: the BGM220PC22HNA2 module of the BRD4314A explorer kit,
  * as observed on that hardware.  Only these fields are known; the remaining
- * DEVINFO words (PART, calibration, ...) read zero.
+ * DEVINFO words (calibration, ...) read zero.
+ *
+ * INFO, PART and MEMINFO (RM SS6.4.2.1-3): OpenOCD's efm32 driver decodes
+ * them as it probes, and on the kit it reported "EFR32BG22 C224, rev 9" with
+ * 8 KiB erase pages (owo-open-fw docs/hardware-bringup.md, evidence log).
+ * Its "rev" is INFO.PRODREV: QEMU given the suit's DEVINFO dump (INFO
+ * 0x07240110) prints "rev 36".  The suit's dump also fixes the PART
+ * encoding: 0x021608AE = FAMILY 2 (BG), FAMILYNUM 22, DEVICENUM 2222 =
+ * C222, its BG22C222F352GM40 die.  So the kit's C224 die reads
+ *   PART    = BG << 24 | 22 << 16 | ('C' - 'A') * 1000 + 224 = 0x021608B0,
+ *   INFO    = DEVINFOREV 7 (RM reset value; the suit's page reads 7) |
+ *             PRODREV 9; CRC [U] never read (0),
+ *   MEMINFO = FLASHPAGESIZE 3 (2^(3 + 10) = 8 KiB); DILEN and UDPAGESIZE
+ *             [U] never read (0).
+ * Without PART, OpenOCD's flash driver stopped at "Unknown MCU family 0".
  */
+#define EFR32_DEVINFO_INFO 0x000u
+#define EFR32_DEVINFO_INFO_DEVINFOREV_SHIFT 24
+#define EFR32_DEVINFO_INFO_PRODREV_SHIFT 16
+#define EFR32_DEVINFO_MEMINFO 0x008u
+#define EFR32_DEVINFO_MEMINFO_FLASHPAGESIZE_8K 3u
+#define EFR32_DEVINFO_PART_DEVICENUM(letter, number) \
+    (((letter) - 'A') * 1000u + (number))
+#define EFR32_BGM220_HNA2_DEVINFOREV 7u
+#define EFR32_BGM220_HNA2_PRODREV 9u
+#define EFR32_BGM220_HNA2_PART \
+    ((EFR32_DEVINFO_PART_FAMILY_BG << EFR32_DEVINFO_PART_FAMILY_SHIFT) | \
+     (EFR32_DEVINFO_PART_FAMILYNUM_XG22 << \
+      EFR32_DEVINFO_PART_FAMILYNUM_SHIFT) | \
+     EFR32_DEVINFO_PART_DEVICENUM('C', 224u))
 #define EFR32_BGM220_HNA2_FLASH_KB 512u
 #define EFR32_BGM220_HNA2_SRAM_KB 32u
 #define EFR32_BGM220_HNA2_EUI64L 0x0000beefu
@@ -6702,6 +6730,14 @@ static bool efr32_soc_load_identity(Efr32Bg22SoCState *s, Error **errp)
             return false;
         }
     } else {
+        efr32_info_put(devinfo, EFR32_DEVINFO_INFO,
+                       (EFR32_BGM220_HNA2_DEVINFOREV <<
+                        EFR32_DEVINFO_INFO_DEVINFOREV_SHIFT) |
+                       (EFR32_BGM220_HNA2_PRODREV <<
+                        EFR32_DEVINFO_INFO_PRODREV_SHIFT));
+        efr32_info_put(devinfo, EFR32_DEVINFO_PART, EFR32_BGM220_HNA2_PART);
+        efr32_info_put(devinfo, EFR32_DEVINFO_MEMINFO,
+                       EFR32_DEVINFO_MEMINFO_FLASHPAGESIZE_8K);
         efr32_info_put(devinfo, EFR32_DEVINFO_MSIZE,
                        EFR32_BGM220_HNA2_FLASH_KB |
                        (EFR32_BGM220_HNA2_SRAM_KB <<

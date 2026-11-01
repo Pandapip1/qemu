@@ -369,6 +369,16 @@ static void attribute_radio_secure(void)
 #define DEVINFO_BASE          0x0fe00000
 #define DEVINFO_MODULENAME0   0x8130
 #define DEVINFO_MODULEINFO    0x814c
+/* DEVINFO INFO, PART, MEMINFO (RM SS6.4.2.1-3) of the kit's C224 die. */
+#define DEVINFO_INFO          0x8000
+#define DEVINFO_PART          0x8004
+#define DEVINFO_MEMINFO       0x8008
+#define KIT_DEVINFO_INFO      0x07090000 /* DEVINFOREV 7, PRODREV 9 */
+#define KIT_DEVINFO_PART      0x021608b0 /* BG, family 22, device C224 */
+#define KIT_DEVINFO_MEMINFO   0x00000003 /* 8 KiB flash pages */
+#define SYSCFG_CHIPREV        0x014
+#define SYSCFG_CHIPREV_FAMILY (0x3fu << 6)
+#define SYSCFG_CHIPREV_BG22   (53u << 6)
 
 static void qtest_seq_enable_radio_bus_clocks(QTestState *qts)
 {
@@ -413,6 +423,15 @@ static void test_bgm220_module_identity(void)
                         ==, module_name[i]);
     }
     g_assert_cmphex(readl(DEVINFO_BASE + DEVINFO_MODULEINFO), ==, 0x00570100);
+    /* What OpenOCD's efm32 driver decodes: "EFR32BG22 C224, rev 9". */
+    g_assert_cmphex(readl(DEVINFO_BASE + DEVINFO_INFO), ==, KIT_DEVINFO_INFO);
+    g_assert_cmphex(readl(DEVINFO_BASE + DEVINFO_PART), ==, KIT_DEVINFO_PART);
+    g_assert_cmphex(readl(DEVINFO_BASE + DEVINFO_MEMINFO), ==,
+                    KIT_DEVINFO_MEMINFO);
+    /* The family the boot code leaves in CHIPREV follows DEVINFO.PART. */
+    writel(CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW, CMU_CLKEN0_SYSCFG);
+    g_assert_cmphex(readl(SYSCFG_BASE + SYSCFG_CHIPREV) &
+                    SYSCFG_CHIPREV_FAMILY, ==, SYSCFG_CHIPREV_BG22);
 }
 
 static void test_register_aliases(void)
@@ -2178,8 +2197,6 @@ static void setup_no_clocks(QTestState *qts)
 #define PART_C222F352_FLASH_END 0x58000
 #define DEVINFO_OFFSET          0x8000
 #define INFO_PAGE_SIZE          0x400
-#define SYSCFG_CHIPREV          0x014
-#define SYSCFG_CHIPREV_BG22     (53u << 6)
 #define MSC_WRITECTRL           0x00c
 #define MSC_WRITECTRL_WREN      (1u << 0)
 #define MSC_WRITECMD            0x010
