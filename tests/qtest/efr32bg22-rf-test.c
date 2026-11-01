@@ -171,10 +171,21 @@ static void rf_enable_radio_clocks(void)
     }
 }
 
+static void rf_power_up(void)
+{
+    rf_enable_radio_clocks();
+    /*
+     * Both radios on the same reachable carrier, 2402 MHz: SYNTH.FREQ resets to 0, which the
+     * synthesizer does not reach and the medium never matches (SS7.85).
+     */
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_FREQ, SYNTH_FREQ_2402_MHZ);
+    qtest_writel(global_qtest, peer(SYNTH_BASE + SYNTH_FREQ), SYNTH_FREQ_2402_MHZ);
+}
+
 static void rf_reset_with_clocks(void)
 {
     qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
-    rf_enable_radio_clocks();
+    rf_power_up();
 }
 
 /*
@@ -328,6 +339,141 @@ static void test_tx_offer_requires_matching_synth_channel(void)
                         ==, payload[index]);
     }
 
+    rf_reset_with_clocks();
+}
+
+static void rf_step(int64_t ns);
+
+/* SYNTH.FREQ for a carrier in kHz: round(f x 2^19 / 38.4 MHz) (SS7.80). */
+static uint32_t synth_freq_word(uint64_t khz)
+{
+    return (uint32_t)(((khz * 1000u << 19) + 19200000u) / 38400000u);
+}
+
+#define MODEM_CTRL0              0x020
+#define MODEM_CTRL0_MODFORMAT_OOKASK (6u << 6)
+#define MODEM_TXBR               0x058
+/* TXBRNUM 24000, TXBRDEN 1: 38.4 MHz / (8 x 24000) = 200 Bd. */
+#define MODEM_TXBR_200BD         ((1u << 16) | 24000u)
+#define MODEM_CTRL1              0x024
+#define MODEM_CTRL1_SYNCBITS_32  31u
+
+/*
+ * Transmit two octets on @p tx_khz with the peer searching on @p rx_khz; return whether the
+ * peer received them. With @p ook the source modem is set to on-off keying.
+ */
+static bool rf_delivered(uint64_t tx_khz, uint64_t rx_khz, bool ook)
+{
+    const uint8_t payload[] = { 0x6e, 0xb4 };
+    const uint32_t source_tx_channel = BUFC_BASE + BUFC_CH0;
+    const uint64_t peer_rx_channel = peer(BUFC_BASE + BUFC_CH1);
+    bool delivered;
+
+    rf_reset_with_clocks();
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_CMD, 1);
+    qtest_writel(global_qtest, peer_rx_channel, 0);
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_FREQ, synth_freq_word(tx_khz));
+    qtest_writel(global_qtest, peer(SYNTH_BASE + SYNTH_FREQ), synth_freq_word(rx_khz));
+    if (ook) {
+        qtest_writel(global_qtest, MODEM_BASE + MODEM_CTRL0, MODEM_CTRL0_MODFORMAT_OOKASK);
+        qtest_writel(global_qtest, MODEM_BASE + MODEM_TXBR, MODEM_TXBR_200BD);
+        qtest_writel(global_qtest, MODEM_BASE + MODEM_CTRL1, MODEM_CTRL1_SYNCBITS_32);
+    }
+    qtest_writel(global_qtest,
+                 peer(RAC_BASE + RAC_RXENSRCEN + REGISTER_SET_WINDOW),
+                 RAC_RXENSRCEN_SWRXEN);
+    qtest_writel(global_qtest, source_tx_channel + BUFC_CMD, 1);
+    for (size_t index = 0; index < G_N_ELEMENTS(payload); index++) {
+        qtest_writel(global_qtest, source_tx_channel + BUFC_WRITEDATA, payload[index]);
+    }
+    qtest_writel(global_qtest, RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(1);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+    delivered = (qtest_readl(global_qtest, peer(FRC_BASE + FRC_IF)) & FRC_IF_RXDONE) != 0;
+    rf_reset_with_clocks();
+    return delivered;
+}
+
+/*
+ * Amateur channel plans (owo-open-fw docs/amateur-radio.md) put carriers on any whole MHz: the
+ * medium matches carriers on a 1 MHz raster, so 2403 MHz reaches only a receiver on 2403 MHz,
+ * not one on a Bluetooth channel either side.
+ */
+static void test_carrier_matches_on_1mhz_raster(void)
+{
+    g_assert_true(rf_delivered(2403000, 2403000, false));
+    g_assert_false(rf_delivered(2403000, 2402000, false));
+    g_assert_false(rf_delivered(2403000, 2404000, false));
+    g_assert_true(rf_delivered(2447000, 2447000, false));
+    g_assert_true(rf_delivered(2402000, 2402000, false));
+    /* 13 cm below the ISM band: measured reachable (SS7.85). */
+    g_assert_true(rf_delivered(2304000, 2304000, false));
+    g_assert_true(rf_delivered(2395000, 2395000, false));
+}
+
+/*
+ * A carrier the synthesizer does not reach (EFR32_SYNTH_LOCK_MIN_HZ..MAX_HZ, SS7.85) reaches no
+ * receiver, even one tuned to the same word.
+ */
+static void test_carrier_outside_synth_range_not_delivered(void)
+{
+    g_assert_false(rf_delivered(2289000, 2289000, false));
+    g_assert_false(rf_delivered(2280000, 2280000, false));
+    g_assert_false(rf_delivered(2501000, 2501000, false));
+}
+
+/* Nor does the synthesizer report lock there (SYNTH.STATUS.INLOCK, SS7.72, SS7.85). */
+static void test_synth_never_locks_outside_range(void)
+{
+    rf_reset_with_clocks();
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_FREQ, synth_freq_word(2280000));
+    qtest_writel(global_qtest, RAC_BASE + RAC_SYEN, RAC_SYEN_STOCK_TX);
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_CMD,
+                 SYNTH_CMD_DISABLEIF | SYNTH_CMD_SYNTHSTART);
+    rf_step(SYNTH_LOCK_NS * 10);
+    g_assert_cmphex(qtest_readl(global_qtest, SYNTH_BASE + SYNTH_STATUS) &
+                        SYNTH_STATUS_INLOCK, ==, 0);
+    /* Retuned to a carrier it reaches, it is locked. */
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_FREQ, SYNTH_FREQ_2402_MHZ);
+    g_assert_cmphex(qtest_readl(global_qtest, SYNTH_BASE + SYNTH_STATUS) &
+                        SYNTH_STATUS_INLOCK, ==, SYNTH_STATUS_INLOCK);
+    rf_reset_with_clocks();
+}
+
+/* An on-off keyed frame (MODEM.CTRL0.MODFORMAT = OOK/ASK) is no Bluetooth packet. */
+static void test_ook_frame_not_delivered_to_ble_receiver(void)
+{
+    g_assert_false(rf_delivered(2427000, 2427000, true));
+}
+
+/*
+ * The OOK frame lasts its symbols at the TXBR rate: 32 sync + 16 data symbols at 200 Bd is
+ * 240 ms; TXDONE is not set before.
+ */
+static void test_ook_frame_airtime(void)
+{
+    const uint32_t source_tx_channel = BUFC_BASE + BUFC_CH0;
+    const int64_t airtime_ns = (32 + 16) * 5000000ll;
+
+    rf_reset_with_clocks();
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_FREQ, synth_freq_word(2427000));
+    qtest_writel(global_qtest, MODEM_BASE + MODEM_CTRL0, MODEM_CTRL0_MODFORMAT_OOKASK);
+    qtest_writel(global_qtest, MODEM_BASE + MODEM_TXBR, MODEM_TXBR_200BD);
+    qtest_writel(global_qtest, MODEM_BASE + MODEM_CTRL1, MODEM_CTRL1_SYNCBITS_32);
+    qtest_writel(global_qtest, source_tx_channel + BUFC_CMD, 1);
+    qtest_writel(global_qtest, source_tx_channel + BUFC_WRITEDATA, 0xff);
+    qtest_writel(global_qtest, source_tx_channel + BUFC_WRITEDATA, 0x0f);
+    qtest_writel(global_qtest, RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(airtime_ns - 1000000);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+    g_assert_cmphex(qtest_readl(global_qtest, FRC_BASE + FRC_IF) & FRC_IF_TXDONE, ==, 0);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(2000000);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+    g_assert_cmphex(qtest_readl(global_qtest, FRC_BASE + FRC_IF) & FRC_IF_TXDONE, ==,
+                    FRC_IF_TXDONE);
     rf_reset_with_clocks();
 }
 
@@ -1955,6 +2101,7 @@ static void test_seqram_radio_clock_gate(void)
 static void test_synth_lock_and_pa_ramp_timing(void)
 {
     rf_reset_with_clocks();
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_FREQ, SYNTH_FREQ_2402_MHZ);
     qtest_writel(global_qtest, RAC_BASE + RAC_SYEN, RAC_SYEN_STOCK_TX);
     qtest_writel(global_qtest, SYNTH_BASE + SYNTH_CMD,
                  SYNTH_CMD_DISABLEIF | SYNTH_CMD_SYNTHSTART);
@@ -2008,7 +2155,7 @@ int main(int argc, char **argv)
                                 "-trace enable=efr32bg22_*,file=%s",
                                 rf_trace_path);
     qtest_start(qemu_args);
-    rf_enable_radio_clocks();
+    rf_power_up();
     g_free(qemu_args);
     qtest_add_func("/efr32bg22/rf/peer-bufc-dma-address-space",
                    test_peer_bufc_dma_uses_peer_address_space);
@@ -2016,6 +2163,15 @@ int main(int argc, char **argv)
                    test_tx_offer_reaches_peer_rx_fifo);
     qtest_add_func("/efr32bg22/rf/tx-offer-requires-matching-synth-channel",
                    test_tx_offer_requires_matching_synth_channel);
+    qtest_add_func("/efr32bg22/rf/carrier-matches-on-1mhz-raster",
+                   test_carrier_matches_on_1mhz_raster);
+    qtest_add_func("/efr32bg22/rf/carrier-outside-synth-range-not-delivered",
+                   test_carrier_outside_synth_range_not_delivered);
+    qtest_add_func("/efr32bg22/rf/ook-frame-not-delivered-to-ble-receiver",
+                   test_ook_frame_not_delivered_to_ble_receiver);
+    qtest_add_func("/efr32bg22/rf/ook-frame-airtime", test_ook_frame_airtime);
+    qtest_add_func("/efr32bg22/rf/synth-never-locks-outside-range",
+                   test_synth_never_locks_outside_range);
     qtest_add_func("/efr32bg22/rf/tx-offer-enqueues-synthetic-rx-descriptor",
                    test_tx_offer_enqueues_synthetic_rx_descriptor);
     qtest_add_func("/efr32bg22/rf/tx-offer-drops-descriptor-ring-overflow",

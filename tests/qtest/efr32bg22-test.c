@@ -67,6 +67,8 @@ static char *tx_snapshot_trace_path;
 #define SYNTH_STATUS          0x008
 #define SYNTH_STATUS_INLOCK   (1u << 0)
 #define SYNTH_STATUS_SYNTHREADY (1u << 2)
+#define SYNTH_FREQ            0x034
+#define SYNTH_FREQ_2402_MHZ   0x01f46aabu
 #define SYNTH_CMD             0x00c
 #define SYNTH_CMD_SYNTHSTART  (1u << 0)
 #define SYNTH_CMD_SYNTHSTOP   (1u << 1)
@@ -3416,6 +3418,8 @@ static void test_seq_tx_waits_for_synthesizer(void)
     static const uint32_t syen_stock_tx = 0x00001fbf;
     QTestState *qts = seq_release_with_program(idle, 2, NULL, 0);
 
+    /* A carrier the synthesizer reaches (SS7.85): 2402 MHz. */
+    qtest_writel(qts, SYNTH_BASE + SYNTH_FREQ, SYNTH_FREQ_2402_MHZ);
     qtest_writel(qts, FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW, FRC_IF_TXDONE);
     qtest_writel(qts, RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
     g_assert_cmphex(qtest_readl(qts, RAC_BASE + RAC_STATUS) &
