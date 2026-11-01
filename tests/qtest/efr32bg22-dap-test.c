@@ -479,6 +479,118 @@ static void test_wdog_debugrun(void)
     wdog_debug_halt(true);
 }
 
+/*
+ * Peripherals that do not run in debug (DEBUGRUN = 0, the reset value) stop
+ * counting while the M33 is halted (efr32bg22.c "debug halt").  The case
+ * the flashing scripts hit: the firmware is halted with a TIMER0 compare
+ * just ahead, the debugger takes its time, then resumes the core.  The
+ * compare must not have passed meanwhile, or the firmware's scheduler
+ * finds its event late on resume (its clock events run on TIMER0 and
+ * BURTC).  TIMER1 with DEBUGRUN = 1 keeps counting.  WDOG0: see
+ * wdog-frozen-in-debug.
+ */
+#define CMU_SET_CLKEN0 0x40009064   /* CMU CLKEN0 through the SET alias */
+#define CMU_CLKEN0_TIMER0_TIMER1 (3u << 4)
+#define CMU_EM01GRPACLKCTRL 0x40008120
+#define CMU_EM01GRPACLK_HFXO 2      /* TIMERn count 38.4 MHz */
+#define TIMER0 0x40048000
+#define TIMER1 0x4004c000
+#define TIMER_CFG 0x004
+#define TIMER_CFG_DEBUGRUN (1u << 6)
+#define TIMER_CMD 0x00c
+#define TIMER_CMD_START (1u << 0)
+#define TIMER_IF 0x014
+#define TIMER_TOP 0x01c
+#define TIMER_CNT 0x024
+#define TIMER_EN 0x030
+#define TIMER_CC0_CFG 0x060
+#define TIMER_CC0_OC 0x068
+#define TIMER_CC_OUTPUTCOMPARE 0x2
+#define TIMER_IF_CC0 (1u << 4)
+#define TICKS_PER_10US 384          /* 10 us at 38.4 MHz */
+#define TIMER0_OC (TICKS_PER_10US * 3 / 2)
+#define CMU_CLKEN0_BURTC (1u << 29)
+#define BURTC 0x40064000
+#define BURTC_EN 0x004
+#define BURTC_CMD 0x00c
+#define BURTC_CMD_START (1u << 0)
+#define BURTC_STATUS 0x010
+#define BURTC_STATUS_RUNNING (1u << 0)
+#define BURTC_CNT 0x020
+#define BURTC_START_EDGES 3
+/* LF edges of the board's 32.768 kHz BURTC clock, rounded up */
+#define LF_EDGES_NS(n) (((n) * 1000000000LL + 32767) / 32768)
+
+static void test_debug_halt_stops_timers(void)
+{
+    Swd *s = swd_start();
+    uint32_t t0, t1, b;
+
+    swd_power_up(s);
+    mem_write(s, AP_M33, CMU_SET_CLKEN0, CMU_CLKEN0_TIMER0_TIMER1);
+    mem_write(s, AP_M33, CMU_EM01GRPACLKCTRL, CMU_EM01GRPACLK_HFXO);
+    mem_write(s, AP_M33, TIMER0 + TIMER_CC0_CFG, TIMER_CC_OUTPUTCOMPARE);
+    mem_write(s, AP_M33, TIMER1 + TIMER_CFG, TIMER_CFG_DEBUGRUN);
+    mem_write(s, AP_M33, TIMER0 + TIMER_EN, 1);
+    mem_write(s, AP_M33, TIMER1 + TIMER_EN, 1);
+    mem_write(s, AP_M33, TIMER0 + TIMER_TOP, UINT32_MAX);
+    mem_write(s, AP_M33, TIMER0 + TIMER_CC0_OC, TIMER0_OC);
+    mem_write(s, AP_M33, TIMER0 + TIMER_CMD, TIMER_CMD_START);
+    mem_write(s, AP_M33, TIMER1 + TIMER_CMD, TIMER_CMD_START);
+    qtest_clock_step(s->qts, 10000);
+    g_assert_cmphex(mem_read(s, AP_M33, TIMER0 + TIMER_CNT), ==,
+                    TICKS_PER_10US);
+
+    mem_write(s, AP_M33, DHCSR, DBGKEY_C_HALT);
+    g_assert_true(wait_dhcsr(s, DHCSR_S_HALT) & DHCSR_S_HALT);
+    t0 = mem_read(s, AP_M33, TIMER0 + TIMER_CNT);
+    t1 = mem_read(s, AP_M33, TIMER1 + TIMER_CNT);
+    g_assert_cmphex(t0, <, TIMER0_OC);
+    /* Long past the compare: TIMER0 stands still and has not flagged it */
+    qtest_clock_step(s->qts, 100000);
+    g_assert_cmphex(mem_read(s, AP_M33, TIMER0 + TIMER_CNT), ==, t0);
+    g_assert_cmphex(mem_read(s, AP_M33, TIMER0 + TIMER_IF) & TIMER_IF_CC0,
+                    ==, 0);
+    g_assert_cmphex(mem_read(s, AP_M33, TIMER1 + TIMER_CNT), ==,
+                    (t1 + 10 * TICKS_PER_10US) & 0xffff);
+
+    /* Resumed, TIMER0 goes on from where it stopped */
+    mem_write(s, AP_M33, DHCSR, DBGKEY_C_DEBUGEN);
+    g_assert_false(mem_read(s, AP_M33, DHCSR) & DHCSR_S_HALT);
+    qtest_clock_step(s->qts, 10000);
+    g_assert_cmphex(mem_read(s, AP_M33, TIMER0 + TIMER_CNT), ==,
+                    t0 + TICKS_PER_10US);
+    g_assert_cmphex(mem_read(s, AP_M33, TIMER0 + TIMER_IF) & TIMER_IF_CC0,
+                    ==, TIMER_IF_CC0);
+
+    /*
+     * BURTC, the scheduler's low-power clock, likewise (CFG.DEBUGRUN = 0).
+     * START takes effect at the third LF edge and is counted from the next.
+     */
+    mem_write(s, AP_M33, CMU_SET_CLKEN0, CMU_CLKEN0_BURTC);
+    mem_write(s, AP_M33, BURTC + BURTC_EN, 1);
+    mem_write(s, AP_M33, BURTC + BURTC_CMD, BURTC_CMD_START);
+    qtest_clock_step(s->qts, LF_EDGES_NS(BURTC_START_EDGES));
+    g_assert_cmphex(mem_read(s, AP_M33, BURTC + BURTC_STATUS), ==,
+                    BURTC_STATUS_RUNNING);
+    qtest_clock_step(s->qts, LF_EDGES_NS(10));
+    g_assert_cmphex(mem_read(s, AP_M33, BURTC + BURTC_CNT), >=, 9);
+    mem_write(s, AP_M33, DHCSR, DBGKEY_C_HALT);
+    g_assert_true(wait_dhcsr(s, DHCSR_S_HALT) & DHCSR_S_HALT);
+    b = mem_read(s, AP_M33, BURTC + BURTC_CNT);
+    qtest_clock_step(s->qts, LF_EDGES_NS(100));
+    g_assert_cmphex(mem_read(s, AP_M33, BURTC + BURTC_CNT), ==, b);
+    /* Still started: only the count stands still */
+    g_assert_cmphex(mem_read(s, AP_M33, BURTC + BURTC_STATUS), ==,
+                    BURTC_STATUS_RUNNING);
+    mem_write(s, AP_M33, DHCSR, DBGKEY_C_DEBUGEN);
+    qtest_clock_step(s->qts, LF_EDGES_NS(10));
+    g_assert_cmphex(mem_read(s, AP_M33, BURTC + BURTC_CNT), >=, b + 9);
+    g_assert_cmphex(mem_read(s, AP_M33, BURTC + BURTC_CNT), <=, b + 10);
+
+    swd_end(s);
+}
+
 /* OpenOCD's efm32 driver sequence: erase a page, then program a word. */
 static void test_msc_program(void)
 {
@@ -516,6 +628,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/dap/halt-registers-reset",
                    test_halt_registers_and_reset);
     qtest_add_func("/efr32bg22/dap/msc-program", test_msc_program);
+    qtest_add_func("/efr32bg22/dap/debug-halt-stops-timers",
+                   test_debug_halt_stops_timers);
     qtest_add_func("/efr32bg22/dap/wdog-frozen-in-debug",
                    test_wdog_frozen_in_debug);
     qtest_add_func("/efr32bg22/dap/wdog-debugrun", test_wdog_debugrun);

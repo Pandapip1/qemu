@@ -221,6 +221,18 @@ static int exc_group_prio(NVICState *s, int rawprio, bool targets_secure)
     return rawprio;
 }
 
+/*
+ * DHCSR.C_MASKINTS (Armv8-M ARM, DHCSR): while the debugger has set it,
+ * PendSV, SysTick and the external interrupts are masked; they stay pending
+ * but are not candidates for being taken.
+ */
+static bool nvic_debug_masked(NVICState *s, int exc)
+{
+    return s->debug_maskints &&
+           (exc == ARMV7M_EXCP_PENDSV || exc == ARMV7M_EXCP_SYSTICK ||
+            exc >= NVIC_FIRST_IRQ);
+}
+
 /* Recompute vectpending and exception_prio for a CPU which implements
  * the Security extension
  */
@@ -261,7 +273,7 @@ static void nvic_recompute_state_secure(NVICState *s)
 
             prio = exc_group_prio(s, vec->prio, targets_secure);
             subprio = vec->prio & ~nvic_gprio_mask(s, targets_secure);
-            if (vec->enabled && vec->pending &&
+            if (vec->enabled && vec->pending && !nvic_debug_masked(s, i) &&
                 ((prio < pend_prio) ||
                  (prio == pend_prio && prio >= 0 && subprio < pend_subprio))) {
                 pend_prio = prio;
@@ -309,7 +321,8 @@ static void nvic_recompute_state(NVICState *s)
     for (i = 1; i < s->num_irq; i++) {
         VecInfo *vec = &s->vectors[i];
 
-        if (vec->enabled && vec->pending && vec->prio < pend_prio) {
+        if (vec->enabled && vec->pending && !nvic_debug_masked(s, i) &&
+            vec->prio < pend_prio) {
             pend_prio = vec->prio;
             pend_irq = i;
         }
@@ -488,6 +501,14 @@ static void nvic_irq_update(NVICState *s)
     lvl = (pend_prio < s->exception_prio);
     trace_nvic_irq_update(s->vectpending, pend_prio, s->exception_prio, lvl);
     qemu_set_irq(s->excpout, lvl);
+}
+
+void armv7m_nvic_set_debug_maskints(NVICState *s, bool mask)
+{
+    if (s->debug_maskints != mask) {
+        s->debug_maskints = mask;
+        nvic_irq_update(s);
+    }
 }
 
 /**

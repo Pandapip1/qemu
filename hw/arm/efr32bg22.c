@@ -2551,6 +2551,33 @@ static uint32_t efr32_lfrco_status(Efr32Periph *s)
 }
 
 /*
+ * --------------------------------------------------------- debug halt
+ *
+ * TIMER0-4, BURTC, RTCC and WDOG0 each have a DEBUGRUN bit, reset 0, in
+ * the public efr32bg22_{timer,burtc,rtcc,wdog}.h ("Debug Mode Run
+ * Enable"; TIMER_CFG bit 6, BURTC_CFG bit 0, RTCC_CFG bit 0, WDOG_CFG
+ * bit 4).  With it clear the peripheral's count stops while the M33 is
+ * halted in Debug state: the SDK documents the field as "Stop counter
+ * during debug halt" (sl_hal_timer.h, and silabs_burtc_clock_event.c
+ * configures BURTC "stop during debug halt"); for WDOG0 see RM SS27.3.2
+ * and the WDOG0 section.  The halt is the debug unit's "halted" output
+ * (DHCSR.S_HALT, GPIO in "m33-debug-halted"), not the sequencer M0+'s.
+ * [I] unmeasured on silicon: the clock edge at which a TIMER/BURTC/RTCC
+ * count stops and restarts relative to the halt (here the edge at the
+ * halt and resume instants), and whether STATUS.RUNNING reads 1 meanwhile
+ * (kept 1 here: the timer is still started).
+ */
+#define EFR32_TIMER_CFG_DEBUGRUN (1u << 6)
+#define EFR32_BURTC_CFG_DEBUGRUN (1u << 0)
+#define EFR32_RTCC_CFG_DEBUGRUN (1u << 0)
+
+/* A peripheral with DEBUGRUN = @debugrun has its count stopped now. */
+static bool efr32_debug_frozen(Efr32Periph *s, bool debugrun)
+{
+    return s->m33_debug_halted && !debugrun;
+}
+
+/*
  * ------------------------------------------------------------------ BURTC
  *
  * The counter advances on edges of the clock CMU.EM4GRPACLKCTRL selects
@@ -2661,7 +2688,10 @@ static uint32_t efr32_burtc_div(Efr32Periph *s)
 
 static bool efr32_burtc_counting(Efr32Periph *s)
 {
-    return s->burtc_run && efr32_burtc_enabled(s);
+    return s->burtc_run && efr32_burtc_enabled(s) &&
+           !efr32_debug_frozen(s, efr32_register_get(s, EFR32_BURTC_BASE +
+                                                        EFR32_BURTC_CFG) &
+                                      EFR32_BURTC_CFG_DEBUGRUN);
 }
 
 static uint32_t efr32_burtc_cnt_at(Efr32Periph *s, int64_t edge)
@@ -2843,7 +2873,8 @@ static uint32_t efr32_burtc_syncbusy(Efr32Periph *s)
 static uint32_t efr32_burtc_status(Efr32Periph *s)
 {
     efr32_burtc_process(s);
-    return efr32_burtc_counting(s) ? EFR32_BURTC_STATUS_RUNNING : 0;
+    return s->burtc_run && efr32_burtc_enabled(s) ? EFR32_BURTC_STATUS_RUNNING
+                                                  : 0;
 }
 
 /* Returns true when the write was fully handled. */
@@ -3005,10 +3036,18 @@ static bool efr32_timer_enabled(Efr32Periph *s, int i)
     return efr32_timer_reg(s, i, EFR32_TIMER_EN) & EFR32_TIMER_EN_EN;
 }
 
-static bool efr32_timer_counting(Efr32Periph *s, int i)
+/* Started (STATUS.RUNNING), whether or not a debug halt stops the count. */
+static bool efr32_timer_started(Efr32Periph *s, int i)
 {
     return s->timers[i].running && efr32_timer_enabled(s, i) &&
            !(efr32_timer_reg(s, i, EFR32_TIMER_CFG) & EFR32_TIMER_CFG_MODE_MASK);
+}
+
+static bool efr32_timer_counting(Efr32Periph *s, int i)
+{
+    return efr32_timer_started(s, i) &&
+           !efr32_debug_frozen(s, efr32_timer_reg(s, i, EFR32_TIMER_CFG) &
+                                      EFR32_TIMER_CFG_DEBUGRUN);
 }
 
 static bool efr32_timer_sync_reg(uint32_t offset)
@@ -3360,7 +3399,7 @@ static bool efr32_timer_read(Efr32Periph *s, uint32_t address, uint32_t *value)
         *value = efr32_timer_counter(s, i);
         return true;
     case EFR32_TIMER_STATUS:
-        *value = (efr32_timer_counting(s, i) ? EFR32_TIMER_STATUS_RUNNING : 0) |
+        *value = (efr32_timer_started(s, i) ? EFR32_TIMER_STATUS_RUNNING : 0) |
                  (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) <
                           s->timers[i].sync_until_ns
                       ? EFR32_TIMER_STATUS_SYNCBUSY : 0) |
@@ -3563,7 +3602,9 @@ static unsigned efr32_rtcc_presc(Efr32Periph *s)
 static bool efr32_rtcc_counting(Efr32Periph *s)
 {
     return s->rtcc_run && efr32_rtcc_hz(s) &&
-           (efr32_rtcc_get(s, EFR32_RTCC_EN) & EFR32_RTCC_EN_EN);
+           (efr32_rtcc_get(s, EFR32_RTCC_EN) & EFR32_RTCC_EN_EN) &&
+           !efr32_debug_frozen(s, efr32_rtcc_get(s, EFR32_RTCC_CFG) &
+                                      EFR32_RTCC_CFG_DEBUGRUN);
 }
 
 /* Edges counted (pre-counter and counter together) at LF edge @edge. */
@@ -3989,15 +4030,13 @@ static void efr32_wdog_sync_done(void *opaque)
 }
 
 /* SS27.3.2: DEBUGRUN = 0 freezes the counter while the core is halted. */
-static void efr32_wdog_debug_halt(void *opaque, int n, int level)
+static void efr32_wdog_debug_halt(Efr32Periph *s)
 {
-    Efr32Periph *s = EFR32_PERIPH(opaque);
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    bool freeze = level && s->wdog_running &&
+    bool freeze = s->m33_debug_halted && s->wdog_running &&
                   !(efr32_wdog_get(s, EFR32_WDOG_CFG) &
                     EFR32_WDOG_CFG_DEBUGRUN);
 
-    s->m33_debug_halted = level;
     if (freeze == s->wdog_frozen) {
         return;
     }
@@ -4010,6 +4049,40 @@ static void efr32_wdog_debug_halt(void *opaque, int n, int level)
     trace_efr32_wdog(s->endpoint_id, now, freeze ? "freeze" : "thaw",
                      efr32_wdog_counter(s, now));
     efr32_wdog_schedule(s);
+}
+
+/*
+ * The M33's DHCSR.S_HALT changed (the debug unit's "halted" line, see
+ * "debug halt"): each count with DEBUGRUN = 0 is taken up to now under the
+ * old state, then stops or restarts from there.
+ */
+static void efr32_m33_debug_halted(void *opaque, int n, int level)
+{
+    Efr32Periph *s = EFR32_PERIPH(opaque);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (s->m33_debug_halted == !!level) {
+        return;
+    }
+    for (int i = 0; i < EFR32_TIMER_COUNT; i++) {
+        efr32_timer_rebase(s, i);
+    }
+    efr32_burtc_process(s);
+    if (efr32_burtc_hz(s)) {
+        efr32_burtc_rebase(s, efr32_burtc_edge_at(s, now));
+    }
+    efr32_rtcc_process(s);
+    efr32_rtcc_rebase(s, efr32_rtcc_pos_at(s, s->rtcc_last_edge));
+
+    s->m33_debug_halted = level;
+
+    for (int i = 0; i < EFR32_TIMER_COUNT; i++) {
+        efr32_timer_schedule(s, i);
+        efr32_timer_pwm_update(s, i);
+    }
+    efr32_burtc_process(s);
+    efr32_rtcc_process(s);
+    efr32_wdog_debug_halt(s);
 }
 
 static bool efr32_wdog_read(Efr32Periph *s, uint32_t address,
@@ -5801,7 +5874,7 @@ static void efr32_periph_init(Object *o)
     s->wdog_sync_timer =
         timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_wdog_sync_done, s);
     /* DHCSR.S_HALT of the M33, from its debug unit (WDOG0 DEBUGRUN). */
-    qdev_init_gpio_in_named(DEVICE(o), efr32_wdog_debug_halt,
+    qdev_init_gpio_in_named(DEVICE(o), efr32_m33_debug_halted,
                             "m33-debug-halted", 1);
     /* Fault injection (qom-set at run time): conversions never complete. */
     object_property_add_uint32_ptr(o, "x-iadc-stall", &s->iadc_stall,

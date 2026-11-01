@@ -75,6 +75,11 @@ struct NVICState {
     bool vectpending_is_s_banked;
     int exception_prio; /* group prio of the highest prio active exception */
     int vectpending_prio; /* group prio of the exception in vectpending */
+    /*
+     * DHCSR.C_MASKINTS with C_DEBUGEN (Armv8-M ARM, DHCSR): PendSV, SysTick
+     * and the external interrupts are masked; set by a halting debug unit.
+     */
+    bool debug_maskints;
 
     MemoryRegion sysregmem;
 
@@ -197,6 +202,12 @@ static inline bool armv7m_nvic_neg_prio_requested(NVICState *s, bool secure)
     return false;
 }
 #endif
+/**
+ * armv7m_nvic_set_debug_maskints: DHCSR.C_MASKINTS (with C_DEBUGEN) changed
+ * @s: the NVIC
+ * @mask: PendSV, SysTick and external interrupts are masked
+ */
+void armv7m_nvic_set_debug_maskints(NVICState *s, bool mask);
 #ifndef CONFIG_USER_ONLY
 bool armv7m_nvic_can_take_pending_exception(NVICState *s);
 #else

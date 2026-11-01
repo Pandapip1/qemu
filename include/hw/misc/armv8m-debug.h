@@ -62,7 +62,10 @@ struct ARMv8MDebugState {
     uint32_t dscsr;
     bool stepping;
     bool halt_queued;
-    /* "halted" GPIO output: DHCSR.S_HALT. */
+    /*
+     * "halted" GPIO output: DHCSR.S_HALT, like the Cortex-M33 HALTED signal;
+     * the SoC stops the peripherals that do not run in debug (DEBUGRUN = 0).
+     */
     qemu_irq halted_out;
 
     /* FPB */

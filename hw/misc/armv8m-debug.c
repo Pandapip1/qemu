@@ -13,7 +13,10 @@
  *
  * The core enters and leaves Debug state through the ARMMDebugOps hooks in
  * target/arm: BKPT, FPB comparator matches (QEMU BP_CPU breakpoints) and
- * the end of a halting step (QEMU single-step) are reported here.
+ * the end of a halting step (QEMU single-step) are reported here.  The
+ * "halted" GPIO output follows Debug state like the Cortex-M33's HALTED
+ * signal (Cortex-M33 TRM, debug interface signals), for the SoC to stop
+ * peripherals that do not run in debug.
  *
  * Copyright (c) 2026 Gavin John
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -26,6 +29,7 @@
 #include "qemu/timer.h"
 #include "qapi/error.h"
 #include "hw/misc/armv8m-debug.h"
+#include "hw/intc/armv7m_nvic.h"
 #include "hw/qdev-clock.h"
 #include "hw/qdev-properties.h"
 #include "exec/exec-all.h"
@@ -367,6 +371,9 @@ static void dbg_op_reset(void *opaque)
     if (s->vc_corereset_honoured && (s->demcr & DEMCR_VC_CORERESET) &&
         (s->dhcsr_ctrl & DHCSR_C_DEBUGEN)) {
         dbg_enter_debug_state(s, DFSR_VCATCH);
+    } else {
+        /* The reset took the core out of Debug state (arm_cpu_reset_hold) */
+        qemu_set_irq(s->halted_out, 0);
     }
 }
 
@@ -423,6 +430,10 @@ static void dbg_dhcsr_write(ARMv8MDebugState *s, uint32_t value)
         ctrl &= ~(DHCSR_C_HALT | DHCSR_C_STEP | DHCSR_C_MASKINTS);
     }
     s->dhcsr_ctrl = ctrl;
+    /* C_MASKINTS masks interrupts whenever the core runs, not only in steps */
+    armv7m_nvic_set_debug_maskints(cpu->env.nvic,
+                                   (ctrl & DHCSR_C_DEBUGEN) &&
+                                   (ctrl & DHCSR_C_MASKINTS));
     if (halted && !(ctrl & DHCSR_C_HALT)) {
         dbg_leave_debug_state(s, ctrl & DHCSR_C_STEP);
     } else if (!halted && (ctrl & DHCSR_C_HALT) && !s->halt_queued) {
