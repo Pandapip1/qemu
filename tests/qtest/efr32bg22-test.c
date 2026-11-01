@@ -66,6 +66,7 @@ static char *tx_snapshot_trace_path;
 #define SYNTH_BASE            0xa8018000
 #define SYNTH_STATUS          0x008
 #define SYNTH_STATUS_INLOCK   (1u << 0)
+#define SYNTH_STATUS_SYNTHREADY (1u << 2)
 #define SYNTH_CMD             0x00c
 #define SYNTH_CMD_SYNTHSTART  (1u << 0)
 #define SYNTH_CMD_SYNTHSTOP   (1u << 1)
@@ -1286,6 +1287,14 @@ static void test_rac_enable_requires_dependency_order(void)
     enable_radio_bus_clocks();
     writel(BUFC_BASE + BUFC_EN, 1);
     writel(PROTIMER_BASE + PROTIMER_EN, 1);
+    writel(RAC_BASE + RAC_EN, 1);
+    g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK,
+                    ==, 0);
+
+    /* PROTIMER.EN is not needed at all (silicon, SS7.71). */
+    reset_with_radio_clocks();
+    enable_radio_bus_clocks();
+    writel(BUFC_BASE + BUFC_EN, 1);
     writel(RAC_BASE + RAC_EN, 1);
     g_assert_cmphex(readl(RAC_BASE + RAC_STATUS) & RAC_STATUS_STATE_MASK,
                     ==, 0);
@@ -3397,8 +3406,9 @@ static void test_seq_tx_waits_for_synthesizer(void)
     g_assert_cmphex(qtest_readl(qts, RAC_BASE + RAC_STATUS) &
                         RAC_STATUS_STATE_MASK, ==, RAC_STATUS_STATE_TX);
     g_assert_cmphex(qtest_readl(qts, FRC_BASE + FRC_IF) & FRC_IF_TXDONE, ==, 0);
-    g_assert_cmphex(qtest_readl(qts, SYNTH_BASE + SYNTH_STATUS) &
-                        SYNTH_STATUS_INLOCK, ==, 0);
+    /* SS7.42/SS7.60: 0x4, SYNTHREADY without INLOCK, no SYNTH.CMD written */
+    g_assert_cmphex(qtest_readl(qts, SYNTH_BASE + SYNTH_STATUS), ==,
+                    SYNTH_STATUS_SYNTHREADY);
 
     /* SYNTHSTART with the VCO unpowered starts nothing. */
     qtest_writel(qts, SYNTH_BASE + SYNTH_CMD, SYNTH_CMD_SYNTHSTART);

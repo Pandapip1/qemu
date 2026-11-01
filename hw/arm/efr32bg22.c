@@ -5508,11 +5508,15 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
      * not repair that boot.  Preserve that ordering-sensitive failure here;
      * the successful proprietary sequencer hand-off itself is still outside
      * this model, so the valid order retains the existing abstract OFF state.
+     * PROTIMER is not part of it: on silicon a build that never sets
+     * PROTIMER.EN runs, transmits and receives (owo-open-fw
+     * docs/radio-tables.md SS7.71; only RAC.STATUS bit 28 differs, meaning
+     * unknown).  [I] BUFC.EN before RAC.EN stays required; never measured
+     * on its own.
      */
     if (register_address == EFR32_RAC_BASE + EFR32_RADIO_EN &&
         !(old & 1u) && (next & 1u) &&
-        (!(efr32_register_get(s, EFR32_BUFC_BASE + EFR32_RADIO_EN) & 1u) ||
-         !(efr32_register_get(s, EFR32_PROTIMER_BASE + EFR32_RADIO_EN) & 1u))) {
+        !(efr32_register_get(s, EFR32_BUFC_BASE + EFR32_RADIO_EN) & 1u)) {
         efr32_rac_set_state(s, EFR32_RAC_STATE_SHUTDOWN);
     }
 
@@ -6216,6 +6220,13 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
                        EFR32_EMU_STATUS_RESET);
     efr32_register_put(s, EFR32_EMU_BASE + EFR32_EMU_RSTCAUSE, s->rstcause);
     efr32_register_put(s, EFR32_EMU_BASE + EFR32_EMU_RSTCTRL, s->rstctrl);
+    /*
+     * SYNTH.STATUS.SYNTHREADY reads 1 with SYNTH.CMD never written: 0x4
+     * throughout stage 3's stalled TX (SS7.42, SS7.60) and in an RXSEARCH
+     * reached from OFF with nothing powered (SS7.80), on silicon.
+     */
+    efr32_register_put(s, EFR32_SYNTH_BASE + EFR32_SYNTH_STATUS,
+                       EFR32_SYNTH_STATUS_SYNTHREADY);
     efr32_msc_reset(s);
     efr32_rtcc_reset(s);
     memset(s->iadc_fifo, 0, sizeof(s->iadc_fifo));
