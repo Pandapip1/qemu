@@ -80,6 +80,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/irq.h"
 #include "hw/arm/efr32-gpio.h"
+#include "hw/arm/efr32bg22.h"
 #include "hw/misc/analog-source.h"
 #include "hw/misc/owo-suit.h"
 #include "sysemu/reset.h"
@@ -270,6 +271,7 @@ struct OwoSuitState {
     int64_t vcd_time;
     bool vcd_full;
     Notifier exit_notifier;
+    Notifier mcu_reset_notifier;
     double vcd_real[SIG_COUNT];
     int64_t vcd_int[SIG_COUNT];
     bool vcd_known[SIG_COUNT];
@@ -837,9 +839,9 @@ static void suit_script_parse(OwoSuitState *s, Error **errp)
 
 /* ------------------------------------------------------------- device */
 
-static void suit_mcu_reset(void *opaque)
+static void suit_mcu_reset(Notifier *n, void *data)
 {
-    OwoSuitState *s = opaque;
+    OwoSuitState *s = container_of(n, OwoSuitState, mcu_reset_notifier);
 
     suit_advance(s);
     s->reset_count++;
@@ -952,7 +954,8 @@ static void suit_realize(DeviceState *dev, Error **errp)
     qemu_set_irq(s->dac_clr, 1);
     s->script_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, suit_script_fire, s);
     suit_script_arm(s);
-    qemu_register_reset(suit_mcu_reset, s);
+    s->mcu_reset_notifier.notify = suit_mcu_reset;
+    efr32bg22_soc_add_reset_notifier(s->soc, &s->mcu_reset_notifier);
     s->exit_notifier.notify = suit_exit_notify;
     qemu_add_exit_notifier(&s->exit_notifier);
     suit_refresh(s);

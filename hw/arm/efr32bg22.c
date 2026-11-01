@@ -18,6 +18,9 @@
 #include "hw/arm/efr32-gpio.h"
 #include "hw/arm/efr32-i2c.h"
 #include "hw/arm/efr32-radioaes.h"
+#include "hw/arm/efr32-trng.h"
+#include "hw/arm/efr32-gpcrc.h"
+#include "hw/arm/efr32-interconnect.h"
 #include "hw/misc/analog-source.h"
 #include "hw/misc/owo-suit.h"
 #include "hw/ptimer.h"
@@ -27,6 +30,8 @@
 #include "hw/sysbus.h"
 #include "hw/arm/armv7m.h"
 #include "hw/arm/efr32bg22-debug.h"
+#include "hw/arm/efr32bg22.h"
+#include "hw/core/resetcontainer.h"
 #include "sysemu/reset.h"
 #include "sysemu/runstate.h"
 #include "sysemu/cpu-timers.h"
@@ -423,6 +428,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_RDSCRATCHPAD_BASE 0xa8024000u
 #define EFR32_RDMAILBOX0_BASE 0xa8028000u
 #define EFR32_RDMAILBOX1_BASE 0xa802c000u
+#define EFR32_CRYPTOACC_BASE 0x4c020000u
+#define EFR32_CRYPTOACC_END 0x4c02c000u
+#define EFR32_CMU_CLKEN1_CRYPTOACC (1u << 13)
+#define EFR32_CMU_CLKEN0_GPCRC (1u << 3)
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_MASK 0x7u
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_FSRCO 1u
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_HFXO 3u
@@ -753,7 +762,9 @@ struct Efr32Periph
     AddressSpace dma_as;
     bool dma_as_initialized;
     GHashTable *registers;
-    uint32_t trng_state;
+    Efr32Trng trng;
+    Efr32Gpcrc gpcrc;
+    Efr32Interconnect ic;
     Efr32RadioAes radioaes;
     uint32_t rac_state;
     bool hfxo_fsm_locked;
@@ -824,6 +835,21 @@ struct Efr32Periph
     Object *analog_source;
     /* Fault injection: IADC conversions never complete. */
     uint32_t iadc_stall;
+    /* IADC conversions in progress, in completion order (efr32_iadc_*). */
+    QEMUTimer *iadc_timer;
+    struct {
+        int64_t done_ns;
+        uint8_t queue, id;
+        bool last;
+        uint32_t input;
+    } iadc_conv[2 * 16 + 1];
+    unsigned iadc_nconv;
+    int64_t iadc_busy_until_ns;
+    /* Warm (ADCWARM) for this PRESCALE/ADCMODE/REFSEL key; or in standby. */
+    bool iadc_warm, iadc_standby;
+    uint32_t iadc_warm_key;
+    uint32_t iadc_last_input;
+    bool iadc_have_input;
     /* TIMERn CCm compare/PWM outputs, to the GPIO routes. */
     qemu_irq timer_cc_out[5 * 3];
     /* To the debug port: RAC clock retiming wedges it (SS7.80) */
@@ -4337,6 +4363,9 @@ static void efr32_wdog_schedule(Efr32Periph *s)
     timer_mod(s->wdog_timer, warnsel && !s->wdog_warned ? warn_ns : tout_ns);
 }
 
+/* A reset of the part that owns these peripherals (efr32_soc_reset). */
+static void efr32_periph_reset_request(Efr32Periph *s);
+
 static void efr32_wdog_expired(void *opaque)
 {
     Efr32Periph *s = EFR32_PERIPH(opaque);
@@ -4369,7 +4398,7 @@ static void efr32_wdog_expired(void *opaque)
         (s->rstctrl & EFR32_EMU_RSTCTRL_WDOG0RMODE)) {
         s->rstcause |= EFR32_EMU_RSTCAUSE_WDOG0;
         s->wdog_running = false;
-        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        efr32_periph_reset_request(s);
         return;
     }
     /* Reset disabled: the counter wraps and runs on. */
@@ -4663,9 +4692,10 @@ static bool efr32_cmu_wdoglock_write(Efr32Periph *s, uint32_t key,
  * or left-aligned (LEFT12), unipolar for a single-ended input.
  * Fault injection: "x-iadc-stall" (periph property) makes conversions never
  * complete: commands are accepted and nothing ever comes out.
- * [U] Not modelled: timer and PRS triggers, oversampling and 16/20-bit
- * results, the window comparator, SUPPLY inputs, conversion and warm-up
- * time (a conversion completes at the command).
+ * Results arrive after the RM's warm-up and conversion times
+ * (efr32_iadc_queue: OSR, ADC_CLK, WARMUPMODE, TIMEBASE; [I] unmeasured).
+ * [U] Not modelled: timer and PRS triggers, oversampling's effect on the
+ * value and 16/20-bit results, the window comparator, SUPPLY inputs.
  */
 #define EFR32_IADC_BASE 0x4a004000u
 #define EFR32_IADC_IRQ 48
@@ -4677,6 +4707,10 @@ static bool efr32_cmu_wdoglock_write(Efr32Periph *s, uint32_t key,
 #define EFR32_IADC_STATUS 0x014u
 #define EFR32_IADC_STATUS_SINGLEFIFODV (1u << 8)
 #define EFR32_IADC_STATUS_SCANFIFODV (1u << 9)
+#define EFR32_IADC_STATUS_SINGLEQEN (1u << 0)
+#define EFR32_IADC_STATUS_SCANQEN (1u << 3)
+#define EFR32_IADC_STATUS_CONVERTING (1u << 6)
+#define EFR32_IADC_STATUS_ADCWARM (1u << 30)
 #define EFR32_IADC_MASKREQ 0x018u
 #define EFR32_IADC_MASKREQ_MASK 0xffffu
 #define EFR32_IADC_IF 0x024u
@@ -4767,8 +4801,20 @@ static void efr32_iadc_update(Efr32Periph *s)
 {
     uint32_t status = efr32_iadc_get(s, EFR32_IADC_STATUS) &
                       ~(EFR32_IADC_STATUS_SINGLEFIFODV |
-                        EFR32_IADC_STATUS_SCANFIFODV);
+                        EFR32_IADC_STATUS_SCANFIFODV |
+                        EFR32_IADC_STATUS_SINGLEQEN |
+                        EFR32_IADC_STATUS_SCANQEN |
+                        EFR32_IADC_STATUS_CONVERTING |
+                        EFR32_IADC_STATUS_ADCWARM);
 
+    for (unsigned i = 0; i < s->iadc_nconv; i++) {
+        status |= EFR32_IADC_STATUS_CONVERTING |
+                  (s->iadc_conv[i].queue ? EFR32_IADC_STATUS_SCANQEN
+                                         : EFR32_IADC_STATUS_SINGLEQEN);
+    }
+    if (s->iadc_warm) {
+        status |= EFR32_IADC_STATUS_ADCWARM;
+    }
     if (s->iadc_fifo[0].count) {
         status |= EFR32_IADC_STATUS_SINGLEFIFODV;
     }
@@ -4878,10 +4924,160 @@ static uint32_t efr32_iadc_push(Efr32Periph *s, unsigned q,
     return flags;
 }
 
+/*
+ * Conversion timing, RM SS24.3.2-24.3.3 ([I]: the RM's formulas; never
+ * measured on silicon):
+ *  - CLK_CMU_ADC: CMU_IADCCLKCTRL.CLKSEL, EM01GRPACLK (1, reset) or FSRCO
+ *    (2); CLK_SRC_ADC = CLK_CMU_ADC / (CTRL.HSCLKRATE + 1); ADC_CLK =
+ *    CLK_SRC_ADC / (SCHEDx.PRESCALE + 1), PRESCALE taken as 1 when it is 0
+ *    and HSCLKRATE is not.
+ *  - Warm-up: five TIMEBASE intervals ((CTRL.TIMEBASE + 1) CLK_SRC_ADC
+ *    cycles) from power-down (WARMUPMODE NORMAL, after every request) or on
+ *    a change of PRESCALE, ADCMODE or REFSEL; one from standby
+ *    (KEEPINSTANDBY); none while kept warm (KEEPWARM).
+ *  - Each conversion: ((4 * OSR) + 2) ADC_CLK cycles, OSR = 2 << OSRHS, plus
+ *    2 ADC_CLK cycles when the input changes from the previous conversion.
+ *  - Requests are served in the order they arrive (SINGLETAILGATE off); the
+ *    input is sampled when its conversion completes.  [U] TIMER and PRS
+ *    triggers, continuous trigger actions, tailgating, 16/20-bit modes and
+ *    the window comparator are not modelled (IMMEDIATE, ONCE).
+ */
+#define EFR32_IADC_CTRL 0x008u
+#define EFR32_IADC_CTRL_WARMUPMODE_SHIFT 4
+#define EFR32_IADC_CTRL_WARMUPMODE_MASK 0x3u
+#define EFR32_IADC_WARMUP_KEEPINSTANDBY 1u
+#define EFR32_IADC_WARMUP_KEEPWARM 2u
+#define EFR32_IADC_CTRL_TIMEBASE_SHIFT 16
+#define EFR32_IADC_CTRL_TIMEBASE_MASK 0x7fu
+#define EFR32_IADC_CTRL_HSCLKRATE_SHIFT 28
+#define EFR32_IADC_CTRL_HSCLKRATE_MASK 0x7u
+#define EFR32_IADC_SCHED0 0x054u
+#define EFR32_IADC_SCHED_PRESCALE_MASK 0x3ffu
+#define EFR32_IADC_CFG_ADCMODE_MASK 0x3u
+#define EFR32_IADC_CFG_OSRHS_SHIFT 2
+#define EFR32_IADC_CFG_OSRHS_MASK 0x7u
+#define EFR32_CMU_IADCCLKCTRL 0x180u
+#define EFR32_CMU_IADCCLKCTRL_CLKSEL_MASK 0x3u
+#define EFR32_CMU_IADCCLKCTRL_EM01GRPACLK 1u
+#define EFR32_CMU_IADCCLKCTRL_FSRCO 2u
+#define EFR32_IADC_WARMUP_INTERVALS_OFF 5
+#define EFR32_IADC_WARMUP_INTERVALS_STANDBY 1
+#define EFR32_IADC_CONV_SWITCH_CYCLES 2
+
+static uint64_t efr32_iadc_cmu_hz(Efr32Periph *s)
+{
+    switch (efr32_register_get(s, EFR32_CMU_BASE + EFR32_CMU_IADCCLKCTRL) &
+            EFR32_CMU_IADCCLKCTRL_CLKSEL_MASK) {
+    case 0:
+    case EFR32_CMU_IADCCLKCTRL_EM01GRPACLK:
+        /* Reset value EM01GRPACLK (the register store reads 0 before). */
+        return efr32_em01grpa_hz(s);
+    case EFR32_CMU_IADCCLKCTRL_FSRCO:
+        return EFR32_FSRCO_MEASURED_HZ;
+    default:
+        return 0;
+    }
+}
+
+/* Schedule one conversion of @input (config group from it). */
+static void efr32_iadc_queue(Efr32Periph *s, unsigned queue, unsigned id,
+                             uint32_t input, bool last)
+{
+    uint32_t ctrl = efr32_iadc_get(s, EFR32_IADC_CTRL);
+    unsigned group = (input & EFR32_IADC_INPUT_CFG) ? 1 : 0;
+    uint32_t cfg = efr32_iadc_get(s, EFR32_IADC_CFG0 +
+                                         group * EFR32_IADC_CFG_STRIDE);
+    uint32_t prescale = efr32_iadc_get(s, EFR32_IADC_SCHED0 +
+                                              group * EFR32_IADC_CFG_STRIDE) &
+                        EFR32_IADC_SCHED_PRESCALE_MASK;
+    uint32_t hsclkrate = (ctrl >> EFR32_IADC_CTRL_HSCLKRATE_SHIFT) &
+                         EFR32_IADC_CTRL_HSCLKRATE_MASK;
+    uint32_t mode = (ctrl >> EFR32_IADC_CTRL_WARMUPMODE_SHIFT) &
+                    EFR32_IADC_CTRL_WARMUPMODE_MASK;
+    uint32_t key, osr, cycles;
+    uint64_t src_hz = efr32_iadc_cmu_hz(s) / (hsclkrate + 1), adc_hz;
+    int64_t t;
+
+    if (hsclkrate && !prescale) {
+        prescale = 1;
+    }
+    adc_hz = src_hz / (prescale + 1);
+    if (!adc_hz || s->iadc_nconv == ARRAY_SIZE(s->iadc_conv)) {
+        return;
+    }
+    t = MAX(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), s->iadc_busy_until_ns);
+    key = prescale | (cfg & EFR32_IADC_CFG_ADCMODE_MASK) << 10 |
+          ((cfg >> EFR32_IADC_CFG_REFSEL_SHIFT) &
+           EFR32_IADC_CFG_REFSEL_MASK) << 12;
+    if (!s->iadc_warm || key != s->iadc_warm_key) {
+        unsigned intervals = s->iadc_standby && key == s->iadc_warm_key
+                                 ? EFR32_IADC_WARMUP_INTERVALS_STANDBY
+                                 : EFR32_IADC_WARMUP_INTERVALS_OFF;
+
+        t += muldiv64((uint64_t)intervals *
+                          (((ctrl >> EFR32_IADC_CTRL_TIMEBASE_SHIFT) &
+                            EFR32_IADC_CTRL_TIMEBASE_MASK) + 1),
+                      NANOSECONDS_PER_SECOND, src_hz);
+        s->iadc_warm = true;
+        s->iadc_warm_key = key;
+    }
+    osr = 2u << ((cfg >> EFR32_IADC_CFG_OSRHS_SHIFT) &
+                 EFR32_IADC_CFG_OSRHS_MASK);
+    cycles = 4 * osr + 2;
+    if (s->iadc_have_input && input != s->iadc_last_input) {
+        cycles += EFR32_IADC_CONV_SWITCH_CYCLES;
+    }
+    s->iadc_last_input = input;
+    s->iadc_have_input = true;
+    t += muldiv64(cycles, NANOSECONDS_PER_SECOND, adc_hz);
+    s->iadc_busy_until_ns = t;
+    s->iadc_conv[s->iadc_nconv++] = (typeof(s->iadc_conv[0])){
+        t, queue, id, last, input,
+    };
+    if (last && mode != EFR32_IADC_WARMUP_KEEPWARM) {
+        /* Powered down or in standby once the request is served. */
+        s->iadc_warm = false;
+        s->iadc_standby = mode == EFR32_IADC_WARMUP_KEEPINSTANDBY;
+    }
+    timer_mod(s->iadc_timer, s->iadc_conv[0].done_ns);
+}
+
+/* Conversions whose time has come deliver their results. */
+static void efr32_iadc_complete(void *opaque)
+{
+    Efr32Periph *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint32_t flags = 0;
+    unsigned done = 0;
+
+    while (done < s->iadc_nconv && s->iadc_conv[done].done_ns <= now) {
+        typeof(s->iadc_conv[0]) *c = &s->iadc_conv[done++];
+        const Efr32IadcQueue *queue = c->queue ? &efr32_iadc_scan
+                                               : &efr32_iadc_single;
+        uint32_t result = efr32_iadc_convert(s, c->input,
+                                             efr32_iadc_get(s,
+                                                            queue->fifocfg));
+
+        flags |= efr32_iadc_push(s, c->queue, queue, result, c->id);
+        if (c->queue) {
+            flags |= EFR32_IADC_IF_SCANENTRYDONE;
+            flags |= c->last ? EFR32_IADC_IF_SCANTABLEDONE : 0;
+        } else {
+            flags |= EFR32_IADC_IF_SINGLEDONE;
+        }
+    }
+    memmove(s->iadc_conv, s->iadc_conv + done,
+            (s->iadc_nconv - done) * sizeof(s->iadc_conv[0]));
+    s->iadc_nconv -= done;
+    if (s->iadc_nconv) {
+        timer_mod(s->iadc_timer, s->iadc_conv[0].done_ns);
+    }
+    efr32_iadc_put(s, EFR32_IADC_IF, efr32_iadc_get(s, EFR32_IADC_IF) | flags);
+    efr32_iadc_update(s);
+}
+
 static void efr32_iadc_command(Efr32Periph *s, uint32_t command)
 {
-    uint32_t flags = 0;
-
     if (command & EFR32_IADC_CMD_SINGLEFIFOFLUSH) {
         s->iadc_fifo[0].count = 0;
     }
@@ -4889,13 +5085,8 @@ static void efr32_iadc_command(Efr32Periph *s, uint32_t command)
         s->iadc_fifo[1].count = 0;
     }
     if ((command & EFR32_IADC_CMD_SINGLESTART) && !s->iadc_stall) {
-        uint32_t result = efr32_iadc_convert(
-            s, efr32_iadc_get(s, EFR32_IADC_SINGLE),
-            efr32_iadc_get(s, EFR32_IADC_SINGLEFIFOCFG));
-
-        flags |= efr32_iadc_push(s, 0, &efr32_iadc_single, result,
-                                 EFR32_IADC_SINGLE_ID);
-        flags |= EFR32_IADC_IF_SINGLEDONE;
+        efr32_iadc_queue(s, 0, EFR32_IADC_SINGLE_ID,
+                         efr32_iadc_get(s, EFR32_IADC_SINGLE), true);
     }
     if ((command & EFR32_IADC_CMD_SCANSTART) && !s->iadc_stall) {
         uint32_t mask = efr32_iadc_get(s, EFR32_IADC_MASKREQ) &
@@ -4903,17 +5094,13 @@ static void efr32_iadc_command(Efr32Periph *s, uint32_t command)
 
         for (unsigned id = 0; id < EFR32_IADC_SCANTABLE_ENTRIES; id++) {
             if (mask & (1u << id)) {
-                uint32_t result = efr32_iadc_convert(
-                    s, efr32_iadc_get(s, EFR32_IADC_SCANTABLE0 + 4 * id),
-                    efr32_iadc_get(s, EFR32_IADC_SCANFIFOCFG));
-
-                flags |= efr32_iadc_push(s, 1, &efr32_iadc_scan, result, id);
-                flags |= EFR32_IADC_IF_SCANENTRYDONE;
+                efr32_iadc_queue(s, 1, id,
+                                 efr32_iadc_get(s, EFR32_IADC_SCANTABLE0 +
+                                                       4 * id),
+                                 !(mask >> (id + 1)));
             }
         }
-        flags |= EFR32_IADC_IF_SCANTABLEDONE;
     }
-    efr32_iadc_put(s, EFR32_IADC_IF, efr32_iadc_get(s, EFR32_IADC_IF) | flags);
     efr32_iadc_update(s);
 }
 
@@ -5301,16 +5488,28 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
             return value;
         }
     }
-    if ((address & ~0xfffu) == 0x4c024000)
-    {
-        uint32_t x = s->trng_state;
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        return s->trng_state = x;
+    if (address >= EFR32_GPCRC_BASE &&
+        address < EFR32_GPCRC_BASE + EFR32_GPCRC_SIZE) {
+        uint32_t value;
+
+        if (efr32_gpcrc_read(&s->gpcrc, address - EFR32_GPCRC_BASE,
+                             &value)) {
+            return value;
+        }
     }
-    if (address == 0x4c021004 || address == 0x4c02100c)
-        return 64;
+    if (address >= EFR32_TRNG_FIFO_BASE &&
+        address < EFR32_TRNG_FIFO_BASE + EFR32_TRNG_FIFO_SIZE) {
+        return efr32_trng_pop(&s->trng, clock_get_hz(s->pclk));
+    }
+    if (address >= EFR32_TRNG_CTRL_BASE &&
+        address < EFR32_TRNG_CTRL_BASE + EFR32_TRNG_CTRL_SIZE) {
+        uint32_t value;
+
+        if (efr32_trng_read(&s->trng, address - EFR32_TRNG_CTRL_BASE,
+                            clock_get_hz(s->pclk), &value)) {
+            return value;
+        }
+    }
     if (address == 0x40008008)
         /* CMU.STATUS: every ready flag set; WDOGLOCK as CMU_WDOGLOCK left it. */
         return (UINT32_MAX & ~EFR32_CMU_STATUS_WDOGLOCK) |
@@ -5427,6 +5626,34 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         register_address < EFR32_RADIOAES_BASE + EFR32_RADIOAES_SIZE &&
         efr32_radioaes_write(&s->radioaes, &s->dma_as,
                              register_address - EFR32_RADIOAES_BASE, next)) {
+        return;
+    }
+    /* GPCRC decodes its own SET/CLR/TGL pages (input and command too). */
+    if (efr32_peripheral_canonical_address(word) >= EFR32_GPCRC_BASE &&
+        efr32_peripheral_canonical_address(word) <
+            EFR32_GPCRC_BASE + EFR32_GPCRC_SIZE &&
+        efr32_gpcrc_write(&s->gpcrc,
+                          efr32_peripheral_canonical_address(word) -
+                              EFR32_GPCRC_BASE,
+                          (uint32_t)value << shift)) {
+        return;
+    }
+    /*
+     * CRYPTOACC has no SET/CLR/TGL aliases (RM SS4.2.4.3: none in its
+     * register maps); its RNG block sits at +0x1000, so decode it before
+     * the alias-folding register key.
+     */
+    if (efr32_peripheral_canonical_address(word) >= EFR32_TRNG_CTRL_BASE &&
+        efr32_peripheral_canonical_address(word) <
+            EFR32_TRNG_CTRL_BASE + EFR32_TRNG_CTRL_SIZE) {
+        uint32_t offset = efr32_peripheral_canonical_address(word) -
+                          EFR32_TRNG_CTRL_BASE;
+        uint32_t current = 0;
+
+        efr32_trng_read(&s->trng, offset, clock_get_hz(s->pclk), &current);
+        efr32_trng_write(&s->trng, offset, clock_get_hz(s->pclk),
+                         (current & ~mask) | (((uint32_t)value << shift) &
+                                              mask));
         return;
     }
 
@@ -5946,6 +6173,21 @@ static bool efr32_bus_error(Efr32Periph *s, uint32_t address)
     if (block == EFR32_BUFC_BASE) {
         return !radio_clock;
     }
+    /*
+     * CRYPTOACC (PK control, DMA, RNG control, RNG FIFO, PK RAM;
+     * efr32bg22c224f512im40.h) behind CMU_CLKEN1.CRYPTOACC (bit 13,
+     * efr32bg22_cmu.h; Zephyr's TRNG driver enables it first).  RM
+     * SS4.2.1.2: an access to a peripheral whose clock is disabled is a bus
+     * fault.  [I] Not measured on silicon for this block.
+     */
+    if (block >= EFR32_CRYPTOACC_BASE && block < EFR32_CRYPTOACC_END) {
+        return !(clken1 & EFR32_CMU_CLKEN1_CRYPTOACC);
+    }
+    /* GPCRC behind CMU_CLKEN0.GPCRC (bit 3, efr32bg22_cmu.h), as above. */
+    if (block == EFR32_GPCRC_BASE) {
+        return !(efr32_register_get(s, EFR32_CMU_BASE + EFR32_CMU_CLKEN0) &
+                 EFR32_CMU_CLKEN0_GPCRC);
+    }
     gate = efr32_radio_bus_clock(block);
     return gate && (!radio_clock || !(clken1 & gate));
 }
@@ -5998,39 +6240,25 @@ static bool efr32_bus_error(Efr32Periph *s, uint32_t address)
  * Exception entry, SysTick reload to the first handler load (SS7.73,
  * cross-core probes): M0+ 16 cycles; M33 17 (18 from WFI) with its vector
  * table, handler and stack in SRAM.  [I] The M33 value is used for its
- * flash-resident vectors too.
+ * flash-resident vectors too.  The M0+ probe's handler reads CVR in its
+ * second instruction, after a literal load (2 cycles), so the entry itself
+ * is 14 (the same probe on the model reads 16); efr32-interconnect.c
+ * scales it under M33 SEQRAM traffic.
  */
-#define EFR32_SEQ_EXCEPTION_ENTRY_MILLICYCLES 16000u
+#define EFR32_SEQ_EXCEPTION_ENTRY_MILLICYCLES 14000u
 #define EFR32_M33_EXCEPTION_ENTRY_MILLICYCLES 17000u
 /*
- * Bus model: extra cycles of one access beyond an average instruction, in
- * the accessing core's cycles.  Total cycles per access (loops of 8 copies,
- * n = 5 + 5, no spread; the cross-core probes found the same):
- *  - M33 from flash: SRAM 1; SEQRAM 1.88, or 2.38 while the M0+ executes;
- *    BUFC 1.88; RAC, FRC, SYNTH, MODEM, AGC, CMU, GPIO 3.88; TIMER1 11.88.
- *  - M0+: SEQRAM load 2, store 2.5; BUFC 3.25; RAC, FRC, SYNTH, MODEM, AGC
- *    4.25 back to back.  Between other instructions (the handlers' case:
- *    literal load, literal load, access) a radio access takes 5 and a BUFC
- *    load 4.
- * The M33 extras are relative to an SRAM access (1 cycle), the M0+ extras
- * to an Armv6-M load or store (2).  [I] Other peripherals are charged as
- * CMU, other TIMERs as TIMER1.  Not charged (RAM here): M33 flash data loads
- * (4.5), M0+ SEQRAM stores beyond 2 (2.5 in loops, 2 in the delay loop).
- * Each M33 SEQRAM access while the M0+ executes costs the M0+ 0.9 of its
- * cycles: SEQRAM has one port and the M33 wins (SS7.73, cross-core probes:
- * M0+ code 2.8x slower under M33 SEQRAM streaming).
+ * Bus access costs and contention: hw/arm/efr32-interconnect.c (the RM's
+ * bus matrix and bridges, the radio subsystem paths, calibrated to the
+ * single-core and cross-core measurements of owo-open-fw SS7.74, SS7.75).
  */
-#define EFR32_M33_RADIO_EXTRA_MILLICYCLES 2875u
-#define EFR32_M33_BUFC_EXTRA_MILLICYCLES 875u
-#define EFR32_M33_PERIPH_EXTRA_MILLICYCLES 2875u
-#define EFR32_M33_TIMER_EXTRA_MILLICYCLES 10875u
-#define EFR32_M33_SEQRAM_EXTRA_MILLICYCLES 875u
-#define EFR32_M33_SEQRAM_SHARED_EXTRA_MILLICYCLES 1375u
-#define EFR32_SEQ_SEQRAM_STEAL_MILLICYCLES 900u
-#define EFR32_SEQ_RADIO_EXTRA_MILLICYCLES 3000u
-#define EFR32_SEQ_BUFC_EXTRA_MILLICYCLES 2000u
 #define EFR32_TIMER_BLOCKS_END (EFR32_TIMER4_BASE + 0x4000u)
 #define EFR32_BUFC_WINDOW_END (RADIO_BASE + RADIO_SIZE)
+#define EFR32_LFAPB_BASE 0x48000000u
+#define EFR32_LFAPB_END 0x4c000000u
+/* Main SRAM (RM SS4.2.3: up to 32 KB at 0x20000000). */
+#define EFR32_IC_SRAM_BASE 0x20000000u
+#define EFR32_IC_SRAM_END 0x20008000u
 #define EFR32_SEQRAM_NS_BASE 0xb0000000u
 #define EFR32_SEQRAM_S_BASE 0xa0000000u
 #define EFR32_SEQRAM_WINDOW_SIZE 0x8000u
@@ -6040,15 +6268,6 @@ static bool efr32_bus_error(Efr32Periph *s, uint32_t address)
  * the other is seen up to this late.
  */
 #define EFR32_CORE_CLOCK_QUANTUM_NS 500
-
-/* Occupancy classes of the bus model (IcountBusModel target). */
-enum {
-    EFR32_BUS_RADIO,
-    EFR32_BUS_BUFC,
-    EFR32_BUS_SEQRAM,
-    EFR32_BUS_PERIPH,
-    EFR32_BUS_TIMER,
-};
 
 static uint64_t efr32_sysclk_hz(Efr32Periph *s)
 {
@@ -6111,50 +6330,74 @@ static bool efr32_seq_executing(Efr32Periph *s)
            !s->seq_cpu->icount_clock_stopped;
 }
 
-/*
- * The bus model's cost table: (master, address, size, direction) -> extra
- * cycles of the master and an occupancy class.  A structural interconnect
- * model would replace this function and resolve contention in round_end.
- */
+/* Which interconnect target an address is (efr32-interconnect.h). */
+static Efr32IcTarget efr32_ic_target(uint32_t addr)
+{
+    uint32_t block;
+
+    if ((addr >= EFR32_SEQRAM_NS_BASE &&
+         addr < EFR32_SEQRAM_NS_BASE + EFR32_SEQRAM_WINDOW_SIZE) ||
+        (addr >= EFR32_SEQRAM_S_BASE &&
+         addr < EFR32_SEQRAM_S_BASE + EFR32_SEQRAM_WINDOW_SIZE)) {
+        return EFR32_IC_SEQRAM;
+    }
+    if (addr >= EFR32_IC_SRAM_BASE && addr < EFR32_IC_SRAM_END) {
+        return EFR32_IC_SRAM;
+    }
+    if (addr >= EFR32_BUFC_BASE && addr < EFR32_BUFC_WINDOW_END) {
+        return EFR32_IC_BUFC;
+    }
+    if (addr >= RADIO_BASE && addr < RADIO_BASE + RADIO_SIZE) {
+        return EFR32_IC_RADIO;
+    }
+    block = efr32_peripheral_canonical_address(addr) & ~0x3fffu;
+    if (block >= EFR32_TIMER0_BASE && block < EFR32_TIMER_BLOCKS_END) {
+        return EFR32_IC_TIMER;
+    }
+    /* [I] RTCC (0x48...) and the 0x4A... group: the LF APB bridge. */
+    if (block >= EFR32_LFAPB_BASE && block < EFR32_LFAPB_END) {
+        return EFR32_IC_LFPERIPH;
+    }
+    return EFR32_IC_HFPERIPH;
+}
+
 static uint64_t efr32_bus_cost(void *opaque, CPUState *master, uint64_t addr,
                                unsigned size, bool is_write, unsigned *target)
 {
     Efr32Periph *s = opaque;
-    bool radio = addr >= RADIO_BASE && addr < RADIO_BASE + RADIO_SIZE;
-    bool bufc = addr >= EFR32_BUFC_BASE && addr < EFR32_BUFC_WINDOW_END;
-    uint32_t block;
+    unsigned manager;
+    bool sram_code = false;
 
     if (master == s->seq_cpu) {
-        *target = bufc ? EFR32_BUS_BUFC : EFR32_BUS_RADIO;
-        return bufc ? EFR32_SEQ_BUFC_EXTRA_MILLICYCLES
-                    : EFR32_SEQ_RADIO_EXTRA_MILLICYCLES;
-    }
-    if (master != s->m33_cpu) {
+        manager = EFR32_IC_SEQ;
+    } else if (master == s->m33_cpu) {
+        uint32_t pc = ARM_CPU(master)->env.regs[15];
+
+        manager = EFR32_IC_M33;
+        sram_code = pc >= EFR32_IC_SRAM_BASE && pc < EFR32_IC_SRAM_END;
+    } else {
         *target = ICOUNT_BUS_TARGETS;
         return 0;
     }
-    if (addr >= EFR32_SEQRAM_NS_BASE &&
-        addr < EFR32_SEQRAM_NS_BASE + EFR32_SEQRAM_WINDOW_SIZE) {
-        *target = EFR32_BUS_SEQRAM;
-        if (efr32_seq_executing(s)) {
-            icount_charge_cycles(s->seq_cpu,
-                                 EFR32_SEQ_SEQRAM_STEAL_MILLICYCLES);
-            return EFR32_M33_SEQRAM_SHARED_EXTRA_MILLICYCLES;
-        }
-        return EFR32_M33_SEQRAM_EXTRA_MILLICYCLES;
+    s->ic.hclk_hz = s->m33_cpuclk ? clock_get_hz(s->m33_cpuclk) : 0;
+    s->ic.rhclk_hz = s->seq_cpuclk ? clock_get_hz(s->seq_cpuclk) : 0;
+    s->ic.seq_executing = efr32_seq_executing(s);
+    return efr32_ic_access(&s->ic, manager, efr32_ic_target(addr), sram_code,
+                           target);
+}
+
+static void efr32_bus_round_end(void *opaque, int64_t start_ns,
+                                int64_t end_ns)
+{
+    Efr32Periph *s = opaque;
+
+    s->ic.seq_executing = efr32_seq_executing(s);
+    s->ic.rhclk_hz = s->seq_cpuclk ? clock_get_hz(s->seq_cpuclk) : 0;
+    efr32_ic_round_end(&s->ic, start_ns, end_ns);
+    if (s->seq_cpu) {
+        icount_set_cpu_exception_cycles(
+            s->seq_cpu, efr32_ic_seq_exception_millicycles(&s->ic));
     }
-    if (radio) {
-        *target = bufc ? EFR32_BUS_BUFC : EFR32_BUS_RADIO;
-        return bufc ? EFR32_M33_BUFC_EXTRA_MILLICYCLES
-                    : EFR32_M33_RADIO_EXTRA_MILLICYCLES;
-    }
-    block = efr32_peripheral_canonical_address(addr) & ~0x3fffu;
-    if (block >= EFR32_TIMER0_BASE && block < EFR32_TIMER_BLOCKS_END) {
-        *target = EFR32_BUS_TIMER;
-        return EFR32_M33_TIMER_EXTRA_MILLICYCLES;
-    }
-    *target = EFR32_BUS_PERIPH;
-    return EFR32_M33_PERIPH_EXTRA_MILLICYCLES;
 }
 
 /* Every CPU access to this device goes through the bus model. */
@@ -6305,7 +6548,8 @@ static void efr32_periph_init(Object *o)
     s->registers = g_hash_table_new(g_direct_hash, g_direct_equal);
     s->rstcause = EFR32_EMU_RSTCAUSE_POR;
     s->rstctrl = EFR32_EMU_RSTCTRL_RESET;
-    s->trng_state = 0x2545f491;
+    efr32_trng_reset(&s->trng);
+    efr32_gpcrc_reset(&s->gpcrc);
     efr32_radioaes_reset(&s->radioaes);
     s->rac_state = EFR32_RAC_STATE_OFF;
     s->seq_released = false;
@@ -6336,6 +6580,7 @@ static void efr32_periph_init(Object *o)
                                        efr32_timer_pwm_callbacks[i], s);
     }
     s->wdog_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_wdog_expired, s);
+    s->iadc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_iadc_complete, s);
     s->wdog_sync_timer =
         timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_wdog_sync_done, s);
     /* DHCSR.S_HALT of the M33, from its debug unit (WDOG0 DEBUGRUN). */
@@ -6377,7 +6622,8 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
 {
     Efr32Periph *s = EFR32_PERIPH(o);
     g_hash_table_remove_all(s->registers);
-    s->trng_state = 0x2545f491;
+    efr32_trng_reset(&s->trng);
+    efr32_gpcrc_reset(&s->gpcrc);
     efr32_radioaes_reset(&s->radioaes);
     s->rac_state = EFR32_RAC_STATE_OFF;
     s->seq_released = false;
@@ -6443,6 +6689,10 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     efr32_msc_reset(s);
     efr32_rtcc_reset(s);
     memset(s->iadc_fifo, 0, sizeof(s->iadc_fifo));
+    timer_del(s->iadc_timer);
+    s->iadc_nconv = 0;
+    s->iadc_busy_until_ns = 0;
+    s->iadc_warm = s->iadc_standby = s->iadc_have_input = false;
     efr32_wdog_reset(s);
     efr32_register_put(s, EFR32_SYSCFG_BASE + EFR32_SYSCFG_CHIPREV,
                        s->chiprev);
@@ -6603,6 +6853,10 @@ struct Efr32Bg22SoCState {
     /* Sized from DEVINFO.MSIZE at realize, as on silicon. */
     uint32_t flash_size;
     uint32_t sram_size;
+    /* This part asked for a reset (efr32_soc_reset_request). */
+    bool reset_pending;
+    /* Told after each reset of this part (efr32bg22_soc_add_reset_notifier). */
+    NotifierList reset_notifiers;
 };
 
 struct Efr32State
@@ -6665,6 +6919,91 @@ static void efr32_seq_cpu_reset(void *opaque)
     cpu->halted = 1;
 }
 
+/*
+ * Resets that the part raises itself (SYSRESETREQ, WDOG0, M33 Lockup, the
+ * RESETn pin, the DCI device erase) reset that part alone: two chips on a
+ * bench, the dual machine's two SoCs, do not reset each other.  The request
+ * is taken where QEMU takes a system reset (the main loop, all vCPUs
+ * paused), so it lands at the same point in virtual time as before; the
+ * machine's reset hook then resets only the parts that asked
+ * (efr32_machine_reset_socs).  A reset nobody asked for (power-on, QMP
+ * system_reset) still resets the whole machine.
+ */
+static void efr32_soc_reset_request(Efr32Bg22SoCState *s)
+{
+    s->reset_pending = true;
+    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+}
+
+static void efr32_periph_reset_request(Efr32Periph *p)
+{
+    efr32_soc_reset_request(container_of(p, Efr32Bg22SoCState, periph));
+}
+
+void efr32bg22_soc_add_reset_notifier(Object *soc, Notifier *n)
+{
+    notifier_list_add(&EFR32BG22_SOC(soc)->reset_notifiers, n);
+}
+
+/* Inside this SoC's QOM subtree. */
+static bool efr32_soc_owns(Efr32Bg22SoCState *s, Object *obj)
+{
+    for (; obj; obj = obj->parent) {
+        if (obj == OBJECT(s)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Reset one SoC as a system reset resets it: its devices on the system bus
+ * (and so the buses below them) in the system bus's order, through the same
+ * three reset phases, then its two CPUs, as the root reset container orders
+ * them (devices first, then the board's CPU reset handlers).
+ */
+static void efr32_soc_reset(Efr32Bg22SoCState *s, ResetType type)
+{
+    ResettableContainer *rc =
+        RESETTABLE_CONTAINER(object_new(TYPE_RESETTABLE_CONTAINER));
+    BusState *bus = sysbus_get_default();
+    BusChild *kid;
+
+    QTAILQ_FOREACH(kid, &bus->children, sibling) {
+        if (efr32_soc_owns(s, OBJECT(kid->child))) {
+            resettable_container_add(rc, OBJECT(kid->child));
+        }
+    }
+    resettable_reset(OBJECT(rc), type);
+    object_unref(OBJECT(rc));
+    efr32_cpu_reset(s->armv7m.cpu);
+    efr32_seq_cpu_reset(s->seq_armv7m.cpu);
+    notifier_list_notify(&s->reset_notifiers, NULL);
+}
+
+static void efr32_machine_reset_socs(Efr32Bg22SoCState *socs, unsigned n,
+                                     ResetType type)
+{
+    bool requested = false;
+
+    for (unsigned i = 0; i < n; i++) {
+        requested |= socs[i].reset_pending;
+    }
+    if (!requested) {
+        qemu_devices_reset(type);
+        for (unsigned i = 0; i < n; i++) {
+            notifier_list_notify(&socs[i].reset_notifiers, NULL);
+        }
+        return;
+    }
+    for (unsigned i = 0; i < n; i++) {
+        if (socs[i].reset_pending) {
+            socs[i].reset_pending = false;
+            efr32_soc_reset(&socs[i], type);
+        }
+    }
+}
+
 #define EFR32_DEVINFO_MSIZE 0x00cu
 #define EFR32_DEVINFO_MSIZE_FLASH_MASK 0xffffu
 #define EFR32_DEVINFO_MSIZE_SRAM_SHIFT 16
@@ -6681,8 +7020,43 @@ static void efr32_seq_cpu_reset(void *opaque)
 /*
  * Default identity: the BGM220PC22HNA2 module of the BRD4314A explorer kit,
  * as observed on that hardware.  Only these fields are known; the remaining
- * DEVINFO words (PART, calibration, ...) read zero.
+ * DEVINFO words (calibration, ...) read zero.
+ *
+ * INFO, PART and MEMINFO (RM SS6.4.2.1-3): OpenOCD's efm32 driver decodes
+ * them as it probes, and on the kit it reported "EFR32BG22 C224, rev 9" with
+ * 8 KiB erase pages (owo-open-fw docs/hardware-bringup.md, evidence log).
+ * Its "rev" is INFO.PRODREV: QEMU given the suit's DEVINFO dump (INFO
+ * 0x07240110) prints "rev 36".  The suit's dump also fixes the PART
+ * encoding: 0x021608AE = FAMILY 2 (BG), FAMILYNUM 22, DEVICENUM 2222 =
+ * C222, its BG22C222F352GM40 die.  So the kit's C224 die reads
+ *   PART    = BG << 24 | 22 << 16 | ('C' - 'A') * 1000 + 224 = 0x021608B0,
+ *   INFO    = DEVINFOREV 7 (RM reset value; the suit's page reads 7) |
+ *             PRODREV 9; CRC [U] never read (0),
+ *   MEMINFO = FLASHPAGESIZE 3 (2^(3 + 10) = 8 KiB); DILEN and UDPAGESIZE
+ *             [U] never read (0).
+ * Without PART, OpenOCD's flash driver stopped at "Unknown MCU family 0".
+ * OpenOCD reads that family from the byte at DEVINFO + 0x1FE (its Series
+ * 0/1 location, kept for every series; 128 = "EFR32/EFM32 Series-2",
+ * efm32.c).  The suit's page holds 0x80 there, the rest of that area
+ * erased (word 0x1FC reads 0xFF80FFFF); OpenOCD identified the kit on
+ * silicon, so its page has the same byte.
  */
+#define EFR32_DEVINFO_SERIES2_ID 0x1feu
+#define EFR32_DEVINFO_SERIES2_ID_VALUE 0x80u
+#define EFR32_DEVINFO_INFO 0x000u
+#define EFR32_DEVINFO_INFO_DEVINFOREV_SHIFT 24
+#define EFR32_DEVINFO_INFO_PRODREV_SHIFT 16
+#define EFR32_DEVINFO_MEMINFO 0x008u
+#define EFR32_DEVINFO_MEMINFO_FLASHPAGESIZE_8K 3u
+#define EFR32_DEVINFO_PART_DEVICENUM(letter, number) \
+    (((letter) - 'A') * 1000u + (number))
+#define EFR32_BGM220_HNA2_DEVINFOREV 7u
+#define EFR32_BGM220_HNA2_PRODREV 9u
+#define EFR32_BGM220_HNA2_PART \
+    ((EFR32_DEVINFO_PART_FAMILY_BG << EFR32_DEVINFO_PART_FAMILY_SHIFT) | \
+     (EFR32_DEVINFO_PART_FAMILYNUM_XG22 << \
+      EFR32_DEVINFO_PART_FAMILYNUM_SHIFT) | \
+     EFR32_DEVINFO_PART_DEVICENUM('C', 224u))
 #define EFR32_BGM220_HNA2_FLASH_KB 512u
 #define EFR32_BGM220_HNA2_SRAM_KB 32u
 #define EFR32_BGM220_HNA2_EUI64L 0x0000beefu
@@ -6806,6 +7180,15 @@ static bool efr32_soc_load_identity(Efr32Bg22SoCState *s, Error **errp)
             return false;
         }
     } else {
+        efr32_info_put(devinfo, EFR32_DEVINFO_INFO,
+                       (EFR32_BGM220_HNA2_DEVINFOREV <<
+                        EFR32_DEVINFO_INFO_DEVINFOREV_SHIFT) |
+                       (EFR32_BGM220_HNA2_PRODREV <<
+                        EFR32_DEVINFO_INFO_PRODREV_SHIFT));
+        efr32_info_put(devinfo, EFR32_DEVINFO_PART, EFR32_BGM220_HNA2_PART);
+        devinfo[EFR32_DEVINFO_SERIES2_ID] = EFR32_DEVINFO_SERIES2_ID_VALUE;
+        efr32_info_put(devinfo, EFR32_DEVINFO_MEMINFO,
+                       EFR32_DEVINFO_MEMINFO_FLASHPAGESIZE_8K);
         efr32_info_put(devinfo, EFR32_DEVINFO_MSIZE,
                        EFR32_BGM220_HNA2_FLASH_KB |
                        (EFR32_BGM220_HNA2_SRAM_KB <<
@@ -6904,6 +7287,47 @@ static const MemoryRegionOps efr32_seqram_m33_ops = {
     .impl = {.min_access_size = 1, .max_access_size = 4},
 };
 
+/*
+ * The M0+'s view of main SRAM (SS7.74: the same SRAM as the M33's): an
+ * access through the matrix, so it goes through the bus model
+ * (efr32-interconnect.c), which a RAM alias would bypass.
+ */
+static MemTxResult efr32_seq_sram_read(void *opaque, hwaddr offset,
+                                       uint64_t *data, unsigned size,
+                                       MemTxAttrs attrs)
+{
+    Efr32Bg22SoCState *s = opaque;
+    uint8_t buf[8];
+    MemTxResult r;
+
+    efr32_bus_access(&s->periph, EFR32_SRAM_BASE + offset, size, false);
+    r = address_space_read(&s->periph.dma_as, EFR32_SRAM_BASE + offset,
+                           attrs, buf, size);
+    *data = ldn_le_p(buf, size);
+    return r;
+}
+
+static MemTxResult efr32_seq_sram_write(void *opaque, hwaddr offset,
+                                        uint64_t value, unsigned size,
+                                        MemTxAttrs attrs)
+{
+    Efr32Bg22SoCState *s = opaque;
+    uint8_t buf[8];
+
+    efr32_bus_access(&s->periph, EFR32_SRAM_BASE + offset, size, true);
+    stn_le_p(buf, size, value);
+    return address_space_write(&s->periph.dma_as, EFR32_SRAM_BASE + offset,
+                               attrs, buf, size);
+}
+
+static const MemoryRegionOps efr32_seq_sram_ops = {
+    .read_with_attrs = efr32_seq_sram_read,
+    .write_with_attrs = efr32_seq_sram_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {.min_access_size = 1, .max_access_size = 4},
+    .impl = {.min_access_size = 1, .max_access_size = 4},
+};
+
 /* AIRCR.SYSRESETREQ of the M33: a system reset with RSTCAUSE.SYSREQ. */
 static void efr32_soc_sysresetreq(void *opaque, int n, int level)
 {
@@ -6913,7 +7337,7 @@ static void efr32_soc_sysresetreq(void *opaque, int n, int level)
         s->periph.rstcause |= EFR32_EMU_RSTCAUSE_SYSREQ;
         /* The debug port sees the system reset begin (efr32-dap) */
         efr32bg22_debug_system_reset(OBJECT(s));
-        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        efr32_soc_reset_request(s);
     }
 }
 
@@ -6936,7 +7360,15 @@ static void efr32_soc_nreset(void *opaque, int n, int level)
         s->periph.rstctrl = EFR32_EMU_RSTCTRL_RESET;
     }
     CPU(s->armv7m.cpu)->start_powered_off = level;
-    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    efr32_soc_reset_request(s);
+}
+
+/* The reset that follows a DCI device erase (efr32-dap.c). */
+static void efr32_soc_erase_reset(void *opaque, int n, int level)
+{
+    if (level) {
+        efr32_soc_reset_request(opaque);
+    }
 }
 
 /*
@@ -6953,7 +7385,7 @@ static void efr32_soc_lockup(void *opaque, int n, int level)
 
     if (level && (s->periph.rstctrl & EFR32_EMU_RSTCTRL_LOCKUPRMODE)) {
         s->periph.rstcause |= EFR32_EMU_RSTCAUSE_LOCKUP;
-        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        efr32_soc_reset_request(s);
     }
 }
 
@@ -6989,6 +7421,7 @@ static void efr32_soc_init(Object *obj)
     object_initialize_child(obj, "radio-sequencer", &s->seq_armv7m,
                             TYPE_ARMV7M);
     object_initialize_child(obj, "periph", &s->periph, TYPE_EFR32_PERIPH);
+    notifier_list_init(&s->reset_notifiers);
 }
 
 /* efr32bg22c224f512im40.h IRQn_Type. */
@@ -7149,6 +7582,9 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
                                                            0));
         qdev_connect_gpio_out_named(dap, "nreset", 0,
                                     qemu_allocate_irq(efr32_soc_nreset, s, 0));
+        qdev_connect_gpio_out_named(dap, "erase-reset", 0,
+                                    qemu_allocate_irq(efr32_soc_erase_reset,
+                                                      s, 0));
     }
     efr32_rf_medium_attach(s->rf_medium, EFR32_RF_RADIO(&s->periph), errp);
     if (*errp) {
@@ -7199,8 +7635,9 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
      * peripherals (TIMER1, PRS, CMU); the secure window reads 0.  The stock
      * sequencer reads EMU.TEMP through the secure window (0x40004088).
      */
-    memory_region_init_alias(&s->seq_sram_alias, OBJECT(s), "efr32.seq-sram",
-                             &s->sram, 0, s->sram_size);
+    memory_region_init_io(&s->seq_sram_alias, OBJECT(s),
+                          &efr32_seq_sram_ops, s, "efr32.seq-sram",
+                          s->sram_size);
     memory_region_add_subregion(&s->seq_memory, EFR32_SRAM_BASE,
                                 &s->seq_sram_alias);
     memory_region_init_alias(&s->seq_periph_ns_alias, OBJECT(s),
@@ -7236,7 +7673,10 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
                          "both cores share the instruction rate");
     }
     s->periph.bus_model.access = efr32_bus_cost;
+    s->periph.bus_model.round_end = efr32_bus_round_end;
     s->periph.bus_model.opaque = &s->periph;
+    s->periph.ic.cpu[EFR32_IC_M33] = s->periph.m33_cpu;
+    s->periph.ic.cpu[EFR32_IC_SEQ] = s->periph.seq_cpu;
     icount_register_bus_model(&s->periph.bus_model);
     icount_set_cpu_cycle_counting(s->periph.seq_cpu, true);
     icount_set_cpu_exception_cycles(s->periph.seq_cpu,
@@ -7311,6 +7751,18 @@ static bool efr32_fits_flash(Efr32Bg22SoCState *soc, uint32_t offset,
                              gsize n)
 {
     return offset <= soc->flash_size && n <= soc->flash_size - offset;
+}
+
+static void efr32_machine_reset(MachineState *m, ResetType type)
+{
+    efr32_machine_reset_socs(&EFR32BG22_MACHINE(m)->soc, 1, type);
+}
+
+static void efr32_dual_machine_reset(MachineState *m, ResetType type)
+{
+    Efr32DualState *s = EFR32BG22_DUAL_MACHINE(m);
+
+    efr32_machine_reset_socs(s->soc, G_N_ELEMENTS(s->soc), type);
 }
 
 static void init(MachineState *m)
@@ -7511,6 +7963,7 @@ static void mc(ObjectClass *o, void *d)
     i->check = idau;
     m->desc = "Silicon Labs EFR32BG22 (Cortex-M33), native peripherals";
     m->init = init;
+    m->reset = efr32_machine_reset;
     m->valid_cpu_types = cpu;
     m->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-m33");
     m->default_ram_size = EFR32_FLASH_MAX_SIZE;
@@ -7732,6 +8185,7 @@ static void dual_mc(ObjectClass *o, void *d)
     i->check = idau;
     m->desc = "EFR32BG22 dual-MCU RF test topology";
     m->init = dual_init;
+    m->reset = efr32_dual_machine_reset;
     m->valid_cpu_types = cpu;
     m->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-m33");
     m->default_ram_size = 2 * EFR32_FLASH_MAX_SIZE;

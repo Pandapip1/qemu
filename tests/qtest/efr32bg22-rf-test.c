@@ -957,6 +957,46 @@ static void test_tx_offer_waits_for_receiver_rxsearch(void)
 }
 
 /*
+ * Two chips on a bench reset independently: a WDOG0 timeout in the second
+ * SoC (CFG 0: PERSEL 0, 2^3 + 1 LF cycles, RM SS27.3.2) resets that SoC
+ * alone, RSTCAUSE.WDOG0 (RM SS12.5.15); the first keeps its clocks and its
+ * cleared RSTCAUSE.  (The machine reset, QMP system_reset, still resets both.)
+ */
+#define EMU_BASE                 0x40004000
+#define EMU_CMD                  0x070
+#define EMU_CMD_RSTCAUSECLR      (1u << 17)
+#define EMU_RSTCAUSE             0x094
+#define EMU_RSTCAUSE_WDOG0       (1u << 3)
+#define WDOG0_BASE               0x4a018000
+#define WDOG_EN                  0x04
+#define WDOG_CFG                 0x08
+#define WDOG_TIMEOUT_NS          (UINT64_C(9) * 1000000000 / 32768 + 1)
+
+static void test_wdog_resets_one_soc(void)
+{
+    rf_reset_with_clocks();
+    qtest_writel(global_qtest, EMU_BASE + EMU_CMD, EMU_CMD_RSTCAUSECLR);
+    qtest_writel(global_qtest, peer(EMU_BASE + EMU_CMD), EMU_CMD_RSTCAUSECLR);
+    qtest_writel(global_qtest, peer(WDOG0_BASE + WDOG_CFG), 0);
+    qtest_writel(global_qtest, peer(WDOG0_BASE + WDOG_EN), 1);
+    /* Virtual-clock timers run only while the machine runs. */
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    qtest_clock_step(global_qtest, 2 * WDOG_TIMEOUT_NS);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+
+    g_assert_cmphex(qtest_readl(global_qtest, peer(EMU_BASE + EMU_RSTCAUSE)),
+                    ==, EMU_RSTCAUSE_WDOG0);
+    g_assert_cmphex(qtest_readl(global_qtest, peer(WDOG0_BASE + WDOG_EN)), ==,
+                    0);
+    g_assert_cmphex(qtest_readl(global_qtest, peer(CMU_BASE + CMU_CLKEN1)),
+                    ==, 0);
+    g_assert_cmphex(qtest_readl(global_qtest, EMU_BASE + EMU_RSTCAUSE), ==, 0);
+    g_assert_cmphex(qtest_readl(global_qtest, CMU_BASE + CMU_CLKEN1) &
+                    CMU_CLKEN1_RADIO_BLOCKS, ==, CMU_CLKEN1_RADIO_BLOCKS);
+    rf_reset_with_clocks();
+}
+
+/*
  * A board reset must retire both the deferred handoff timer and its medium
  * mailbox.  Re-entering RXSEARCH after reset must not replay the pre-reset
  * offer as a synthetic receive.
@@ -2188,6 +2228,8 @@ int main(int argc, char **argv)
                    test_tx_offer_waits_for_receiver_rxsearch);
     qtest_add_func("/efr32bg22/rf/system-reset-with-deferred-offer",
                    test_system_reset_with_deferred_offer);
+    qtest_add_func("/efr32bg22/rf/wdog-resets-one-soc",
+                   test_wdog_resets_one_soc);
     qtest_add_func("/efr32bg22/rf/tx-disable-withdraws-deferred-offer",
                    test_tx_disable_withdraws_deferred_offer);
     qtest_add_func("/efr32bg22/rf/rx-disable-withdraws-active-tx-offer",

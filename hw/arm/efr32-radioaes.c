@@ -59,6 +59,19 @@
 #define INCL_IPS_HW_CFG_RESET 0x00000001u
 #define BA411E_HW_CFG_1_RESET 0x05010127u
 #define BA411E_HW_CFG_2_RESET 0x00000080u
+/*
+ * BA411E_HW_CFG_1.g_Keysize (bits 26:24, bgm24_aes.h; 5 in the silicon
+ * value above): one bit per key size, 128 (bit 0), 192 (bit 1), 256 (bit 2)
+ * [I: the header names the field, not its bits].  This engine has no
+ * 192-bit keys, which Silicon Labs' driver agrees with: it answers
+ * SL_STATUS_NOT_SUPPORTED for 192 and implements only 128 and 256
+ * (sli_protocol_crypto_radioaes.c).
+ */
+#define BA411E_HW_CFG_1_KEYSIZE_SHIFT 24
+#define BA411E_HW_CFG_1_KEYSIZE_MASK 0x7u
+#define BA411E_KEYSIZE_128 (1u << 0)
+#define BA411E_KEYSIZE_192 (1u << 1)
+#define BA411E_KEYSIZE_256 (1u << 2)
 
 /* Descriptor (sli_radioaes_dma_descr_t): address, next, length, tag. */
 #define DESC_NEXT_STOP 0x1u
@@ -271,7 +284,8 @@ static void radioaes_run(Efr32RadioAes *ra, AddressSpace *as)
     bool fetch_error = false, push_error = false;
     uint32_t mode, d[4];
     AES_KEY ek, dk;
-    unsigned keybits;
+    unsigned keybits, keysize;
+    bool unsupported = false;
     size_t pos = 0;
     uint32_t hdr_pos = 0, pay_pos = 0;
 
@@ -351,11 +365,37 @@ static void radioaes_run(Efr32RadioAes *ra, AddressSpace *as)
 
     /* Engine. */
     mode = ldl_le_p(cfg + BA411E_OFFSET_CFG);
-    keybits = (mode & MODE_KEYSIZE_MASK) == MODE_AES256 ? 256
-              : (mode & MODE_KEYSIZE_MASK) == MODE_AES192 ? 192 : 128;
-    AES_set_encrypt_key(cfg + BA411E_OFFSET_KEY, keybits, &ek);
-    AES_set_decrypt_key(cfg + BA411E_OFFSET_KEY, keybits, &dk);
-    if (!fetch_error) {
+    switch (mode & MODE_KEYSIZE_MASK) {
+    case MODE_AES256:
+        keybits = 256;
+        keysize = BA411E_KEYSIZE_256;
+        break;
+    case MODE_AES192:
+        keybits = 192;
+        keysize = BA411E_KEYSIZE_192;
+        break;
+    default:
+        keybits = 128;
+        keysize = BA411E_KEYSIZE_128;
+        break;
+    }
+    if (!((BA411E_HW_CFG_1_RESET >> BA411E_HW_CFG_1_KEYSIZE_SHIFT) &
+          BA411E_HW_CFG_1_KEYSIZE_MASK & keysize)) {
+        /*
+         * A key size this engine was built without.  What the hardware does
+         * then is unknown (never tried on silicon), so the model computes
+         * nothing: it reports the operation and the pusher delivers zeros.
+         */
+        qemu_log_mask(LOG_GUEST_ERROR | LOG_UNIMP,
+                      "efr32 RADIOAES: %u-bit key, not in this BA411E "
+                      "(HW_CFG_1 0x%08x); result not modelled\n",
+                      keybits, BA411E_HW_CFG_1_RESET);
+        unsupported = true;
+    } else {
+        AES_set_encrypt_key(cfg + BA411E_OFFSET_KEY, keybits, &ek);
+        AES_set_decrypt_key(cfg + BA411E_OFFSET_KEY, keybits, &dk);
+    }
+    if (!fetch_error && !unsupported) {
         if (mode & MODE_CMAC) {
             do_cmac(&ek, pay.data, pay.len, out.data);
             out.len = BLOCK;

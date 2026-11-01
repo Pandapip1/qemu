@@ -312,6 +312,8 @@ static void test_iadc_scan_board_battery(void)
     writel(IADC_BASE + IADC_MASKREQ, 1);
     writel(IADC_BASE + IADC_SCANFIFOCFG, 0);
     writel(IADC_BASE + IADC_CMD, IADC_CMD_SCANSTART);
+    /* Warm-up and conversion (RM SS24.3.3) at the reset clocks. */
+    clock_run(20000);
     g_assert_cmphex(readl(IADC_BASE + IADC_IF) & IADC_IF_SCANTABLEDONE, ==,
                     IADC_IF_SCANTABLEDONE);
     data = readl(IADC_BASE + IADC_SCANFIFODATA);

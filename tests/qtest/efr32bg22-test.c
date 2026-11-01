@@ -371,6 +371,19 @@ static void attribute_radio_secure(void)
 #define DEVINFO_BASE          0x0fe00000
 #define DEVINFO_MODULENAME0   0x8130
 #define DEVINFO_MODULEINFO    0x814c
+/* DEVINFO INFO, PART, MEMINFO (RM SS6.4.2.1-3) of the kit's C224 die. */
+#define DEVINFO_INFO          0x8000
+#define DEVINFO_PART          0x8004
+#define DEVINFO_MEMINFO       0x8008
+#define KIT_DEVINFO_INFO      0x07090000 /* DEVINFOREV 7, PRODREV 9 */
+#define KIT_DEVINFO_PART      0x021608b0 /* BG, family 22, device C224 */
+#define KIT_DEVINFO_MEMINFO   0x00000003 /* 8 KiB flash pages */
+/* OpenOCD's family byte (efm32.c): 128, Series 2, as on the suit. */
+#define DEVINFO_SERIES2_ID    0x81fe
+#define KIT_SERIES2_ID        0x80
+#define SYSCFG_CHIPREV        0x014
+#define SYSCFG_CHIPREV_FAMILY (0x3fu << 6)
+#define SYSCFG_CHIPREV_BG22   (53u << 6)
 
 static void qtest_seq_enable_radio_bus_clocks(QTestState *qts)
 {
@@ -415,6 +428,17 @@ static void test_bgm220_module_identity(void)
                         ==, module_name[i]);
     }
     g_assert_cmphex(readl(DEVINFO_BASE + DEVINFO_MODULEINFO), ==, 0x00570100);
+    /* What OpenOCD's efm32 driver decodes: "EFR32BG22 C224, rev 9". */
+    g_assert_cmphex(readl(DEVINFO_BASE + DEVINFO_INFO), ==, KIT_DEVINFO_INFO);
+    g_assert_cmphex(readl(DEVINFO_BASE + DEVINFO_PART), ==, KIT_DEVINFO_PART);
+    g_assert_cmphex(readl(DEVINFO_BASE + DEVINFO_MEMINFO), ==,
+                    KIT_DEVINFO_MEMINFO);
+    g_assert_cmphex(readb(DEVINFO_BASE + DEVINFO_SERIES2_ID), ==,
+                    KIT_SERIES2_ID);
+    /* The family the boot code leaves in CHIPREV follows DEVINFO.PART. */
+    writel(CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW, CMU_CLKEN0_SYSCFG);
+    g_assert_cmphex(readl(SYSCFG_BASE + SYSCFG_CHIPREV) &
+                    SYSCFG_CHIPREV_FAMILY, ==, SYSCFG_CHIPREV_BG22);
 }
 
 static void test_register_aliases(void)
@@ -2180,8 +2204,6 @@ static void setup_no_clocks(QTestState *qts)
 #define PART_C222F352_FLASH_END 0x58000
 #define DEVINFO_OFFSET          0x8000
 #define INFO_PAGE_SIZE          0x400
-#define SYSCFG_CHIPREV          0x014
-#define SYSCFG_CHIPREV_BG22     (53u << 6)
 #define MSC_WRITECTRL           0x00c
 #define MSC_WRITECTRL_WREN      (1u << 0)
 #define MSC_WRITECMD            0x010
@@ -2361,14 +2383,55 @@ static void test_rtcc_counts_and_compares(void)
 #define IADC_SINGLE           0x098
 #define IADC_SINGLE_PD02_GND  0x0000b200
 
+/*
+ * Timing (RM SS24.3.3, [I] unmeasured): at reset the IADC clock is
+ * EM01GRPACLK = HFRCODPLL's 19 MHz; TIMEBASE 18 makes a 1 us interval,
+ * PRESCALE 1 a 9.5 MHz ADC_CLK.  WARMUPMODE NORMAL: 5 intervals of warm-up
+ * then (4 * OSR 2 + 2) = 10 ADC_CLK cycles per conversion, every time;
+ * KEEPWARM: the warm-up once.
+ */
+#define IADC_CTRL             0x008
+#define IADC_CTRL_TIMEBASE_1US (18u << 16)
+#define IADC_CTRL_KEEPWARM    (2u << 4)
+#define IADC_SCHED0           0x054
+#define IADC_STATUS_CONVERTING (1u << 6)
+#define IADC_WARMUP_NS        (5 * 19 * 1000000000ull / 19000000)
+#define IADC_CONV_NS          (10 * 1000000000ull * 2 / 19000000)
+
+static void iadc_convert_after(QTestState *qts, uint64_t ns)
+{
+    qtest_writel(qts, IADC_BASE + IADC_CMD, 1);
+    qtest_clock_step(qts, ns - 1);
+    g_assert_cmphex(qtest_readl(qts, IADC_BASE + IADC_STATUS) &
+                    IADC_STATUS_CONVERTING, ==, IADC_STATUS_CONVERTING);
+    qtest_clock_step(qts, 1);
+    g_assert_cmphex(qtest_readl(qts, IADC_BASE + IADC_STATUS) &
+                    (IADC_STATUS_CONVERTING | IADC_STATUS_FIFODV), ==,
+                    IADC_STATUS_FIFODV);
+}
+
 static void test_iadc_single_conversion(void)
 {
     QTestState *qts = qtest_initf("-machine efr32bg22,analog=PD02=968 "
-                                  "-accel tcg -S");
+                                  "-accel qtest");
 
+    qtest_writel(qts, IADC_BASE + IADC_CTRL, IADC_CTRL_TIMEBASE_1US);
+    qtest_writel(qts, IADC_BASE + IADC_SCHED0, 1);
     qtest_writel(qts, IADC_BASE + IADC_CFG0, IADC_CFG0_VDDX_GAIN1);
     qtest_writel(qts, IADC_BASE + IADC_SINGLE, IADC_SINGLE_PD02_GND);
-    qtest_writel(qts, IADC_BASE + IADC_CMD, 1);
+    iadc_convert_after(qts, IADC_WARMUP_NS + IADC_CONV_NS);
+    /* NORMAL: powered down again, so the next one warms up again. */
+    iadc_convert_after(qts, IADC_WARMUP_NS + IADC_CONV_NS);
+    g_assert_cmpuint(qtest_readl(qts, IADC_BASE + IADC_SINGLEFIFODATA), ==,
+                     1201);
+    qtest_writel(qts, IADC_BASE + IADC_CTRL,
+                 IADC_CTRL_TIMEBASE_1US | IADC_CTRL_KEEPWARM);
+    iadc_convert_after(qts, IADC_WARMUP_NS + IADC_CONV_NS);
+    g_assert_cmpuint(qtest_readl(qts, IADC_BASE + IADC_SINGLEFIFODATA), ==,
+                     1201);
+    iadc_convert_after(qts, IADC_CONV_NS);
+    g_assert_cmpuint(qtest_readl(qts, IADC_BASE + IADC_SINGLEFIFODATA), ==,
+                     1201);
     g_assert_cmphex(qtest_readl(qts, IADC_BASE + IADC_STATUS) &
                     IADC_STATUS_FIFODV, ==, IADC_STATUS_FIFODV);
     g_assert_cmphex(qtest_readl(qts, IADC_BASE + IADC_IF) &
@@ -3600,6 +3663,247 @@ static void test_radio_sequencer_release_is_idempotent(void)
     qtest_quit(qts);
 }
 
+/*
+ * RADIOAES (RM 11.4; descriptor format of Silicon Labs'
+ * sli_protocol_crypto_radioaes.c): one AES-ECB block through the
+ * scatter-gather DMA.  Run time on silicon (owo-open-fw docs/crypto.md SS4,
+ * HCLK 76.8 MHz): ECB 1 block 133 cycles = 80 + 55 per block, so the DMA
+ * reports busy for 1042 + 716 ns.  The engine has 128- and 256-bit keys
+ * only (BA411E_HW_CFG_1.g_Keysize = 5 read on silicon): a 192-bit operation
+ * is reported, not computed.
+ */
+#define RADIOAES_BASE          0x44000000
+#define RADIOAES_FETCHADDR     0x000
+#define RADIOAES_PUSHADDR      0x010
+#define RADIOAES_IF            0x028
+#define RADIOAES_CTRL          0x034
+#define RADIOAES_CMD           0x038
+#define RADIOAES_STATUS        0x03c
+#define RADIOAES_HW_CFG_1      0x404
+#define RADIOAES_CTRL_SG       0x3        /* fetcher + pusher scatter-gather */
+#define RADIOAES_CMD_START     0x3        /* start fetcher + pusher */
+#define RADIOAES_STATUS_BUSY   0x3
+#define RADIOAES_IF_STOPPED    0x12       /* FETCHERSTOPPED | PUSHERSTOPPED */
+#define RADIOAES_DESC_STOP     0x1
+#define RADIOAES_TAG_CONFIG    0x11       /* BA411E, configuration, offset 0 */
+#define RADIOAES_TAG_LASTDATA  0x21       /* BA411E, last data */
+#define RADIOAES_MODE_ECB      0x100
+#define RADIOAES_MODE_AES192   0x8
+#define RADIOAES_ECB_1BLOCK_NS (1042 + 716)
+#define AES_SRAM               0x20001000
+#define AES_CFG                (AES_SRAM + 0x000) /* mode, 0, key */
+#define AES_IN                 (AES_SRAM + 0x040)
+#define AES_OUT                (AES_SRAM + 0x080)
+#define AES_FETCH              (AES_SRAM + 0x100) /* two descriptors */
+#define AES_PUSH               (AES_SRAM + 0x120)
+
+static void radioaes_ecb(QTestState *qts, uint32_t mode, const uint8_t *key,
+                         size_t keylen, const uint8_t *in)
+{
+    qtest_writel(qts, AES_CFG, mode);
+    qtest_writel(qts, AES_CFG + 4, 0);
+    qtest_memwrite(qts, AES_CFG + 8, key, keylen);
+    qtest_memwrite(qts, AES_IN, in, 16);
+    qtest_memset(qts, AES_OUT, 0xa5, 16);
+    /* Fetch: the configuration, then the block; push: the block. */
+    qtest_writel(qts, AES_FETCH + 0x0, AES_CFG);
+    qtest_writel(qts, AES_FETCH + 0x4, AES_FETCH + 0x10);
+    qtest_writel(qts, AES_FETCH + 0x8, 8 + keylen);
+    qtest_writel(qts, AES_FETCH + 0xc, RADIOAES_TAG_CONFIG);
+    qtest_writel(qts, AES_FETCH + 0x10, AES_IN);
+    qtest_writel(qts, AES_FETCH + 0x14, RADIOAES_DESC_STOP);
+    qtest_writel(qts, AES_FETCH + 0x18, 16);
+    qtest_writel(qts, AES_FETCH + 0x1c, RADIOAES_TAG_LASTDATA);
+    qtest_writel(qts, AES_PUSH + 0x0, AES_OUT);
+    qtest_writel(qts, AES_PUSH + 0x4, RADIOAES_DESC_STOP);
+    qtest_writel(qts, AES_PUSH + 0x8, 16);
+    qtest_writel(qts, AES_PUSH + 0xc, 0);
+    qtest_writel(qts, RADIOAES_BASE + RADIOAES_FETCHADDR, AES_FETCH);
+    qtest_writel(qts, RADIOAES_BASE + RADIOAES_PUSHADDR, AES_PUSH);
+    qtest_writel(qts, RADIOAES_BASE + RADIOAES_CTRL, RADIOAES_CTRL_SG);
+    qtest_writel(qts, RADIOAES_BASE + RADIOAES_CMD, RADIOAES_CMD_START);
+}
+
+static void test_radioaes_ecb_and_key_sizes(void)
+{
+    /* FIPS-197 Appendix C.1 (AES-128) and C.2 (AES-192). */
+    static const uint8_t key[24] = {
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+    };
+    static const uint8_t plain[16] = {
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+    };
+    static const uint8_t cipher128[16] = {
+        0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30,
+        0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4, 0xc5, 0x5a,
+    };
+    static const uint8_t cipher192[16] = {
+        0xdd, 0xa9, 0x7c, 0xa4, 0x86, 0x4c, 0xdf, 0xe0,
+        0x6e, 0xaf, 0x70, 0xa0, 0xec, 0x0d, 0x71, 0x91,
+    };
+    static const uint8_t zero[16];
+    QTestState *qts = qtest_init("-machine efr32bg22 -accel qtest");
+    uint8_t out[16];
+
+    g_assert_cmphex(qtest_readl(qts, RADIOAES_BASE + RADIOAES_HW_CFG_1), ==,
+                    0x05010127);
+    radioaes_ecb(qts, RADIOAES_MODE_ECB, key, 16, plain);
+    g_assert_cmphex(qtest_readl(qts, RADIOAES_BASE + RADIOAES_STATUS), ==,
+                    RADIOAES_STATUS_BUSY);
+    qtest_clock_step(qts, RADIOAES_ECB_1BLOCK_NS - 1);
+    g_assert_cmphex(qtest_readl(qts, RADIOAES_BASE + RADIOAES_STATUS), ==,
+                    RADIOAES_STATUS_BUSY);
+    qtest_clock_step(qts, 1);
+    g_assert_cmphex(qtest_readl(qts, RADIOAES_BASE + RADIOAES_STATUS), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, RADIOAES_BASE + RADIOAES_IF) &
+                    RADIOAES_IF_STOPPED, ==, RADIOAES_IF_STOPPED);
+    qtest_memread(qts, AES_OUT, out, sizeof(out));
+    g_assert_cmpmem(out, sizeof(out), cipher128, sizeof(cipher128));
+
+    /* No 192-bit keys: nothing computed (the push delivers zeros). */
+    radioaes_ecb(qts, RADIOAES_MODE_ECB | RADIOAES_MODE_AES192, key, 24,
+                 plain);
+    qtest_clock_step(qts, RADIOAES_ECB_1BLOCK_NS);
+    qtest_memread(qts, AES_OUT, out, sizeof(out));
+    g_assert(memcmp(out, cipher192, sizeof(out)) != 0);
+    g_assert_cmpmem(out, sizeof(out), zero, sizeof(zero));
+    qtest_quit(qts);
+}
+
+/*
+ * CRYPTOACC TRNG (RM SS11.5): RNGCTRL.ENABLE starts the noise source; after
+ * the start-up wait (INITWAITVAL PCLK cycles + the 1024-sample NIST start-up
+ * test, [I] timing never measured) 128-bit blocks fill the 64-word FIFO;
+ * a full FIFO stops the rings (STATE FIFOFULLOFF, FULLIF); each read of the
+ * FIFO window pops a word and the rings restart.  Bus clock CLKEN1 bit 13.
+ */
+#define TRNG_CTRL              0x4c021000
+#define TRNG_FIFOLEVEL         0x004
+#define TRNG_FIFODEPTH         0x00c
+#define TRNG_RNGSTATUS         0x030
+#define TRNG_INITWAITVAL       0x034
+#define TRNG_FIFO              0x4c024000
+#define TRNG_ENABLE            0x00040001 /* NB128BITBLOCKS 4 | ENABLE */
+#define TRNG_STATUS_FULLIF     (1u << 7)
+#define TRNG_STATUS_STATE(v)   (((v) >> 1) & 7u)
+#define TRNG_STATE_STARTUP     1
+#define TRNG_STATE_FIFOFULLOFF 3
+#define TRNG_STATE_RUNNING     4
+#define CMU_CLKEN1_CRYPTOACC   (1u << 13)
+
+static void test_trng_fifo(void)
+{
+    QTestState *qts = qtest_init("-machine efr32bg22 -accel qtest");
+    uint32_t words[8];
+    bool differ = false;
+
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN1 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN1_CRYPTOACC);
+    g_assert_cmphex(qtest_readl(qts, TRNG_CTRL + TRNG_FIFODEPTH), ==, 64);
+    g_assert_cmphex(qtest_readl(qts, TRNG_CTRL + TRNG_INITWAITVAL), ==,
+                    0xffff);
+    qtest_writel(qts, TRNG_CTRL, TRNG_ENABLE);
+    g_assert_cmphex(TRNG_STATUS_STATE(qtest_readl(qts, TRNG_CTRL +
+                                                  TRNG_RNGSTATUS)), ==,
+                    TRNG_STATE_STARTUP);
+    g_assert_cmphex(qtest_readl(qts, TRNG_CTRL + TRNG_FIFOLEVEL), ==, 0);
+    qtest_clock_step(qts, 20 * 1000 * 1000);
+    g_assert_cmphex(qtest_readl(qts, TRNG_CTRL + TRNG_FIFOLEVEL), ==, 64);
+    g_assert_cmphex(qtest_readl(qts, TRNG_CTRL + TRNG_RNGSTATUS) &
+                    TRNG_STATUS_FULLIF, ==, TRNG_STATUS_FULLIF);
+    g_assert_cmphex(TRNG_STATUS_STATE(qtest_readl(qts, TRNG_CTRL +
+                                                  TRNG_RNGSTATUS)), ==,
+                    TRNG_STATE_FIFOFULLOFF);
+    for (size_t i = 0; i < G_N_ELEMENTS(words); i++) {
+        words[i] = qtest_readl(qts, TRNG_FIFO + 4 * i);
+        differ |= i && words[i] != words[0];
+    }
+    g_assert_true(differ);
+    g_assert_cmphex(qtest_readl(qts, TRNG_CTRL + TRNG_FIFOLEVEL), ==, 56);
+    g_assert_cmphex(TRNG_STATUS_STATE(qtest_readl(qts, TRNG_CTRL +
+                                                  TRNG_RNGSTATUS)), ==,
+                    TRNG_STATE_RUNNING);
+    qtest_clock_step(qts, 1000 * 1000);
+    g_assert_cmphex(qtest_readl(qts, TRNG_CTRL + TRNG_FIFOLEVEL), ==, 64);
+    qtest_quit(qts);
+}
+
+/*
+ * GPCRC (RM chapter 14) through the register sequence of sl_hal_gpcrc.c and
+ * Zephyr's crc_silabs_gpcrc.c, on the check string "123456789":
+ * CRC-32/IEEE 0xCBF43926 (BITREVERSE 0, DATA, xorout ~0, written as words
+ * then a byte), CRC-16/CCITT-FALSE 0x29B1 (POLY 0x8408 reversed, BITREVERSE
+ * 1, DATAREV, half-words then a byte), CRC-16/KERMIT 0x2189 (BITREVERSE 0,
+ * DATA); BYTEREVERSE of a big-endian word gives the same CRC-32.
+ */
+#define GPCRC_BASE             0x40088000
+#define GPCRC_EN               0x004
+#define GPCRC_CTRL             0x008
+#define GPCRC_CMD              0x00c
+#define GPCRC_INIT             0x010
+#define GPCRC_POLY             0x014
+#define GPCRC_INPUTDATA        0x018
+#define GPCRC_INPUTDATAHWORD   0x01c
+#define GPCRC_INPUTDATABYTE    0x020
+#define GPCRC_DATA             0x024
+#define GPCRC_DATAREV          0x028
+#define GPCRC_CTRL_CRC16       (1u << 4)
+#define GPCRC_CTRL_BITREVERSE  (1u << 9)
+#define GPCRC_CTRL_BYTEREVERSE (1u << 10)
+#define CMU_CLKEN0_GPCRC       (1u << 3)
+
+static void gpcrc_start(QTestState *qts, uint32_t ctrl, uint32_t poly,
+                        uint32_t init)
+{
+    qtest_writel(qts, GPCRC_BASE + GPCRC_EN, 0);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_CTRL, ctrl);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_POLY, poly);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_INIT, init);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_EN, 1);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_CMD, 1);
+}
+
+static void test_gpcrc_crc_vectors(void)
+{
+    QTestState *qts = qtest_init("-machine efr32bg22 -accel qtest");
+
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_GPCRC);
+    /* "1234" "5678" little-endian words, then '9'. */
+    gpcrc_start(qts, 0, 0, 0xffffffff);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_INPUTDATA, 0x34333231);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_INPUTDATA, 0x38373635);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_INPUTDATABYTE, '9');
+    g_assert_cmphex(qtest_readl(qts, GPCRC_BASE + GPCRC_DATA) ^ 0xffffffff,
+                    ==, 0xcbf43926);
+    /* The same words big-endian, byte-reversed by the GPCRC. */
+    gpcrc_start(qts, GPCRC_CTRL_BYTEREVERSE, 0, 0xffffffff);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_INPUTDATA, 0x31323334);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_INPUTDATA, 0x35363738);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_INPUTDATABYTE, '9');
+    g_assert_cmphex(qtest_readl(qts, GPCRC_BASE + GPCRC_DATA) ^ 0xffffffff,
+                    ==, 0xcbf43926);
+    /* CRC-16/CCITT-FALSE: MSB-first, so BITREVERSE and DATAREV. */
+    gpcrc_start(qts, GPCRC_CTRL_CRC16 | GPCRC_CTRL_BITREVERSE, 0x8408,
+                0xffff);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_INPUTDATAHWORD, 0x3231);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_INPUTDATAHWORD, 0x3433);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_INPUTDATAHWORD, 0x3635);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_INPUTDATAHWORD, 0x3837);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_INPUTDATABYTE, '9');
+    g_assert_cmphex(qtest_readl(qts, GPCRC_BASE + GPCRC_DATAREV), ==, 0x29b1);
+    /* CRC-16/KERMIT: reflected, DATA. */
+    gpcrc_start(qts, GPCRC_CTRL_CRC16, 0x8408, 0);
+    for (const char *c = "123456789"; *c; c++) {
+        qtest_writel(qts, GPCRC_BASE + GPCRC_INPUTDATABYTE, *c);
+    }
+    g_assert_cmphex(qtest_readl(qts, GPCRC_BASE + GPCRC_DATA), ==, 0x2189);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     int result;
@@ -3636,6 +3940,10 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/timer-sync-registers-read-zero-when-disabled",
                    test_timer_sync_registers_read_zero_when_disabled);
     qtest_add_func("/efr32bg22/timer-bus-faults", test_timer_bus_faults);
+    qtest_add_func("/efr32bg22/trng-fifo", test_trng_fifo);
+    qtest_add_func("/efr32bg22/gpcrc-crc-vectors", test_gpcrc_crc_vectors);
+    qtest_add_func("/efr32bg22/radioaes-ecb-and-key-sizes",
+                   test_radioaes_ecb_and_key_sizes);
     qtest_add_func("/efr32bg22/lfxo-ready-timeout", test_lfxo_ready_timeout);
     qtest_add_func("/efr32bg22/timer4-counter-and-aliases",
                    test_timer4_counter_and_aliases);
