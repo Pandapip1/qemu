@@ -308,6 +308,7 @@ unsigned efr32_rf_medium_offer_latest_tx(Efr32RfMedium *medium,
 
         if (receiver == efr32_rf_tx_snapshot_get_radio(snapshot) ||
             !efr32_rf_radio_is_rx_ready(receiver) ||
+            snapshot->metadata.channel == EFR32_RF_NO_CHANNEL ||
             efr32_rf_radio_get_channel(receiver) != snapshot->metadata.channel ||
             efr32_rf_tx_snapshot_receiver_delivered(snapshot, receiver)) {
             continue;
@@ -359,6 +360,7 @@ unsigned efr32_rf_medium_offer_active_tx_to_receiver(Efr32RfMedium *medium,
     active_sequence = g_hash_table_lookup(medium->active_tx_sequences, source);
     if (source == receiver || !active_sequence ||
         *active_sequence != efr32_rf_tx_snapshot_get_sequence(snapshot) ||
+        snapshot->metadata.channel == EFR32_RF_NO_CHANNEL ||
         efr32_rf_radio_get_channel(receiver) != snapshot->metadata.channel ||
         efr32_rf_tx_snapshot_receiver_delivered(snapshot, receiver)) {
         return 0;

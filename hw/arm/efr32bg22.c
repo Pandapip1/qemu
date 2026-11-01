@@ -69,8 +69,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_SYNTH_FREQ 0x034u
 #define EFR32_SYNTH_FREQ_MASK 0x0fffffffu
 #define EFR32_SYNTH_FREQ_FRACTION_BITS 19
-#define EFR32_RF_CHANNEL0_HZ 2402000000ull
-#define EFR32_RF_CHANNEL_SPACING_HZ 2000000ull
+#define EFR32_RF_RASTER0_HZ 2290000000ull
+#define EFR32_RF_RASTER_HZ 1000000ull
+/*
+ * Carriers the synthesizer calibrates and locks to (owo-open-fw docs/radio-tables.md SS7.85).
+ * [P] The BGM220P datasheet's tuning range (Table 4.5, FRANGE 2400-2483.5 MHz) until measured.
+ */
+#define EFR32_SYNTH_LOCK_MIN_HZ 2400000000ull
+#define EFR32_SYNTH_LOCK_MAX_HZ 2483500000ull
 /*
  * The frame path needs a running synthesizer (owo-open-fw
  * docs/radio-tables.md SS7.60/SS7.61, measured on silicon): with RAC.SYEN
@@ -2203,8 +2209,8 @@ static uint32_t efr32_frc_dynamic_length_wcntcmp0(const uint8_t *bytes,
     return field + minlength;
 }
 
-/* The 2 MHz channel index of the programmed carrier (see EFR32_SYNTH_FREQ). */
-static uint8_t efr32_rf_channel(Efr32Periph *s)
+/* The programmed carrier in Hz (see EFR32_SYNTH_FREQ). */
+static uint64_t efr32_rf_carrier_hz(Efr32Periph *s)
 {
     uint64_t word = (efr32_register_get(s, EFR32_SYNTH_BASE + EFR32_SYNTH_FREQ) &
                      EFR32_SYNTH_FREQ_MASK) +
@@ -2213,15 +2219,101 @@ static uint8_t efr32_rf_channel(Efr32Periph *s)
                         (efr32_register_get(s, EFR32_SYNTH_BASE +
                                             EFR32_SYNTH_CHSP) &
                          EFR32_SYNTH_CHSP_CHSP_MASK);
-    uint64_t hz = (word * EFR32_HFXO_HZ + (1ull << (EFR32_SYNTH_FREQ_FRACTION_BITS - 1)))
-                  >> EFR32_SYNTH_FREQ_FRACTION_BITS;
 
-    if (hz + EFR32_RF_CHANNEL_SPACING_HZ / 2 < EFR32_RF_CHANNEL0_HZ) {
-        return UINT8_MAX; /* below the band: matches no programmed receiver */
+    return (word * EFR32_HFXO_HZ + (1ull << (EFR32_SYNTH_FREQ_FRACTION_BITS - 1)))
+           >> EFR32_SYNTH_FREQ_FRACTION_BITS;
+}
+
+/* Whether the synthesizer reaches @p hz (EFR32_SYNTH_LOCK_MIN_HZ..MAX_HZ). */
+static bool efr32_synth_in_range(uint64_t hz)
+{
+    return hz >= EFR32_SYNTH_LOCK_MIN_HZ && hz <= EFR32_SYNTH_LOCK_MAX_HZ;
+}
+
+/*
+ * The medium's channel: the carrier on a 1 MHz raster from EFR32_RF_RASTER0_HZ, so Bluetooth
+ * carriers (2 MHz apart) and amateur-plan carriers on any whole MHz each match only themselves.
+ * A carrier the synthesizer cannot reach matches no receiver.
+ */
+static uint8_t efr32_rf_channel(Efr32Periph *s)
+{
+    uint64_t hz = efr32_rf_carrier_hz(s);
+
+    if (!efr32_synth_in_range(hz) ||
+        hz + EFR32_RF_RASTER_HZ / 2 < EFR32_RF_RASTER0_HZ) {
+        return EFR32_RF_NO_CHANNEL;
     }
-    return MIN((hz + EFR32_RF_CHANNEL_SPACING_HZ / 2 - EFR32_RF_CHANNEL0_HZ) /
-                   EFR32_RF_CHANNEL_SPACING_HZ,
-               UINT8_MAX - 1);
+    return MIN((hz + EFR32_RF_RASTER_HZ / 2 - EFR32_RF_RASTER0_HZ) / EFR32_RF_RASTER_HZ,
+               EFR32_RF_NO_CHANNEL - 1);
+}
+
+/*
+ * On-off keying (EFR32xG22 reference manual 5.1.2, "ASK / OOK"): MODEM.CTRL0.MODFORMAT = 6
+ * (public register model bits 8:6; the Silicon Labs configurator's OOK/ASK code). Symbol rate
+ * f_HFXO / (8 x TXBRNUM / TXBRDEN) (MODEM.TXBR, the configurator's calc_txbr_value); the frame
+ * is the preamble (PRE.TXBASES bases of PRE.BASEBITS + 1 bits), the sync word
+ * (CTRL1.SYNCBITS + 1 bits) and the FIFO's octets, least significant bit first, 1 = carrier on.
+ * [I] The keying waveform, its edges and its power are not modelled; a Bluetooth receiver gets
+ * nothing from an OOK frame.
+ */
+#define EFR32_MODEM_CTRL0 0x020u
+#define EFR32_MODEM_CTRL0_MODFORMAT_SHIFT 6
+#define EFR32_MODEM_CTRL0_MODFORMAT_MASK 0x7u
+#define EFR32_MODEM_MODFORMAT_OOKASK 6u
+#define EFR32_MODEM_CTRL1 0x024u
+#define EFR32_MODEM_CTRL1_SYNCBITS_MASK 0x1fu
+#define EFR32_MODEM_TXBR 0x058u
+#define EFR32_MODEM_TXBR_NUM_MASK 0xffffu
+#define EFR32_MODEM_TXBR_DEN_SHIFT 16
+#define EFR32_MODEM_TXBR_DEN_MASK 0xffu
+#define EFR32_MODEM_TXBR_HFXO_DIVIDER 8u
+#define EFR32_MODEM_PRE 0x064u
+#define EFR32_MODEM_PRE_BASEBITS_SHIFT 4
+#define EFR32_MODEM_PRE_BASEBITS_MASK 0x3u
+#define EFR32_MODEM_PRE_TXBASES_SHIFT 16
+#define EFR32_MODEM_PRE_TXBASES_MASK 0xffffu
+#define EFR32_OOK_TRACE_OCTETS_MAX 160u
+
+static bool efr32_modem_ook(Efr32Periph *s)
+{
+    return ((efr32_register_get(s, EFR32_MODEM_BASE + EFR32_MODEM_CTRL0) >>
+             EFR32_MODEM_CTRL0_MODFORMAT_SHIFT) & EFR32_MODEM_CTRL0_MODFORMAT_MASK) ==
+           EFR32_MODEM_MODFORMAT_OOKASK;
+}
+
+/* An OOK frame: its airtime, and a trace of its carrier and key pattern. */
+static int64_t efr32_rac_ook_tx(Efr32Periph *s, const uint8_t *bytes, gsize length)
+{
+    uint32_t txbr = efr32_register_get(s, EFR32_MODEM_BASE + EFR32_MODEM_TXBR);
+    uint32_t num = txbr & EFR32_MODEM_TXBR_NUM_MASK;
+    uint32_t den = (txbr >> EFR32_MODEM_TXBR_DEN_SHIFT) & EFR32_MODEM_TXBR_DEN_MASK;
+    uint32_t pre = efr32_register_get(s, EFR32_MODEM_BASE + EFR32_MODEM_PRE);
+    uint64_t preamble = (uint64_t)((pre >> EFR32_MODEM_PRE_TXBASES_SHIFT) &
+                                   EFR32_MODEM_PRE_TXBASES_MASK) *
+                        (((pre >> EFR32_MODEM_PRE_BASEBITS_SHIFT) &
+                          EFR32_MODEM_PRE_BASEBITS_MASK) + 1u);
+    uint64_t sync = (efr32_register_get(s, EFR32_MODEM_BASE + EFR32_MODEM_CTRL1) &
+                     EFR32_MODEM_CTRL1_SYNCBITS_MASK) + 1u;
+    uint64_t symbols = preamble + sync + (uint64_t)length * BITS_PER_BYTE;
+    uint64_t hz = efr32_rf_carrier_hz(s);
+    g_autofree char *hex = g_malloc0(EFR32_OOK_TRACE_OCTETS_MAX * 2 + 1);
+    int64_t airtime_ns;
+
+    if (num == 0 || den == 0) {
+        return 0;
+    }
+    /* symbols / (f_HFXO x DEN / (8 x NUM)) seconds */
+    airtime_ns = (int64_t)(symbols * EFR32_MODEM_TXBR_HFXO_DIVIDER * num *
+                           NANOSECONDS_PER_SECOND / ((uint64_t)EFR32_HFXO_HZ * den));
+    for (gsize i = 0; i < MIN(length, EFR32_OOK_TRACE_OCTETS_MAX); i++) {
+        snprintf(hex + 2 * i, 3, "%02x", bytes[i]);
+    }
+    trace_efr32bg22_ook_tx(s->endpoint_id, hz / 1000u,
+                           (uint64_t)EFR32_HFXO_HZ * den /
+                               ((uint64_t)EFR32_MODEM_TXBR_HFXO_DIVIDER * num),
+                           (unsigned)(preamble + sync), (unsigned)length, airtime_ns,
+                           efr32_synth_in_range(hz), hex);
+    return airtime_ns;
 }
 
 static void efr32_rac_capture_tx_snapshot(Efr32Periph *s)
@@ -2246,6 +2338,12 @@ static void efr32_rac_capture_tx_snapshot(Efr32Periph *s)
      */
     metadata.air_start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                             EFR32_RAC_TX_ENTRY_TO_AIR_NS;
+    if (efr32_modem_ook(s)) {
+        s->tx_end_ns = metadata.air_start_ns + efr32_rac_ook_tx(s, data->data, data->len) +
+                       EFR32_RAC_FRAMESENT_TO_TX_EXIT_NS;
+        g_byte_array_unref(data);
+        return;
+    }
     s->tx_end_ns = metadata.air_start_ns +
                    efr32_rf_le1m_airtime_ns(data->len) +
                    EFR32_RAC_FRAMESENT_TO_TX_EXIT_NS;
@@ -5137,7 +5235,9 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
         if (s->synth_if_enabled) {
             status |= EFR32_SYNTH_STATUS_IFFREQEN;
         } else if (s->synth_running &&
-                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >= s->synth_lock_ns) {
+                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >= s->synth_lock_ns &&
+                   efr32_synth_in_range(efr32_rf_carrier_hz(s))) {
+            /* A carrier outside the measured range never locks (SS7.85). */
             status |= EFR32_SYNTH_STATUS_INLOCK;
         }
         return status;
@@ -5332,6 +5432,7 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         uint32_t pc = current_cpu ? ARM_CPU(current_cpu)->env.regs[15] : 0;
 
         trace_efr32bg22_radio_write(pc, word, (uint32_t)value, size);
+        trace_efr32bg22_endpoint_radio_write(s->endpoint_id, word, (uint32_t)value);
     }
 
     switch ((address >> 12) & 3)

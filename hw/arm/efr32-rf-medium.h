@@ -25,10 +25,13 @@ struct Efr32RfRadioClass {
     InterfaceClass parent_class;
 
     bool (*is_rx_ready)(Efr32RfRadio *radio);
-    /* Return the currently selected physical SYNTH channel (0..39). */
+    /* The carrier on the medium's channel raster, or EFR32_RF_NO_CHANNEL. */
     uint8_t (*get_channel)(Efr32RfRadio *radio);
     void (*rx_offer_available)(Efr32RfRadio *radio);
 };
+
+/* A carrier the medium delivers nothing on (unreachable by the synthesizer). */
+#define EFR32_RF_NO_CHANNEL UINT8_MAX
 
 bool efr32_rf_radio_is_rx_ready(Efr32RfRadio *radio);
 uint8_t efr32_rf_radio_get_channel(Efr32RfRadio *radio);
@@ -49,7 +52,7 @@ typedef enum Efr32RfTxTrigger {
 typedef struct Efr32RfTxMetadata {
     Efr32RfTxTrigger trigger;
     uint8_t buffer_channel;
-    /* SYNTH.CHSP.CHSP captured with the channel-0 staging snapshot. */
+    /* The carrier's medium channel, or EFR32_RF_NO_CHANNEL (matches no receiver). */
     uint8_t channel;
     /*
      * Virtual time at which the frame's first preamble bit leaves the
