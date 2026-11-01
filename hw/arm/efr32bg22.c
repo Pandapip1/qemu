@@ -92,6 +92,21 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_SYNTH_LOCNTSTATUS 0x08cu
 #define EFR32_SYNTH_LOCNTTARGET 0x090u
 /*
+ * LO-count measurement time.  On silicon (owo-open-fw docs/radio-tables.md
+ * SS7.80) the open sequencer's VCO calibration, stamped with the M0+ SysTick
+ * (38.4 MHz) from just after LOCNTCTRL.RUN to the first poll that reads
+ * LOCNTSTATUS.BUSY clear, took 70 cycles at NUMCYCLE 5, 40 at 4 and 20 at 3
+ * and 2 (20 being the instrumented poll's floor), n = 200 calibrations each.
+ * [I] BUSY lasting 2^(NUMCYCLE + 1) HFXO periods from RUN reproduces all four
+ * after the poll's granularity; the same probe image in this model then reads
+ * the same cycle counts (SS7.80).
+ */
+#define EFR32_SYNTH_LOCNTCTRL 0x088u
+#define EFR32_SYNTH_LOCNTCTRL_RUN (1u << 2)
+#define EFR32_SYNTH_LOCNTCTRL_NUMCYCLE_SHIFT 4
+#define EFR32_SYNTH_LOCNTCTRL_NUMCYCLE_MASK (0xfu << 4)
+#define EFR32_SYNTH_LOCNTSTATUS_BUSY (1u << 19)
+/*
  * RAC.SYEN's VCO supply enables (public RAC_S_field.py).  [I] Taken as the
  * condition for SYNTHSTART to start the VCO: SYEN=0 never started it on
  * silicon, while 0x1FBF and 0x7FBF (both containing these three) did.
@@ -791,6 +806,8 @@ struct Efr32Periph
     /* SYNTH.CMD.ENABLEIF in force; INLOCK reported from synth_lock_ns. */
     bool synth_if_enabled;
     int64_t synth_lock_ns;
+    /* SYNTH.LOCNTSTATUS.BUSY until this time (LOCNTCTRL.RUN). */
+    int64_t locnt_busy_until_ns;
     /* A latched TX request: RAC.STATUS.TXENS. */
     bool tx_requested;
     /* RXDIS seen in RXSEARCH, applied once STATERXSEARCH is clear. */
@@ -1805,6 +1822,31 @@ static void efr32_rac_schedule_rx_handoff(Efr32Periph *s)
     timer_mod(s->rac_rx_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 }
 
+/*
+ * Whether the receive chain is up.  On silicon a receiver opened from OFF by
+ * a sequencer without an RXWARM handler reached RXSEARCH with SYEN, SYLOEN,
+ * LNAMIXEN, RFPATHEN, IFADCDBG and RAC.RX all 0 and SYNTH.STATUS 0x4 (not
+ * started), and detected no frame in any window (0 RXFRAME in 90 windows with
+ * advertisers in range); brought up as the TX->RX turnaround does (SYNTHSTART
+ * with ENABLEIF, RFPATHEN.LNAMIXEN, IFADCDBG.IFADCENCLK among the rest) it
+ * receives (owo-open-fw docs/radio-tables.md SS7.80).  [I] Which of these is
+ * individually required is not measured; the model requires the started IF
+ * synthesizer, the LNA/mixer on the RF path and the clocked IF ADC.
+ */
+#define EFR32_RAC_IFADCDBG 0x0e0u
+#define EFR32_RAC_IFADCDBG_IFADCENCLK (1u << 1)
+#define EFR32_RAC_RFPATHEN 0x140u
+#define EFR32_RAC_RFPATHEN_LNAMIXEN (1u << 1)
+
+static bool efr32_rx_chain_powered(Efr32Periph *s)
+{
+    return s->synth_running && s->synth_if_enabled &&
+           (efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_RFPATHEN) &
+            EFR32_RAC_RFPATHEN_LNAMIXEN) &&
+           (efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_IFADCDBG) &
+            EFR32_RAC_IFADCDBG_IFADCENCLK);
+}
+
 static void efr32_rac_rx_handoff(void *opaque)
 {
     Efr32Periph *s = EFR32_PERIPH(opaque);
@@ -1837,6 +1879,11 @@ static void efr32_rac_rx_handoff(void *opaque)
                                 &length);
         s->rx_offer_pending = efr32_rf_medium_has_rx_offer_for_radio(
             s->rf_medium, EFR32_RF_RADIO(s));
+        if (!efr32_rx_chain_powered(s)) {
+            /* Searching with the receive chain off detects nothing. */
+            efr32_rf_rx_delivery_request_free(request);
+            return;
+        }
         if (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >
             metadata->air_start_ns + EFR32_RF_FRAMESENT_TO_PEER_EOF_NS) {
             /*
@@ -4577,6 +4624,15 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
          address == EFR32_MODEM_BASE + EFR32_MODEM_SEQIF)) {
         efr32_pa_ramp_complete(s);
     }
+    if (address == EFR32_SYNTH_BASE + EFR32_SYNTH_LOCNTSTATUS) {
+        uint32_t status = efr32_register_get(s, address) &
+                          ~EFR32_SYNTH_LOCNTSTATUS_BUSY;
+
+        if (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) < s->locnt_busy_until_ns) {
+            status |= EFR32_SYNTH_LOCNTSTATUS_BUSY;
+        }
+        return status;
+    }
     if (address == EFR32_SYNTH_BASE + EFR32_SYNTH_STATUS) {
         uint32_t status = efr32_register_get(s, address) &
                           ~(EFR32_SYNTH_STATUS_INLOCK |
@@ -4756,6 +4812,16 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         memory_region_set_enabled(s->m33_radio_nonsecure, !secure);
     }
 
+
+    if (register_address == EFR32_SYNTH_BASE + EFR32_SYNTH_LOCNTCTRL &&
+        ((address >> 12) & 3) != 2 &&
+        (((uint32_t)value << shift) & mask & EFR32_SYNTH_LOCNTCTRL_RUN)) {
+        unsigned numcycle = (next & EFR32_SYNTH_LOCNTCTRL_NUMCYCLE_MASK) >>
+                            EFR32_SYNTH_LOCNTCTRL_NUMCYCLE_SHIFT;
+
+        s->locnt_busy_until_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+            efr32_cycles_ns(2ull << numcycle, EFR32_HFXO_HZ);
+    }
 
     if (usart_index >= 0 && (register_address & 0xfff) == EFR32_USART_CMD)
     {
@@ -5665,6 +5731,7 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     s->rx_offer_pending = false;
     s->synth_running = false;
     s->synth_if_enabled = false;
+    s->locnt_busy_until_ns = 0;
     efr32_register_put(s, EFR32_SYNTH_BASE + EFR32_SYNTH_STATUS, 0);
     s->pa_ramp_pending = false;
     efr32_rf_medium_reset_radio(s->rf_medium, EFR32_RF_RADIO(s));
