@@ -31,6 +31,9 @@ static char *rf_trace_path;
 #define RAC_STATUS_STATE_RXSEARCH (2u << 24)
 #define SYNTH_BASE               0xa8018000
 #define SYNTH_CHCTRL             0x040
+#define SYNTH_FREQ               0x034
+#define SYNTH_FREQ_2402_MHZ      0x01f46aabu
+#define SYNTH_FREQ_2404_MHZ      0x01f4d555u
 #define SYNTH_CHSP               0x044
 #define BUFC_BASE                0xaa000000
 #define BUFC_CH0                 0x00c
@@ -284,13 +287,12 @@ static void test_tx_offer_requires_matching_synth_channel(void)
     rf_reset_with_clocks();
     qtest_writel(global_qtest, peer_rx_channel + BUFC_CMD, 1);
     qtest_writel(global_qtest, peer_rx_channel, 0);
-    /* Silicon's working RAIL path leaves CHCTRL zero and selects the physical
-     * 2 MHz channel through CHSP.  A differing CHCTRL must not affect the
-     * modeled medium. */
-    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_CHCTRL, 31);
-    qtest_writel(global_qtest, peer(SYNTH_BASE + SYNTH_CHCTRL), 7);
+    /* The carrier is SYNTH.FREQ (f * 2^19 / 38.4 MHz; SS7.80) with CHCTRL zero, as
+     * silicon's working path programs it; CHSP alone does not move it. */
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_FREQ, SYNTH_FREQ_2402_MHZ);
+    qtest_writel(global_qtest, peer(SYNTH_BASE + SYNTH_FREQ), SYNTH_FREQ_2404_MHZ);
     qtest_writel(global_qtest, SYNTH_BASE + SYNTH_CHSP, 10);
-    qtest_writel(global_qtest, peer(SYNTH_BASE + SYNTH_CHSP), 11);
+    qtest_writel(global_qtest, peer(SYNTH_BASE + SYNTH_CHSP), 10);
     qtest_writel(global_qtest,
                  peer(RAC_BASE + RAC_RXENSRCEN + REGISTER_SET_WINDOW),
                  RAC_RXENSRCEN_SWRXEN);
@@ -309,7 +311,7 @@ static void test_tx_offer_requires_matching_synth_channel(void)
                     ==, 0);
 
     qtest_writel(global_qtest, peer(RAC_BASE + RAC_CMD), RAC_CMD_RXDIS);
-    qtest_writel(global_qtest, peer(SYNTH_BASE + SYNTH_CHSP), 10);
+    qtest_writel(global_qtest, peer(SYNTH_BASE + SYNTH_FREQ), SYNTH_FREQ_2402_MHZ);
     qtest_writel(global_qtest,
                  peer(RAC_BASE + RAC_RXENSRCEN + REGISTER_SET_WINDOW),
                  RAC_RXENSRCEN_SWRXEN);
@@ -1543,6 +1545,60 @@ static void test_released_rx_chain_off_detects_nothing(void)
                     FRC_IF_RXDONE, ==, 0);
 }
 
+/*
+ * A received frame that does not fit the RX FIFO (SS7.80, silicon): BUFC.IF
+ * channel 1 overflow, no RXDONE, the RAC held in RXOVERFLOW with no state
+ * event latched until FORCEDISABLE, which takes it to SHUTDOWN.
+ */
+#define BUFC_IF_OFFSET           0x114
+#define BUFC_IF_BUF1OF           (1u << 8)
+#define RAC_STATE_RXOVERFLOW     6
+
+static void test_released_rx_fifo_overflow(void)
+{
+    const uint8_t request[] = { 0xc3, 0x02, 0x11, 0x22 };
+    const uint64_t peer_rac = peer(RAC_BASE);
+    const uint64_t peer_rx_channel = peer(BUFC_BASE + BUFC_CH1);
+
+    rf_reset_with_clocks();
+    rf_release_sequencer(peer_rac, peer(SYNTH_BASE));
+    qtest_writel(global_qtest, peer(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW),
+                 FRC_IF_RXDONE | FRC_IF_TXDONE);
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_CMD, 1);
+    qtest_writel(global_qtest, peer_rx_channel, 0);
+    /* 62 of the default 64 octets already held: the 4-octet frame cannot fit. */
+    for (int i = 0; i < 62; i++) {
+        qtest_writel(global_qtest, peer_rx_channel + BUFC_WRITEDATA, 0);
+    }
+    rf_start_rx(peer_rac);
+    rf_ack(peer_rac, RAC_STATE_RXSEARCH);
+
+    rf_stage_tx(BUFC_BASE + BUFC_CH0, request, sizeof(request));
+    qtest_writel(global_qtest, RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+    rf_step(MODEL_RX_DETECT_NS);
+    g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RXFRAME);
+    qtest_writel(global_qtest, peer_rac + RAC_SEQIF + REGISTER_CLEAR_WINDOW,
+                 UINT32_MAX);
+    rf_step(MODEL_RX_EOF_NS(sizeof(request)) - MODEL_RX_DETECT_NS + 1);
+    g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RXOVERFLOW);
+    g_assert_cmphex(qtest_readl(global_qtest, peer(BUFC_BASE + BUFC_IF_OFFSET)) &
+                    BUFC_IF_BUF1OF, ==, BUFC_IF_BUF1OF);
+    g_assert_cmphex(qtest_readl(global_qtest, peer(FRC_BASE + FRC_IF)) &
+                    FRC_IF_RXDONE, ==, 0);
+    g_assert_cmphex(rf_status(peer_rac) & RAC_STATUS_SEQACTIVE, ==, 0);
+
+    /* RXDIS and withdrawing SWRXEN leave it there. */
+    qtest_writel(global_qtest, peer_rac + RAC_CMD, RAC_CMD_RXDIS);
+    qtest_writel(global_qtest, peer_rac + RAC_RXENSRCEN + REGISTER_CLEAR_WINDOW,
+                 RAC_RXENSRCEN_SWRXEN);
+    rf_step(ACK_TO_TRANSITION_NS * 4);
+    g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RXOVERFLOW);
+
+    qtest_writel(global_qtest, peer_rac + RAC_CTRL + REGISTER_SET_WINDOW,
+                 RAC_CTRL_FORCEDISABLE);
+    g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_SHUTDOWN);
+}
+
 static void test_released_rx_frame_turns_around_to_tx(void)
 {
     const uint8_t request[] = { 0xc3, 0x02, 0x11, 0x22 };
@@ -1836,6 +1892,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/rf/released-tx-turns-around-to-rx",
                    test_released_tx_turns_around_to_rx);
     qtest_add_func("/efr32bg22/rf/locnt-busy-window", test_locnt_busy_window);
+    qtest_add_func("/efr32bg22/rf/released-rx-fifo-overflow",
+                   test_released_rx_fifo_overflow);
     qtest_add_func("/efr32bg22/rf/released-rx-chain-off-detects-nothing",
                    test_released_rx_chain_off_detects_nothing);
     qtest_add_func("/efr32bg22/rf/released-rx-frame-turns-around-to-tx",

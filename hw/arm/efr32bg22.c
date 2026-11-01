@@ -55,6 +55,20 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_SYNTH_CHSP 0x044u
 #define EFR32_SYNTH_CHSP_CHSP_MASK 0x3fu
 /*
+ * The carrier.  SYNTH.FREQ is in units of f_HFXO / 2^19: the three words
+ * captured on silicon for the advertising channels are round(f * 2^19 /
+ * 38.4 MHz) exactly (owo-open-fw docs/radio-tables.md SS7.80), and stock
+ * leaves CHCTRL zero.  [I] CHCTRL x CHSP (the public "channel" and "channel
+ * spacing" fields) adds to FREQ in the same units; it is zero in every
+ * observed configuration.  The medium compares 2 MHz channel indices from
+ * 2402 MHz.
+ */
+#define EFR32_SYNTH_FREQ 0x034u
+#define EFR32_SYNTH_FREQ_MASK 0x0fffffffu
+#define EFR32_SYNTH_FREQ_FRACTION_BITS 19
+#define EFR32_RF_CHANNEL0_HZ 2402000000ull
+#define EFR32_RF_CHANNEL_SPACING_HZ 2000000ull
+/*
  * The frame path needs a running synthesizer (owo-open-fw
  * docs/radio-tables.md SS7.60/SS7.61, measured on silicon): with RAC.SYEN
  * clear and no SYNTH.CMD.SYNTHSTART, RAC sits in TX indefinitely and FRC
@@ -228,6 +242,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_RAC_STATE_RXFRAME 3u
 #define EFR32_RAC_STATE_RXPD 4u
 #define EFR32_RAC_STATE_RX2RX 5u
+#define EFR32_RAC_STATE_RXOVERFLOW 6u
 #define EFR32_RAC_STATE_RX2TX 7u
 #define EFR32_RAC_STATE_TX2RX 11u
 #define EFR32_RAC_STATE_TXWARM 8u
@@ -661,6 +676,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_BUFC_STRIDE 0x040u
 #define EFR32_BUFC_ADDR 0x004u
 #define EFR32_BUFC_IF 0x114u
+#define EFR32_BUFC_IF_BUF1OF (1u << 8)
 #define EFR32_BUFC_IEN 0x118u
 #define EFR32_BUFC_CTRL 0x000u
 #define EFR32_BUFC_WRITEOFFSET 0x008u
@@ -1473,8 +1489,13 @@ static void efr32_rac_set_state(Efr32Periph *s, uint32_t state)
     efr32_register_put(s, EFR32_RAC_BASE + EFR32_RAC_IF,
                        efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_IF) |
                            1);
-    /* Every state, SHUTDOWN included, latches its own event (SS7.69). */
-    sequence_flag = efr32_rac_seq_state_flag(state);
+    /*
+     * Every state, SHUTDOWN included, latches its own event (SS7.69), except
+     * RXOVERFLOW: on silicon it showed SEQACTIVE clear and the open
+     * sequencer's IRQ6 never ran (SS7.80).
+     */
+    sequence_flag = state == EFR32_RAC_STATE_RXOVERFLOW
+                        ? 0 : efr32_rac_seq_state_flag(state);
     efr32_register_put(s, EFR32_RAC_BASE + EFR32_RAC_SEQIF,
                        efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_SEQIF) |
                            sequence_flag | 1u);
@@ -1735,6 +1756,35 @@ static void efr32_rac_rx_frame_end(void *opaque)
     }
 
     data = g_bytes_get_data(s->rx_frame, &length);
+    if (efr32_bufc_capacity(s, EFR32_RF_RX_BUFC_CHANNEL) &&
+        efr32_bufc_count(s, EFR32_RF_RX_BUFC_CHANNEL) + length +
+                ((efr32_register_get(s, EFR32_FRC_BASE + EFR32_FRC_TRAILRXDATA) &
+                  EFR32_FRC_TRAILRXDATA_CRCOK) ? 1 : 0) >
+            efr32_bufc_capacity(s, EFR32_RF_RX_BUFC_CHANNEL)) {
+        /*
+         * RX FIFO overflow, measured on silicon (owo-open-fw
+         * docs/radio-tables.md SS7.80): received frames filled the 512-octet
+         * channel-1 FIFO (WRITEOFFSET 512, READOFFSET 0), BUFC.IF read 0x100
+         * (channel 1 overflow) and the RAC sat in RXOVERFLOW with no state
+         * event pending; RXDIS, SWRXEN withdrawn, BUFC CLEAR, FRC.CMD.RXABORT
+         * and clearing BUFC.IF left it there, FORCEDISABLE took it to
+         * SHUTDOWN and OFF.  [I] The frame's octets that fit are written,
+         * no RXDONE is raised.
+         */
+        uint32_t room = efr32_bufc_capacity(s, EFR32_RF_RX_BUFC_CHANNEL) -
+                        efr32_bufc_count(s, EFR32_RF_RX_BUFC_CHANNEL);
+
+        for (gsize index = 0; index < MIN(length, room); index++) {
+            efr32_bufc_write_data_port(s, EFR32_RF_RX_BUFC_CHANNEL, data[index],
+                                       false);
+        }
+        efr32_register_put(s, EFR32_BUFC_BASE + EFR32_BUFC_IF,
+                           efr32_register_get(s, EFR32_BUFC_BASE + EFR32_BUFC_IF) |
+                               EFR32_BUFC_IF_BUF1OF);
+        g_clear_pointer(&s->rx_frame, g_bytes_unref);
+        efr32_rac_set_state(s, EFR32_RAC_STATE_RXOVERFLOW);
+        return;
+    }
     for (gsize index = 0; index < length; index++) {
         efr32_register_put(s, EFR32_FRC_BASE + EFR32_FRC_RXRAWDATA,
                            data[index]);
@@ -2020,14 +2070,33 @@ static uint32_t efr32_frc_dynamic_length_wcntcmp0(const uint8_t *bytes,
     return field + minlength;
 }
 
+/* The 2 MHz channel index of the programmed carrier (see EFR32_SYNTH_FREQ). */
+static uint8_t efr32_rf_channel(Efr32Periph *s)
+{
+    uint64_t word = (efr32_register_get(s, EFR32_SYNTH_BASE + EFR32_SYNTH_FREQ) &
+                     EFR32_SYNTH_FREQ_MASK) +
+                    (uint64_t)efr32_register_get(s, EFR32_SYNTH_BASE +
+                                                 EFR32_SYNTH_CHCTRL) *
+                        (efr32_register_get(s, EFR32_SYNTH_BASE +
+                                            EFR32_SYNTH_CHSP) &
+                         EFR32_SYNTH_CHSP_CHSP_MASK);
+    uint64_t hz = (word * EFR32_HFXO_HZ + (1ull << (EFR32_SYNTH_FREQ_FRACTION_BITS - 1)))
+                  >> EFR32_SYNTH_FREQ_FRACTION_BITS;
+
+    if (hz + EFR32_RF_CHANNEL_SPACING_HZ / 2 < EFR32_RF_CHANNEL0_HZ) {
+        return UINT8_MAX; /* below the band: matches no programmed receiver */
+    }
+    return MIN((hz + EFR32_RF_CHANNEL_SPACING_HZ / 2 - EFR32_RF_CHANNEL0_HZ) /
+                   EFR32_RF_CHANNEL_SPACING_HZ,
+               UINT8_MAX - 1);
+}
+
 static void efr32_rac_capture_tx_snapshot(Efr32Periph *s)
 {
     Efr32RfTxMetadata metadata = {
         .trigger = EFR32_RF_TX_TRIGGER_RAC_CMD_TXEN,
         .buffer_channel = EFR32_RF_TX_BUFC_CHANNEL,
-        .channel = efr32_register_get(s, EFR32_SYNTH_BASE +
-                                      EFR32_SYNTH_CHSP) &
-                   EFR32_SYNTH_CHSP_CHSP_MASK,
+        .channel = efr32_rf_channel(s),
     };
     GByteArray *data = efr32_bufc_snapshot_data(
         s, EFR32_RF_TX_BUFC_CHANNEL);
@@ -5816,10 +5885,7 @@ static bool efr32_periph_is_rx_ready(Efr32RfRadio *radio)
 
 static uint8_t efr32_periph_get_channel(Efr32RfRadio *radio)
 {
-    Efr32Periph *s = EFR32_PERIPH(radio);
-
-    return efr32_register_get(s, EFR32_SYNTH_BASE + EFR32_SYNTH_CHSP) &
-           EFR32_SYNTH_CHSP_CHSP_MASK;
+    return efr32_rf_channel(EFR32_PERIPH(radio));
 }
 
 static void efr32_periph_rx_offer_available(Efr32RfRadio *radio)
