@@ -1768,6 +1768,74 @@ static void test_released_rx_frame_turns_around_to_tx(void)
     rf_reset_with_clocks();
 }
 
+/*
+ * The demodulator rate follows the channel (owo-open-fw SS7.83, silicon): on
+ * 2426 MHz the sample-rate converter must carry that channel's ratios
+ * (stock's MODEM.SRCCHF there, 0x8C2F2891); the 2402 MHz PHY-table value
+ * (0x8C2BE890) is 1 % off and the frame fails its CRC.  1M PHY settings:
+ * SYNTH.IFFREQ 9557 high side, IF ADC in half mode.
+ */
+#define SYNTH_IFFREQ             0x038
+#define SYNTH_FREQ_2426MHZ       0x01f96aabu
+#define SYNTH_IFFREQ_BLE_1M      0x00102555u
+#define RAC_IFADCTRIM0           0x0e4
+#define RAC_IFADCTRIM0_BLE_1M    0x13512c6eu
+#define MODEM_SRCCHF             (MODEM_BASE + 0x0ec)
+#define MODEM_SRCCHF_2426MHZ     0x8c2f2891u
+#define MODEM_SRCCHF_2402MHZ     0x8c2be890u
+
+static uint32_t rf_receive_with_srcchf(uint32_t srcchf)
+{
+    const uint8_t frame[] = { 0x00, 0x0e, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+                              13, 14 };
+    const uint64_t peer_rac = peer(RAC_BASE);
+    const uint64_t peer_rx_channel = peer(BUFC_BASE + BUFC_CH1);
+
+    rf_reset_with_clocks();
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_FREQ, SYNTH_FREQ_2426MHZ);
+    qtest_writel(global_qtest, peer(SYNTH_BASE + SYNTH_FREQ), SYNTH_FREQ_2426MHZ);
+    qtest_writel(global_qtest, peer(SYNTH_BASE + SYNTH_IFFREQ),
+                 SYNTH_IFFREQ_BLE_1M);
+    qtest_writel(global_qtest, peer(RAC_BASE + RAC_IFADCTRIM0),
+                 RAC_IFADCTRIM0_BLE_1M);
+    qtest_writel(global_qtest, peer(MODEM_SRCCHF), srcchf);
+    rf_release_sequencer(peer_rac, peer(SYNTH_BASE));
+    qtest_writel(global_qtest, peer(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW),
+                 FRC_IF_RXDONE | FRC_IF_TXDONE);
+    qtest_writel(global_qtest, peer(FRC_BASE + FRC_TRAILRXDATA),
+                 FRC_TRAILRXDATA_CRCOK);
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_CMD, 1);
+    qtest_writel(global_qtest, peer_rx_channel, 0);
+    rf_start_rx(peer_rac);
+    rf_ack(peer_rac, RAC_STATE_RXSEARCH);
+
+    rf_stage_tx(BUFC_BASE + BUFC_CH0, frame, sizeof(frame));
+    qtest_writel(global_qtest, RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+    rf_step(MODEL_RX_DETECT_NS);
+    g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RXFRAME);
+    rf_step(MODEL_RX_EOF_NS(sizeof(frame)) - MODEL_RX_DETECT_NS);
+    g_assert_cmphex(qtest_readl(global_qtest, peer(FRC_BASE + FRC_IF)) &
+                    FRC_IF_RXDONE, ==, FRC_IF_RXDONE);
+    g_assert_cmphex(qtest_readl(global_qtest, peer_rx_channel + BUFC_STATUS) &
+                    0x1fff, ==, sizeof(frame) + 1);
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_READOFFSET, 0);
+    for (size_t index = 0; index < sizeof(frame); index++) {
+        g_assert_cmphex(qtest_readl(global_qtest,
+                                    peer_rx_channel + BUFC_READDATA),
+                        ==, frame[index]);
+    }
+    return qtest_readl(global_qtest, peer_rx_channel + BUFC_READDATA);
+}
+
+static void test_released_rx_srcchf_follows_channel(void)
+{
+    g_assert_cmphex(rf_receive_with_srcchf(MODEM_SRCCHF_2426MHZ), ==,
+                    FRC_TRAILER_CRCOK);
+    g_assert_cmphex(rf_receive_with_srcchf(MODEM_SRCCHF_2402MHZ) &
+                    FRC_TRAILER_CRCOK, ==, 0);
+    rf_reset_with_clocks();
+}
+
 /* Deliver one legacy-source frame to a released receiver in RXSEARCH. */
 static void rf_offer_frame_to_released_peer(void)
 {
@@ -1979,6 +2047,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/rf/released-tx-turns-around-to-rx",
                    test_released_tx_turns_around_to_rx);
     qtest_add_func("/efr32bg22/rf/locnt-busy-window", test_locnt_busy_window);
+    qtest_add_func("/efr32bg22/rf/released-rx-srcchf-follows-channel",
+                   test_released_rx_srcchf_follows_channel);
     qtest_add_func("/efr32bg22/rf/released-rx-fifo-overflow",
                    test_released_rx_fifo_overflow);
     qtest_add_func("/efr32bg22/rf/released-rx-frame-disables",
