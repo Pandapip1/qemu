@@ -51,6 +51,7 @@
 #define DHCSR_S_REGRDY (1u << 16)
 #define DHCSR_S_HALT (1u << 17)
 #define DHCSR_S_SLEEP (1u << 18)
+#define DHCSR_S_LOCKUP (1u << 19)
 #define DHCSR_S_SDE (1u << 20)
 #define DHCSR_S_RETIRE_ST (1u << 24)
 #define DHCSR_S_RESET_ST (1u << 25)
@@ -250,6 +251,8 @@ static void dbg_enter_debug_state(ARMv8MDebugState *s, uint32_t dfsr)
         cpu_single_step(cs, 0);
     }
     cpu->m_debug_halted = true;
+    /* A halt request takes the core out of Lockup (Armv8-M B3.30) */
+    cpu->m_locked_up = false;
     cs->halted = 1;
     qemu_set_irq(s->halted_out, 1);
     s->dhcsr_ctrl |= DHCSR_C_HALT;
@@ -395,6 +398,8 @@ static uint32_t dbg_dhcsr_read(ARMv8MDebugState *s)
 
     if (halted) {
         value |= DHCSR_S_HALT;
+    } else if (cpu->m_locked_up) {
+        value |= DHCSR_S_LOCKUP;
     } else if (cs->halted) {
         value |= DHCSR_S_SLEEP;
     }

@@ -2660,6 +2660,157 @@ static void test_seq_sleeping_follows_wfi(void)
     qtest_quit(qts);
 }
 
+/*
+ * Lockup and EMU_RSTCTRL (RM 12.5.14, 12.5.15; owo-open-fw
+ * docs/radio-tables.md SS7.58).  Each program counts its runs in a RAM word
+ * and then faults (or requests a reset); the HardFault vector points back
+ * at the program, so its second fault, inside HardFault, is a Lockup.
+ */
+#define LOCKUP_COUNTER_M33     0x20001000u
+#define LOCKUP_EMU_RSTCTRL     (EMU_BASE + 0x090)
+#define LOCKUP_RSTCTRL_RESET   0x00010405u
+#define LOCKUP_RSTCTRL_SYSRMODE (1u << 2)
+#define LOCKUP_RSTCTRL_LOCKUPRMODE (1u << 3)
+#define LOCKUP_RSTCAUSE        (EMU_BASE + 0x094)
+#define LOCKUP_RSTCAUSE_LOCKUP (1u << 5)
+#define LOCKUP_RSTCAUSE_SYSREQ (1u << 6)
+
+/* ldr r0,=ctr; ldr r1,[r0]; adds r1,#1; str r1,[r0]; ldr r2,=bad; ldr r3,[r2] */
+static const uint32_t lockup_program[] = {
+    0x68014803, 0x60013101, 0x68134a02, 0xbf00e7fe,
+};
+/* ...; ldr r2,=AIRCR; ldr r3,=VECTKEY|SYSRESETREQ; str r3,[r2]; b . */
+static const uint32_t sysreq_program[] = {
+    0x68014803, 0x60013101, 0x4b034a02, 0xe7fe6013,
+};
+
+static QTestState *m33_run(const uint32_t *code, size_t n, uint32_t lit1,
+                           uint32_t lit2, uint32_t rstctrl)
+{
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel tcg -S");
+
+    qtest_writel(qts, 0x0, 0x20008000);
+    qtest_writel(qts, 0x4, 0x101);
+    qtest_writel(qts, 0xc, 0x101);  /* HardFault: the program again */
+    for (size_t i = 0; i < n; i++) {
+        qtest_writel(qts, 0x100 + 4 * i, code[i]);
+    }
+    qtest_writel(qts, 0x110, LOCKUP_COUNTER_M33);
+    qtest_writel(qts, 0x114, lit1);
+    qtest_writel(qts, 0x118, lit2);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    qtest_writel(qts, LOCKUP_COUNTER_M33, 0);
+    qtest_writel(qts, LOCKUP_EMU_RSTCTRL, rstctrl);
+    qtest_writel(qts, EMU_BASE + EMU_CMD, EMU_CMD_RSTCAUSECLR);
+    qtest_qmp_assert_success(qts, "{'execute':'cont'}");
+    return qts;
+}
+
+static uint32_t wait_counter(QTestState *qts, uint32_t addr, uint32_t min)
+{
+    for (unsigned i = 0; i < 5000 && qtest_readl(qts, addr) < min; i++) {
+        g_usleep(1000);
+    }
+    return qtest_readl(qts, addr);
+}
+
+/*
+ * An M33 Lockup with LOCKUPRMODE 0 (the reset value) leaves the core locked
+ * and QEMU running; with LOCKUPRMODE 1 it resets the device, RSTCAUSE.LOCKUP.
+ */
+static void test_m33_lockup(void)
+{
+    const uint32_t unmapped = 0x30000000;
+    QTestState *qts = m33_run(lockup_program, 4, unmapped, 0,
+                              LOCKUP_RSTCTRL_RESET);
+
+    g_assert_cmpuint(wait_counter(qts, LOCKUP_COUNTER_M33, 2), ==, 2);
+    g_usleep(50000);
+    g_assert_cmpuint(qtest_readl(qts, LOCKUP_COUNTER_M33), ==, 2);
+    g_assert_cmphex(qtest_readl(qts, LOCKUP_RSTCAUSE) &
+                    LOCKUP_RSTCAUSE_LOCKUP, ==, 0);
+    g_assert_cmphex(qtest_readl(qts, LOCKUP_EMU_RSTCTRL), ==,
+                    LOCKUP_RSTCTRL_RESET);
+    qtest_quit(qts);
+
+    qts = m33_run(lockup_program, 4, unmapped, 0,
+                  LOCKUP_RSTCTRL_RESET | LOCKUP_RSTCTRL_LOCKUPRMODE);
+    g_assert_cmpuint(wait_counter(qts, LOCKUP_COUNTER_M33, 6), >=, 6);
+    g_assert_cmphex(qtest_readl(qts, LOCKUP_RSTCAUSE) &
+                    LOCKUP_RSTCAUSE_LOCKUP, ==, LOCKUP_RSTCAUSE_LOCKUP);
+    /* RSTCTRL survives the soft resets it allowed */
+    g_assert_cmphex(qtest_readl(qts, LOCKUP_EMU_RSTCTRL), ==,
+                    LOCKUP_RSTCTRL_RESET | LOCKUP_RSTCTRL_LOCKUPRMODE);
+    qtest_quit(qts);
+}
+
+/* SYSRESETREQ resets with SYSRMODE 1 (reset value) and is blocked with 0. */
+static void test_rstctrl_blocks_sysresetreq(void)
+{
+    const uint32_t aircr = 0xe000ed0c, sysresetreq = 0x05fa0004;
+    QTestState *qts = m33_run(sysreq_program, 4, aircr, sysresetreq,
+                              LOCKUP_RSTCTRL_RESET);
+
+    g_assert_cmpuint(wait_counter(qts, LOCKUP_COUNTER_M33, 4), >=, 4);
+    g_assert_cmphex(qtest_readl(qts, LOCKUP_RSTCAUSE) &
+                    LOCKUP_RSTCAUSE_SYSREQ, ==, LOCKUP_RSTCAUSE_SYSREQ);
+    qtest_quit(qts);
+
+    qts = m33_run(sysreq_program, 4, aircr, sysresetreq,
+                  LOCKUP_RSTCTRL_RESET & ~LOCKUP_RSTCTRL_SYSRMODE);
+    g_assert_cmpuint(wait_counter(qts, LOCKUP_COUNTER_M33, 1), ==, 1);
+    g_usleep(50000);
+    g_assert_cmpuint(qtest_readl(qts, LOCKUP_COUNTER_M33), ==, 1);
+    g_assert_cmphex(qtest_readl(qts, LOCKUP_RSTCAUSE) &
+                    LOCKUP_RSTCAUSE_SYSREQ, ==, 0);
+    qtest_quit(qts);
+}
+
+/*
+ * The radio M0+ (Armv6-M) locks up on a fault inside HardFault and stays
+ * locked -- no reset follows -- until SEQRESET (silicon, SS7.58).  Its
+ * load from the M33-only non-secure radio alias 0xb8000000 faults.
+ */
+static void seq_release_lockup_program(QTestState *qts)
+{
+    static const uint32_t code[] = {
+        0x68014803, 0x60013101, 0x68134a02, 0xbf00e7fe,
+        SEQ_SPARE0, 0xb8000000,
+    };
+
+    qtest_writel(qts, RAC_BASE + RAC_CTRL, RAC_CTRL_SEQRESET);
+    qtest_writel(qts, SEQRAM_NS_BASE + 0x000, 0x00003e00);
+    qtest_writel(qts, SEQRAM_NS_BASE + 0x004, 0x00000101);
+    qtest_writel(qts, SEQRAM_NS_BASE + 0x00c, 0x00000101);
+    for (size_t i = 0; i < G_N_ELEMENTS(code); i++) {
+        qtest_writel(qts, SEQRAM_NS_BASE + 0x100 + 4 * i, code[i]);
+    }
+    qtest_writel(qts, RAC_BASE + RAC_CTRL, RAC_CTRL_CPUWAITDIS);
+}
+
+static void test_seq_lockup_until_seqreset(void)
+{
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel tcg -S");
+    const uint32_t counter = SEQRAM_NS_BASE + SEQ_SPARE0;
+
+    qtest_writel(qts, 0x00000000, 0x20008000);
+    qtest_writel(qts, 0x00000004, 0x00000101);
+    qtest_writel(qts, 0x00000100, 0x0000e7fe);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    qtest_seq_enable_radio_bus_clocks(qts);
+    qtest_writel(qts, counter, 0);
+    seq_release_lockup_program(qts);
+    qtest_qmp_assert_success(qts, "{'execute':'cont'}");
+    g_assert_cmpuint(wait_counter(qts, counter, 2), ==, 2);
+    g_usleep(50000);
+    g_assert_cmpuint(qtest_readl(qts, counter), ==, 2);
+
+    /* SEQRESET and a new release run it again: 3, then 4 and Lockup. */
+    seq_release_lockup_program(qts);
+    g_assert_cmpuint(wait_counter(qts, counter, 4), ==, 4);
+    qtest_quit(qts);
+}
+
 /* RAIL_StartTx clears RAC.SR0 bit 5 through the Series-2 CLR alias. */
 static void test_rac_sr0_clear_alias(void)
 {
@@ -3578,6 +3729,11 @@ int main(int argc, char **argv)
                    test_gated_bus_clock_faults_and_drops);
     qtest_add_func("/efr32bg22/seq-sleeping-follows-wfi",
                    test_seq_sleeping_follows_wfi);
+    qtest_add_func("/efr32bg22/m33-lockup", test_m33_lockup);
+    qtest_add_func("/efr32bg22/rstctrl-blocks-sysresetreq",
+                   test_rstctrl_blocks_sysresetreq);
+    qtest_add_func("/efr32bg22/seq-lockup-until-seqreset",
+                   test_seq_lockup_until_seqreset);
     qtest_add_func("/efr32bg22/rac-sr0-clear-alias",
                    test_rac_sr0_clear_alias);
     qtest_add_func("/efr32bg22/rac-force-disable", test_rac_force_disable);

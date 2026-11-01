@@ -1036,6 +1036,10 @@ static void v7m_exception_taken(ARMCPU *cpu, uint32_t lr, bool dotailchain,
     int exc;
     bool push_failed = false;
 
+    /* A derived exception that could not be taken put the core in Lockup */
+    if (cpu->m_locked_up) {
+        return;
+    }
     armv7m_nvic_get_pending_irq_info(env->nvic, &exc, &targets_secure);
     qemu_log_mask(CPU_LOG_INT, "...taking pending %s exception %d\n",
                   targets_secure ? "secure" : "nonsecure", exc);
@@ -2615,6 +2619,10 @@ void arm_v7m_cpu_do_interrupt(CPUState *cs)
 
     /* Per-CPU clocks under icount: the cycles an exception entry takes. */
     icount_charge_exception(cs);
+    /* The exception could not be taken: the core is in Lockup (NVIC). */
+    if (cpu->m_locked_up) {
+        return;
+    }
     ignore_stackfaults = v7m_push_stack(cpu);
     v7m_exception_taken(cpu, lr, false, ignore_stackfaults);
 }

@@ -86,6 +86,7 @@ struct NVICState {
     uint32_t num_irq;
     qemu_irq excpout;
     qemu_irq sysresetreq;
+    qemu_irq lockup;    /* "LOCKUP": the core has entered Lockup */
 };
 
 /* Interface between CPU and Interrupt controller.  */

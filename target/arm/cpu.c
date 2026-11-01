@@ -137,6 +137,10 @@ static bool arm_cpu_has_work(CPUState *cs)
     if (cpu->m_debug_halted) {
         return false;
     }
+    /* Nor does a core in Lockup (cpu.h m_locked_up). */
+    if (cpu->m_locked_up) {
+        return false;
+    }
     return (cpu->power_state != PSCI_OFF)
         && cs->interrupt_request &
         (CPU_INTERRUPT_FIQ | CPU_INTERRUPT_HARD
@@ -591,6 +595,7 @@ static void arm_cpu_reset_hold(Object *obj, ResetType type)
      */
     if (arm_feature(env, ARM_FEATURE_M)) {
         cpu->m_debug_halted = false;
+        cpu->m_locked_up = false;
         if (cpu->m_debug_ops) {
             cpu->m_debug_ops->reset(cpu->m_debug_opaque);
         }

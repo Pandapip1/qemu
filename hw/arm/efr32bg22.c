@@ -476,14 +476,29 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
  * AIRCR.SYSRESETREQ sets SYSREQ.  The Gecko bootloader and AppLoader honour
  * the reset-reason word in RAM only when SYSREQ is set.
  * [I] Causes accumulate until cleared (the RM's instruction to clear after
- * reading); unmeasured.  Pin, watchdog, lockup, BOD, EM4 and DCI causes are
- * not modelled.
+ * reading); unmeasured.  Pin, WDOG0 and lockup causes are modelled; BOD,
+ * EM4 and DCI causes are not.
+ *
+ * EMU_RSTCTRL (RM 12.5.14, Table 12.8): whether a soft reset source resets
+ * the device.  SYSRMODE (reset 1) for SYSRESETREQ, WDOG0RMODE (1) for the
+ * watchdog, LOCKUPRMODE (0) for an M33 Lockup; 0 = "Reset request is
+ * blocked".  RSTCTRL is EMU state that the soft resets (SYSREQ, WDOG0,
+ * LOCKUP) leave alone and the hard ones (POR, PIN) restore.  [I] A blocked
+ * request leaves no RSTCAUSE bit; a blocked watchdog runs on as with
+ * CFG.WDOGRSTDIS.
  */
 #define EFR32_EMU_CMD 0x070u
 #define EFR32_EMU_CMD_RSTCAUSECLR (1u << 17)
+#define EFR32_EMU_RSTCTRL 0x090u
+#define EFR32_EMU_RSTCTRL_WDOG0RMODE (1u << 0)
+#define EFR32_EMU_RSTCTRL_SYSRMODE (1u << 2)
+#define EFR32_EMU_RSTCTRL_LOCKUPRMODE (1u << 3)
+#define EFR32_EMU_RSTCTRL_WRITABLE 0x000104cdu /* bits 16, 10, 7, 6, 3, 2, 0 */
+#define EFR32_EMU_RSTCTRL_RESET 0x00010405u    /* DCI, DECBOD, SYS, WDOG0 */
 #define EFR32_EMU_RSTCAUSE 0x094u
 #define EFR32_EMU_RSTCAUSE_POR (1u << 0)
 #define EFR32_EMU_RSTCAUSE_PIN (1u << 1)
+#define EFR32_EMU_RSTCAUSE_LOCKUP (1u << 5)
 #define EFR32_EMU_RSTCAUSE_SYSREQ (1u << 6)
 
 /*
@@ -784,6 +799,8 @@ struct Efr32Periph
     uint32_t flash_size;
     /* EMU.RSTCAUSE: survives system reset until RSTCAUSECLR. */
     uint32_t rstcause;
+    /* EMU.RSTCTRL: survives soft resets, restored by POR and PIN. */
+    uint32_t rstctrl;
     /* SYSCFG.CHIPREV as the part leaves boot (from DEVINFO.PART). */
     uint32_t chiprev;
     /* Board: millivolts on each GPIO pin, -1 when undriven (IADC input). */
@@ -4141,7 +4158,8 @@ static void efr32_wdog_expired(void *opaque)
     efr32_wdog_update_irq(s);
     trace_efr32_wdog(s->endpoint_id, now, "timeout",
                      efr32_wdog_get(s, EFR32_WDOG_CFG));
-    if (!(efr32_wdog_get(s, EFR32_WDOG_CFG) & EFR32_WDOG_CFG_WDOGRSTDIS)) {
+    if (!(efr32_wdog_get(s, EFR32_WDOG_CFG) & EFR32_WDOG_CFG_WDOGRSTDIS) &&
+        (s->rstctrl & EFR32_EMU_RSTCTRL_WDOG0RMODE)) {
         s->rstcause |= EFR32_EMU_RSTCAUSE_WDOG0;
         s->wdog_running = false;
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
@@ -5273,6 +5291,11 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
     if (register_address == EFR32_EMU_BASE + EFR32_EMU_RSTCAUSE) {
         return; /* read-only */
     }
+    if (register_address == EFR32_EMU_BASE + EFR32_EMU_RSTCTRL) {
+        s->rstctrl = next & EFR32_EMU_RSTCTRL_WRITABLE;
+        efr32_register_put(s, register_address, s->rstctrl);
+        return;
+    }
     if (register_address == EFR32_EMU_BASE + EFR32_EMU_CMD &&
         (next & EFR32_EMU_CMD_RSTCAUSECLR)) {
         s->rstcause = 0;
@@ -5547,6 +5570,12 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
 
     if (register_address == EFR32_RAC_BASE + EFR32_RAC_CTRL && s->seq_cpu) {
         if (next & EFR32_RAC_CTRL_SEQRESET) {
+            /*
+             * The M0+ reset includes its NVIC (Armv6-M B1.5.5: reset makes
+             * every exception inactive); without it an exception the core
+             * was handling, e.g. the HardFault of a Lockup, stayed active.
+             */
+            device_cold_reset(DEVICE(ARM_CPU(s->seq_cpu)->env.nvic));
             cpu_reset(s->seq_cpu);
             s->seq_cpu->halted = 1;
             s->seq_released = false;
@@ -6058,6 +6087,7 @@ static void efr32_periph_init(Object *o)
     Efr32Periph *s = EFR32_PERIPH(o);
     s->registers = g_hash_table_new(g_direct_hash, g_direct_equal);
     s->rstcause = EFR32_EMU_RSTCAUSE_POR;
+    s->rstctrl = EFR32_EMU_RSTCTRL_RESET;
     s->trng_state = 0x2545f491;
     efr32_radioaes_reset(&s->radioaes);
     s->rac_state = EFR32_RAC_STATE_OFF;
@@ -6185,6 +6215,7 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     efr32_register_put(s, EFR32_EMU_BASE + EFR32_EMU_STATUS,
                        EFR32_EMU_STATUS_RESET);
     efr32_register_put(s, EFR32_EMU_BASE + EFR32_EMU_RSTCAUSE, s->rstcause);
+    efr32_register_put(s, EFR32_EMU_BASE + EFR32_EMU_RSTCTRL, s->rstctrl);
     efr32_msc_reset(s);
     efr32_rtcc_reset(s);
     memset(s->iadc_fifo, 0, sizeof(s->iadc_fifo));
@@ -6654,7 +6685,7 @@ static void efr32_soc_sysresetreq(void *opaque, int n, int level)
 {
     Efr32Bg22SoCState *s = opaque;
 
-    if (level) {
+    if (level && (s->periph.rstctrl & EFR32_EMU_RSTCTRL_SYSRMODE)) {
         s->periph.rstcause |= EFR32_EMU_RSTCAUSE_SYSREQ;
         /* The debug port sees the system reset begin (efr32-dap) */
         efr32bg22_debug_system_reset(OBJECT(s));
@@ -6677,9 +6708,29 @@ static void efr32_soc_nreset(void *opaque, int n, int level)
 
     if (level) {
         s->periph.rstcause |= EFR32_EMU_RSTCAUSE_PIN;
+        /* A hard reset: EMU_RSTCTRL returns to its reset value */
+        s->periph.rstctrl = EFR32_EMU_RSTCTRL_RESET;
     }
     CPU(s->armv7m.cpu)->start_powered_off = level;
     qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+}
+
+/*
+ * The M33's LOCKUP output (armv7m_nvic): an M33 Lockup resets the device
+ * only with EMU_RSTCTRL.LOCKUPRMODE set (RM 12.5.14, reset 0, "Reset
+ * Request is Block[ed]"), recorded as RSTCAUSE.LOCKUP; otherwise the core
+ * stays in Lockup.  The radio M0+'s Lockup is not wired to any reset: on
+ * silicon it stayed locked until the debugger or a reset cleared it
+ * (owo-open-fw docs/radio-tables.md SS7.58, SS7.59).
+ */
+static void efr32_soc_lockup(void *opaque, int n, int level)
+{
+    Efr32Bg22SoCState *s = opaque;
+
+    if (level && (s->periph.rstctrl & EFR32_EMU_RSTCTRL_LOCKUPRMODE)) {
+        s->periph.rstcause |= EFR32_EMU_RSTCAUSE_LOCKUP;
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    }
 }
 
 /*
@@ -6845,6 +6896,8 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
     qdev_connect_gpio_out_named(nvic, "SYSRESETREQ", 0,
                                 qemu_allocate_irq(efr32_soc_sysresetreq, s,
                                                   0));
+    qdev_connect_gpio_out_named(nvic, "LOCKUP", 0,
+                                qemu_allocate_irq(efr32_soc_lockup, s, 0));
     efr32bg22_debug_realize(OBJECT(s), &s->armv7m, &s->flash, s->clk, errp);
     if (*errp) {
         return;

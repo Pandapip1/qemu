@@ -66,6 +66,31 @@ static const uint8_t nvic_id[] = {
     0x00, 0xb0, 0x1b, 0x00, 0x0d, 0xe0, 0x05, 0xb1
 };
 
+/*
+ * Lockup (Armv8-M ARM B3.30, Armv6-M ARM B1.5.15 "Unrecoverable exception
+ * cases"): an exception that must be taken cannot be, e.g. a fault inside
+ * the HardFault handler.  The core stops executing and takes no interrupt;
+ * only a reset or entry to Debug state ends it.  The core reports it on the
+ * LOCKUP output (the Cortex-M LOCKUP signal), which a SoC may wire to a
+ * reset (e.g. EFR32 EMU_RSTCTRL.LOCKUPRMODE) or leave alone.
+ */
+static void G_GNUC_PRINTF(2, 3) nvic_lockup(NVICState *s, const char *fmt,
+                                             ...)
+{
+    CPUState *cs = CPU(s->cpu);
+    g_autofree char *why = NULL;
+    va_list ap;
+
+    va_start(ap, fmt);
+    why = g_strdup_vprintf(fmt, ap);
+    va_end(ap);
+    qemu_log_mask(LOG_GUEST_ERROR, "Lockup: %s", why);
+    s->cpu->m_locked_up = true;
+    cs->halted = 1;
+    cpu_exit(cs);
+    qemu_set_irq(s->lockup, 1);
+}
+
 static void signal_sysresetreq(NVICState *s)
 {
     if (qemu_irq_is_connected(s->sysresetreq)) {
@@ -600,10 +625,10 @@ static void do_armv7m_nvic_set_pending(void *opaque, int irq, bool secure,
              * which saves having to have an extra argument is_terminal
              * that we'd only use in one place.
              */
-            cpu_abort(CPU(s->cpu),
-                      "Lockup: can't take terminal derived exception "
-                      "(original exception priority %d)\n",
-                      s->vectpending_prio);
+            nvic_lockup(s, "can't take terminal derived exception "
+                        "(original exception priority %d)\n",
+                        s->vectpending_prio);
+            return;
         }
         /* We now continue with the same code as for a normal pending
          * exception, which will cause us to pend the derived exception.
@@ -663,12 +688,11 @@ static void do_armv7m_nvic_set_pending(void *opaque, int irq, bool secure,
             if (running <= vec->prio) {
                 /* We want to escalate to HardFault but we can't take the
                  * synchronous HardFault at this point either. This is a
-                 * Lockup condition due to a guest bug. We don't model
-                 * Lockup, so report via cpu_abort() instead.
+                 * Lockup condition due to a guest bug.
                  */
-                cpu_abort(CPU(s->cpu),
-                          "Lockup: can't escalate %d to HardFault "
-                          "(current priority %d)\n", irq, running);
+                nvic_lockup(s, "can't escalate %d to HardFault "
+                            "(current priority %d)\n", irq, running);
+                return;
             }
 
             /* HF may be banked but there is only one shared HFSR */
@@ -764,9 +788,9 @@ void armv7m_nvic_set_pending_lazyfp(NVICState *s, int irq, bool secure)
              * We want to escalate to HardFault but the context the
              * FP state belongs to prevents the exception pre-empting.
              */
-            cpu_abort(CPU(s->cpu),
-                      "Lockup: can't escalate to HardFault during "
-                      "lazy FP register stacking\n");
+            nvic_lockup(s, "can't escalate to HardFault during lazy FP "
+                        "register stacking\n");
+            return;
         }
     }
 
@@ -2606,6 +2630,8 @@ static void armv7m_nvic_reset(DeviceState *dev)
     int resetprio;
     NVICState *s = NVIC(dev);
 
+    /* Reset ends Lockup (the CPU clears its own m_locked_up). */
+    qemu_set_irq(s->lockup, 0);
     memset(s->vectors, 0, sizeof(s->vectors));
     memset(s->sec_vectors, 0, sizeof(s->sec_vectors));
     s->prigroup[M_REG_NS] = 0;
@@ -2747,6 +2773,7 @@ static void armv7m_nvic_instance_init(Object *obj)
 
     sysbus_init_irq(sbd, &nvic->excpout);
     qdev_init_gpio_out_named(dev, &nvic->sysresetreq, "SYSRESETREQ", 1);
+    qdev_init_gpio_out_named(dev, &nvic->lockup, "LOCKUP", 1);
     qdev_init_gpio_in_named(dev, nvic_systick_trigger, "systick-trigger",
                             M_REG_NUM_BANKS);
     qdev_init_gpio_in_named(dev, nvic_nmi_trigger, "NMI", 1);

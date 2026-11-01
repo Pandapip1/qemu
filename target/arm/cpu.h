@@ -966,6 +966,12 @@ struct ArchCPU {
     void *m_debug_opaque;
     /* M-profile core is in Debug state (DHCSR.S_HALT). */
     bool m_debug_halted;
+    /*
+     * M-profile core is in Lockup (Armv8-M ARM B3.30 / Armv6-M ARM B1.5.15
+     * "Unrecoverable exception cases"): it executes nothing and takes no
+     * interrupt until a reset or a debug halt (DHCSR.S_LOCKUP).
+     */
+    bool m_locked_up;
 
     /* [QEMU_]KVM_ARM_TARGET_* constant for this CPU, or
      * QEMU_KVM_ARM_TARGET_NONE if the kernel doesn't support this CPU type.

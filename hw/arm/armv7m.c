@@ -376,6 +376,7 @@ static void armv7m_realize(DeviceState *dev, Error **errp)
      */
     qdev_pass_gpios(DEVICE(&s->nvic), dev, NULL);
     qdev_pass_gpios(DEVICE(&s->nvic), dev, "SYSRESETREQ");
+    qdev_pass_gpios(DEVICE(&s->nvic), dev, "LOCKUP");
     qdev_pass_gpios(DEVICE(&s->nvic), dev, "NMI");
 
     /*
