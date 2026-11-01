@@ -18,6 +18,7 @@
 #include "hw/arm/efr32-gpio.h"
 #include "hw/arm/efr32-i2c.h"
 #include "hw/arm/efr32-radioaes.h"
+#include "hw/arm/efr32-trng.h"
 #include "hw/misc/analog-source.h"
 #include "hw/misc/owo-suit.h"
 #include "hw/ptimer.h"
@@ -416,6 +417,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_RDSCRATCHPAD_BASE 0xa8024000u
 #define EFR32_RDMAILBOX0_BASE 0xa8028000u
 #define EFR32_RDMAILBOX1_BASE 0xa802c000u
+#define EFR32_CRYPTOACC_BASE 0x4c020000u
+#define EFR32_CRYPTOACC_END 0x4c02c000u
+#define EFR32_CMU_CLKEN1_CRYPTOACC (1u << 13)
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_MASK 0x7u
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_FSRCO 1u
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_HFXO 3u
@@ -746,7 +750,7 @@ struct Efr32Periph
     AddressSpace dma_as;
     bool dma_as_initialized;
     GHashTable *registers;
-    uint32_t trng_state;
+    Efr32Trng trng;
     Efr32RadioAes radioaes;
     uint32_t rac_state;
     bool hfxo_fsm_locked;
@@ -5203,16 +5207,19 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
             return value;
         }
     }
-    if ((address & ~0xfffu) == 0x4c024000)
-    {
-        uint32_t x = s->trng_state;
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        return s->trng_state = x;
+    if (address >= EFR32_TRNG_FIFO_BASE &&
+        address < EFR32_TRNG_FIFO_BASE + EFR32_TRNG_FIFO_SIZE) {
+        return efr32_trng_pop(&s->trng, clock_get_hz(s->pclk));
     }
-    if (address == 0x4c021004 || address == 0x4c02100c)
-        return 64;
+    if (address >= EFR32_TRNG_CTRL_BASE &&
+        address < EFR32_TRNG_CTRL_BASE + EFR32_TRNG_CTRL_SIZE) {
+        uint32_t value;
+
+        if (efr32_trng_read(&s->trng, address - EFR32_TRNG_CTRL_BASE,
+                            clock_get_hz(s->pclk), &value)) {
+            return value;
+        }
+    }
     if (address == 0x40008008)
         /* CMU.STATUS: every ready flag set; WDOGLOCK as CMU_WDOGLOCK left it. */
         return (UINT32_MAX & ~EFR32_CMU_STATUS_WDOGLOCK) |
@@ -5329,6 +5336,24 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         register_address < EFR32_RADIOAES_BASE + EFR32_RADIOAES_SIZE &&
         efr32_radioaes_write(&s->radioaes, &s->dma_as,
                              register_address - EFR32_RADIOAES_BASE, next)) {
+        return;
+    }
+    /*
+     * CRYPTOACC has no SET/CLR/TGL aliases (RM SS4.2.4.3: none in its
+     * register maps); its RNG block sits at +0x1000, so decode it before
+     * the alias-folding register key.
+     */
+    if (efr32_peripheral_canonical_address(word) >= EFR32_TRNG_CTRL_BASE &&
+        efr32_peripheral_canonical_address(word) <
+            EFR32_TRNG_CTRL_BASE + EFR32_TRNG_CTRL_SIZE) {
+        uint32_t offset = efr32_peripheral_canonical_address(word) -
+                          EFR32_TRNG_CTRL_BASE;
+        uint32_t current = 0;
+
+        efr32_trng_read(&s->trng, offset, clock_get_hz(s->pclk), &current);
+        efr32_trng_write(&s->trng, offset, clock_get_hz(s->pclk),
+                         (current & ~mask) | (((uint32_t)value << shift) &
+                                              mask));
         return;
     }
 
@@ -5847,6 +5872,16 @@ static bool efr32_bus_error(Efr32Periph *s, uint32_t address)
     if (block == EFR32_BUFC_BASE) {
         return !radio_clock;
     }
+    /*
+     * CRYPTOACC (PK control, DMA, RNG control, RNG FIFO, PK RAM;
+     * efr32bg22c224f512im40.h) behind CMU_CLKEN1.CRYPTOACC (bit 13,
+     * efr32bg22_cmu.h; Zephyr's TRNG driver enables it first).  RM
+     * SS4.2.1.2: an access to a peripheral whose clock is disabled is a bus
+     * fault.  [I] Not measured on silicon for this block.
+     */
+    if (block >= EFR32_CRYPTOACC_BASE && block < EFR32_CRYPTOACC_END) {
+        return !(clken1 & EFR32_CMU_CLKEN1_CRYPTOACC);
+    }
     gate = efr32_radio_bus_clock(block);
     return gate && (!radio_clock || !(clken1 & gate));
 }
@@ -6206,7 +6241,7 @@ static void efr32_periph_init(Object *o)
     s->registers = g_hash_table_new(g_direct_hash, g_direct_equal);
     s->rstcause = EFR32_EMU_RSTCAUSE_POR;
     s->rstctrl = EFR32_EMU_RSTCTRL_RESET;
-    s->trng_state = 0x2545f491;
+    efr32_trng_reset(&s->trng);
     efr32_radioaes_reset(&s->radioaes);
     s->rac_state = EFR32_RAC_STATE_OFF;
     s->seq_released = false;
@@ -6278,7 +6313,7 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
 {
     Efr32Periph *s = EFR32_PERIPH(o);
     g_hash_table_remove_all(s->registers);
-    s->trng_state = 0x2545f491;
+    efr32_trng_reset(&s->trng);
     efr32_radioaes_reset(&s->radioaes);
     s->rac_state = EFR32_RAC_STATE_OFF;
     s->seq_released = false;

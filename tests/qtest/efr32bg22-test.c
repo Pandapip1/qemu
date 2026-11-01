@@ -3723,6 +3723,64 @@ static void test_radioaes_ecb_and_key_sizes(void)
     qtest_quit(qts);
 }
 
+/*
+ * CRYPTOACC TRNG (RM SS11.5): RNGCTRL.ENABLE starts the noise source; after
+ * the start-up wait (INITWAITVAL PCLK cycles + the 1024-sample NIST start-up
+ * test, [I] timing never measured) 128-bit blocks fill the 64-word FIFO;
+ * a full FIFO stops the rings (STATE FIFOFULLOFF, FULLIF); each read of the
+ * FIFO window pops a word and the rings restart.  Bus clock CLKEN1 bit 13.
+ */
+#define TRNG_CTRL              0x4c021000
+#define TRNG_FIFOLEVEL         0x004
+#define TRNG_FIFODEPTH         0x00c
+#define TRNG_RNGSTATUS         0x030
+#define TRNG_INITWAITVAL       0x034
+#define TRNG_FIFO              0x4c024000
+#define TRNG_ENABLE            0x00040001 /* NB128BITBLOCKS 4 | ENABLE */
+#define TRNG_STATUS_FULLIF     (1u << 7)
+#define TRNG_STATUS_STATE(v)   (((v) >> 1) & 7u)
+#define TRNG_STATE_STARTUP     1
+#define TRNG_STATE_FIFOFULLOFF 3
+#define TRNG_STATE_RUNNING     4
+#define CMU_CLKEN1_CRYPTOACC   (1u << 13)
+
+static void test_trng_fifo(void)
+{
+    QTestState *qts = qtest_init("-machine efr32bg22 -accel qtest");
+    uint32_t words[8];
+    bool differ = false;
+
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN1 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN1_CRYPTOACC);
+    g_assert_cmphex(qtest_readl(qts, TRNG_CTRL + TRNG_FIFODEPTH), ==, 64);
+    g_assert_cmphex(qtest_readl(qts, TRNG_CTRL + TRNG_INITWAITVAL), ==,
+                    0xffff);
+    qtest_writel(qts, TRNG_CTRL, TRNG_ENABLE);
+    g_assert_cmphex(TRNG_STATUS_STATE(qtest_readl(qts, TRNG_CTRL +
+                                                  TRNG_RNGSTATUS)), ==,
+                    TRNG_STATE_STARTUP);
+    g_assert_cmphex(qtest_readl(qts, TRNG_CTRL + TRNG_FIFOLEVEL), ==, 0);
+    qtest_clock_step(qts, 20 * 1000 * 1000);
+    g_assert_cmphex(qtest_readl(qts, TRNG_CTRL + TRNG_FIFOLEVEL), ==, 64);
+    g_assert_cmphex(qtest_readl(qts, TRNG_CTRL + TRNG_RNGSTATUS) &
+                    TRNG_STATUS_FULLIF, ==, TRNG_STATUS_FULLIF);
+    g_assert_cmphex(TRNG_STATUS_STATE(qtest_readl(qts, TRNG_CTRL +
+                                                  TRNG_RNGSTATUS)), ==,
+                    TRNG_STATE_FIFOFULLOFF);
+    for (size_t i = 0; i < G_N_ELEMENTS(words); i++) {
+        words[i] = qtest_readl(qts, TRNG_FIFO + 4 * i);
+        differ |= i && words[i] != words[0];
+    }
+    g_assert_true(differ);
+    g_assert_cmphex(qtest_readl(qts, TRNG_CTRL + TRNG_FIFOLEVEL), ==, 56);
+    g_assert_cmphex(TRNG_STATUS_STATE(qtest_readl(qts, TRNG_CTRL +
+                                                  TRNG_RNGSTATUS)), ==,
+                    TRNG_STATE_RUNNING);
+    qtest_clock_step(qts, 1000 * 1000);
+    g_assert_cmphex(qtest_readl(qts, TRNG_CTRL + TRNG_FIFOLEVEL), ==, 64);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     int result;
@@ -3759,6 +3817,7 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/timer-sync-registers-read-zero-when-disabled",
                    test_timer_sync_registers_read_zero_when_disabled);
     qtest_add_func("/efr32bg22/timer-bus-faults", test_timer_bus_faults);
+    qtest_add_func("/efr32bg22/trng-fifo", test_trng_fifo);
     qtest_add_func("/efr32bg22/radioaes-ecb-and-key-sizes",
                    test_radioaes_ecb_and_key_sizes);
     qtest_add_func("/efr32bg22/lfxo-ready-timeout", test_lfxo_ready_timeout);
