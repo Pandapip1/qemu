@@ -3781,6 +3781,79 @@ static void test_trng_fifo(void)
     qtest_quit(qts);
 }
 
+/*
+ * GPCRC (RM chapter 14) through the register sequence of sl_hal_gpcrc.c and
+ * Zephyr's crc_silabs_gpcrc.c, on the check string "123456789":
+ * CRC-32/IEEE 0xCBF43926 (BITREVERSE 0, DATA, xorout ~0, written as words
+ * then a byte), CRC-16/CCITT-FALSE 0x29B1 (POLY 0x8408 reversed, BITREVERSE
+ * 1, DATAREV, half-words then a byte), CRC-16/KERMIT 0x2189 (BITREVERSE 0,
+ * DATA); BYTEREVERSE of a big-endian word gives the same CRC-32.
+ */
+#define GPCRC_BASE             0x40088000
+#define GPCRC_EN               0x004
+#define GPCRC_CTRL             0x008
+#define GPCRC_CMD              0x00c
+#define GPCRC_INIT             0x010
+#define GPCRC_POLY             0x014
+#define GPCRC_INPUTDATA        0x018
+#define GPCRC_INPUTDATAHWORD   0x01c
+#define GPCRC_INPUTDATABYTE    0x020
+#define GPCRC_DATA             0x024
+#define GPCRC_DATAREV          0x028
+#define GPCRC_CTRL_CRC16       (1u << 4)
+#define GPCRC_CTRL_BITREVERSE  (1u << 9)
+#define GPCRC_CTRL_BYTEREVERSE (1u << 10)
+#define CMU_CLKEN0_GPCRC       (1u << 3)
+
+static void gpcrc_start(QTestState *qts, uint32_t ctrl, uint32_t poly,
+                        uint32_t init)
+{
+    qtest_writel(qts, GPCRC_BASE + GPCRC_EN, 0);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_CTRL, ctrl);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_POLY, poly);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_INIT, init);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_EN, 1);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_CMD, 1);
+}
+
+static void test_gpcrc_crc_vectors(void)
+{
+    QTestState *qts = qtest_init("-machine efr32bg22 -accel qtest");
+
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_GPCRC);
+    /* "1234" "5678" little-endian words, then '9'. */
+    gpcrc_start(qts, 0, 0, 0xffffffff);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_INPUTDATA, 0x34333231);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_INPUTDATA, 0x38373635);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_INPUTDATABYTE, '9');
+    g_assert_cmphex(qtest_readl(qts, GPCRC_BASE + GPCRC_DATA) ^ 0xffffffff,
+                    ==, 0xcbf43926);
+    /* The same words big-endian, byte-reversed by the GPCRC. */
+    gpcrc_start(qts, GPCRC_CTRL_BYTEREVERSE, 0, 0xffffffff);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_INPUTDATA, 0x31323334);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_INPUTDATA, 0x35363738);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_INPUTDATABYTE, '9');
+    g_assert_cmphex(qtest_readl(qts, GPCRC_BASE + GPCRC_DATA) ^ 0xffffffff,
+                    ==, 0xcbf43926);
+    /* CRC-16/CCITT-FALSE: MSB-first, so BITREVERSE and DATAREV. */
+    gpcrc_start(qts, GPCRC_CTRL_CRC16 | GPCRC_CTRL_BITREVERSE, 0x8408,
+                0xffff);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_INPUTDATAHWORD, 0x3231);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_INPUTDATAHWORD, 0x3433);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_INPUTDATAHWORD, 0x3635);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_INPUTDATAHWORD, 0x3837);
+    qtest_writel(qts, GPCRC_BASE + GPCRC_INPUTDATABYTE, '9');
+    g_assert_cmphex(qtest_readl(qts, GPCRC_BASE + GPCRC_DATAREV), ==, 0x29b1);
+    /* CRC-16/KERMIT: reflected, DATA. */
+    gpcrc_start(qts, GPCRC_CTRL_CRC16, 0x8408, 0);
+    for (const char *c = "123456789"; *c; c++) {
+        qtest_writel(qts, GPCRC_BASE + GPCRC_INPUTDATABYTE, *c);
+    }
+    g_assert_cmphex(qtest_readl(qts, GPCRC_BASE + GPCRC_DATA), ==, 0x2189);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     int result;
@@ -3818,6 +3891,7 @@ int main(int argc, char **argv)
                    test_timer_sync_registers_read_zero_when_disabled);
     qtest_add_func("/efr32bg22/timer-bus-faults", test_timer_bus_faults);
     qtest_add_func("/efr32bg22/trng-fifo", test_trng_fifo);
+    qtest_add_func("/efr32bg22/gpcrc-crc-vectors", test_gpcrc_crc_vectors);
     qtest_add_func("/efr32bg22/radioaes-ecb-and-key-sizes",
                    test_radioaes_ecb_and_key_sizes);
     qtest_add_func("/efr32bg22/lfxo-ready-timeout", test_lfxo_ready_timeout);

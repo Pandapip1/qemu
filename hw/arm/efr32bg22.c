@@ -19,6 +19,7 @@
 #include "hw/arm/efr32-i2c.h"
 #include "hw/arm/efr32-radioaes.h"
 #include "hw/arm/efr32-trng.h"
+#include "hw/arm/efr32-gpcrc.h"
 #include "hw/misc/analog-source.h"
 #include "hw/misc/owo-suit.h"
 #include "hw/ptimer.h"
@@ -420,6 +421,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_CRYPTOACC_BASE 0x4c020000u
 #define EFR32_CRYPTOACC_END 0x4c02c000u
 #define EFR32_CMU_CLKEN1_CRYPTOACC (1u << 13)
+#define EFR32_CMU_CLKEN0_GPCRC (1u << 3)
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_MASK 0x7u
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_FSRCO 1u
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_HFXO 3u
@@ -751,6 +753,7 @@ struct Efr32Periph
     bool dma_as_initialized;
     GHashTable *registers;
     Efr32Trng trng;
+    Efr32Gpcrc gpcrc;
     Efr32RadioAes radioaes;
     uint32_t rac_state;
     bool hfxo_fsm_locked;
@@ -5207,6 +5210,15 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
             return value;
         }
     }
+    if (address >= EFR32_GPCRC_BASE &&
+        address < EFR32_GPCRC_BASE + EFR32_GPCRC_SIZE) {
+        uint32_t value;
+
+        if (efr32_gpcrc_read(&s->gpcrc, address - EFR32_GPCRC_BASE,
+                             &value)) {
+            return value;
+        }
+    }
     if (address >= EFR32_TRNG_FIFO_BASE &&
         address < EFR32_TRNG_FIFO_BASE + EFR32_TRNG_FIFO_SIZE) {
         return efr32_trng_pop(&s->trng, clock_get_hz(s->pclk));
@@ -5336,6 +5348,16 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         register_address < EFR32_RADIOAES_BASE + EFR32_RADIOAES_SIZE &&
         efr32_radioaes_write(&s->radioaes, &s->dma_as,
                              register_address - EFR32_RADIOAES_BASE, next)) {
+        return;
+    }
+    /* GPCRC decodes its own SET/CLR/TGL pages (input and command too). */
+    if (efr32_peripheral_canonical_address(word) >= EFR32_GPCRC_BASE &&
+        efr32_peripheral_canonical_address(word) <
+            EFR32_GPCRC_BASE + EFR32_GPCRC_SIZE &&
+        efr32_gpcrc_write(&s->gpcrc,
+                          efr32_peripheral_canonical_address(word) -
+                              EFR32_GPCRC_BASE,
+                          (uint32_t)value << shift)) {
         return;
     }
     /*
@@ -5882,6 +5904,11 @@ static bool efr32_bus_error(Efr32Periph *s, uint32_t address)
     if (block >= EFR32_CRYPTOACC_BASE && block < EFR32_CRYPTOACC_END) {
         return !(clken1 & EFR32_CMU_CLKEN1_CRYPTOACC);
     }
+    /* GPCRC behind CMU_CLKEN0.GPCRC (bit 3, efr32bg22_cmu.h), as above. */
+    if (block == EFR32_GPCRC_BASE) {
+        return !(efr32_register_get(s, EFR32_CMU_BASE + EFR32_CMU_CLKEN0) &
+                 EFR32_CMU_CLKEN0_GPCRC);
+    }
     gate = efr32_radio_bus_clock(block);
     return gate && (!radio_clock || !(clken1 & gate));
 }
@@ -6242,6 +6269,7 @@ static void efr32_periph_init(Object *o)
     s->rstcause = EFR32_EMU_RSTCAUSE_POR;
     s->rstctrl = EFR32_EMU_RSTCTRL_RESET;
     efr32_trng_reset(&s->trng);
+    efr32_gpcrc_reset(&s->gpcrc);
     efr32_radioaes_reset(&s->radioaes);
     s->rac_state = EFR32_RAC_STATE_OFF;
     s->seq_released = false;
@@ -6314,6 +6342,7 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     Efr32Periph *s = EFR32_PERIPH(o);
     g_hash_table_remove_all(s->registers);
     efr32_trng_reset(&s->trng);
+    efr32_gpcrc_reset(&s->gpcrc);
     efr32_radioaes_reset(&s->radioaes);
     s->rac_state = EFR32_RAC_STATE_OFF;
     s->seq_released = false;
