@@ -2381,14 +2381,55 @@ static void test_rtcc_counts_and_compares(void)
 #define IADC_SINGLE           0x098
 #define IADC_SINGLE_PD02_GND  0x0000b200
 
+/*
+ * Timing (RM SS24.3.3, [I] unmeasured): at reset the IADC clock is
+ * EM01GRPACLK = HFRCODPLL's 19 MHz; TIMEBASE 18 makes a 1 us interval,
+ * PRESCALE 1 a 9.5 MHz ADC_CLK.  WARMUPMODE NORMAL: 5 intervals of warm-up
+ * then (4 * OSR 2 + 2) = 10 ADC_CLK cycles per conversion, every time;
+ * KEEPWARM: the warm-up once.
+ */
+#define IADC_CTRL             0x008
+#define IADC_CTRL_TIMEBASE_1US (18u << 16)
+#define IADC_CTRL_KEEPWARM    (2u << 4)
+#define IADC_SCHED0           0x054
+#define IADC_STATUS_CONVERTING (1u << 6)
+#define IADC_WARMUP_NS        (5 * 19 * 1000000000ull / 19000000)
+#define IADC_CONV_NS          (10 * 1000000000ull * 2 / 19000000)
+
+static void iadc_convert_after(QTestState *qts, uint64_t ns)
+{
+    qtest_writel(qts, IADC_BASE + IADC_CMD, 1);
+    qtest_clock_step(qts, ns - 1);
+    g_assert_cmphex(qtest_readl(qts, IADC_BASE + IADC_STATUS) &
+                    IADC_STATUS_CONVERTING, ==, IADC_STATUS_CONVERTING);
+    qtest_clock_step(qts, 1);
+    g_assert_cmphex(qtest_readl(qts, IADC_BASE + IADC_STATUS) &
+                    (IADC_STATUS_CONVERTING | IADC_STATUS_FIFODV), ==,
+                    IADC_STATUS_FIFODV);
+}
+
 static void test_iadc_single_conversion(void)
 {
     QTestState *qts = qtest_initf("-machine efr32bg22,analog=PD02=968 "
-                                  "-accel tcg -S");
+                                  "-accel qtest");
 
+    qtest_writel(qts, IADC_BASE + IADC_CTRL, IADC_CTRL_TIMEBASE_1US);
+    qtest_writel(qts, IADC_BASE + IADC_SCHED0, 1);
     qtest_writel(qts, IADC_BASE + IADC_CFG0, IADC_CFG0_VDDX_GAIN1);
     qtest_writel(qts, IADC_BASE + IADC_SINGLE, IADC_SINGLE_PD02_GND);
-    qtest_writel(qts, IADC_BASE + IADC_CMD, 1);
+    iadc_convert_after(qts, IADC_WARMUP_NS + IADC_CONV_NS);
+    /* NORMAL: powered down again, so the next one warms up again. */
+    iadc_convert_after(qts, IADC_WARMUP_NS + IADC_CONV_NS);
+    g_assert_cmpuint(qtest_readl(qts, IADC_BASE + IADC_SINGLEFIFODATA), ==,
+                     1201);
+    qtest_writel(qts, IADC_BASE + IADC_CTRL,
+                 IADC_CTRL_TIMEBASE_1US | IADC_CTRL_KEEPWARM);
+    iadc_convert_after(qts, IADC_WARMUP_NS + IADC_CONV_NS);
+    g_assert_cmpuint(qtest_readl(qts, IADC_BASE + IADC_SINGLEFIFODATA), ==,
+                     1201);
+    iadc_convert_after(qts, IADC_CONV_NS);
+    g_assert_cmpuint(qtest_readl(qts, IADC_BASE + IADC_SINGLEFIFODATA), ==,
+                     1201);
     g_assert_cmphex(qtest_readl(qts, IADC_BASE + IADC_STATUS) &
                     IADC_STATUS_FIFODV, ==, IADC_STATUS_FIFODV);
     g_assert_cmphex(qtest_readl(qts, IADC_BASE + IADC_IF) &

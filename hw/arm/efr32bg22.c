@@ -826,6 +826,21 @@ struct Efr32Periph
     Object *analog_source;
     /* Fault injection: IADC conversions never complete. */
     uint32_t iadc_stall;
+    /* IADC conversions in progress, in completion order (efr32_iadc_*). */
+    QEMUTimer *iadc_timer;
+    struct {
+        int64_t done_ns;
+        uint8_t queue, id;
+        bool last;
+        uint32_t input;
+    } iadc_conv[2 * 16 + 1];
+    unsigned iadc_nconv;
+    int64_t iadc_busy_until_ns;
+    /* Warm (ADCWARM) for this PRESCALE/ADCMODE/REFSEL key; or in standby. */
+    bool iadc_warm, iadc_standby;
+    uint32_t iadc_warm_key;
+    uint32_t iadc_last_input;
+    bool iadc_have_input;
     /* TIMERn CCm compare/PWM outputs, to the GPIO routes. */
     qemu_irq timer_cc_out[5 * 3];
     /* To the debug port: RAC clock retiming wedges it (SS7.80) */
@@ -4576,9 +4591,10 @@ static bool efr32_cmu_wdoglock_write(Efr32Periph *s, uint32_t key,
  * or left-aligned (LEFT12), unipolar for a single-ended input.
  * Fault injection: "x-iadc-stall" (periph property) makes conversions never
  * complete: commands are accepted and nothing ever comes out.
- * [U] Not modelled: timer and PRS triggers, oversampling and 16/20-bit
- * results, the window comparator, SUPPLY inputs, conversion and warm-up
- * time (a conversion completes at the command).
+ * Results arrive after the RM's warm-up and conversion times
+ * (efr32_iadc_queue: OSR, ADC_CLK, WARMUPMODE, TIMEBASE; [I] unmeasured).
+ * [U] Not modelled: timer and PRS triggers, oversampling's effect on the
+ * value and 16/20-bit results, the window comparator, SUPPLY inputs.
  */
 #define EFR32_IADC_BASE 0x4a004000u
 #define EFR32_IADC_IRQ 48
@@ -4590,6 +4606,10 @@ static bool efr32_cmu_wdoglock_write(Efr32Periph *s, uint32_t key,
 #define EFR32_IADC_STATUS 0x014u
 #define EFR32_IADC_STATUS_SINGLEFIFODV (1u << 8)
 #define EFR32_IADC_STATUS_SCANFIFODV (1u << 9)
+#define EFR32_IADC_STATUS_SINGLEQEN (1u << 0)
+#define EFR32_IADC_STATUS_SCANQEN (1u << 3)
+#define EFR32_IADC_STATUS_CONVERTING (1u << 6)
+#define EFR32_IADC_STATUS_ADCWARM (1u << 30)
 #define EFR32_IADC_MASKREQ 0x018u
 #define EFR32_IADC_MASKREQ_MASK 0xffffu
 #define EFR32_IADC_IF 0x024u
@@ -4680,8 +4700,20 @@ static void efr32_iadc_update(Efr32Periph *s)
 {
     uint32_t status = efr32_iadc_get(s, EFR32_IADC_STATUS) &
                       ~(EFR32_IADC_STATUS_SINGLEFIFODV |
-                        EFR32_IADC_STATUS_SCANFIFODV);
+                        EFR32_IADC_STATUS_SCANFIFODV |
+                        EFR32_IADC_STATUS_SINGLEQEN |
+                        EFR32_IADC_STATUS_SCANQEN |
+                        EFR32_IADC_STATUS_CONVERTING |
+                        EFR32_IADC_STATUS_ADCWARM);
 
+    for (unsigned i = 0; i < s->iadc_nconv; i++) {
+        status |= EFR32_IADC_STATUS_CONVERTING |
+                  (s->iadc_conv[i].queue ? EFR32_IADC_STATUS_SCANQEN
+                                         : EFR32_IADC_STATUS_SINGLEQEN);
+    }
+    if (s->iadc_warm) {
+        status |= EFR32_IADC_STATUS_ADCWARM;
+    }
     if (s->iadc_fifo[0].count) {
         status |= EFR32_IADC_STATUS_SINGLEFIFODV;
     }
@@ -4791,10 +4823,160 @@ static uint32_t efr32_iadc_push(Efr32Periph *s, unsigned q,
     return flags;
 }
 
+/*
+ * Conversion timing, RM SS24.3.2-24.3.3 ([I]: the RM's formulas; never
+ * measured on silicon):
+ *  - CLK_CMU_ADC: CMU_IADCCLKCTRL.CLKSEL, EM01GRPACLK (1, reset) or FSRCO
+ *    (2); CLK_SRC_ADC = CLK_CMU_ADC / (CTRL.HSCLKRATE + 1); ADC_CLK =
+ *    CLK_SRC_ADC / (SCHEDx.PRESCALE + 1), PRESCALE taken as 1 when it is 0
+ *    and HSCLKRATE is not.
+ *  - Warm-up: five TIMEBASE intervals ((CTRL.TIMEBASE + 1) CLK_SRC_ADC
+ *    cycles) from power-down (WARMUPMODE NORMAL, after every request) or on
+ *    a change of PRESCALE, ADCMODE or REFSEL; one from standby
+ *    (KEEPINSTANDBY); none while kept warm (KEEPWARM).
+ *  - Each conversion: ((4 * OSR) + 2) ADC_CLK cycles, OSR = 2 << OSRHS, plus
+ *    2 ADC_CLK cycles when the input changes from the previous conversion.
+ *  - Requests are served in the order they arrive (SINGLETAILGATE off); the
+ *    input is sampled when its conversion completes.  [U] TIMER and PRS
+ *    triggers, continuous trigger actions, tailgating, 16/20-bit modes and
+ *    the window comparator are not modelled (IMMEDIATE, ONCE).
+ */
+#define EFR32_IADC_CTRL 0x008u
+#define EFR32_IADC_CTRL_WARMUPMODE_SHIFT 4
+#define EFR32_IADC_CTRL_WARMUPMODE_MASK 0x3u
+#define EFR32_IADC_WARMUP_KEEPINSTANDBY 1u
+#define EFR32_IADC_WARMUP_KEEPWARM 2u
+#define EFR32_IADC_CTRL_TIMEBASE_SHIFT 16
+#define EFR32_IADC_CTRL_TIMEBASE_MASK 0x7fu
+#define EFR32_IADC_CTRL_HSCLKRATE_SHIFT 28
+#define EFR32_IADC_CTRL_HSCLKRATE_MASK 0x7u
+#define EFR32_IADC_SCHED0 0x054u
+#define EFR32_IADC_SCHED_PRESCALE_MASK 0x3ffu
+#define EFR32_IADC_CFG_ADCMODE_MASK 0x3u
+#define EFR32_IADC_CFG_OSRHS_SHIFT 2
+#define EFR32_IADC_CFG_OSRHS_MASK 0x7u
+#define EFR32_CMU_IADCCLKCTRL 0x180u
+#define EFR32_CMU_IADCCLKCTRL_CLKSEL_MASK 0x3u
+#define EFR32_CMU_IADCCLKCTRL_EM01GRPACLK 1u
+#define EFR32_CMU_IADCCLKCTRL_FSRCO 2u
+#define EFR32_IADC_WARMUP_INTERVALS_OFF 5
+#define EFR32_IADC_WARMUP_INTERVALS_STANDBY 1
+#define EFR32_IADC_CONV_SWITCH_CYCLES 2
+
+static uint64_t efr32_iadc_cmu_hz(Efr32Periph *s)
+{
+    switch (efr32_register_get(s, EFR32_CMU_BASE + EFR32_CMU_IADCCLKCTRL) &
+            EFR32_CMU_IADCCLKCTRL_CLKSEL_MASK) {
+    case 0:
+    case EFR32_CMU_IADCCLKCTRL_EM01GRPACLK:
+        /* Reset value EM01GRPACLK (the register store reads 0 before). */
+        return efr32_em01grpa_hz(s);
+    case EFR32_CMU_IADCCLKCTRL_FSRCO:
+        return EFR32_FSRCO_MEASURED_HZ;
+    default:
+        return 0;
+    }
+}
+
+/* Schedule one conversion of @input (config group from it). */
+static void efr32_iadc_queue(Efr32Periph *s, unsigned queue, unsigned id,
+                             uint32_t input, bool last)
+{
+    uint32_t ctrl = efr32_iadc_get(s, EFR32_IADC_CTRL);
+    unsigned group = (input & EFR32_IADC_INPUT_CFG) ? 1 : 0;
+    uint32_t cfg = efr32_iadc_get(s, EFR32_IADC_CFG0 +
+                                         group * EFR32_IADC_CFG_STRIDE);
+    uint32_t prescale = efr32_iadc_get(s, EFR32_IADC_SCHED0 +
+                                              group * EFR32_IADC_CFG_STRIDE) &
+                        EFR32_IADC_SCHED_PRESCALE_MASK;
+    uint32_t hsclkrate = (ctrl >> EFR32_IADC_CTRL_HSCLKRATE_SHIFT) &
+                         EFR32_IADC_CTRL_HSCLKRATE_MASK;
+    uint32_t mode = (ctrl >> EFR32_IADC_CTRL_WARMUPMODE_SHIFT) &
+                    EFR32_IADC_CTRL_WARMUPMODE_MASK;
+    uint32_t key, osr, cycles;
+    uint64_t src_hz = efr32_iadc_cmu_hz(s) / (hsclkrate + 1), adc_hz;
+    int64_t t;
+
+    if (hsclkrate && !prescale) {
+        prescale = 1;
+    }
+    adc_hz = src_hz / (prescale + 1);
+    if (!adc_hz || s->iadc_nconv == ARRAY_SIZE(s->iadc_conv)) {
+        return;
+    }
+    t = MAX(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), s->iadc_busy_until_ns);
+    key = prescale | (cfg & EFR32_IADC_CFG_ADCMODE_MASK) << 10 |
+          ((cfg >> EFR32_IADC_CFG_REFSEL_SHIFT) &
+           EFR32_IADC_CFG_REFSEL_MASK) << 12;
+    if (!s->iadc_warm || key != s->iadc_warm_key) {
+        unsigned intervals = s->iadc_standby && key == s->iadc_warm_key
+                                 ? EFR32_IADC_WARMUP_INTERVALS_STANDBY
+                                 : EFR32_IADC_WARMUP_INTERVALS_OFF;
+
+        t += muldiv64((uint64_t)intervals *
+                          (((ctrl >> EFR32_IADC_CTRL_TIMEBASE_SHIFT) &
+                            EFR32_IADC_CTRL_TIMEBASE_MASK) + 1),
+                      NANOSECONDS_PER_SECOND, src_hz);
+        s->iadc_warm = true;
+        s->iadc_warm_key = key;
+    }
+    osr = 2u << ((cfg >> EFR32_IADC_CFG_OSRHS_SHIFT) &
+                 EFR32_IADC_CFG_OSRHS_MASK);
+    cycles = 4 * osr + 2;
+    if (s->iadc_have_input && input != s->iadc_last_input) {
+        cycles += EFR32_IADC_CONV_SWITCH_CYCLES;
+    }
+    s->iadc_last_input = input;
+    s->iadc_have_input = true;
+    t += muldiv64(cycles, NANOSECONDS_PER_SECOND, adc_hz);
+    s->iadc_busy_until_ns = t;
+    s->iadc_conv[s->iadc_nconv++] = (typeof(s->iadc_conv[0])){
+        t, queue, id, last, input,
+    };
+    if (last && mode != EFR32_IADC_WARMUP_KEEPWARM) {
+        /* Powered down or in standby once the request is served. */
+        s->iadc_warm = false;
+        s->iadc_standby = mode == EFR32_IADC_WARMUP_KEEPINSTANDBY;
+    }
+    timer_mod(s->iadc_timer, s->iadc_conv[0].done_ns);
+}
+
+/* Conversions whose time has come deliver their results. */
+static void efr32_iadc_complete(void *opaque)
+{
+    Efr32Periph *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint32_t flags = 0;
+    unsigned done = 0;
+
+    while (done < s->iadc_nconv && s->iadc_conv[done].done_ns <= now) {
+        typeof(s->iadc_conv[0]) *c = &s->iadc_conv[done++];
+        const Efr32IadcQueue *queue = c->queue ? &efr32_iadc_scan
+                                               : &efr32_iadc_single;
+        uint32_t result = efr32_iadc_convert(s, c->input,
+                                             efr32_iadc_get(s,
+                                                            queue->fifocfg));
+
+        flags |= efr32_iadc_push(s, c->queue, queue, result, c->id);
+        if (c->queue) {
+            flags |= EFR32_IADC_IF_SCANENTRYDONE;
+            flags |= c->last ? EFR32_IADC_IF_SCANTABLEDONE : 0;
+        } else {
+            flags |= EFR32_IADC_IF_SINGLEDONE;
+        }
+    }
+    memmove(s->iadc_conv, s->iadc_conv + done,
+            (s->iadc_nconv - done) * sizeof(s->iadc_conv[0]));
+    s->iadc_nconv -= done;
+    if (s->iadc_nconv) {
+        timer_mod(s->iadc_timer, s->iadc_conv[0].done_ns);
+    }
+    efr32_iadc_put(s, EFR32_IADC_IF, efr32_iadc_get(s, EFR32_IADC_IF) | flags);
+    efr32_iadc_update(s);
+}
+
 static void efr32_iadc_command(Efr32Periph *s, uint32_t command)
 {
-    uint32_t flags = 0;
-
     if (command & EFR32_IADC_CMD_SINGLEFIFOFLUSH) {
         s->iadc_fifo[0].count = 0;
     }
@@ -4802,13 +4984,8 @@ static void efr32_iadc_command(Efr32Periph *s, uint32_t command)
         s->iadc_fifo[1].count = 0;
     }
     if ((command & EFR32_IADC_CMD_SINGLESTART) && !s->iadc_stall) {
-        uint32_t result = efr32_iadc_convert(
-            s, efr32_iadc_get(s, EFR32_IADC_SINGLE),
-            efr32_iadc_get(s, EFR32_IADC_SINGLEFIFOCFG));
-
-        flags |= efr32_iadc_push(s, 0, &efr32_iadc_single, result,
-                                 EFR32_IADC_SINGLE_ID);
-        flags |= EFR32_IADC_IF_SINGLEDONE;
+        efr32_iadc_queue(s, 0, EFR32_IADC_SINGLE_ID,
+                         efr32_iadc_get(s, EFR32_IADC_SINGLE), true);
     }
     if ((command & EFR32_IADC_CMD_SCANSTART) && !s->iadc_stall) {
         uint32_t mask = efr32_iadc_get(s, EFR32_IADC_MASKREQ) &
@@ -4816,17 +4993,13 @@ static void efr32_iadc_command(Efr32Periph *s, uint32_t command)
 
         for (unsigned id = 0; id < EFR32_IADC_SCANTABLE_ENTRIES; id++) {
             if (mask & (1u << id)) {
-                uint32_t result = efr32_iadc_convert(
-                    s, efr32_iadc_get(s, EFR32_IADC_SCANTABLE0 + 4 * id),
-                    efr32_iadc_get(s, EFR32_IADC_SCANFIFOCFG));
-
-                flags |= efr32_iadc_push(s, 1, &efr32_iadc_scan, result, id);
-                flags |= EFR32_IADC_IF_SCANENTRYDONE;
+                efr32_iadc_queue(s, 1, id,
+                                 efr32_iadc_get(s, EFR32_IADC_SCANTABLE0 +
+                                                       4 * id),
+                                 !(mask >> (id + 1)));
             }
         }
-        flags |= EFR32_IADC_IF_SCANTABLEDONE;
     }
-    efr32_iadc_put(s, EFR32_IADC_IF, efr32_iadc_get(s, EFR32_IADC_IF) | flags);
     efr32_iadc_update(s);
 }
 
@@ -6303,6 +6476,7 @@ static void efr32_periph_init(Object *o)
                                        efr32_timer_pwm_callbacks[i], s);
     }
     s->wdog_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_wdog_expired, s);
+    s->iadc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_iadc_complete, s);
     s->wdog_sync_timer =
         timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_wdog_sync_done, s);
     /* DHCSR.S_HALT of the M33, from its debug unit (WDOG0 DEBUGRUN). */
@@ -6411,6 +6585,10 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     efr32_msc_reset(s);
     efr32_rtcc_reset(s);
     memset(s->iadc_fifo, 0, sizeof(s->iadc_fifo));
+    timer_del(s->iadc_timer);
+    s->iadc_nconv = 0;
+    s->iadc_busy_until_ns = 0;
+    s->iadc_warm = s->iadc_standby = s->iadc_have_input = false;
     efr32_wdog_reset(s);
     efr32_register_put(s, EFR32_SYSCFG_BASE + EFR32_SYSCFG_CHIPREV,
                        s->chiprev);
