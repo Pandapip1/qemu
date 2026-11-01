@@ -15,6 +15,7 @@
 #include "hw/arm/efr32-usart.h"
 #include "hw/arm/efr32-gpio.h"
 #include "hw/arm/efr32-i2c.h"
+#include "hw/arm/efr32-radioaes.h"
 #include "hw/misc/analog-source.h"
 #include "hw/misc/owo-suit.h"
 #include "hw/ptimer.h"
@@ -693,6 +694,7 @@ struct Efr32Periph
     bool dma_as_initialized;
     GHashTable *registers;
     uint32_t trng_state;
+    Efr32RadioAes radioaes;
     uint32_t rac_state;
     bool hfxo_fsm_locked;
     bool rx_offer_pending;
@@ -4637,8 +4639,15 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
     if (address == EFR32_MSC_BASE) {
         return EFR32_MSC_IPVERSION_VALUE;
     }
-    if (address == 0x4400003c)
-        return 0x20; /* RADIOAES.STATUS WAITING */
+    if (address >= EFR32_RADIOAES_BASE &&
+        address < EFR32_RADIOAES_BASE + EFR32_RADIOAES_SIZE) {
+        uint32_t value;
+
+        if (efr32_radioaes_read(&s->radioaes, address - EFR32_RADIOAES_BASE,
+                                &value)) {
+            return value;
+        }
+    }
     if ((address & ~0xfffu) == 0x4c024000)
     {
         uint32_t x = s->trng_state;
@@ -4723,6 +4732,12 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         return;
     }
     if (efr32_frc_status_write_ignored(register_address)) {
+        return;
+    }
+    if (register_address >= EFR32_RADIOAES_BASE &&
+        register_address < EFR32_RADIOAES_BASE + EFR32_RADIOAES_SIZE &&
+        efr32_radioaes_write(&s->radioaes, &s->dma_as,
+                             register_address - EFR32_RADIOAES_BASE, next)) {
         return;
     }
 
@@ -5559,6 +5574,7 @@ static void efr32_periph_init(Object *o)
     s->registers = g_hash_table_new(g_direct_hash, g_direct_equal);
     s->rstcause = EFR32_EMU_RSTCAUSE_POR;
     s->trng_state = 0x2545f491;
+    efr32_radioaes_reset(&s->radioaes);
     s->rac_state = EFR32_RAC_STATE_OFF;
     s->seq_released = false;
     s->hfxo_fsm_locked = true;
@@ -5624,6 +5640,7 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     Efr32Periph *s = EFR32_PERIPH(o);
     g_hash_table_remove_all(s->registers);
     s->trng_state = 0x2545f491;
+    efr32_radioaes_reset(&s->radioaes);
     s->rac_state = EFR32_RAC_STATE_OFF;
     s->seq_released = false;
     s->hfxo_fsm_locked = true;
@@ -5885,6 +5902,8 @@ struct Efr32DualState {
     char *devinfo[2];
     char *userdata[2];
     char *analog[2];
+    /* The board around each SoC ("owo-suit"), or none, as the single machine's "board". */
+    char *board[2];
     bool core_clocks;
 };
 
@@ -6759,6 +6778,21 @@ static void dual_init(MachineState *m)
         qemu_register_reset(efr32_cpu_reset, s->soc[index].armv7m.cpu);
         qemu_register_reset(efr32_seq_cpu_reset,
                             s->soc[index].seq_armv7m.cpu);
+        if (s->board[index] && !strcmp(s->board[index], TYPE_OWO_SUIT)) {
+            gchar *child = g_strdup_printf("suit%u", index);
+            DeviceState *board = qdev_new(TYPE_OWO_SUIT);
+
+            object_property_add_child(OBJECT(m), child, OBJECT(board));
+            object_property_set_link(OBJECT(board), "soc",
+                                     OBJECT(&s->soc[index]), &error_fatal);
+            qdev_realize_and_unref(board, NULL, &error_fatal);
+            s->soc[index].periph.analog_source = OBJECT(board);
+            g_free(child);
+        } else if (s->board[index]) {
+            error_report("efr32bg22-dual: unknown board '%s' (known: %s)",
+                         s->board[index], TYPE_OWO_SUIT);
+            exit(EXIT_FAILURE);
+        }
         g_free(memory_name);
         g_free(name);
     }
@@ -6821,6 +6855,9 @@ static char **efr32_dual_identity_field(Object *o, const char *name)
     if (g_str_has_prefix(name, "analog")) {
         return &s->analog[index];
     }
+    if (g_str_has_prefix(name, "board")) {
+        return &s->board[index];
+    }
     return &s->userdata[index];
 }
 
@@ -6853,6 +6890,8 @@ EFR32_DUAL_IDENTITY_ACCESSORS(userdata0)
 EFR32_DUAL_IDENTITY_ACCESSORS(userdata1)
 EFR32_DUAL_IDENTITY_ACCESSORS(analog0)
 EFR32_DUAL_IDENTITY_ACCESSORS(analog1)
+EFR32_DUAL_IDENTITY_ACCESSORS(board0)
+EFR32_DUAL_IDENTITY_ACCESSORS(board1)
 
 static void efr32_dual_machine_instance_init(Object *obj)
 {
@@ -6895,6 +6934,8 @@ static void dual_mc(ObjectClass *o, void *d)
                                   dual_analog0_set);
     object_class_property_add_str(o, "analog1", dual_analog1_get,
                                   dual_analog1_set);
+    object_class_property_add_str(o, "board0", dual_board0_get, dual_board0_set);
+    object_class_property_add_str(o, "board1", dual_board1_get, dual_board1_set);
 }
 
 static const TypeInfo dual_machine_info = {
