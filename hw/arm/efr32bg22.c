@@ -20,6 +20,7 @@
 #include "hw/arm/efr32-radioaes.h"
 #include "hw/arm/efr32-trng.h"
 #include "hw/arm/efr32-gpcrc.h"
+#include "hw/arm/efr32-interconnect.h"
 #include "hw/misc/analog-source.h"
 #include "hw/misc/owo-suit.h"
 #include "hw/ptimer.h"
@@ -754,6 +755,7 @@ struct Efr32Periph
     GHashTable *registers;
     Efr32Trng trng;
     Efr32Gpcrc gpcrc;
+    Efr32Interconnect ic;
     Efr32RadioAes radioaes;
     uint32_t rac_state;
     bool hfxo_fsm_locked;
@@ -5961,39 +5963,25 @@ static bool efr32_bus_error(Efr32Periph *s, uint32_t address)
  * Exception entry, SysTick reload to the first handler load (SS7.73,
  * cross-core probes): M0+ 16 cycles; M33 17 (18 from WFI) with its vector
  * table, handler and stack in SRAM.  [I] The M33 value is used for its
- * flash-resident vectors too.
+ * flash-resident vectors too.  The M0+ probe's handler reads CVR in its
+ * second instruction, after a literal load (2 cycles), so the entry itself
+ * is 14 (the same probe on the model reads 16); efr32-interconnect.c
+ * scales it under M33 SEQRAM traffic.
  */
-#define EFR32_SEQ_EXCEPTION_ENTRY_MILLICYCLES 16000u
+#define EFR32_SEQ_EXCEPTION_ENTRY_MILLICYCLES 14000u
 #define EFR32_M33_EXCEPTION_ENTRY_MILLICYCLES 17000u
 /*
- * Bus model: extra cycles of one access beyond an average instruction, in
- * the accessing core's cycles.  Total cycles per access (loops of 8 copies,
- * n = 5 + 5, no spread; the cross-core probes found the same):
- *  - M33 from flash: SRAM 1; SEQRAM 1.88, or 2.38 while the M0+ executes;
- *    BUFC 1.88; RAC, FRC, SYNTH, MODEM, AGC, CMU, GPIO 3.88; TIMER1 11.88.
- *  - M0+: SEQRAM load 2, store 2.5; BUFC 3.25; RAC, FRC, SYNTH, MODEM, AGC
- *    4.25 back to back.  Between other instructions (the handlers' case:
- *    literal load, literal load, access) a radio access takes 5 and a BUFC
- *    load 4.
- * The M33 extras are relative to an SRAM access (1 cycle), the M0+ extras
- * to an Armv6-M load or store (2).  [I] Other peripherals are charged as
- * CMU, other TIMERs as TIMER1.  Not charged (RAM here): M33 flash data loads
- * (4.5), M0+ SEQRAM stores beyond 2 (2.5 in loops, 2 in the delay loop).
- * Each M33 SEQRAM access while the M0+ executes costs the M0+ 0.9 of its
- * cycles: SEQRAM has one port and the M33 wins (SS7.73, cross-core probes:
- * M0+ code 2.8x slower under M33 SEQRAM streaming).
+ * Bus access costs and contention: hw/arm/efr32-interconnect.c (the RM's
+ * bus matrix and bridges, the radio subsystem paths, calibrated to the
+ * single-core and cross-core measurements of owo-open-fw SS7.74, SS7.75).
  */
-#define EFR32_M33_RADIO_EXTRA_MILLICYCLES 2875u
-#define EFR32_M33_BUFC_EXTRA_MILLICYCLES 875u
-#define EFR32_M33_PERIPH_EXTRA_MILLICYCLES 2875u
-#define EFR32_M33_TIMER_EXTRA_MILLICYCLES 10875u
-#define EFR32_M33_SEQRAM_EXTRA_MILLICYCLES 875u
-#define EFR32_M33_SEQRAM_SHARED_EXTRA_MILLICYCLES 1375u
-#define EFR32_SEQ_SEQRAM_STEAL_MILLICYCLES 900u
-#define EFR32_SEQ_RADIO_EXTRA_MILLICYCLES 3000u
-#define EFR32_SEQ_BUFC_EXTRA_MILLICYCLES 2000u
 #define EFR32_TIMER_BLOCKS_END (EFR32_TIMER4_BASE + 0x4000u)
 #define EFR32_BUFC_WINDOW_END (RADIO_BASE + RADIO_SIZE)
+#define EFR32_LFAPB_BASE 0x48000000u
+#define EFR32_LFAPB_END 0x4c000000u
+/* Main SRAM (RM SS4.2.3: up to 32 KB at 0x20000000). */
+#define EFR32_IC_SRAM_BASE 0x20000000u
+#define EFR32_IC_SRAM_END 0x20008000u
 #define EFR32_SEQRAM_NS_BASE 0xb0000000u
 #define EFR32_SEQRAM_S_BASE 0xa0000000u
 #define EFR32_SEQRAM_WINDOW_SIZE 0x8000u
@@ -6003,15 +5991,6 @@ static bool efr32_bus_error(Efr32Periph *s, uint32_t address)
  * the other is seen up to this late.
  */
 #define EFR32_CORE_CLOCK_QUANTUM_NS 500
-
-/* Occupancy classes of the bus model (IcountBusModel target). */
-enum {
-    EFR32_BUS_RADIO,
-    EFR32_BUS_BUFC,
-    EFR32_BUS_SEQRAM,
-    EFR32_BUS_PERIPH,
-    EFR32_BUS_TIMER,
-};
 
 static uint64_t efr32_sysclk_hz(Efr32Periph *s)
 {
@@ -6074,50 +6053,74 @@ static bool efr32_seq_executing(Efr32Periph *s)
            !s->seq_cpu->icount_clock_stopped;
 }
 
-/*
- * The bus model's cost table: (master, address, size, direction) -> extra
- * cycles of the master and an occupancy class.  A structural interconnect
- * model would replace this function and resolve contention in round_end.
- */
+/* Which interconnect target an address is (efr32-interconnect.h). */
+static Efr32IcTarget efr32_ic_target(uint32_t addr)
+{
+    uint32_t block;
+
+    if ((addr >= EFR32_SEQRAM_NS_BASE &&
+         addr < EFR32_SEQRAM_NS_BASE + EFR32_SEQRAM_WINDOW_SIZE) ||
+        (addr >= EFR32_SEQRAM_S_BASE &&
+         addr < EFR32_SEQRAM_S_BASE + EFR32_SEQRAM_WINDOW_SIZE)) {
+        return EFR32_IC_SEQRAM;
+    }
+    if (addr >= EFR32_IC_SRAM_BASE && addr < EFR32_IC_SRAM_END) {
+        return EFR32_IC_SRAM;
+    }
+    if (addr >= EFR32_BUFC_BASE && addr < EFR32_BUFC_WINDOW_END) {
+        return EFR32_IC_BUFC;
+    }
+    if (addr >= RADIO_BASE && addr < RADIO_BASE + RADIO_SIZE) {
+        return EFR32_IC_RADIO;
+    }
+    block = efr32_peripheral_canonical_address(addr) & ~0x3fffu;
+    if (block >= EFR32_TIMER0_BASE && block < EFR32_TIMER_BLOCKS_END) {
+        return EFR32_IC_TIMER;
+    }
+    /* [I] RTCC (0x48...) and the 0x4A... group: the LF APB bridge. */
+    if (block >= EFR32_LFAPB_BASE && block < EFR32_LFAPB_END) {
+        return EFR32_IC_LFPERIPH;
+    }
+    return EFR32_IC_HFPERIPH;
+}
+
 static uint64_t efr32_bus_cost(void *opaque, CPUState *master, uint64_t addr,
                                unsigned size, bool is_write, unsigned *target)
 {
     Efr32Periph *s = opaque;
-    bool radio = addr >= RADIO_BASE && addr < RADIO_BASE + RADIO_SIZE;
-    bool bufc = addr >= EFR32_BUFC_BASE && addr < EFR32_BUFC_WINDOW_END;
-    uint32_t block;
+    unsigned manager;
+    bool sram_code = false;
 
     if (master == s->seq_cpu) {
-        *target = bufc ? EFR32_BUS_BUFC : EFR32_BUS_RADIO;
-        return bufc ? EFR32_SEQ_BUFC_EXTRA_MILLICYCLES
-                    : EFR32_SEQ_RADIO_EXTRA_MILLICYCLES;
-    }
-    if (master != s->m33_cpu) {
+        manager = EFR32_IC_SEQ;
+    } else if (master == s->m33_cpu) {
+        uint32_t pc = ARM_CPU(master)->env.regs[15];
+
+        manager = EFR32_IC_M33;
+        sram_code = pc >= EFR32_IC_SRAM_BASE && pc < EFR32_IC_SRAM_END;
+    } else {
         *target = ICOUNT_BUS_TARGETS;
         return 0;
     }
-    if (addr >= EFR32_SEQRAM_NS_BASE &&
-        addr < EFR32_SEQRAM_NS_BASE + EFR32_SEQRAM_WINDOW_SIZE) {
-        *target = EFR32_BUS_SEQRAM;
-        if (efr32_seq_executing(s)) {
-            icount_charge_cycles(s->seq_cpu,
-                                 EFR32_SEQ_SEQRAM_STEAL_MILLICYCLES);
-            return EFR32_M33_SEQRAM_SHARED_EXTRA_MILLICYCLES;
-        }
-        return EFR32_M33_SEQRAM_EXTRA_MILLICYCLES;
+    s->ic.hclk_hz = s->m33_cpuclk ? clock_get_hz(s->m33_cpuclk) : 0;
+    s->ic.rhclk_hz = s->seq_cpuclk ? clock_get_hz(s->seq_cpuclk) : 0;
+    s->ic.seq_executing = efr32_seq_executing(s);
+    return efr32_ic_access(&s->ic, manager, efr32_ic_target(addr), sram_code,
+                           target);
+}
+
+static void efr32_bus_round_end(void *opaque, int64_t start_ns,
+                                int64_t end_ns)
+{
+    Efr32Periph *s = opaque;
+
+    s->ic.seq_executing = efr32_seq_executing(s);
+    s->ic.rhclk_hz = s->seq_cpuclk ? clock_get_hz(s->seq_cpuclk) : 0;
+    efr32_ic_round_end(&s->ic, start_ns, end_ns);
+    if (s->seq_cpu) {
+        icount_set_cpu_exception_cycles(
+            s->seq_cpu, efr32_ic_seq_exception_millicycles(&s->ic));
     }
-    if (radio) {
-        *target = bufc ? EFR32_BUS_BUFC : EFR32_BUS_RADIO;
-        return bufc ? EFR32_M33_BUFC_EXTRA_MILLICYCLES
-                    : EFR32_M33_RADIO_EXTRA_MILLICYCLES;
-    }
-    block = efr32_peripheral_canonical_address(addr) & ~0x3fffu;
-    if (block >= EFR32_TIMER0_BASE && block < EFR32_TIMER_BLOCKS_END) {
-        *target = EFR32_BUS_TIMER;
-        return EFR32_M33_TIMER_EXTRA_MILLICYCLES;
-    }
-    *target = EFR32_BUS_PERIPH;
-    return EFR32_M33_PERIPH_EXTRA_MILLICYCLES;
 }
 
 /* Every CPU access to this device goes through the bus model. */
@@ -6994,6 +6997,47 @@ static const MemoryRegionOps efr32_seqram_m33_ops = {
     .impl = {.min_access_size = 1, .max_access_size = 4},
 };
 
+/*
+ * The M0+'s view of main SRAM (SS7.74: the same SRAM as the M33's): an
+ * access through the matrix, so it goes through the bus model
+ * (efr32-interconnect.c), which a RAM alias would bypass.
+ */
+static MemTxResult efr32_seq_sram_read(void *opaque, hwaddr offset,
+                                       uint64_t *data, unsigned size,
+                                       MemTxAttrs attrs)
+{
+    Efr32Bg22SoCState *s = opaque;
+    uint8_t buf[8];
+    MemTxResult r;
+
+    efr32_bus_access(&s->periph, EFR32_SRAM_BASE + offset, size, false);
+    r = address_space_read(&s->periph.dma_as, EFR32_SRAM_BASE + offset,
+                           attrs, buf, size);
+    *data = ldn_le_p(buf, size);
+    return r;
+}
+
+static MemTxResult efr32_seq_sram_write(void *opaque, hwaddr offset,
+                                        uint64_t value, unsigned size,
+                                        MemTxAttrs attrs)
+{
+    Efr32Bg22SoCState *s = opaque;
+    uint8_t buf[8];
+
+    efr32_bus_access(&s->periph, EFR32_SRAM_BASE + offset, size, true);
+    stn_le_p(buf, size, value);
+    return address_space_write(&s->periph.dma_as, EFR32_SRAM_BASE + offset,
+                               attrs, buf, size);
+}
+
+static const MemoryRegionOps efr32_seq_sram_ops = {
+    .read_with_attrs = efr32_seq_sram_read,
+    .write_with_attrs = efr32_seq_sram_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {.min_access_size = 1, .max_access_size = 4},
+    .impl = {.min_access_size = 1, .max_access_size = 4},
+};
+
 /* AIRCR.SYSRESETREQ of the M33: a system reset with RSTCAUSE.SYSREQ. */
 static void efr32_soc_sysresetreq(void *opaque, int n, int level)
 {
@@ -7301,8 +7345,9 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
      * peripherals (TIMER1, PRS, CMU); the secure window reads 0.  The stock
      * sequencer reads EMU.TEMP through the secure window (0x40004088).
      */
-    memory_region_init_alias(&s->seq_sram_alias, OBJECT(s), "efr32.seq-sram",
-                             &s->sram, 0, s->sram_size);
+    memory_region_init_io(&s->seq_sram_alias, OBJECT(s),
+                          &efr32_seq_sram_ops, s, "efr32.seq-sram",
+                          s->sram_size);
     memory_region_add_subregion(&s->seq_memory, EFR32_SRAM_BASE,
                                 &s->seq_sram_alias);
     memory_region_init_alias(&s->seq_periph_ns_alias, OBJECT(s),
@@ -7338,7 +7383,10 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
                          "both cores share the instruction rate");
     }
     s->periph.bus_model.access = efr32_bus_cost;
+    s->periph.bus_model.round_end = efr32_bus_round_end;
     s->periph.bus_model.opaque = &s->periph;
+    s->periph.ic.cpu[EFR32_IC_M33] = s->periph.m33_cpu;
+    s->periph.ic.cpu[EFR32_IC_SEQ] = s->periph.seq_cpu;
     icount_register_bus_model(&s->periph.bus_model);
     icount_set_cpu_cycle_counting(s->periph.seq_cpu, true);
     icount_set_cpu_exception_cycles(s->periph.seq_cpu,
