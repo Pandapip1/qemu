@@ -100,6 +100,33 @@
 #define WDOG0_BASE 0x4a018000u
 #define WDOG_EN 0x04u
 #define WDOG_CFG 0x08u
+#define WDOG_CFG_EM2RUN (1u << 1)
+#define WDOG_CFG_EM3RUN (1u << 2)
+#define WDOG_CFG_PERSEL(n) ((uint32_t)(n) << 16)
+#define WDOG_CFG_WARNSEL(n) ((uint32_t)(n) << 24)
+#define WDOG_CMD 0x0cu
+#define WDOG_CMD_CLEAR (1u << 0)
+#define WDOG_STATUS 0x14u
+#define WDOG_STATUS_LOCK (1u << 31)
+#define WDOG_IF 0x18u
+#define WDOG_IF_WARN (1u << 1)
+#define WDOG_LOCK 0x20u
+#define WDOG_SYNCBUSY 0x24u
+#define WDOG_SYNCBUSY_CMD (1u << 0)
+/* RM SS27.3.1: 2^(PERSEL + 3) + 1 cycles; SS4.2.4.4.4: LFSYNC 3-4 cycles. */
+#define WDOG_PERSEL_BIAS 3
+#define WDOG_LFSYNC_CYCLES 4
+/* CMU.WDOG0CLKCTRL resets to the LFRCO (RM SS8.5.21): 32768 Hz. */
+#define WDOG_LF_HZ 32768u
+#define WDOG_NS_PER_S UINT64_C(1000000000)
+#define EMU_CMD 0x40004070u
+#define CMU_STATUS 0x008u
+#define CMU_STATUS_WDOGLOCK (1u << 30)
+#define CMU_WDOGLOCK 0x014u
+#define CMU_WDOG0CLKCTRL 0x200u
+#define CMU_WDOG0CLKCTRL_LFRCO 1u
+#define CMU_WDOG0CLKCTRL_ULFRCO 3u
+#define EMU_CMD_RSTCAUSECLR (1u << 17)
 #define EMU_RSTCAUSE 0x40004094u
 #define EMU_RSTCAUSE_WDOG0 (1u << 3)
 
@@ -306,6 +333,69 @@ static void test_wdog_reset(void)
     g_assert_cmphex(readl(WDOG0_BASE + WDOG_EN), ==, 0);
 }
 
+/* Virtual nanoseconds of @cycles watchdog-clock cycles, rounded up. */
+static int64_t wdog_ns(uint64_t cycles)
+{
+    return (cycles * WDOG_NS_PER_S + WDOG_LF_HZ - 1) / WDOG_LF_HZ;
+}
+
+/*
+ * The product's configuration (owo-open-fw docs/watchdog.md): CFG is a
+ * CONFIG register (RM SS4.2.4.4.2), so a write while enabled is a bus error
+ * and keeps the value; LOCK (SS27.5.8) keeps EN set; IF.WARN at WARNSEL x
+ * 25 % (SS27.3.4) stays set across a clear (INTFLAG); CMD is LFSYNC
+ * (SS4.2.4.4.4): SYNCBUSY.CMD until it completes, the counter restarts then.
+ */
+static void test_wdog_config_lock_warning_clear(void)
+{
+    const unsigned persel = 8, warnsel = 3;
+    const uint32_t cfg = WDOG_CFG_PERSEL(persel) | WDOG_CFG_WARNSEL(warnsel) |
+                         WDOG_CFG_EM2RUN | WDOG_CFG_EM3RUN;
+    const uint64_t period = (UINT64_C(1) << (persel + WDOG_PERSEL_BIAS)) + 1;
+    const uint64_t warn = period * warnsel / 4;
+
+    reset();
+    writel(EMU_CMD, EMU_CMD_RSTCAUSECLR);
+    writel(WDOG0_BASE + WDOG_CFG, cfg);
+    writel(WDOG0_BASE + WDOG_EN, 1);
+    writel(WDOG0_BASE + WDOG_CFG, 0);
+    g_assert_cmphex(readl(WDOG0_BASE + WDOG_CFG), ==, cfg);
+    writel(WDOG0_BASE + WDOG_LOCK, 0);
+    g_assert_cmphex(readl(WDOG0_BASE + WDOG_STATUS), ==, WDOG_STATUS_LOCK);
+    writel(WDOG0_BASE + WDOG_EN, 0);
+    g_assert_cmphex(readl(WDOG0_BASE + WDOG_EN), ==, 1);
+    /* CMU_WDOGLOCK (RM SS8.5.4) freezes the clock selection. */
+    writel(CMU_BASE + CMU_WDOGLOCK, 0);
+    g_assert_cmphex(readl(CMU_BASE + CMU_STATUS) & CMU_STATUS_WDOGLOCK, ==,
+                    CMU_STATUS_WDOGLOCK);
+    writel(CMU_BASE + CMU_WDOG0CLKCTRL, CMU_WDOG0CLKCTRL_ULFRCO);
+    g_assert_cmphex(readl(CMU_BASE + CMU_WDOG0CLKCTRL), ==,
+                    CMU_WDOG0CLKCTRL_LFRCO);
+
+    clock_run(wdog_ns(warn) - wdog_ns(1));
+    g_assert_cmphex(readl(WDOG0_BASE + WDOG_IF) & WDOG_IF_WARN, ==, 0);
+    clock_run(wdog_ns(2));
+    g_assert_cmphex(readl(WDOG0_BASE + WDOG_IF) & WDOG_IF_WARN, ==,
+                    WDOG_IF_WARN);
+
+    writel(WDOG0_BASE + WDOG_CMD, WDOG_CMD_CLEAR);
+    g_assert_cmphex(readl(WDOG0_BASE + WDOG_SYNCBUSY), ==, WDOG_SYNCBUSY_CMD);
+    clock_run(wdog_ns(WDOG_LFSYNC_CYCLES));
+    g_assert_cmphex(readl(WDOG0_BASE + WDOG_SYNCBUSY), ==, 0);
+    g_assert_cmphex(readl(WDOG0_BASE + WDOG_IF) & WDOG_IF_WARN, ==,
+                    WDOG_IF_WARN);
+    /* Past the first period's end: the clear restarted the count. */
+    clock_run(wdog_ns(period - warn));
+    g_assert_cmphex(readl(EMU_RSTCAUSE) & EMU_RSTCAUSE_WDOG0, ==, 0);
+    /* One period after the clear: reset, which also unlocks and disables. */
+    clock_run(wdog_ns(warn + WDOG_LFSYNC_CYCLES));
+    g_assert_cmphex(readl(EMU_RSTCAUSE) & EMU_RSTCAUSE_WDOG0, ==,
+                    EMU_RSTCAUSE_WDOG0);
+    g_assert_cmphex(readl(WDOG0_BASE + WDOG_EN), ==, 0);
+    g_assert_cmphex(readl(WDOG0_BASE + WDOG_STATUS), ==, 0);
+    g_assert_cmphex(readl(CMU_BASE + CMU_STATUS) & CMU_STATUS_WDOGLOCK, ==, 0);
+}
+
 int main(int argc, char **argv)
 {
     int result;
@@ -321,6 +411,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22-board/iadc-scan-board-battery",
                    test_iadc_scan_board_battery);
     qtest_add_func("/efr32bg22-board/wdog-reset", test_wdog_reset);
+    qtest_add_func("/efr32bg22-board/wdog-config-lock-warning-clear",
+                   test_wdog_config_lock_warning_clear);
     result = g_test_run();
     qtest_end();
     return result;

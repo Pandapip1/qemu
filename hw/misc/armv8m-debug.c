@@ -20,6 +20,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/irq.h"
 #include "qemu/log.h"
 #include "qemu/main-loop.h"
 #include "qemu/timer.h"
@@ -246,6 +247,7 @@ static void dbg_enter_debug_state(ARMv8MDebugState *s, uint32_t dfsr)
     }
     cpu->m_debug_halted = true;
     cs->halted = 1;
+    qemu_set_irq(s->halted_out, 1);
     s->dhcsr_ctrl |= DHCSR_C_HALT;
     s->halt_queued = false;
     s->s_regrdy = true;
@@ -270,6 +272,7 @@ static void dbg_leave_debug_state(ARMv8MDebugState *s, bool step)
     s->s_retire_st = true;
     cpu->m_debug_halted = false;
     cs->halted = 0;
+    qemu_set_irq(s->halted_out, 0);
     dwt_cyccnt_rebase(s, cyccnt);
     qemu_cpu_kick(cs);
 }
@@ -762,6 +765,8 @@ static void armv8m_debug_init(Object *obj)
         sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio[i]);
     }
     s->cpuclk = qdev_init_clock_in(DEVICE(obj), "cpuclk", NULL, NULL, 0);
+    /* DHCSR.S_HALT as a line, for peripherals that freeze in Debug state. */
+    qdev_init_gpio_out_named(DEVICE(obj), &s->halted_out, "halted", 1);
     s->cyccnt_since_ns = -1;
 }
 

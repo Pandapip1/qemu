@@ -86,6 +86,17 @@
 #define REGSEL_R0 0
 #define EFR32_M33_CPUID 0x410fd214u
 
+/* WDOG0 and EMU (RM SS27.5, SS12.5.15) */
+#define WDOG0_EN 0x4a018004u
+#define WDOG0_CFG 0x4a018008u
+#define WDOG_CFG_DEBUGRUN (1u << 4)
+/* PERSEL 0: 9 cycles of the 32768 Hz LFRCO, about 275 us. */
+#define WDOG_PERSEL0_NS 274659
+#define EMU_CMD 0x40004070u
+#define EMU_CMD_RSTCAUSECLR (1u << 17)
+#define EMU_RSTCAUSE 0x40004094u
+#define EMU_RSTCAUSE_WDOG0 (1u << 3)
+
 /* MSC */
 #define MSC_NS 0x50030000
 #define MSC_WRITECTRL 0x00c
@@ -426,6 +437,48 @@ static void test_halt_registers_and_reset(void)
     swd_end(s);
 }
 
+/*
+ * WDOG0 CFG.DEBUGRUN (RM SS27.3.2): with 0 the counter is frozen while the
+ * core is halted and resumes with it; with 1 it runs on and resets.
+ */
+static void wdog_debug_halt(bool debugrun)
+{
+    Swd *s = swd_start();
+    const int64_t many_periods = 40 * (int64_t)WDOG_PERSEL0_NS;
+
+    swd_power_up(s);
+    mem_write(s, AP_M33, DHCSR, DBGKEY_C_HALT);
+    g_assert_true(wait_dhcsr(s, DHCSR_S_HALT) & DHCSR_S_HALT);
+    mem_write(s, AP_M33, EMU_CMD, EMU_CMD_RSTCAUSECLR);
+    mem_write(s, AP_M33, WDOG0_CFG, debugrun ? WDOG_CFG_DEBUGRUN : 0);
+    mem_write(s, AP_M33, WDOG0_EN, 1);
+    qtest_clock_step(s->qts, many_periods);
+    if (debugrun) {
+        g_assert_cmphex(mem_read(s, AP_M33, EMU_RSTCAUSE) &
+                        EMU_RSTCAUSE_WDOG0, ==, EMU_RSTCAUSE_WDOG0);
+        swd_end(s);
+        return;
+    }
+    g_assert_cmphex(mem_read(s, AP_M33, EMU_RSTCAUSE) & EMU_RSTCAUSE_WDOG0,
+                    ==, 0);
+    g_assert_cmphex(mem_read(s, AP_M33, WDOG0_EN), ==, 1);
+    mem_write(s, AP_M33, DHCSR, DBGKEY_C_DEBUGEN);
+    qtest_clock_step(s->qts, many_periods);
+    g_assert_cmphex(mem_read(s, AP_M33, EMU_RSTCAUSE) & EMU_RSTCAUSE_WDOG0,
+                    ==, EMU_RSTCAUSE_WDOG0);
+    swd_end(s);
+}
+
+static void test_wdog_frozen_in_debug(void)
+{
+    wdog_debug_halt(false);
+}
+
+static void test_wdog_debugrun(void)
+{
+    wdog_debug_halt(true);
+}
+
 /* OpenOCD's efm32 driver sequence: erase a page, then program a word. */
 static void test_msc_program(void)
 {
@@ -463,5 +516,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/dap/halt-registers-reset",
                    test_halt_registers_and_reset);
     qtest_add_func("/efr32bg22/dap/msc-program", test_msc_program);
+    qtest_add_func("/efr32bg22/dap/wdog-frozen-in-debug",
+                   test_wdog_frozen_in_debug);
+    qtest_add_func("/efr32bg22/dap/wdog-debugrun", test_wdog_debugrun);
     return g_test_run();
 }
