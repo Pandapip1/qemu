@@ -407,6 +407,9 @@ static void test_carrier_matches_on_1mhz_raster(void)
     g_assert_false(rf_delivered(2403000, 2404000, false));
     g_assert_true(rf_delivered(2447000, 2447000, false));
     g_assert_true(rf_delivered(2402000, 2402000, false));
+    /* 13 cm below the ISM band: measured reachable (SS7.85). */
+    g_assert_true(rf_delivered(2304000, 2304000, false));
+    g_assert_true(rf_delivered(2395000, 2395000, false));
 }
 
 /*
@@ -415,16 +418,16 @@ static void test_carrier_matches_on_1mhz_raster(void)
  */
 static void test_carrier_outside_synth_range_not_delivered(void)
 {
-    g_assert_false(rf_delivered(2300000, 2300000, false));
-    g_assert_false(rf_delivered(2290000, 2290000, false));
-    g_assert_false(rf_delivered(2500000, 2500000, false));
+    g_assert_false(rf_delivered(2289000, 2289000, false));
+    g_assert_false(rf_delivered(2280000, 2280000, false));
+    g_assert_false(rf_delivered(2501000, 2501000, false));
 }
 
 /* Nor does the synthesizer report lock there (SYNTH.STATUS.INLOCK, SS7.72, SS7.85). */
 static void test_synth_never_locks_outside_range(void)
 {
     rf_reset_with_clocks();
-    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_FREQ, synth_freq_word(2300000));
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_FREQ, synth_freq_word(2280000));
     qtest_writel(global_qtest, RAC_BASE + RAC_SYEN, RAC_SYEN_STOCK_TX);
     qtest_writel(global_qtest, SYNTH_BASE + SYNTH_CMD,
                  SYNTH_CMD_DISABLEIF | SYNTH_CMD_SYNTHSTART);

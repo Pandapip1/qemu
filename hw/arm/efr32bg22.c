@@ -72,11 +72,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_RF_RASTER0_HZ 2290000000ull
 #define EFR32_RF_RASTER_HZ 1000000ull
 /*
- * Carriers the synthesizer calibrates and locks to (owo-open-fw docs/radio-tables.md SS7.85).
- * [P] The BGM220P datasheet's tuning range (Table 4.5, FRANGE 2400-2483.5 MHz) until measured.
+ * Carriers the synthesizer calibrates and locks to (owo-open-fw docs/radio-tables.md SS7.85,
+ * measured on a BGM220P): the VCO calibration converged at every 5 MHz step from 2290 to
+ * 2500 MHz (receive), and SYNTH.STATUS.INLOCK held throughout transmissions at 2304, 2395 and
+ * 2445 MHz. Beyond the probed range nothing was measured, and the model reaches nothing
+ * there (the datasheet specifies 2400-2483.5 MHz, Table 4.5 FRANGE).
  */
-#define EFR32_SYNTH_LOCK_MIN_HZ 2400000000ull
-#define EFR32_SYNTH_LOCK_MAX_HZ 2483500000ull
+#define EFR32_SYNTH_LOCK_MIN_HZ 2290000000ull
+#define EFR32_SYNTH_LOCK_MAX_HZ 2500000000ull
 /*
  * The frame path needs a running synthesizer (owo-open-fw
  * docs/radio-tables.md SS7.60/SS7.61, measured on silicon): with RAC.SYEN
