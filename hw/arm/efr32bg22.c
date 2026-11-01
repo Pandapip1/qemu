@@ -1823,8 +1823,13 @@ static void efr32_rac_rx_frame_end(void *opaque)
  *  - TXDIS withdraws the request; in TX it ends the frame at once, into
  *    TXPD, or TX2RX with SWRXEN asserted, even with STATETX uncleared;
  *  - RXDIS takes RXSEARCH to RXPD (once STATERXSEARCH is clear); it had no
- *    effect in RXWARM, RXPD or TX.  [I] RXDIS in RXFRAME, RX2RX, RX2TX and
- *    TX2RX is likewise ignored here; not measured.
+ *    effect in RXWARM, RXPD or TX.  RXDIS does not end RXFRAME: the RAC
+ *    finishes the frame it is receiving (silicon, SS7.80: an instrumented
+ *    scanner build waited 297 us entered in RXFRAME, RAC.STATUS 0x23400000,
+ *    for the RAC to become idle after RXDIS with SWRXEN withdrawn; by
+ *    debugger, RXDIS left RXFRAME alone while FORCEDISABLE went to OFF at
+ *    once, 5/5).  [I] RXDIS in RX2RX, RX2TX and TX2RX is likewise ignored
+ *    here; not measured.
  */
 static void efr32_rac_seq_command(Efr32Periph *s, uint32_t command)
 {
@@ -1851,11 +1856,19 @@ static void efr32_rac_seq_command(Efr32Periph *s, uint32_t command)
     efr32_rac_seq_evaluate(s);
 }
 
-/* FORCEDISABLE: SHUTDOWN at once from any state, dropping a TX request. */
+/*
+ * FORCEDISABLE: SHUTDOWN at once from any state, dropping a TX request.  In
+ * RXFRAME it abandons the frame being received (silicon, SS7.80: RXFRAME to
+ * OFF at once, 5/5, where RXDIS lets the frame finish): nothing more of it
+ * reaches BUFC and no RXDONE follows.
+ */
 static void efr32_rac_seq_force_disable(Efr32Periph *s)
 {
     efr32_rac_cancel_tx_completion(s);
     timer_del(s->rac_rx_timer);
+    timer_del(s->rac_frame_timer);
+    g_clear_pointer(&s->rx_frame, g_bytes_unref);
+    s->rx_frame_ended = false;
     efr32_rf_medium_withdraw_active_tx(s->rf_medium, EFR32_RF_RADIO(s));
     efr32_rac_cancel_turnaround(s);
     efr32_rac_enter_state(s, EFR32_RAC_STATE_SHUTDOWN);

@@ -1599,6 +1599,72 @@ static void test_released_rx_fifo_overflow(void)
     g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_SHUTDOWN);
 }
 
+/*
+ * Disabling a receiver in the middle of a frame (silicon, SS7.80): RXDIS --
+ * with SWRXEN withdrawn, as the scanner's abort does -- does not end RXFRAME;
+ * the RAC finishes the frame (EOF, RXDONE) and only then leaves for RXPD.
+ * FORCEDISABLE ends RXFRAME at once: SHUTDOWN, and the abandoned frame never
+ * reaches BUFC or raises RXDONE.
+ */
+static void rf_peer_in_rxframe(const uint8_t *frame, size_t length)
+{
+    const uint64_t peer_rac = peer(RAC_BASE);
+    const uint64_t peer_rx_channel = peer(BUFC_BASE + BUFC_CH1);
+
+    rf_reset_with_clocks();
+    rf_release_sequencer(peer_rac, peer(SYNTH_BASE));
+    qtest_writel(global_qtest, peer(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW),
+                 FRC_IF_RXDONE | FRC_IF_TXDONE);
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_CMD, 1);
+    qtest_writel(global_qtest, peer_rx_channel, 0);
+    rf_start_rx(peer_rac);
+    rf_ack(peer_rac, RAC_STATE_RXSEARCH);
+    rf_stage_tx(BUFC_BASE + BUFC_CH0, frame, length);
+    qtest_writel(global_qtest, RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+    rf_step(MODEL_RX_DETECT_NS);
+    g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RXFRAME);
+    qtest_writel(global_qtest, peer_rac + RAC_SEQIF + REGISTER_CLEAR_WINDOW,
+                 UINT32_MAX);
+}
+
+static void test_released_rx_frame_disables(void)
+{
+    const uint8_t request[] = { 0xc3, 0x02, 0x11, 0x22 };
+    const uint64_t peer_rac = peer(RAC_BASE);
+    const uint64_t peer_rx_channel = peer(BUFC_BASE + BUFC_CH1);
+
+    /* RXDIS: the frame is finished. */
+    rf_peer_in_rxframe(request, sizeof(request));
+    qtest_writel(global_qtest, peer_rac + RAC_RXENSRCEN + REGISTER_CLEAR_WINDOW,
+                 RAC_RXENSRCEN_SWRXEN);
+    qtest_writel(global_qtest, peer_rac + RAC_CMD, RAC_CMD_RXDIS);
+    rf_step(MODEL_RX_EOF_NS(sizeof(request)) - MODEL_RX_DETECT_NS - 1);
+    g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RXFRAME);
+    g_assert_cmphex(qtest_readl(global_qtest, peer(FRC_BASE + FRC_IF)) &
+                    FRC_IF_RXDONE, ==, 0);
+    rf_step(2);
+    g_assert_cmphex(qtest_readl(global_qtest, peer(FRC_BASE + FRC_IF)) &
+                    FRC_IF_RXDONE, ==, FRC_IF_RXDONE);
+    g_assert_cmpuint(qtest_readl(global_qtest,
+                                 peer_rx_channel + BUFC_WRITEOFFSET), !=, 0);
+    rf_step(EOF_TO_RX_EXIT_NS);
+    g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RXPD);
+
+    /* FORCEDISABLE: RXFRAME ends at once and the frame is abandoned. */
+    rf_peer_in_rxframe(request, sizeof(request));
+    qtest_writel(global_qtest, peer_rac + RAC_CTRL + REGISTER_SET_WINDOW,
+                 RAC_CTRL_FORCEDISABLE);
+    g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_SHUTDOWN);
+    rf_step(MODEL_RX_EOF_NS(sizeof(request)) + MODEL_LONG_WAIT_NS);
+    g_assert_cmpuint(rf_state(peer_rac), !=, RAC_STATE_RXFRAME);
+    g_assert_cmphex(qtest_readl(global_qtest, peer(FRC_BASE + FRC_IF)) &
+                    FRC_IF_RXDONE, ==, 0);
+    g_assert_cmpuint(qtest_readl(global_qtest,
+                                 peer_rx_channel + BUFC_WRITEOFFSET), ==, 0);
+    qtest_writel(global_qtest, peer_rac + RAC_CTRL + REGISTER_CLEAR_WINDOW,
+                 RAC_CTRL_FORCEDISABLE);
+}
+
 static void test_released_rx_frame_turns_around_to_tx(void)
 {
     const uint8_t request[] = { 0xc3, 0x02, 0x11, 0x22 };
@@ -1894,6 +1960,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/rf/locnt-busy-window", test_locnt_busy_window);
     qtest_add_func("/efr32bg22/rf/released-rx-fifo-overflow",
                    test_released_rx_fifo_overflow);
+    qtest_add_func("/efr32bg22/rf/released-rx-frame-disables",
+                   test_released_rx_frame_disables);
     qtest_add_func("/efr32bg22/rf/released-rx-chain-off-detects-nothing",
                    test_released_rx_chain_off_detects_nothing);
     qtest_add_func("/efr32bg22/rf/released-rx-frame-turns-around-to-tx",
