@@ -7,6 +7,7 @@
 #include "qemu/units.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "qemu/log.h"
 #include "exec/memory.h"
 #include "exec/address-spaces.h"
 #include "qemu/timer.h"
@@ -770,6 +771,16 @@ struct Efr32Periph
     bool wdog_running;
     int64_t wdog_epoch_ns;
     QEMUTimer *wdog_timer;
+    /* The warning of the current period has fired. */
+    bool wdog_warned;
+    /* Frozen (debug halt with DEBUGRUN = 0) since wdog_frozen_ns. */
+    bool wdog_frozen;
+    int64_t wdog_frozen_ns;
+    bool m33_debug_halted;
+    /* A CMD write is synchronising to the watchdog clock (SYNCBUSY.CMD). */
+    bool wdog_sync_pending;
+    uint32_t wdog_cmd_pending;
+    QEMUTimer *wdog_sync_timer;
     qemu_irq irq[64];
     qemu_irq seq_irq_state[EFR32_RAC_SEQ_STATE_EVENTS];
     qemu_irq seq_irq_mailbox;
@@ -3754,20 +3765,41 @@ static void efr32_rtcc_reset(Efr32Periph *s)
  *
  * RM chapter 27 (register map SS27.4, fields from the public
  * efr32bg22_wdog.h).  EN.EN starts the counter from 0 (and clearing EN
- * resets it, SS27.3); CMD.CLEAR returns it to 0; it counts the clock
- * CMU.WDOG0CLKCTRL.CLKSEL selects (LFRCO, LFXO, ULFRCO or HCLK / 1024,
- * SS27.3.1).  It times out after 2^(PERSEL + 3) + 1 cycles (Figure in
- * SS27.3.1 and the PERSEL table: SEL0 = 9 cycles ... SEL15 = 256k): IF.TOUT
- * sets and, unless CFG.WDOGRSTDIS, the chip resets with EMU.RSTCAUSE.WDOG0
- * (bit 3, efr32bg22_emu.h).  IF.WARN sets at WARNSEL x 25 % of the period
- * (SS27.3.4).  WDOG0 is IRQ 43 (IF & IEN).  Writing LOCK with anything but
- * 0xABE8 locks EN and CFG (STATUS.LOCK, SS27.3).
- * [U] Not modelled: freezing in EM2/EM3 (EM2RUN/EM3RUN; the model does not
- * distinguish sleep depths, so the counter runs in every sleep mode), the
- * debug halt (a halted QEMU stops virtual time, which freezes the counter
- * as DEBUGRUN = 0 does), the window interrupt, PRS clear and monitoring,
- * EM4BLOCK, and the LF synchronisation delay of CMD.CLEAR (SYNCBUSY reads 0;
- * the RM requires CLEAR 4 cycles before the timeout, not checked).
+ * resets it, SS27.3); it counts the clock CMU.WDOG0CLKCTRL.CLKSEL selects
+ * (LFRCO, LFXO, ULFRCO or HCLK / 1024, SS27.3.1).  It times out after
+ * 2^(PERSEL + 3) + 1 cycles (SS27.3.1 and the PERSEL table: SEL0 = 9 cycles
+ * ... SEL15 = 256k): IF.TOUT sets and, unless CFG.WDOGRSTDIS, the chip resets
+ * with EMU.RSTCAUSE.WDOG0 (bit 3, efr32bg22_emu.h).  IF.WARN sets at
+ * WARNSEL x 25 % of the period (SS27.3.4).  WDOG0 is IRQ 43 (IF & IEN).
+ *
+ * Register types (SS27.4, rules in SS4.2.4.4):
+ *  - CFG is a CONFIG register: a write while EN.EN is set is a bus error
+ *    (BusFault), SS4.2.4.4.2.
+ *  - CMD is an LFSYNC register: a write is pending for EFR32_WDOG_LFSYNC_CYCLES
+ *    watchdog-clock cycles (SS4.2.4.4.4: "3 - 4 PERCLK cycles", the model
+ *    takes the upper bound), SYNCBUSY.CMD reads 1 meanwhile, CMD.CLEAR
+ *    returns the counter to 0 when the write completes, and a CMD write
+ *    while one is pending is a bus error (SS4.2.4.4.4).
+ *  - EN is an ENABLE register: clearing it while an LFSYNC write is pending
+ *    is a bus error (SS4.2.4.4.5).
+ *  - IF is an INTFLAG register: flags stay set until software clears them
+ *    (SS27.3: "Any pending interrupt flags will remain active until
+ *    cleared"); clearing the counter does not clear IF.WARN.
+ * Writing LOCK with anything but 0xABE8 locks EN and CFG (STATUS.LOCK,
+ * SS27.3, SS27.5.8); 0xABE8 unlocks.  A write to a locked EN or CFG is
+ * ignored (the RM does not say whether it faults) [U].
+ * CFG.DEBUGRUN (SS27.3.2): while the M33 is in Debug state (DHCSR.S_HALT,
+ * the "m33-debug-halted" input from the debug unit) and DEBUGRUN = 0 the
+ * counter is frozen and continues where it left off on resume.  A stopped
+ * QEMU (gdbstub, monitor stop) stops virtual time altogether; that is not a
+ * debug halt, and it freezes every timer.
+ * [U] Not modelled: freezing in EM2/EM3 (EM2RUN/EM3RUN, SS27.3.3; the
+ * machine does not distinguish sleep depths, so the counter runs in every
+ * sleep mode, which is the EM2RUN = EM3RUN = 1 behaviour; enabling with
+ * either bit clear is logged as unimplemented), the enable delay of EN
+ * (2 - 3 cycles, SS4.2.4.4.5), the window interrupt, PRS clear and
+ * monitoring, EM4BLOCK, and the requirement that CLEAR be written 4 cycles
+ * before the timeout (SS27.5.4).
  */
 #define EFR32_WDOG0_BASE 0x4a018000u
 #define EFR32_WDOG0_IRQ 43
@@ -3775,6 +3807,9 @@ static void efr32_rtcc_reset(Efr32Periph *s)
 #define EFR32_WDOG_EN_EN (1u << 0)
 #define EFR32_WDOG_CFG 0x008u
 #define EFR32_WDOG_CFG_RESET 0x000f0000u
+#define EFR32_WDOG_CFG_EM2RUN (1u << 1)
+#define EFR32_WDOG_CFG_EM3RUN (1u << 2)
+#define EFR32_WDOG_CFG_DEBUGRUN (1u << 4)
 #define EFR32_WDOG_CFG_WDOGRSTDIS (1u << 8)
 #define EFR32_WDOG_CFG_PERSEL_SHIFT 16
 #define EFR32_WDOG_CFG_PERSEL_MASK 0xfu
@@ -3792,11 +3827,24 @@ static void efr32_rtcc_reset(Efr32Periph *s)
 #define EFR32_WDOG_LOCK 0x020u
 #define EFR32_WDOG_LOCK_UNLOCK 0xabe8u
 #define EFR32_WDOG_SYNCBUSY 0x024u
+#define EFR32_WDOG_SYNCBUSY_CMD (1u << 0)
 /* SS27.3.1: TTIMEOUT = [2^(PERSEL + 3) + 1] / f. */
 #define EFR32_WDOG_PERSEL_BIAS 3
 /* SS27.3.4: TWARNING = TTIMEOUT x WARNSEL / 4. */
 #define EFR32_WDOG_WARN_QUARTERS 4
+/* SS4.2.4.4.4: an LFSYNC write completes after 3 - 4 PERCLK cycles. [U] */
+#define EFR32_WDOG_LFSYNC_CYCLES 4
 #define EFR32_CMU_WDOG0CLKCTRL 0x200u
+/*
+ * RM SS8.5.4: CMU_WDOGLOCK, any key but 0x93F7 locks the WDOG clock selection
+ * (CMU_STATUS.WDOGLOCK, SS8.5.2); the unlock key unlocks.  A write to a locked
+ * WDOG0CLKCTRL is ignored [U: the RM says only "lock registers from editing"].
+ */
+#define EFR32_CMU_STATUS 0x008u
+#define EFR32_CMU_STATUS_WDOGLOCK (1u << 30)
+#define EFR32_CMU_WDOGLOCK 0x014u
+#define EFR32_CMU_WDOGLOCK_UNLOCK 0x93f7u
+#define EFR32_CMU_WDOGLOCK_KEY_MASK 0xffffu
 #define EFR32_CMU_WDOG0CLKCTRL_RESET 1u
 #define EFR32_CMU_WDOG0CLKCTRL_CLKSEL_MASK 0x7u
 #define EFR32_CMU_WDOG0CLKCTRL_HCLKDIV1024 4u
@@ -3840,6 +3888,17 @@ static uint64_t efr32_wdog_period_cycles(Efr32Periph *s)
     return (UINT64_C(1) << (persel + EFR32_WDOG_PERSEL_BIAS)) + 1;
 }
 
+/* Watchdog-clock cycles counted since the last return to 0. */
+static uint64_t efr32_wdog_counter(Efr32Periph *s, int64_t now)
+{
+    if (!s->wdog_running) {
+        return 0;
+    }
+    return muldiv64((s->wdog_frozen ? s->wdog_frozen_ns : now) -
+                        s->wdog_epoch_ns,
+                    efr32_wdog_hz(s), NANOSECONDS_PER_SECOND);
+}
+
 static void efr32_wdog_update_irq(Efr32Periph *s)
 {
     qemu_set_irq(s->irq[EFR32_WDOG0_IRQ],
@@ -3855,11 +3914,10 @@ static void efr32_wdog_schedule(Efr32Periph *s)
     uint32_t warnsel = (efr32_wdog_get(s, EFR32_WDOG_CFG) >>
                         EFR32_WDOG_CFG_WARNSEL_SHIFT) &
                        EFR32_WDOG_CFG_WARNSEL_MASK;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int64_t warn_ns, tout_ns;
 
     timer_del(s->wdog_timer);
-    if (!s->wdog_running || !hz) {
+    if (!s->wdog_running || s->wdog_frozen || !hz) {
         return;
     }
     tout_ns = s->wdog_epoch_ns +
@@ -3867,10 +3925,7 @@ static void efr32_wdog_schedule(Efr32Periph *s)
     warn_ns = s->wdog_epoch_ns +
               muldiv64(period * warnsel, NANOSECONDS_PER_SECOND,
                        hz * EFR32_WDOG_WARN_QUARTERS);
-    timer_mod(s->wdog_timer, warnsel && warn_ns > now &&
-                             !(efr32_wdog_get(s, EFR32_WDOG_IF) &
-                               EFR32_WDOG_IF_WARN)
-                                 ? warn_ns : tout_ns);
+    timer_mod(s->wdog_timer, warnsel && !s->wdog_warned ? warn_ns : tout_ns);
 }
 
 static void efr32_wdog_expired(void *opaque)
@@ -3880,16 +3935,18 @@ static void efr32_wdog_expired(void *opaque)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int64_t tout_ns;
 
-    if (!s->wdog_running || !hz) {
+    if (!s->wdog_running || s->wdog_frozen || !hz) {
         return;
     }
     tout_ns = s->wdog_epoch_ns +
               muldiv64(efr32_wdog_period_cycles(s), NANOSECONDS_PER_SECOND,
                        hz);
     if (now < tout_ns) {
+        s->wdog_warned = true;
         efr32_wdog_put(s, EFR32_WDOG_IF, efr32_wdog_get(s, EFR32_WDOG_IF) |
                                              EFR32_WDOG_IF_WARN);
-        trace_efr32_wdog(s->endpoint_id, now, "warning", 0);
+        trace_efr32_wdog(s->endpoint_id, now, "warning",
+                         efr32_wdog_counter(s, now));
         efr32_wdog_update_irq(s);
         efr32_wdog_schedule(s);
         return;
@@ -3907,6 +3964,51 @@ static void efr32_wdog_expired(void *opaque)
     }
     /* Reset disabled: the counter wraps and runs on. */
     s->wdog_epoch_ns = tout_ns;
+    s->wdog_warned = false;
+    efr32_wdog_schedule(s);
+}
+
+/* An LFSYNC write to CMD completes: CLEAR returns the counter to 0. */
+static void efr32_wdog_sync_done(void *opaque)
+{
+    Efr32Periph *s = EFR32_PERIPH(opaque);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    bool clear = s->wdog_cmd_pending & EFR32_WDOG_CMD_CLEAR;
+
+    s->wdog_sync_pending = false;
+    s->wdog_cmd_pending = 0;
+    if (!clear || !s->wdog_running) {
+        return;
+    }
+    trace_efr32_wdog(s->endpoint_id, now, "clear",
+                     efr32_wdog_counter(s, now));
+    s->wdog_epoch_ns = now;
+    s->wdog_frozen_ns = now;
+    s->wdog_warned = false;
+    efr32_wdog_schedule(s);
+}
+
+/* SS27.3.2: DEBUGRUN = 0 freezes the counter while the core is halted. */
+static void efr32_wdog_debug_halt(void *opaque, int n, int level)
+{
+    Efr32Periph *s = EFR32_PERIPH(opaque);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    bool freeze = level && s->wdog_running &&
+                  !(efr32_wdog_get(s, EFR32_WDOG_CFG) &
+                    EFR32_WDOG_CFG_DEBUGRUN);
+
+    s->m33_debug_halted = level;
+    if (freeze == s->wdog_frozen) {
+        return;
+    }
+    if (freeze) {
+        s->wdog_frozen_ns = now;
+    } else {
+        s->wdog_epoch_ns += now - s->wdog_frozen_ns;
+    }
+    s->wdog_frozen = freeze;
+    trace_efr32_wdog(s->endpoint_id, now, freeze ? "freeze" : "thaw",
+                     efr32_wdog_counter(s, now));
     efr32_wdog_schedule(s);
 }
 
@@ -3919,12 +4021,63 @@ static bool efr32_wdog_read(Efr32Periph *s, uint32_t address,
     switch (address & 0xfffu) {
     case EFR32_WDOG_CMD:
     case EFR32_WDOG_LOCK:
-    case EFR32_WDOG_SYNCBUSY:
         *value = 0;
+        return true;
+    case EFR32_WDOG_SYNCBUSY:
+        *value = s->wdog_sync_pending ? EFR32_WDOG_SYNCBUSY_CMD : 0;
         return true;
     default:
         return false;
     }
+}
+
+/*
+ * A write WDOG0 answers with a bus error (SS4.2.4.4): CFG while enabled,
+ * CMD while a CMD write is still synchronising, and disabling while one is.
+ * `address` is canonical (SET/CLR/TGL window in bits 13:12).
+ */
+static bool efr32_wdog_write_rejected(Efr32Periph *s, uint32_t address,
+                                      uint32_t value)
+{
+    uint32_t en = efr32_wdog_get(s, EFR32_WDOG_EN);
+    bool locked = efr32_wdog_get(s, EFR32_WDOG_STATUS) &
+                  EFR32_WDOG_STATUS_LOCK;
+    bool reject = false;
+
+    if ((address & ~0x3fffu) != EFR32_WDOG0_BASE) {
+        return false;
+    }
+    switch (address & 0xfffu) {
+    case EFR32_WDOG_CFG:
+        reject = en & EFR32_WDOG_EN_EN;
+        break;
+    case EFR32_WDOG_CMD:
+        reject = s->wdog_sync_pending;
+        break;
+    case EFR32_WDOG_EN:
+        switch ((address >> 12) & 3) {
+        case 1:
+            en |= value;
+            break;
+        case 2:
+            en &= ~value;
+            break;
+        case 3:
+            en ^= value;
+            break;
+        default:
+            en = value;
+        }
+        reject = !locked && s->wdog_sync_pending && !(en & EFR32_WDOG_EN_EN);
+        break;
+    default:
+        break;
+    }
+    if (reject) {
+        trace_efr32_wdog(s->endpoint_id, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                         "bus-error", address);
+    }
+    return reject;
 }
 
 /* Returns true when the WDOG write is fully handled. */
@@ -3933,6 +4086,8 @@ static bool efr32_wdog_write(Efr32Periph *s, uint32_t offset, uint32_t next)
     bool locked = efr32_wdog_get(s, EFR32_WDOG_STATUS) &
                   EFR32_WDOG_STATUS_LOCK;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint32_t cfg = efr32_wdog_get(s, EFR32_WDOG_CFG);
+    uint64_t hz;
 
     switch (offset) {
     case EFR32_WDOG_EN:
@@ -3942,9 +4097,20 @@ static bool efr32_wdog_write(Efr32Periph *s, uint32_t offset, uint32_t next)
         efr32_wdog_put(s, offset, next & EFR32_WDOG_EN_EN);
         if (!(next & EFR32_WDOG_EN_EN)) {
             s->wdog_running = false;
+            s->wdog_frozen = false;
         } else if (!s->wdog_running) {
             s->wdog_running = true;
             s->wdog_epoch_ns = now;
+            s->wdog_warned = false;
+            s->wdog_frozen = s->m33_debug_halted &&
+                             !(cfg & EFR32_WDOG_CFG_DEBUGRUN);
+            s->wdog_frozen_ns = now;
+            if ((cfg & (EFR32_WDOG_CFG_EM2RUN | EFR32_WDOG_CFG_EM3RUN)) !=
+                (EFR32_WDOG_CFG_EM2RUN | EFR32_WDOG_CFG_EM3RUN)) {
+                qemu_log_mask(LOG_UNIMP, "efr32bg22: WDOG0 EM2RUN/EM3RUN = 0 "
+                              "is not modelled; the counter runs in every "
+                              "sleep mode\n");
+            }
         }
         trace_efr32_wdog(s->endpoint_id, now, "enable", next);
         break;
@@ -3955,18 +4121,23 @@ static bool efr32_wdog_write(Efr32Periph *s, uint32_t offset, uint32_t next)
         }
         break;
     case EFR32_WDOG_CMD:
-        if (next & EFR32_WDOG_CMD_CLEAR) {
-            s->wdog_epoch_ns = now;
-            efr32_wdog_put(s, EFR32_WDOG_IF, efr32_wdog_get(s, EFR32_WDOG_IF) &
-                                                 ~EFR32_WDOG_IF_WARN);
+        hz = efr32_wdog_hz(s);
+        if (!(next & EFR32_WDOG_CMD_CLEAR) || !hz) {
+            return true;
         }
-        break;
+        s->wdog_sync_pending = true;
+        s->wdog_cmd_pending = next & EFR32_WDOG_CMD_CLEAR;
+        timer_mod(s->wdog_sync_timer,
+                  now + muldiv64(EFR32_WDOG_LFSYNC_CYCLES,
+                                 NANOSECONDS_PER_SECOND, hz));
+        return true;
     case EFR32_WDOG_LOCK:
         if ((next & 0xffffu) != EFR32_WDOG_LOCK_UNLOCK) {
             efr32_wdog_put(s, EFR32_WDOG_STATUS, EFR32_WDOG_STATUS_LOCK);
         } else {
             efr32_wdog_put(s, EFR32_WDOG_STATUS, 0);
         }
+        trace_efr32_wdog(s->endpoint_id, now, "lock", next);
         return true;
     case EFR32_WDOG_STATUS:
     case EFR32_WDOG_SYNCBUSY:
@@ -3986,10 +4157,41 @@ static bool efr32_wdog_write(Efr32Periph *s, uint32_t offset, uint32_t next)
 static void efr32_wdog_reset(Efr32Periph *s)
 {
     timer_del(s->wdog_timer);
+    timer_del(s->wdog_sync_timer);
     s->wdog_running = false;
+    s->wdog_frozen = false;
+    s->wdog_warned = false;
+    s->wdog_sync_pending = false;
+    s->wdog_cmd_pending = 0;
+    efr32_wdog_put(s, EFR32_WDOG_EN, 0);
     efr32_wdog_put(s, EFR32_WDOG_CFG, EFR32_WDOG_CFG_RESET);
+    efr32_wdog_put(s, EFR32_WDOG_STATUS, 0);
+    efr32_wdog_put(s, EFR32_WDOG_IF, 0);
+    efr32_wdog_put(s, EFR32_WDOG_IEN, 0);
     efr32_register_put(s, EFR32_CMU_BASE + EFR32_CMU_WDOG0CLKCTRL,
                        EFR32_CMU_WDOG0CLKCTRL_RESET);
+    efr32_register_put(s, EFR32_CMU_BASE + EFR32_CMU_STATUS,
+                       efr32_cmu_get(s, EFR32_CMU_STATUS) &
+                           ~EFR32_CMU_STATUS_WDOGLOCK);
+}
+
+/* CMU_WDOGLOCK and the WDOG0CLKCTRL it guards; true when the write is handled. */
+static bool efr32_cmu_wdoglock_write(Efr32Periph *s, uint32_t key,
+                                     uint32_t next)
+{
+    uint32_t status = efr32_cmu_get(s, EFR32_CMU_STATUS);
+
+    if (key == EFR32_CMU_BASE + EFR32_CMU_WDOGLOCK) {
+        if ((next & EFR32_CMU_WDOGLOCK_KEY_MASK) != EFR32_CMU_WDOGLOCK_UNLOCK) {
+            status |= EFR32_CMU_STATUS_WDOGLOCK;
+        } else {
+            status &= ~EFR32_CMU_STATUS_WDOGLOCK;
+        }
+        efr32_register_put(s, EFR32_CMU_BASE + EFR32_CMU_STATUS, status);
+        return true;
+    }
+    return key == EFR32_CMU_BASE + EFR32_CMU_WDOG0CLKCTRL &&
+           (status & EFR32_CMU_STATUS_WDOGLOCK);
 }
 
 /*
@@ -4650,7 +4852,9 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
     if (address == 0x4c021004 || address == 0x4c02100c)
         return 64;
     if (address == 0x40008008)
-        return UINT32_MAX; /* CMU.STATUS */
+        /* CMU.STATUS: every ready flag set; WDOGLOCK as CMU_WDOGLOCK left it. */
+        return (UINT32_MAX & ~EFR32_CMU_STATUS_WDOGLOCK) |
+               (efr32_cmu_get(s, EFR32_CMU_STATUS) & EFR32_CMU_STATUS_WDOGLOCK);
     if (address == 0x4001000c || address == 0x40018004 || address == 0x40028008)
         return 0x00010001;
     if (address == EFR32_HFXO_BASE + EFR32_HFXO_STATUS)
@@ -4798,6 +5002,9 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
     }
     if ((register_address & ~0x3fffu) == EFR32_WDOG0_BASE &&
         efr32_wdog_write(s, register_address & 0xfffu, next)) {
+        return;
+    }
+    if (efr32_cmu_wdoglock_write(s, register_address, next)) {
         return;
     }
 
@@ -5473,7 +5680,10 @@ static MemTxResult efr32_peripheral_mmio_write(void *opaque, hwaddr offset,
     if (efr32_timer_clock_gated(s, efr32_peripheral_canonical_address(
                                        PERIPH_BASE + offset) & ~0x3fffu) ||
         efr32_timer_write_rejected(s, efr32_peripheral_canonical_address(
-                                          PERIPH_BASE + offset))) {
+                                          PERIPH_BASE + offset)) ||
+        efr32_wdog_write_rejected(s, efr32_peripheral_canonical_address(
+                                         PERIPH_BASE + offset),
+                                  size == 4 ? value : 0)) {
         return MEMTX_ERROR;
     }
     if (efr32_bus_error(s, PERIPH_BASE + offset)) {
@@ -5588,6 +5798,11 @@ static void efr32_periph_init(Object *o)
                                        efr32_timer_pwm_callbacks[i], s);
     }
     s->wdog_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_wdog_expired, s);
+    s->wdog_sync_timer =
+        timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_wdog_sync_done, s);
+    /* DHCSR.S_HALT of the M33, from its debug unit (WDOG0 DEBUGRUN). */
+    qdev_init_gpio_in_named(DEVICE(o), efr32_wdog_debug_halt,
+                            "m33-debug-halted", 1);
     /* Fault injection (qom-set at run time): conversions never complete. */
     object_property_add_uint32_ptr(o, "x-iadc-stall", &s->iadc_stall,
                                  OBJ_PROP_FLAG_READWRITE);
@@ -6310,6 +6525,10 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
     if (!sysbus_realize(periph, errp)) {
         return;
     }
+    qdev_connect_gpio_out_named(
+        DEVICE(object_resolve_path_component(OBJECT(s), "m33-debug")),
+        "halted", 0,
+        qdev_get_gpio_in_named(DEVICE(&s->periph), "m33-debug-halted", 0));
     efr32_rf_medium_attach(s->rf_medium, EFR32_RF_RADIO(&s->periph), errp);
     if (*errp) {
         return;

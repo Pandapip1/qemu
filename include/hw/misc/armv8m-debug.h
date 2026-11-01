@@ -62,6 +62,8 @@ struct ARMv8MDebugState {
     uint32_t dscsr;
     bool stepping;
     bool halt_queued;
+    /* "halted" GPIO output: DHCSR.S_HALT. */
+    qemu_irq halted_out;
 
     /* FPB */
     bool fpb_enable;
