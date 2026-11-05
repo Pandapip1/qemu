@@ -57,6 +57,16 @@ static uint32_t override_lookup(hwaddr addr, int *hit)
     return 0;
 }
 
+/* Sparse write-readback store: registers not otherwise modelled return the
+ * last value written (0 if never written). Overrides take priority. */
+static GHashTable *regstore;
+
+/* Free-running counter registers (timers): each read returns the previous value
+ * plus one. Default: the 0xc0d02c68 timebase used by IML delay loops. */
+#define MAX_CTRS 16
+static struct { hwaddr addr; uint32_t val; } ctrs[MAX_CTRS] = { { 0xc0d02c68, 0 } };
+static int n_ctrs = 1;
+
 static target_ulong cur_pc(void)
 {
     if (current_cpu) {
@@ -84,6 +94,18 @@ static uint64_t trace_read(void *opaque, hwaddr addr, unsigned size)
 {
     hwaddr base = (hwaddr)(uintptr_t)opaque;
     int hit; uint32_t v = override_lookup(base + addr, &hit);
+    for (int i = 0; i < n_ctrs; i++) {
+        if (ctrs[i].addr == base + addr) {
+            v = ++ctrs[i].val;
+            trace_log("R.ctr", base + addr, v, size);
+            return v;
+        }
+    }
+    if (!hit && regstore) {
+        gpointer p = g_hash_table_lookup(regstore,
+                                         GUINT_TO_POINTER((guint)(base + addr)));
+        v = (uint32_t)(uintptr_t)p;
+    }
     trace_log(hit ? "R.ovr" : "R", base + addr, v, size);
     return v;
 }
@@ -92,6 +114,11 @@ static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     hwaddr base = (hwaddr)(uintptr_t)opaque;
     trace_log("W", base + addr, val, size);
+    if (!regstore) {
+        regstore = g_hash_table_new(g_direct_hash, g_direct_equal);
+    }
+    g_hash_table_insert(regstore, GUINT_TO_POINTER((guint)(base + addr)),
+                        (gpointer)(uintptr_t)(uint32_t)val);
 }
 
 static const MemoryRegionOps trace_ops = {
@@ -149,6 +176,17 @@ static void ax210_init(MachineState *machine)
     add_trace("ax210.csr",      0xf0000000, 0x01000000, 10); /* chip CSRs */
 
     if (getenv("AX210_TRACECAP")) trace_cap = strtoul(getenv("AX210_TRACECAP"), 0, 0);
+
+    const char *ctr = getenv("AX210_CTR");
+    if (ctr) {
+        char *c = g_strdup(ctr), *t2, *sv = NULL;
+        for (t2 = strtok_r(c, ",", &sv); t2 && n_ctrs < MAX_CTRS;
+             t2 = strtok_r(NULL, ",", &sv)) {
+            ctrs[n_ctrs].addr = strtoull(t2, 0, 16);
+            ctrs[n_ctrs++].val = 0;
+        }
+        g_free(c);
+    }
 
     /* MMIO read overrides, discovered iteratively, as
      * AX210_OVR="c0d02c68=0x100,c0d02c7c=0xffffffff,...". */
