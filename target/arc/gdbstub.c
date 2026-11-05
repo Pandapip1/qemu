@@ -726,7 +726,12 @@ void arc_cpu_register_gdb_regs_for_features(ARCCPU *cpu)
                                  GDB_ARCV3_64_FPU_XML,
                                  0);
     } else {
-        g_assert_not_reached();
+        /* ARCompact (arc700/arc600): reuse the ARCv2 aux coprocessor so that
+         * PC/STATUS32/LP_* are exposed over gdb (sufficient for the harness).
+         * These core aux regs are common across ARCompact and ARCv2. */
+        gdb_register_coprocessor(cs,
+          gdb_v2_aux_read, gdb_v2_aux_write,
+          GDB_ARCV2_AUX_LAST, GDB_ARCV2_AUX_XML, 0);
     }
 }
 

@@ -101,8 +101,9 @@ static void setup_fpu_build_reg(ARCCPU *cpu) {
                     (0 << 24);    /* dd: no demand driven floating point */
             break;
         default:
-            error_report("Invalid cpu family for fpu build register");
-            exit(EXIT_FAILURE);
+            /* ARCompact (arc700/arc600): no FPU present -> empty build cfg. */
+            reg_bld = 0;
+            break;
     }
     cpu->fpu_build_config = reg_bld;
 }

@@ -156,6 +156,11 @@ static void arc_cpu_reset(DeviceState *dev)
          */
         cpu->mpy_build = 0x00000410;
         break;
+    case ARC_OPCODE_ARC700:
+    case ARC_OPCODE_ARC600:
+        /* ARCompact multiply build config (advertise 32x32/16x16 multiply). */
+        cpu->mpy_build = 0x00023006;
+        break;
     default:
         assert(!"MULTIPLY_BUILD register is not implemented for this CPU family.");
     }
