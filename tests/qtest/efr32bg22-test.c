@@ -4632,6 +4632,134 @@ static void test_euart_chardev(void)
     qtest_quit(qts);
 }
 
+/*
+ * LDMA (RM ch. 26): a software-requested memory copy, a linked list loaded
+ * with LINKLOAD (XFER, relative link, WRI), a peripheral-paced transfer
+ * (EUART0 TXFL into TXDATA, looped back into the RX FIFO), and the bus
+ * error of a radio-register source (silicon, SS7.74).
+ */
+#define LDMA_BASE               0x40040000
+#define LDMAXBAR_BASE           0x40044000
+#define LD_STATUS               0x00c
+#define LD_CHEN                 0x024
+#define LD_CHSTATUS             0x02c
+#define LD_CHDONE               0x034
+#define LD_SWREQ                0x03c
+#define LD_LINKLOAD             0x048
+#define LD_IF                   0x050
+#define LD_CH(n)                (0x058 + 0x30 * (n))
+#define LD_CH_CTRL              0x0c
+#define LD_CH_SRC               0x10
+#define LD_CH_DST               0x14
+#define LD_CH_LINK              0x18
+#define LD_IF_ERROR             (1u << 31)
+#define LD_CTRL_XFERCNT(n)      (((n) - 1) << 4)
+#define LD_CTRL_STRUCTREQ       (1u << 3)
+#define LD_CTRL_BLOCK_ALL       (15u << 16)
+#define LD_CTRL_DONEIEN         (1u << 20)
+#define LD_CTRL_REQMODE_ALL     (1u << 21)
+#define LD_CTRL_SRCINC_NONE     (3u << 24)
+#define LD_CTRL_SIZE_WORD       (2u << 26)
+#define LD_CTRL_DSTINC_NONE     (3u << 28)
+#define LD_STRUCT_WRI           2u
+#define LD_LINK_REL_NEXT        (0x10 | 0x2 | 0x1)
+#define CMU_CLKEN0_LDMA         ((1u << 0) | (1u << 1))
+#define LD_SRAM                 0x20004000
+
+static QTestState *ldma_start(void)
+{
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel qtest");
+
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_LDMA | CMU_CLKEN0_EUART0);
+    return qts;
+}
+
+static void test_ldma_memory_copy(void)
+{
+    QTestState *qts = ldma_start();
+
+    for (unsigned i = 0; i < 16; i++) {
+        qtest_writeb(qts, LD_SRAM + i, 0x30 + i);
+    }
+    qtest_writel(qts, LDMA_BASE + LD_CH(0) + LD_CH_CTRL,
+                 LD_CTRL_XFERCNT(16) | LD_CTRL_BLOCK_ALL |
+                     LD_CTRL_REQMODE_ALL | LD_CTRL_DONEIEN);
+    qtest_writel(qts, LDMA_BASE + LD_CH(0) + LD_CH_SRC, LD_SRAM);
+    qtest_writel(qts, LDMA_BASE + LD_CH(0) + LD_CH_DST, LD_SRAM + 0x100);
+    qtest_writel(qts, LDMA_BASE + LD_CHEN, 1);
+    qtest_writel(qts, LDMA_BASE + LD_SWREQ, 1);
+    g_assert_cmphex(qtest_readl(qts, LDMA_BASE + LD_CHDONE), ==, 0);
+    qtest_clock_step(qts, 10000);
+    g_assert_cmphex(qtest_readl(qts, LDMA_BASE + LD_CHDONE), ==, 1);
+    g_assert_cmphex(qtest_readl(qts, LDMA_BASE + LD_IF), ==, 1);
+    g_assert_cmphex(qtest_readl(qts, LDMA_BASE + LD_CHSTATUS), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, LD_SRAM + 0x10c), ==, 0x3f3e3d3c);
+    g_assert_cmphex(qtest_readl(qts, LDMA_BASE + LD_CH(0) + LD_CH_SRC), ==,
+                    LD_SRAM + 16);
+
+    /* LINKLOAD a two-entry list: 4 words, then a write-immediate. */
+    qtest_writel(qts, LD_SRAM + 0x200, LD_CTRL_XFERCNT(4) | LD_CTRL_BLOCK_ALL |
+                                           LD_CTRL_REQMODE_ALL |
+                                           LD_CTRL_SIZE_WORD |
+                                           LD_CTRL_STRUCTREQ);
+    qtest_writel(qts, LD_SRAM + 0x204, LD_SRAM);
+    qtest_writel(qts, LD_SRAM + 0x208, LD_SRAM + 0x300);
+    qtest_writel(qts, LD_SRAM + 0x20c, LD_LINK_REL_NEXT);
+    qtest_writel(qts, LD_SRAM + 0x210, LD_STRUCT_WRI | LD_CTRL_DONEIEN);
+    qtest_writel(qts, LD_SRAM + 0x214, 0xcafef00d);
+    qtest_writel(qts, LD_SRAM + 0x218, LD_SRAM + 0x320);
+    qtest_writel(qts, LD_SRAM + 0x21c, 0);
+    qtest_writel(qts, LDMA_BASE + LD_IF + REGISTER_CLEAR_WINDOW, ~0u);
+    qtest_writel(qts, LDMA_BASE + LD_CHDONE, 0);
+    qtest_writel(qts, LDMA_BASE + LD_CH(2) + LD_CH_LINK, LD_SRAM + 0x200);
+    qtest_writel(qts, LDMA_BASE + LD_LINKLOAD, 1u << 2);
+    g_assert_cmphex(qtest_readl(qts, LDMA_BASE + LD_CHSTATUS), ==, 1u << 2);
+    qtest_clock_step(qts, 10000);
+    g_assert_cmphex(qtest_readl(qts, LD_SRAM + 0x30c), ==, 0x3f3e3d3c);
+    g_assert_cmphex(qtest_readl(qts, LD_SRAM + 0x320), ==, 0xcafef00d);
+    g_assert_cmphex(qtest_readl(qts, LDMA_BASE + LD_CHDONE), ==, 1u << 2);
+    g_assert_cmphex(qtest_readl(qts, LDMA_BASE + LD_IF), ==, 1u << 2);
+
+    /* A radio register source: IF.ERROR, STATUS.CHERROR = 3. */
+    qtest_writel(qts, LDMA_BASE + LD_CH(3) + LD_CH_CTRL,
+                 LD_CTRL_XFERCNT(1) | LD_CTRL_SIZE_WORD);
+    qtest_writel(qts, LDMA_BASE + LD_CH(3) + LD_CH_SRC, RAC_BASE + RAC_STATUS);
+    qtest_writel(qts, LDMA_BASE + LD_CH(3) + LD_CH_DST, LD_SRAM + 0x400);
+    qtest_writel(qts, LDMA_BASE + LD_CHEN, 1u << 3);
+    qtest_writel(qts, LDMA_BASE + LD_SWREQ, 1u << 3);
+    qtest_clock_step(qts, 10000);
+    g_assert_cmphex(qtest_readl(qts, LDMA_BASE + LD_IF) & LD_IF_ERROR, ==,
+                    LD_IF_ERROR);
+    g_assert_cmphex((qtest_readl(qts, LDMA_BASE + LD_STATUS) >> 8) & 0x1f,
+                    ==, 3);
+    qtest_quit(qts);
+}
+
+static void test_ldma_peripheral_request(void)
+{
+    QTestState *qts = euart_start("", true);
+
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_LDMA);
+    qtest_writel(qts, LD_SRAM, 0x44332211);
+    /* EUART0 TXFL: SOURCESEL 0x10, SIGSEL 1; one byte per request. */
+    qtest_writel(qts, LDMAXBAR_BASE + 4 * 1, (0x10u << 16) | 1);
+    qtest_writel(qts, LDMA_BASE + LD_CH(1) + LD_CH_CTRL,
+                 LD_CTRL_XFERCNT(4) | LD_CTRL_DSTINC_NONE | LD_CTRL_DONEIEN);
+    qtest_writel(qts, LDMA_BASE + LD_CH(1) + LD_CH_SRC, LD_SRAM);
+    qtest_writel(qts, LDMA_BASE + LD_CH(1) + LD_CH_DST,
+                 EUART0_BASE + EU_TXDATA);
+    qtest_writel(qts, LDMA_BASE + LD_CHEN, 1u << 1);
+    qtest_clock_step(qts, 4 * EU_FRAME_NS + 1000);
+    g_assert_cmphex(qtest_readl(qts, LDMA_BASE + LD_CHDONE), ==, 1u << 1);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_RXDATA), ==, 0x11);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_RXDATA), ==, 0x22);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_RXDATA), ==, 0x33);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_RXDATA), ==, 0x44);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     int result;
@@ -4684,6 +4812,9 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/letimer-oneshot-pwm", test_letimer_oneshot_pwm);
     qtest_add_func("/efr32bg22/euart-loopback", test_euart_loopback);
     qtest_add_func("/efr32bg22/euart-chardev", test_euart_chardev);
+    qtest_add_func("/efr32bg22/ldma-memory-copy", test_ldma_memory_copy);
+    qtest_add_func("/efr32bg22/ldma-peripheral-request",
+                   test_ldma_peripheral_request);
     qtest_add_func("/efr32bg22/trng-fifo", test_trng_fifo);
     qtest_add_func("/efr32bg22/gpcrc-crc-vectors", test_gpcrc_crc_vectors);
     qtest_add_func("/efr32bg22/radioaes-ecb-and-key-sizes",

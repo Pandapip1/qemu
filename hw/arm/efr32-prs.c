@@ -103,6 +103,7 @@ struct Efr32PrsState {
     qemu_irq consumer_line[EFR32_PRS_CONSUMERS];
     qemu_irq consumer_sync_line[EFR32_PRS_CONSUMERS];
     qemu_irq async_ch_line[EFR32_PRS_ASYNC_CHANNELS];
+    qemu_irq ldma_sync_line[EFR32_PRS_LDMA_SYNC_CHANNELS];
     qemu_irq sync_ch_line[EFR32_PRS_SYNC_CHANNELS];
 };
 
@@ -246,6 +247,9 @@ static void prs_update(Efr32PrsState *s)
         for (unsigned ch = 0; ch < EFR32_PRS_ASYNC_CHANNELS; ch++) {
             if (changed & (1u << ch)) {
                 qemu_set_irq(s->async_ch_line[ch], !!(out & (1u << ch)));
+                if (ch < EFR32_PRS_LDMA_SYNC_CHANNELS) {
+                    qemu_set_irq(s->ldma_sync_line[ch], !!(out & (1u << ch)));
+                }
             }
         }
         for (unsigned ch = 0; ch < EFR32_PRS_SYNC_CHANNELS; ch++) {
@@ -435,6 +439,8 @@ static void prs_init(Object *obj)
                              EFR32_PRS_ASYNC_CHANNELS);
     qdev_init_gpio_out_named(dev, s->sync_ch_line, EFR32_PRS_SYNC_CH,
                              EFR32_PRS_SYNC_CHANNELS);
+    qdev_init_gpio_out_named(dev, s->ldma_sync_line, EFR32_PRS_ASYNC_CH_LDMA,
+                             EFR32_PRS_LDMA_SYNC_CHANNELS);
 }
 
 static void prs_class_init(ObjectClass *klass, void *data)

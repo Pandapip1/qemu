@@ -43,6 +43,9 @@
 #define EFR32_PRS_CONSUMER_SYNC "consumer-sync"
 #define EFR32_PRS_ASYNC_CH "async-ch"
 #define EFR32_PRS_SYNC_CH "sync-ch"
+/* Asynchronous channels 0-7 again, for the LDMA's SYNCTRIG inputs. */
+#define EFR32_PRS_ASYNC_CH_LDMA "async-ch-ldma"
+#define EFR32_PRS_LDMA_SYNC_CHANNELS 8
 
 /* Asynchronous producers, RM Table 13.5 (SOURCESEL). */
 enum {

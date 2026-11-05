@@ -202,6 +202,8 @@ struct Efr32UsartState {
     MemoryRegion mmio_ns;
     qemu_irq rx_irq;
     qemu_irq tx_irq;
+    /* LDMA requests RXDATAV, RXDATAVRIGHT, TXBL, TXBLRIGHT, TXEMPTY. */
+    qemu_irq dma_req[EFR32_USART_DMA_REQS];
     Clock *pclk;
     CharBackend chr;
     IcountBusModel *bus_model;
@@ -314,6 +316,22 @@ static void usart_update_irq(Efr32UsartState *s)
 
     qemu_set_irq(s->rx_irq, !!(pending & USART_IF_RX_LINE));
     qemu_set_irq(s->tx_irq, !!(pending & USART_IF_TX_LINE));
+    /*
+     * LDMA requests (LDMAXBAR SIGSEL, efr32bg22_ldmaxbar_defines.h): the
+     * buffer conditions; [I] the RIGHT variants as their plain ones.
+     */
+    {
+        uint32_t status = usart_status(s);
+        bool rx = status & USART_STATUS_RXDATAV;
+        bool tx = s->tx_enabled && (status & USART_STATUS_TXBL);
+
+        qemu_set_irq(s->dma_req[0], rx);
+        qemu_set_irq(s->dma_req[1], rx);
+        qemu_set_irq(s->dma_req[2], tx);
+        qemu_set_irq(s->dma_req[3], tx);
+        qemu_set_irq(s->dma_req[4], s->tx_enabled &&
+                                        (status & USART_STATUS_TXIDLE));
+    }
 }
 
 /* Tell the host side the line format, for a backend that has one (a tty). */
@@ -673,7 +691,10 @@ static const MemoryRegionOps usart_ops = {
     .read = usart_read,
     .write = usart_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = {.min_access_size = 4, .max_access_size = 4},
+    /* Byte and half-word accesses act as word accesses (the LDMA writes
+     * TXDATA a byte at a time). */
+    .valid = {.min_access_size = 1, .max_access_size = 4},
+    .impl = {.min_access_size = 4, .max_access_size = 4},
 };
 
 static void usart_reset_hold(Object *obj, ResetType type)
@@ -716,6 +737,8 @@ static void usart_init(Object *obj)
     sysbus_init_mmio(sbd, &s->mmio);
     sysbus_init_irq(sbd, &s->rx_irq);
     sysbus_init_irq(sbd, &s->tx_irq);
+    qdev_init_gpio_out_named(DEVICE(obj), s->dma_req, EFR32_USART_DMA_REQ,
+                             EFR32_USART_DMA_REQS);
     s->pclk = qdev_init_clock_in(DEVICE(obj), "pclk", NULL, NULL, 0);
     fifo8_create(&s->rx_fifo, USART_BUFFER_FRAMES);
     fifo8_create(&s->tx_fifo, USART_BUFFER_FRAMES);

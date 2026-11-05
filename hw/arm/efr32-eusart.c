@@ -861,7 +861,10 @@ static const MemoryRegionOps eu_ops = {
     .read_with_attrs = eu_read,
     .write_with_attrs = eu_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = {.min_access_size = 4, .max_access_size = 4},
+    /* Byte and half-word accesses act as word accesses (the LDMA writes
+     * TXDATA a byte at a time). */
+    .valid = {.min_access_size = 1, .max_access_size = 4},
+    .impl = {.min_access_size = 4, .max_access_size = 4},
 };
 
 /* PRS consumer EUART0 TRIGGER (TRIGCTRL.RXTEN / TXTEN, SS22.3.27). */

@@ -25,6 +25,7 @@
 #include "hw/arm/efr32-buram.h"
 #include "hw/arm/efr32-letimer.h"
 #include "hw/arm/efr32-eusart.h"
+#include "hw/arm/efr32-ldma.h"
 #include "hw/arm/efr32-soc-link.h"
 #include "hw/misc/analog-source.h"
 #include "hw/misc/owo-suit.h"
@@ -889,6 +890,8 @@ struct Efr32Periph
     QEMUTimer *iadc_local_timer;
     /* When the request being queued was triggered (efr32_iadc_queue). */
     int64_t iadc_request_ns;
+    /* TIMERn LDMA requests: CC0-2, UFOF (efr32-ldma.h signals). */
+    qemu_irq timer_dma[5][4];
     /* TIMERn CCm PRS output in PRSCONF = LEVEL. */
     bool timer_prs_level[5][3];
     /* RTCC CCn PRS outputs (CMOA). */
@@ -3994,10 +3997,13 @@ static void efr32_timer_event(Efr32Periph *s, int i)
     efr32_timer_schedule(s, i);
     if (flags & EFR32_TIMER_IF_OF) {
         efr32_timer_prs_event(s, i, EFR32_PRS_SIG_TIMER_OF);
+        /* RM SS19.3.6: each event also sets a DMA request; [I] a pulse. */
+        qemu_irq_pulse(s->timer_dma[i][EFR32_LDMA_SIG_TIMER_UFOF]);
     }
     for (unsigned n = 0; n < EFR32_TIMER0_CHANNELS; n++) {
         if (flags & EFR32_TIMER_IF_CC(n)) {
             efr32_timer_prs_cc_event(s, i, n);
+            qemu_irq_pulse(s->timer_dma[i][EFR32_LDMA_SIG_TIMER_CC(n)]);
         }
     }
 }
@@ -4103,6 +4109,7 @@ static void efr32_timer_ic_capture(Efr32Periph *s, int i, unsigned n,
                        efr32_timer_reg(s, i, EFR32_TIMER_IF) | flags);
     efr32_timer_update_irq(s, i);
     efr32_timer_prs_cc_event(s, i, n);
+    qemu_irq_pulse(s->timer_dma[i][EFR32_LDMA_SIG_TIMER_CC(n)]);
 }
 
 static void efr32_timer_counter_action(Efr32Periph *s, int i, unsigned action)
@@ -7479,6 +7486,8 @@ static void efr32_periph_init(Object *o)
                              EFR32_PRS_SYNC_INPUTS);
     qdev_init_gpio_in_named(DEVICE(o), efr32_prs_consumer_in, "prs-consumer",
                             EFR32_PRS_CONSUMERS);
+    qdev_init_gpio_out_named(DEVICE(o), &s->timer_dma[0][0], "timer-dma",
+                             EFR32_TIMER_COUNT * 4);
     qdev_init_gpio_in_named(DEVICE(o), efr32_prs_consumer_sync_in,
                             "prs-consumer-sync", EFR32_PRS_CONSUMERS);
     for (int i = 0; i < EFR32_TIMER_COUNT; i++) {
@@ -8424,6 +8433,13 @@ static void efr32_soc_create_reflex(Efr32Bg22SoCState *s, DeviceState *gpio)
         PERIPH_NONSECURE_OFFSET,
         qdev_get_gpio_in(DEVICE(&s->armv7m), EFR32_EUART0_RX_IRQ),
         qdev_get_gpio_in(DEVICE(&s->armv7m), EFR32_EUART0_TX_IRQ));
+    DeviceState *ldma = efr32_ldma_create(
+        OBJECT(s), s->memory, &s->periph.link, PERIPH_NONSECURE_OFFSET,
+        qdev_get_gpio_in(DEVICE(&s->armv7m), EFR32_LDMA_IRQ));
+    static const uint8_t timer_dma_source[EFR32_TIMER_COUNT] = {
+        EFR32_LDMA_SRC_TIMER0, EFR32_LDMA_SRC_TIMER1, EFR32_LDMA_SRC_TIMER2,
+        EFR32_LDMA_SRC_TIMER3, EFR32_LDMA_SRC_TIMER4,
+    };
     /* Consumer lines served outside the core model, and by whom. */
     struct {
         unsigned consumer;
@@ -8435,7 +8451,51 @@ static void efr32_soc_create_reflex(Efr32Bg22SoCState *s, DeviceState *gpio)
         { EFR32_PRS_CON_LETIMER0_STOP, letimer, EFR32_LETIMER_PRS_IN, 1 },
         { EFR32_PRS_CON_LETIMER0_CLEAR, letimer, EFR32_LETIMER_PRS_IN, 2 },
         { EFR32_PRS_CON_EUART0_TRIGGER, euart, EFR32_EUSART_PRS_TRIGGER, 0 },
+        { EFR32_PRS_CON_LDMAXBAR_DMAREQ0, ldma, EFR32_LDMA_REQ,
+          EFR32_LDMA_REQ_LINE(EFR32_LDMA_SRC_LDMAXBAR, 0) },
+        { EFR32_PRS_CON_LDMAXBAR_DMAREQ1, ldma, EFR32_LDMA_REQ,
+          EFR32_LDMA_REQ_LINE(EFR32_LDMA_SRC_LDMAXBAR, 1) },
     };
+
+    for (unsigned t = 0; t < EFR32_TIMER_COUNT; t++) {
+        for (unsigned n = 0; n < 4; n++) {
+            qdev_connect_gpio_out_named(periph, "timer-dma", t * 4 + n,
+                                        qdev_get_gpio_in_named(
+                                            ldma, EFR32_LDMA_REQ,
+                                            EFR32_LDMA_REQ_LINE(
+                                                timer_dma_source[t], n)));
+        }
+    }
+    qdev_connect_gpio_out_named(euart, EFR32_EUSART_DMA_REQ, 0,
+                                qdev_get_gpio_in_named(
+                                    ldma, EFR32_LDMA_REQ,
+                                    EFR32_LDMA_REQ_LINE(
+                                        EFR32_LDMA_SRC_EUART0,
+                                        EFR32_LDMA_SIG_EUART_TXFL)));
+    qdev_connect_gpio_out_named(euart, EFR32_EUSART_DMA_REQ, 1,
+                                qdev_get_gpio_in_named(
+                                    ldma, EFR32_LDMA_REQ,
+                                    EFR32_LDMA_REQ_LINE(
+                                        EFR32_LDMA_SRC_EUART0,
+                                        EFR32_LDMA_SIG_EUART_RXFL)));
+    for (unsigned u = 0; u < 2; u++) {
+        DeviceState *usart = DEVICE(object_resolve_path_component(
+            OBJECT(s), u ? "usart1" : "usart0"));
+
+        for (unsigned n = 0; n < EFR32_USART_DMA_REQS; n++) {
+            qdev_connect_gpio_out_named(usart, EFR32_USART_DMA_REQ, n,
+                                        qdev_get_gpio_in_named(
+                                            ldma, EFR32_LDMA_REQ,
+                                            EFR32_LDMA_REQ_LINE(
+                                                EFR32_LDMA_SRC_USART0 + u,
+                                                n)));
+        }
+    }
+    for (unsigned ch = 0; ch < EFR32_PRS_LDMA_SYNC_CHANNELS; ch++) {
+        qdev_connect_gpio_out_named(prs, EFR32_PRS_ASYNC_CH_LDMA, ch,
+                                    qdev_get_gpio_in_named(
+                                        ldma, EFR32_LDMA_PRS_SYNC, ch));
+    }
 
     qdev_connect_gpio_out_named(euart, EFR32_EUSART_PRS_TXC, 0,
                                 qdev_get_gpio_in_named(
