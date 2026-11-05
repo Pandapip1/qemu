@@ -368,7 +368,9 @@ static enum arc_opcode_map arc_map_opcode(const struct arc_opcode *opcode)
         qemu_log_mask(LOG_UNIMP,
                       "Instruction %s is not mapped to semantic function.\n",
                       opcode->name);
-        assert("This should not happen" == 0);
+        /* ARCompact-only mnemonics may lack a semantic mapping. Return
+         * MAP_NONE instead of aborting qemu so execution/fuzzing survives. */
+        return MAP_NONE;
     }
 
     return MAP_NONE;

@@ -262,8 +262,11 @@ const struct arc_opcode *arc_find_format_v2(insn_t *insnd,
     const struct arc_opcode *ret = NULL;
 
     unsigned char mcount = find_insn_for_opcode(insn, isa_mask, insn_len, multi_match);
-    /* TODO: This should eventually trigger invalid instruction exception */
-    assert(mcount != 0);
+    /* No match -> return NULL so the caller raises EXCP_INST_ERROR instead of
+     * aborting qemu (needed for ARCompact and for robust fuzzing). */
+    if (mcount == 0) {
+        return NULL;
+    }
 
     for(unsigned char i = 0; i < mcount; i++) {
         bool invalid = FALSE;
