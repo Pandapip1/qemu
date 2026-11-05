@@ -2467,6 +2467,51 @@ static void test_iadc_single_conversion(void)
     qtest_quit(qts);
 }
 
+/*
+ * Output resolution 11 + log2(OSR x DIGAVG) bits (RM SS24.3.7.4): OSR 4 and
+ * 4-sample averaging give 15 bits, 968 mV of 3.3 V = 9612, read RIGHT16 as
+ * 9612 << 1 = 19224 (its 12 MSBs are still 1201); the window comparator
+ * (SS24.3.8) flags it inside ADGT 0x4000..ADLT 0x5000, not outside it.
+ */
+#define IADC_CMPTHR           0x01c
+#define IADC_SINGLEFIFOCFG    0x070
+#define IADC_CFG_OSR4         (1u << 2)
+#define IADC_CFG_AVG4         (2u << 21)
+#define IADC_ALIGN_RIGHT16    1u
+#define IADC_SINGLE_CMP       (1u << 17)
+#define IADC_IF_SINGLECMP     (1u << 2)
+
+static void test_iadc_resolution_and_window(void)
+{
+    QTestState *qts = qtest_initf("-machine efr32bg22,analog=PD02=968 "
+                                  "-accel qtest");
+
+    qtest_writel(qts, IADC_BASE + IADC_CTRL, IADC_CTRL_TIMEBASE_1US);
+    qtest_writel(qts, IADC_BASE + IADC_SCHED0, 1);
+    qtest_writel(qts, IADC_BASE + IADC_CFG0, IADC_CFG0_VDDX_GAIN1 |
+                                                 IADC_CFG_OSR4 | IADC_CFG_AVG4);
+    qtest_writel(qts, IADC_BASE + IADC_SINGLEFIFOCFG, IADC_ALIGN_RIGHT16);
+    qtest_writel(qts, IADC_BASE + IADC_SINGLE,
+                 IADC_SINGLE_PD02_GND | IADC_SINGLE_CMP);
+    qtest_writel(qts, IADC_BASE + IADC_CMPTHR, (0x4000u << 16) | 0x5000u);
+    qtest_writel(qts, IADC_BASE + IADC_CMD, 1);
+    qtest_clock_step(qts, 20000);
+    g_assert_cmpuint(qtest_readl(qts, IADC_BASE + IADC_SINGLEFIFODATA), ==,
+                     19224);
+    g_assert_cmphex(qtest_readl(qts, IADC_BASE + IADC_IF) & IADC_IF_SINGLECMP,
+                    ==, IADC_IF_SINGLECMP);
+    qtest_writel(qts, IADC_BASE + IADC_IF + REGISTER_CLEAR_WINDOW,
+                 IADC_IF_SINGLECMP);
+    qtest_writel(qts, IADC_BASE + IADC_CMPTHR, (0x5000u << 16) | 0x4000u);
+    qtest_writel(qts, IADC_BASE + IADC_CMD, 1);
+    qtest_clock_step(qts, 20000);
+    g_assert_cmpuint(qtest_readl(qts, IADC_BASE + IADC_SINGLEFIFODATA), ==,
+                     19224);
+    g_assert_cmphex(qtest_readl(qts, IADC_BASE + IADC_IF) & IADC_IF_SINGLECMP,
+                    ==, 0);
+    qtest_quit(qts);
+}
+
 /* EMU.RSTCAUSE: POR after power-up, cleared by EMU_CMD.RSTCAUSECLR. */
 #define EMU_CMD               0x070
 #define EMU_CMD_RSTCAUSECLR   (1u << 17)
@@ -4838,6 +4883,8 @@ int main(int argc, char **argv)
                    test_prs_timer_reloadstart_oneshot);
     qtest_add_func("/efr32bg22/prs-rtcc-capture", test_prs_rtcc_capture);
     qtest_add_func("/efr32bg22/iadc-triggers", test_iadc_triggers);
+    qtest_add_func("/efr32bg22/iadc-resolution-and-window",
+                   test_iadc_resolution_and_window);
     qtest_add_func("/efr32bg22/buram-retention", test_buram_retention);
     qtest_add_func("/efr32bg22/letimer-free-running-toggle",
                    test_letimer_free_running_toggle);

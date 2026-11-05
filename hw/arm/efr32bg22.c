@@ -5317,8 +5317,10 @@ static bool efr32_cmu_wdoglock_write(Efr32Periph *s, uint32_t key,
  * Results arrive after the RM's warm-up and conversion times
  * (efr32_iadc_queue: OSR, ADC_CLK, WARMUPMODE, TIMEBASE; [I] unmeasured).
  * Triggers (local timer, PRS, continuous): efr32_iadc_request and around.
- * [U] Not modelled: oversampling's effect on the
- * value and 16/20-bit results, the window comparator, SUPPLY inputs.
+ * Output resolution, 16/20-bit alignment and the window comparator:
+ * efr32_iadc_convert, efr32_iadc_window_hit.
+ * [U] Not modelled: bipolar output (TWOSCOMPL, differential inputs below
+ * 0 read 0), gain/offset calibration (SCALEx), SUPPLY inputs.
  */
 #define EFR32_IADC_BASE 0x4a004000u
 #define EFR32_IADC_IRQ 48
@@ -5381,7 +5383,15 @@ static bool efr32_cmu_wdoglock_write(Efr32Periph *s, uint32_t key,
 #define EFR32_IADC_PORT_GPIO_FIRST 8u /* PORTA; PORTB 9, PORTC 10, PORTD 11 */
 #define EFR32_IADC_FIFO_DEPTH 4
 #define EFR32_IADC_RESULT_BITS 12
-#define EFR32_IADC_LEFT12_SHIFT 4
+#define EFR32_IADC_WORD_BITS 20
+#define EFR32_IADC_CFG_OSRHS_SHIFT 2
+#define EFR32_IADC_CFG_OSRHS_MASK 0x7u
+#define EFR32_IADC_CFG_DIGAVG_SHIFT 21
+#define EFR32_IADC_CFG_DIGAVG_MASK 0x7u
+#define EFR32_IADC_FIFOCFG_ALIGNMENT_RIGHT16 1u
+#define EFR32_IADC_FIFOCFG_ALIGNMENT_RIGHT20 2u
+#define EFR32_IADC_FIFOCFG_ALIGNMENT_LEFT16 4u
+#define EFR32_IADC_FIFOCFG_ALIGNMENT_LEFT20 5u
 /* SHOWID: entry index in bits 31:24 (right-aligned), 7:0 (left-aligned). */
 #define EFR32_IADC_ID_RIGHT_SHIFT 24
 #define EFR32_IADC_SINGLE_ID 0x20u
@@ -5488,7 +5498,7 @@ static uint32_t efr32_iadc_input_mv(Efr32Periph *s, uint32_t port,
 
 /* Convert the input an entry (SINGLE or a SCANTABLE word) selects. */
 static uint32_t efr32_iadc_convert(Efr32Periph *s, uint32_t input,
-                                   uint32_t fifocfg)
+                                   uint32_t fifocfg, uint32_t *code12)
 {
     uint32_t cfg = efr32_iadc_get(s, EFR32_IADC_CFG0 +
                                          ((input & EFR32_IADC_INPUT_CFG)
@@ -5502,7 +5512,7 @@ static uint32_t efr32_iadc_convert(Efr32Periph *s, uint32_t input,
                     : refsel == EFR32_IADC_CFG_REFSEL_VBGR
                         ? EFR32_IADC_VBGR_MV
                         : 0;
-    uint32_t full = (1u << EFR32_IADC_RESULT_BITS) - 1;
+    uint32_t full;
     uint64_t pos = efr32_iadc_input_mv(
         s, (input >> EFR32_IADC_INPUT_PORTPOS_SHIFT) &
                EFR32_IADC_INPUT_FIELD_MASK,
@@ -5513,8 +5523,21 @@ static uint32_t efr32_iadc_convert(Efr32Periph *s, uint32_t input,
                EFR32_IADC_INPUT_FIELD_MASK,
         (input >> EFR32_IADC_INPUT_PINNEG_SHIFT) &
             EFR32_IADC_INPUT_FIELD_MASK);
+    /*
+     * Output resolution (RM SS24.3.7.4): 11 + log2(OSR x DIGAVG) bits, at
+     * most 20, MSB-aligned in the 20-bit word and truncated to the 12, 16
+     * or 20 bits ALIGNMENT asks for (Figure 24.17).
+     */
+    unsigned osr_log2 = 1 + ((cfg >> EFR32_IADC_CFG_OSRHS_SHIFT) &
+                             EFR32_IADC_CFG_OSRHS_MASK);
+    unsigned avg_log2 = MIN((cfg >> EFR32_IADC_CFG_DIGAVG_SHIFT) &
+                            EFR32_IADC_CFG_DIGAVG_MASK, 4u);
+    unsigned bits = MIN(EFR32_IADC_RESULT_BITS - 1 + osr_log2 + avg_log2,
+                        EFR32_IADC_WORD_BITS);
     uint64_t code;
+    uint32_t code20;
 
+    full = (1u << bits) - 1;
     if (!vref || gain >= ARRAY_SIZE(efr32_iadc_gain_half) || pos <= neg) {
         code = 0;
     } else {
@@ -5523,11 +5546,48 @@ static uint32_t efr32_iadc_convert(Efr32Periph *s, uint32_t input,
                    ((pos - neg) * efr32_iadc_gain_half[gain] * full +
                     vref) / (2 * (uint64_t)vref));
     }
-    if ((fifocfg & EFR32_IADC_FIFOCFG_ALIGNMENT_MASK) ==
-        EFR32_IADC_FIFOCFG_ALIGNMENT_LEFT12) {
-        code <<= EFR32_IADC_LEFT12_SHIFT;
+    code20 = code << (EFR32_IADC_WORD_BITS - bits);
+    if (code12) {
+        *code12 = code20 >> (EFR32_IADC_WORD_BITS - EFR32_IADC_RESULT_BITS);
     }
-    return code;
+    switch (fifocfg & EFR32_IADC_FIFOCFG_ALIGNMENT_MASK) {
+    case EFR32_IADC_FIFOCFG_ALIGNMENT_RIGHT16:
+        return code20 >> 4;
+    case EFR32_IADC_FIFOCFG_ALIGNMENT_RIGHT20:
+        return code20;
+    case EFR32_IADC_FIFOCFG_ALIGNMENT_LEFT12:
+        return (code20 >> 8) << 20;
+    case EFR32_IADC_FIFOCFG_ALIGNMENT_LEFT16:
+        return (code20 >> 4) << 16;
+    case EFR32_IADC_FIFOCFG_ALIGNMENT_LEFT20:
+        return code20 << 12;
+    default:
+        return code20 >> 8;
+    }
+}
+
+/*
+ * Window compare (RM SS24.3.8): for an input with its CMP bit, the 12-bit
+ * result against the upper 12 bits of CMPTHR's 16-bit left-justified ADGT
+ * (>=) and ADLT (<=): inside the window when ADLT >= ADGT, outside it
+ * otherwise.
+ */
+#define EFR32_IADC_CMPTHR 0x01cu
+#define EFR32_IADC_CMPTHR_ADGT_SHIFT 16
+#define EFR32_IADC_CMPTHR_FIELD_MASK 0xfff0u
+#define EFR32_IADC_INPUT_CMP (1u << 17)
+#define EFR32_IADC_IF_SINGLECMP (1u << 2)
+#define EFR32_IADC_IF_SCANCMP (1u << 3)
+
+static bool efr32_iadc_window_hit(Efr32Periph *s, uint32_t code12)
+{
+    uint32_t thr = efr32_iadc_get(s, EFR32_IADC_CMPTHR);
+    uint32_t lt = thr & EFR32_IADC_CMPTHR_FIELD_MASK;
+    uint32_t gt = (thr >> EFR32_IADC_CMPTHR_ADGT_SHIFT) &
+                  EFR32_IADC_CMPTHR_FIELD_MASK;
+    uint32_t data = code12 << 4;
+
+    return lt >= gt ? data <= lt && data >= gt : data <= lt || data >= gt;
 }
 
 /* Push one result into a queue's FIFO; returns the IF bits it raises. */
@@ -5541,7 +5601,8 @@ static uint32_t efr32_iadc_push(Efr32Periph *s, unsigned q,
     uint32_t flags = 0;
 
     if (fifocfg & EFR32_IADC_FIFOCFG_SHOWID) {
-        result |= (fifocfg & EFR32_IADC_FIFOCFG_ALIGNMENT_MASK) ==
+        /* Figure 24.18: bits 7:0 when left-aligned, 31:24 when right. */
+        result |= (fifocfg & EFR32_IADC_FIFOCFG_ALIGNMENT_MASK) >=
                           EFR32_IADC_FIFOCFG_ALIGNMENT_LEFT12
                       ? id
                       : id << EFR32_IADC_ID_RIGHT_SHIFT;
@@ -5657,7 +5718,9 @@ static void efr32_iadc_queue(Efr32Periph *s, unsigned queue, unsigned id,
     }
     osr = 2u << ((cfg >> EFR32_IADC_CFG_OSRHS_SHIFT) &
                  EFR32_IADC_CFG_OSRHS_MASK);
-    cycles = 4 * osr + 2;
+    /* DIGAVG: 1-16 conversions back to back per result (SS24.3.7.3). */
+    cycles = (4 * osr + 2) << MIN((cfg >> EFR32_IADC_CFG_DIGAVG_SHIFT) &
+                                  EFR32_IADC_CFG_DIGAVG_MASK, 4u);
     if (s->iadc_have_input && input != s->iadc_last_input) {
         cycles += EFR32_IADC_CONV_SWITCH_CYCLES;
     }
@@ -5692,9 +5755,17 @@ static void efr32_iadc_complete(void *opaque)
         typeof(s->iadc_conv[0]) *c = &s->iadc_conv[done++];
         const Efr32IadcQueue *queue = c->queue ? &efr32_iadc_scan
                                                : &efr32_iadc_single;
+        uint32_t code12;
         uint32_t result = efr32_iadc_convert(s, c->input,
                                              efr32_iadc_get(s,
-                                                            queue->fifocfg));
+                                                            queue->fifocfg),
+                                             &code12);
+
+        if ((c->input & EFR32_IADC_INPUT_CMP) &&
+            efr32_iadc_window_hit(s, code12)) {
+            flags |= c->queue ? EFR32_IADC_IF_SCANCMP
+                              : EFR32_IADC_IF_SINGLECMP;
+        }
 
         request_done[c->queue] |= c->last;
         flags |= efr32_iadc_push(s, c->queue, queue, result, c->id);
