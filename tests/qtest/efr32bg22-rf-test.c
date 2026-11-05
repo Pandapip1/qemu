@@ -410,24 +410,27 @@ static void test_carrier_matches_on_1mhz_raster(void)
     /* 13 cm below the ISM band: measured reachable (SS7.85). */
     g_assert_true(rf_delivered(2304000, 2304000, false));
     g_assert_true(rf_delivered(2395000, 2395000, false));
+    /* The ends of the measured lock range (SS7.90). */
+    g_assert_true(rf_delivered(2158000, 2158000, false));
+    g_assert_true(rf_delivered(2644000, 2644000, false));
 }
 
 /*
- * A carrier the synthesizer does not reach (EFR32_SYNTH_LOCK_MIN_HZ..MAX_HZ, SS7.85) reaches no
+ * A carrier the synthesizer does not reach (EFR32_SYNTH_LOCK_MIN_HZ..MAX_HZ, SS7.90) reaches no
  * receiver, even one tuned to the same word.
  */
 static void test_carrier_outside_synth_range_not_delivered(void)
 {
-    g_assert_false(rf_delivered(2289000, 2289000, false));
-    g_assert_false(rf_delivered(2280000, 2280000, false));
-    g_assert_false(rf_delivered(2501000, 2501000, false));
+    g_assert_false(rf_delivered(2157000, 2157000, false));
+    g_assert_false(rf_delivered(2100000, 2100000, false));
+    g_assert_false(rf_delivered(2645000, 2645000, false));
 }
 
-/* Nor does the synthesizer report lock there (SYNTH.STATUS.INLOCK, SS7.72, SS7.85). */
+/* Nor does the synthesizer report lock there (SYNTH.STATUS.INLOCK, SS7.72, SS7.85, SS7.90). */
 static void test_synth_never_locks_outside_range(void)
 {
     rf_reset_with_clocks();
-    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_FREQ, synth_freq_word(2280000));
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_FREQ, synth_freq_word(2150000));
     qtest_writel(global_qtest, RAC_BASE + RAC_SYEN, RAC_SYEN_STOCK_TX);
     qtest_writel(global_qtest, SYNTH_BASE + SYNTH_CMD,
                  SYNTH_CMD_DISABLEIF | SYNTH_CMD_SYNTHSTART);
@@ -2289,6 +2292,229 @@ static void test_synth_lock_and_pa_ramp_timing(void)
     rf_reset_with_clocks();
 }
 
+/*
+ * The LO counter and the LO in time (owo-open-fw docs/radio-tables.md SS7.90, BGM220P, receive
+ * only). Expected values are the silicon readings.
+ */
+#define SYNTH_LOCNTCTRL_ENABLE   (1u << 0)
+#define SYNTH_LOCNTCTRL_CLEAR    (1u << 1)
+#define SYNTH_LOCNTCTRL_READ     (1u << 3)
+#define SYNTH_LOCNTCTRL_FCALRUNCLKEN (1u << 11)
+#define SYNTH_LOCOUNT_MASK       0x7ffffu
+#define SYNTH_LOCNTTARGET        0x090
+#define SYNTH_VCOTUNING          0x04c
+#define SYNTH_VCOTUNING_VCAPSEL_16 (16u << 11)
+#define SYNTH_CMD_CAPCALSTART    (1u << 4)
+#define SYNTH_CALOFFSET          0x048
+#define RAC_SYNTHENCTRL          0x094
+#define RAC_SYNTHENCTRL_LPFBWSEL (1u << 20)
+/* 2^13 HFXO periods: the longest count (NUMCYCLE 12 and above). */
+#define LOCNT_NUMCYCLE_MAX_NS    213334
+#define LO_SETTLE_NS             1000000
+
+/* One LO count of NUMCYCLE @p numcycle from now; its LOCOUNT. */
+static uint32_t rf_locnt(uint32_t numcycle, uint32_t extra)
+{
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_LOCNTCTRL,
+                 SYNTH_LOCNTCTRL_ENABLE | SYNTH_LOCNTCTRL_READ | extra | (numcycle << 4) |
+                     SYNTH_LOCNTCTRL_CLEAR | SYNTH_LOCNTCTRL_RUN);
+    rf_step(LOCNT_NUMCYCLE_MAX_NS + 1000);
+    return qtest_readl(global_qtest, SYNTH_BASE + SYNTH_LOCNTSTATUS) & SYNTH_LOCOUNT_MASK;
+}
+
+/* The receiver's synthesizer running and settled on @p freq (1M PHY IF). */
+static void rf_synth_rx_running(uint32_t freq)
+{
+    rf_reset_with_clocks();
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_FREQ, freq);
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_IFFREQ, SYNTH_IFFREQ_BLE_1M);
+    qtest_writel(global_qtest, RAC_BASE + RAC_SYEN, RAC_SYEN_STOCK_TX);
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_CMD,
+                 SYNTH_CMD_ENABLEIF | SYNTH_CMD_SYNTHSTART);
+    rf_step(LO_SETTLE_NS);
+}
+
+/*
+ * Closed loop the counter counts only with FCALRUNCLKEN: 2402 MHz receive (LO 2402.7 MHz) read
+ * 0 without it, 512576 at NUMCYCLE 12 and the same at 13-15, 4004/4005 at 5; at LO 2480.7 MHz
+ * NUMCYCLE 12 wraps the 19-bit count (4928/4929).
+ */
+static void test_synth_locnt_counts_lo(void)
+{
+    rf_synth_rx_running(SYNTH_FREQ_2402_MHZ);
+    g_assert_cmpuint(rf_locnt(12, 0), ==, 0);
+    g_assert_cmpuint(rf_locnt(12, SYNTH_LOCNTCTRL_FCALRUNCLKEN), >=, 512575);
+    g_assert_cmpuint(rf_locnt(12, SYNTH_LOCNTCTRL_FCALRUNCLKEN), <=, 512577);
+    g_assert_cmpuint(rf_locnt(15, SYNTH_LOCNTCTRL_FCALRUNCLKEN), >=, 512575);
+    g_assert_cmpuint(rf_locnt(15, SYNTH_LOCNTCTRL_FCALRUNCLKEN), <=, 512577);
+    g_assert_cmpuint(rf_locnt(5, SYNTH_LOCNTCTRL_FCALRUNCLKEN), >=, 4004);
+    g_assert_cmpuint(rf_locnt(5, SYNTH_LOCNTCTRL_FCALRUNCLKEN), <=, 4005);
+    /* NUMCYCLE 15 is busy as long as 12. */
+    rf_reset_with_clocks();
+    rf_locnt_busy_window(15, LOCNT_NUMCYCLE_MAX_NS);
+
+    rf_synth_rx_running(synth_freq_word(2480000));
+    g_assert_cmpuint(rf_locnt(12, SYNTH_LOCNTCTRL_FCALRUNCLKEN), >=, 4926);
+    g_assert_cmpuint(rf_locnt(12, SYNTH_LOCNTCTRL_FCALRUNCLKEN), <=, 4930);
+    rf_reset_with_clocks();
+}
+
+/*
+ * The calibration state (SYNTHSTOP, CAPCALSTART): the counter counts the open-loop VCO at
+ * VCOTUNING (NUMCYCLE 8, 2402 MHz: 35084 at code 0, 28876 at 2047, VCAPSEL 16; 35905 at code
+ * 0 with VCAPSEL 0), TARGET reads the programmed LO's count for the NUMCYCLE of the last RUN
+ * (125 after CAPCALSTART, 32036 after a NUMCYCLE-8 count), and the sequencer's successive
+ * approximation (efr32_seq_vco_calibrate) lands near the silicon code 0x334.
+ */
+static void test_synth_calibration_open_loop(void)
+{
+    static const uint8_t low_bits[] = { 0, 0, 0, 1, 1, 2, 4, 8, 16, 32, 32 };
+    static const uint8_t numcycle[] = { 5, 5, 5, 4, 4, 4, 4, 3, 2, 2, 2 };
+    uint32_t accepted = SYNTH_VCOTUNING_VCAPSEL_16;
+
+    rf_synth_rx_running(SYNTH_FREQ_2402_MHZ);
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_CMD,
+                 SYNTH_CMD_SYNTHSTOP | SYNTH_CMD_ENABLEIF);
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_CMD, SYNTH_CMD_CAPCALSTART);
+    g_assert_cmpuint(qtest_readl(global_qtest, SYNTH_BASE + SYNTH_LOCNTTARGET), ==, 125);
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_VCOTUNING, SYNTH_VCOTUNING_VCAPSEL_16);
+    g_assert_cmpuint(rf_locnt(8, 0), ==, 35084);
+    g_assert_cmpuint(qtest_readl(global_qtest, SYNTH_BASE + SYNTH_LOCNTTARGET), ==, 32036);
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_VCOTUNING,
+                 SYNTH_VCOTUNING_VCAPSEL_16 | 2047);
+    g_assert_cmpuint(rf_locnt(8, 0), ==, 28876);
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_VCOTUNING, 0);
+    g_assert_cmpuint(rf_locnt(8, 0), ==, 35905);
+
+    for (int bit = 10; bit >= 0; bit--) {
+        uint32_t trial = accepted | (1u << bit);
+
+        qtest_writel(global_qtest, SYNTH_BASE + SYNTH_VCOTUNING, trial | low_bits[bit]);
+        if (rf_locnt(numcycle[bit], 0) >
+            qtest_readl(global_qtest, SYNTH_BASE + SYNTH_LOCNTTARGET)) {
+            accepted = trial;
+        }
+    }
+    g_assert_cmphex(accepted & ~0x7ffu, ==, SYNTH_VCOTUNING_VCAPSEL_16);
+    g_assert_cmpuint(accepted & 0x7ffu, >=, 0x334 - 8);
+    g_assert_cmpuint(accepted & 0x7ffu, <=, 0x334 + 8);
+    rf_reset_with_clocks();
+}
+
+/*
+ * A SYNTH.FREQ step of 4 MHz without recalibration, receive loop at 2399 MHz: about 0.35 of
+ * the step in the first 0.42 us, 0.83 of it averaged over 0.6-2.3 us, 1.1-1.2 at 2-4 us, the
+ * target within a count after 60 us. With the loop configured for TX (LPFBWSEL) the first
+ * 0.42 us already carried about 1.1 of it. NUMCYCLE 5: 600 kHz per count.
+ */
+static void test_synth_freq_step_settles(void)
+{
+    const uint32_t base = synth_freq_word(2399000);
+    const uint32_t step = synth_freq_word(2403000) - base;
+    uint32_t settled;
+    uint32_t high;
+    uint32_t first;
+
+    rf_synth_rx_running(base + step);
+    settled = rf_locnt(5, SYNTH_LOCNTCTRL_FCALRUNCLKEN);
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_FREQ, base);
+    rf_step(LO_SETTLE_NS);
+    /* 4 MHz is 6.67 counts of NUMCYCLE 5. */
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_FREQ, base + step);
+    first = rf_locnt(5, SYNTH_LOCNTCTRL_FCALRUNCLKEN);
+    g_assert_cmpuint(first, <, settled - 1);
+    g_assert_cmpuint(first, >, settled - 6);
+
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_FREQ, base);
+    rf_step(LO_SETTLE_NS);
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_FREQ, base + step);
+    rf_step(2000);
+    high = rf_locnt(5, SYNTH_LOCNTCTRL_FCALRUNCLKEN);
+    g_assert_cmpuint(high, >=, settled);
+
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_FREQ, base);
+    rf_step(LO_SETTLE_NS);
+    qtest_writel(global_qtest, RAC_BASE + RAC_SYNTHENCTRL + REGISTER_SET_WINDOW,
+                 RAC_SYNTHENCTRL_LPFBWSEL);
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_FREQ, base + step);
+    first = rf_locnt(5, SYNTH_LOCNTCTRL_FCALRUNCLKEN);
+    g_assert_cmpuint(first, >=, settled - 1);
+    rf_reset_with_clocks();
+}
+
+/*
+ * Beyond +9.9 / -11.6 MHz from where the LO is, a step without recalibration slews: +24 MHz at
+ * 2399 MHz averaged +9.90 MHz over its first 53.3 us (NUMCYCLE 10, 18.75 kHz per count) and
+ * reached the target after about 1.3 ms; the medium has no channel until it arrives.
+ */
+static void test_synth_large_step_slews(void)
+{
+    const uint32_t base = synth_freq_word(2399000);
+    const uint32_t step = synth_freq_word(2423000) - base;
+    const double hz_per_count10 = 38400000.0 / 2048.0;
+    uint32_t start;
+    uint32_t first;
+
+    rf_synth_rx_running(base);
+    start = rf_locnt(10, SYNTH_LOCNTCTRL_FCALRUNCLKEN);
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_FREQ, base + step);
+    first = rf_locnt(10, SYNTH_LOCNTCTRL_FCALRUNCLKEN);
+    g_assert_cmpfloat((first - start) * hz_per_count10, >, 9.0e6);
+    g_assert_cmpfloat((first - start) * hz_per_count10, <, 11.5e6);
+    rf_step(2 * LO_SETTLE_NS);
+    g_assert_cmpfloat((rf_locnt(10, SYNTH_LOCNTCTRL_FCALRUNCLKEN) - start) * hz_per_count10,
+                      >, 23.9e6);
+    rf_reset_with_clocks();
+}
+
+/*
+ * Past the VCO the LO stops: with VCAPSEL 16, receiving on 2652 MHz (LO 2652.7 MHz) the LO
+ * count of NUMCYCLE 12 read 2647.57 MHz (40526 after the 19-bit wrap).
+ */
+static void test_synth_lo_stops_at_vco_limit(void)
+{
+    rf_reset_with_clocks();
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_VCOTUNING, SYNTH_VCOTUNING_VCAPSEL_16);
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_FREQ, synth_freq_word(2652000));
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_IFFREQ, SYNTH_IFFREQ_BLE_1M);
+    qtest_writel(global_qtest, RAC_BASE + RAC_SYEN, RAC_SYEN_STOCK_TX);
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_CMD,
+                 SYNTH_CMD_ENABLEIF | SYNTH_CMD_SYNTHSTART);
+    rf_step(LO_SETTLE_NS);
+    g_assert_cmpuint(rf_locnt(12, SYNTH_LOCNTCTRL_FCALRUNCLKEN), >=, 40525);
+    g_assert_cmpuint(rf_locnt(12, SYNTH_LOCNTCTRL_FCALRUNCLKEN), <=, 40527);
+    rf_reset_with_clocks();
+}
+
+/*
+ * CHCTRL.CHNO x CHSP and CALOFFSET (15-bit two's complement) add to the carrier in SYNTH.FREQ
+ * units: CHSP 13653 moved the LO count of NUMCYCLE 12 by 213-214 per CHNO; CALOFFSET 0x1000,
+ * 0x4000 and 0x7fff by +64, -256 and 0 (4.6875 kHz per count).
+ */
+static void test_synth_channel_and_offset_fields(void)
+{
+    uint32_t base;
+
+    rf_synth_rx_running(SYNTH_FREQ_2402_MHZ);
+    base = rf_locnt(12, SYNTH_LOCNTCTRL_FCALRUNCLKEN);
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_CHSP, 13653);
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_CHCTRL, 2);
+    rf_step(LO_SETTLE_NS);
+    g_assert_cmpint((int)rf_locnt(12, SYNTH_LOCNTCTRL_FCALRUNCLKEN) - (int)base, >=, 426);
+    g_assert_cmpint((int)rf_locnt(12, SYNTH_LOCNTCTRL_FCALRUNCLKEN) - (int)base, <=, 428);
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_CHCTRL, 0);
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_CALOFFSET, 0x1000);
+    rf_step(LO_SETTLE_NS);
+    g_assert_cmpint((int)rf_locnt(12, SYNTH_LOCNTCTRL_FCALRUNCLKEN) - (int)base, ==, 64);
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_CALOFFSET, 0x4000);
+    rf_step(LO_SETTLE_NS);
+    g_assert_cmpint((int)rf_locnt(12, SYNTH_LOCNTCTRL_FCALRUNCLKEN) - (int)base, ==, -256);
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_CALOFFSET, 0x7fff);
+    rf_step(LO_SETTLE_NS);
+    g_assert_cmpint((int)rf_locnt(12, SYNTH_LOCNTCTRL_FCALRUNCLKEN) - (int)base, ==, 0);
+    rf_reset_with_clocks();
+}
+
 int main(int argc, char **argv)
 {
 
@@ -2352,6 +2578,14 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/rf/released-tx-turns-around-to-rx",
                    test_released_tx_turns_around_to_rx);
     qtest_add_func("/efr32bg22/rf/locnt-busy-window", test_locnt_busy_window);
+    qtest_add_func("/efr32bg22/rf/synth-locnt-counts-lo", test_synth_locnt_counts_lo);
+    qtest_add_func("/efr32bg22/rf/synth-calibration-open-loop",
+                   test_synth_calibration_open_loop);
+    qtest_add_func("/efr32bg22/rf/synth-freq-step-settles", test_synth_freq_step_settles);
+    qtest_add_func("/efr32bg22/rf/synth-large-step-slews", test_synth_large_step_slews);
+    qtest_add_func("/efr32bg22/rf/synth-lo-stops-at-vco-limit", test_synth_lo_stops_at_vco_limit);
+    qtest_add_func("/efr32bg22/rf/synth-channel-and-offset-fields",
+                   test_synth_channel_and_offset_fields);
     qtest_add_func("/efr32bg22/rf/prs-radio-probe-routes",
                    test_prs_radio_probe_routes);
     qtest_add_func("/efr32bg22/rf/released-rx-srcchf-follows-channel",

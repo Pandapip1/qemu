@@ -26,15 +26,15 @@ struct Efr32RfRadioClass {
 
     bool (*is_rx_ready)(Efr32RfRadio *radio);
     /* The carrier on the medium's channel raster, or EFR32_RF_NO_CHANNEL. */
-    uint8_t (*get_channel)(Efr32RfRadio *radio);
+    uint16_t (*get_channel)(Efr32RfRadio *radio);
     void (*rx_offer_available)(Efr32RfRadio *radio);
 };
 
 /* A carrier the medium delivers nothing on (unreachable by the synthesizer). */
-#define EFR32_RF_NO_CHANNEL UINT8_MAX
+#define EFR32_RF_NO_CHANNEL UINT16_MAX
 
 bool efr32_rf_radio_is_rx_ready(Efr32RfRadio *radio);
-uint8_t efr32_rf_radio_get_channel(Efr32RfRadio *radio);
+uint16_t efr32_rf_radio_get_channel(Efr32RfRadio *radio);
 void efr32_rf_radio_rx_offer_available(Efr32RfRadio *radio);
 
 typedef enum Efr32RfTxTrigger {
@@ -53,7 +53,7 @@ typedef struct Efr32RfTxMetadata {
     Efr32RfTxTrigger trigger;
     uint8_t buffer_channel;
     /* The carrier's medium channel, or EFR32_RF_NO_CHANNEL (matches no receiver). */
-    uint8_t channel;
+    uint16_t channel;
     /*
      * Virtual time at which the frame's first preamble bit leaves the
      * transmitter.  A receiver derives sync and end-of-frame times from it.
