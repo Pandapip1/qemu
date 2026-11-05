@@ -438,6 +438,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_CRYPTOACC_END 0x4c02c000u
 #define EFR32_CMU_CLKEN1_CRYPTOACC (1u << 13)
 #define EFR32_CMU_CLKEN0_GPCRC (1u << 3)
+#define EFR32_CMU_CLKEN0_RADIOAES (1u << 2)
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_MASK 0x7u
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_FSRCO 1u
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_HFXO 3u
@@ -7022,6 +7023,17 @@ static bool efr32_bus_error(Efr32Periph *s, uint32_t address)
      */
     if (block >= EFR32_CRYPTOACC_BASE && block < EFR32_CRYPTOACC_END) {
         return !(clken1 & EFR32_CMU_CLKEN1_CRYPTOACC);
+    }
+    /*
+     * RADIOAES behind CMU_CLKEN0.RADIOAES (bit 2) and the radio bridge clock
+     * CMU_RADIOCLKCTRL.EN (RM 8.5, 8.5.25; owo-open-fw docs/crypto.md:
+     * Silicon Labs' sli_radioaes_acquire sets both, and so does the open
+     * firmware).  [I] Unmeasured: a gated access faults as RM SS4.2.1.2
+     * says (reads; writes are dropped like the other gated blocks here).
+     */
+    if (block == EFR32_RADIOAES_BASE) {
+        return !(efr32_register_get(s, EFR32_CMU_BASE + EFR32_CMU_CLKEN0) &
+                 EFR32_CMU_CLKEN0_RADIOAES) || !radio_clock;
     }
     /* GPCRC behind CMU_CLKEN0.GPCRC (bit 3, efr32bg22_cmu.h), as above. */
     if (block == EFR32_GPCRC_BASE) {

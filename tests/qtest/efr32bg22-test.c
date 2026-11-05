@@ -3747,6 +3747,37 @@ static void radioaes_ecb(QTestState *qts, uint32_t mode, const uint8_t *key,
     qtest_writel(qts, RADIOAES_BASE + RADIOAES_CMD, RADIOAES_CMD_START);
 }
 
+/*
+ * RADIOAES needs CMU_CLKEN0.RADIOAES and CMU_RADIOCLKCTRL.EN (RM 8.5,
+ * 8.5.25; what sli_radioaes_acquire and the open firmware set): a gated
+ * access faults.
+ */
+#define CMU_CLKEN0_RADIOAES    (1u << 2)
+
+static void setup_radioaes_clocks(QTestState *qts)
+{
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_RADIOAES);
+    qtest_writel(qts, CMU_BASE + CMU_RADIOCLKCTRL + REGISTER_SET_WINDOW,
+                 CMU_RADIOCLKCTRL_EN);
+}
+
+static void setup_radioaes_bus_clock_only(QTestState *qts)
+{
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_RADIOAES);
+}
+
+static void test_radioaes_clock_gate(void)
+{
+    g_assert_true(m33_load_faults(RADIOAES_BASE + RADIOAES_STATUS,
+                                  setup_no_clocks));
+    g_assert_true(m33_load_faults(RADIOAES_BASE + RADIOAES_STATUS,
+                                  setup_radioaes_bus_clock_only));
+    g_assert_false(m33_load_faults(RADIOAES_BASE + RADIOAES_STATUS,
+                                   setup_radioaes_clocks));
+}
+
 static void test_radioaes_ecb_and_key_sizes(void)
 {
     /* FIPS-197 Appendix C.1 (AES-128) and C.2 (AES-192). */
@@ -3771,6 +3802,7 @@ static void test_radioaes_ecb_and_key_sizes(void)
     QTestState *qts = qtest_init("-machine efr32bg22 -accel qtest");
     uint8_t out[16];
 
+    setup_radioaes_clocks(qts);
     g_assert_cmphex(qtest_readl(qts, RADIOAES_BASE + RADIOAES_HW_CFG_1), ==,
                     0x05010127);
     radioaes_ecb(qts, RADIOAES_MODE_ECB, key, 16, plain);
@@ -4819,6 +4851,7 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/gpcrc-crc-vectors", test_gpcrc_crc_vectors);
     qtest_add_func("/efr32bg22/radioaes-ecb-and-key-sizes",
                    test_radioaes_ecb_and_key_sizes);
+    qtest_add_func("/efr32bg22/radioaes-clock-gate", test_radioaes_clock_gate);
     qtest_add_func("/efr32bg22/lfxo-ready-timeout", test_lfxo_ready_timeout);
     qtest_add_func("/efr32bg22/timer4-counter-and-aliases",
                    test_timer4_counter_and_aliases);
