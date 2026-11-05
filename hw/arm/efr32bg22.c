@@ -21,6 +21,12 @@
 #include "hw/arm/efr32-trng.h"
 #include "hw/arm/efr32-gpcrc.h"
 #include "hw/arm/efr32-interconnect.h"
+#include "hw/arm/efr32-prs.h"
+#include "hw/arm/efr32-buram.h"
+#include "hw/arm/efr32-letimer.h"
+#include "hw/arm/efr32-eusart.h"
+#include "hw/arm/efr32-ldma.h"
+#include "hw/arm/efr32-soc-link.h"
 #include "hw/misc/analog-source.h"
 #include "hw/misc/owo-suit.h"
 #include "hw/ptimer.h"
@@ -442,6 +448,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_CRYPTOACC_END 0x4c02c000u
 #define EFR32_CMU_CLKEN1_CRYPTOACC (1u << 13)
 #define EFR32_CMU_CLKEN0_GPCRC (1u << 3)
+#define EFR32_CMU_CLKEN0_RADIOAES (1u << 2)
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_MASK 0x7u
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_FSRCO 1u
 #define EFR32_CMU_SYSCLKCTRL_CLKSEL_HFXO 3u
@@ -862,6 +869,44 @@ struct Efr32Periph
     bool iadc_have_input;
     /* TIMERn CCm compare/PWM outputs, to the GPIO routes. */
     qemu_irq timer_cc_out[5 * 3];
+    /* SoC services for the blocks outside this model (efr32-soc-link.h). */
+    Efr32SocLink link;
+    /* Producer lines into the PRS, numbered as its inputs (efr32-prs.h). */
+    qemu_irq prs_async[EFR32_PRS_ASYNC_INPUTS];
+    qemu_irq prs_sync[EFR32_PRS_SYNC_INPUTS];
+    /* TIMERn CCm input logic and capture FIFO (efr32_timer_ic_*). */
+    struct {
+        uint32_t fifo[2];
+        bool fifo_falling[2];
+        unsigned count;
+        uint32_t icof;
+        bool async_level;
+        bool sync_level;
+        /* The level the 2-clock sampler last passed (PRSASYNCLEVEL). */
+        bool sampled;
+        QEMUTimer *sampler;
+        struct Efr32Periph *owner;
+        uint8_t timer, channel;
+    } timer_ic[5][3];
+    /* The access in progress comes from a debug access port. */
+    bool debugger_access;
+    /* The PRS, and the radio's pending PRS pulses (efr32_rac_prs_*). */
+    DeviceState *prs;
+    QEMUTimer *prs_radio_timer;
+    int64_t prs_syncsent_ns;
+    int64_t prs_framesent_ns;
+    /* IADC queues enabled for triggers (CMD.xSTART..xSTOP); local timer. */
+    bool iadc_qen[2];
+    bool iadc_timer_on;
+    QEMUTimer *iadc_local_timer;
+    /* When the request being queued was triggered (efr32_iadc_queue). */
+    int64_t iadc_request_ns;
+    /* TIMERn LDMA requests: CC0-2, UFOF (efr32-ldma.h signals). */
+    qemu_irq timer_dma[5][4];
+    /* TIMERn CCm PRS output in PRSCONF = LEVEL. */
+    bool timer_prs_level[5][3];
+    /* RTCC CCn PRS outputs (CMOA). */
+    bool rtcc_ccv[3];
     /* To the debug port: RAC clock retiming wedges it (SS7.80) */
     qemu_irq debug_wedge;
     bool timer_cc_level[5][3];
@@ -930,6 +975,27 @@ struct Efr32Periph
 static uint32_t efr32_register_get(Efr32Periph *s, uint32_t address);
 static void efr32_register_put(Efr32Periph *s, uint32_t address,
                                uint32_t value);
+
+/*
+ * PRS producers (RM SS13.3.3): a level, or a pulse (a raise and a lower at
+ * the same instant; see efr32-prs.c for why that width suffices).
+ */
+static void efr32_prs_level(Efr32Periph *s, unsigned source, unsigned signal,
+                            bool level)
+{
+    qemu_set_irq(s->prs_async[EFR32_PRS_LINE(source, signal)], level);
+}
+
+static void efr32_prs_pulse(Efr32Periph *s, unsigned source, unsigned signal)
+{
+    qemu_irq_pulse(s->prs_async[EFR32_PRS_LINE(source, signal)]);
+}
+
+static void efr32_prs_sync_pulse(Efr32Periph *s, unsigned source,
+                                 unsigned signal)
+{
+    qemu_irq_pulse(s->prs_sync[EFR32_PRS_LINE(source, signal)]);
+}
 
 static void efr32_agc_update_irq(Efr32Periph *s)
 {
@@ -1554,6 +1620,8 @@ static void efr32_rdmailbox_update_irqs(Efr32Periph *s)
     }
 }
 
+static void efr32_rac_prs_state(Efr32Periph *s, uint32_t state);
+
 static void efr32_rac_set_state(Efr32Periph *s, uint32_t state)
 {
     uint32_t previous_state;
@@ -1581,6 +1649,7 @@ static void efr32_rac_set_state(Efr32Periph *s, uint32_t state)
                        efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_SEQIF) |
                            sequence_flag | 1u);
     efr32_rac_update_irqs(s);
+    efr32_rac_prs_state(s, state);
     if (state == EFR32_RAC_STATE_RXSEARCH) {
         /*
          * RXSEARCH can begin after a peer's TXEN but before that model
@@ -1593,6 +1662,98 @@ static void efr32_rac_set_state(Efr32Periph *s, uint32_t state)
     trace_efr32bg22_rac_state(s->endpoint_id,
                               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
                               previous_state, state);
+}
+
+/*
+ * Radio PRS producers (RM Table 13.5) at the instants the model already
+ * has, the same anchors that silicon timed through these very signals
+ * (SS7.71, SS7.72; see the frame timing anchors above):
+ *  - RACL.ACTIVE: the RAC is out of OFF ([I] SS7.71: its rise marks the
+ *    TXEN write, the RAC leaving OFF; RACL.ACTIVE -> RACL.RX rise is the
+ *    166.6 us RX ready delay, SWRXEN to RXSEARCH, SS7.79/7.82);
+ *  - RACL.RX: RXSEARCH or RXFRAME (rises at RXSEARCH entry, falls
+ *    EFR32_RAC_EOF_TO_RX_EXIT_NS after EOF as RXFRAME is left);
+ *  - RACL.TX: the TX state (SYNCSENT 40.65 us after its rise, its fall
+ *    0.9 us after FRAMESENT);
+ *  - [I] RACL.LNAEN: RXWARM to RXFRAME and RX2RX; RACL.PAEN: TX;
+ *  - MODEMH.SYNCSENT (pulse) as the access address ends,
+ *    EFR32_RAC_TX_ENTRY_TO_SYNCSENT_NS after TX entry; MODEM.FRAMESENT
+ *    (pulse) with the frame's last bit; MODEML.FRAMEDET (pulse) at RXFRAME
+ *    entry; MODEMH.EOF (pulse) at the received frame's end.
+ * The TX pulses are timed only while a PRS channel selects them, so a
+ * firmware that never routes them sees no extra timer events.
+ * [U] The other radio producers (AGC, BUFC, FRC, PROTIMER, SYNTH, MODEM
+ * signals not listed) are not driven.
+ */
+static bool efr32_rac_rx_level(uint32_t state)
+{
+    return state == EFR32_RAC_STATE_RXSEARCH ||
+           state == EFR32_RAC_STATE_RXFRAME;
+}
+
+static bool efr32_rac_lna_level(uint32_t state)
+{
+    return state == EFR32_RAC_STATE_RXWARM ||
+           state == EFR32_RAC_STATE_RXSEARCH ||
+           state == EFR32_RAC_STATE_RXFRAME ||
+           state == EFR32_RAC_STATE_RX2RX;
+}
+
+static void efr32_rac_prs_state(Efr32Periph *s, uint32_t state)
+{
+    efr32_prs_level(s, EFR32_PRS_SRC_RACL, EFR32_PRS_SIG_RACL_ACTIVE,
+                    state != EFR32_RAC_STATE_OFF);
+    efr32_prs_level(s, EFR32_PRS_SRC_RACL, EFR32_PRS_SIG_RACL_RX,
+                    efr32_rac_rx_level(state));
+    efr32_prs_level(s, EFR32_PRS_SRC_RACL, EFR32_PRS_SIG_RACL_TX,
+                    state == EFR32_RAC_STATE_TX);
+    efr32_prs_level(s, EFR32_PRS_SRC_RACL, EFR32_PRS_SIG_RACL_LNAEN,
+                    efr32_rac_lna_level(state));
+    efr32_prs_level(s, EFR32_PRS_SRC_RACL, EFR32_PRS_SIG_RACL_PAEN,
+                    state == EFR32_RAC_STATE_TX);
+}
+
+static void efr32_rac_prs_arm(Efr32Periph *s)
+{
+    int64_t next = MIN(s->prs_syncsent_ns, s->prs_framesent_ns);
+
+    if (next == INT64_MAX) {
+        timer_del(s->prs_radio_timer);
+    } else {
+        timer_mod(s->prs_radio_timer, next);
+    }
+}
+
+static void efr32_rac_prs_expired(void *opaque)
+{
+    Efr32Periph *s = EFR32_PERIPH(opaque);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (s->prs_syncsent_ns <= now) {
+        s->prs_syncsent_ns = INT64_MAX;
+        efr32_prs_pulse(s, EFR32_PRS_SRC_MODEMH, EFR32_PRS_SIG_MODEMH_SYNCSENT);
+    }
+    if (s->prs_framesent_ns <= now) {
+        s->prs_framesent_ns = INT64_MAX;
+        efr32_prs_pulse(s, EFR32_PRS_SRC_MODEM, EFR32_PRS_SIG_MODEM_FRAMESENT);
+    }
+    efr32_rac_prs_arm(s);
+}
+
+/* At TX entry, with s->tx_end_ns known. */
+static void efr32_rac_prs_tx_events(Efr32Periph *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    s->prs_syncsent_ns = s->prs &&
+        efr32_prs_selected(s->prs, EFR32_PRS_SRC_MODEMH,
+                           EFR32_PRS_SIG_MODEMH_SYNCSENT)
+        ? now + EFR32_RAC_TX_ENTRY_TO_SYNCSENT_NS : INT64_MAX;
+    s->prs_framesent_ns = s->prs &&
+        efr32_prs_selected(s->prs, EFR32_PRS_SRC_MODEM,
+                           EFR32_PRS_SIG_MODEM_FRAMESENT)
+        ? s->tx_end_ns - EFR32_RAC_FRAMESENT_TO_TX_EXIT_NS : INT64_MAX;
+    efr32_rac_prs_arm(s);
 }
 
 static void efr32_rac_capture_tx_snapshot(Efr32Periph *s);
@@ -1899,6 +2060,8 @@ static void efr32_rac_rx_frame_end(void *opaque)
         /* The frame has been detected: RXFRAME until EOF. */
         if (s->rac_state == EFR32_RAC_STATE_RXSEARCH) {
             efr32_rac_hardware_transition(s, EFR32_RAC_STATE_RXFRAME);
+            efr32_prs_pulse(s, EFR32_PRS_SRC_MODEML,
+                            EFR32_PRS_SIG_MODEML_FRAMEDET);
         }
         timer_mod(s->rac_frame_timer, s->rx_eof_ns);
         return;
@@ -1908,6 +2071,7 @@ static void efr32_rac_rx_frame_end(void *opaque)
         return;
     }
 
+    efr32_prs_pulse(s, EFR32_PRS_SRC_MODEMH, EFR32_PRS_SIG_MODEMH_EOF);
     data = g_bytes_get_data(s->rx_frame, &length);
     if (efr32_bufc_capacity(s, EFR32_RF_RX_BUFC_CHANNEL) &&
         efr32_bufc_count(s, EFR32_RF_RX_BUFC_CHANNEL) + length +
@@ -2020,6 +2184,8 @@ static void efr32_rac_cancel_tx_completion(Efr32Periph *s)
 {
     timer_del(s->rac_tx_timer);
     s->tx_waiting_for_synth = false;
+    s->prs_syncsent_ns = s->prs_framesent_ns = INT64_MAX;
+    efr32_rac_prs_arm(s);
 }
 
 /* The frame captured at TX entry ends at s->tx_end_ns (or now, if later). */
@@ -2381,11 +2547,13 @@ static void efr32_rac_capture_tx_snapshot(Efr32Periph *s)
         s->tx_end_ns = metadata.air_start_ns + efr32_rac_ook_tx(s, data->data, data->len) +
                        EFR32_RAC_FRAMESENT_TO_TX_EXIT_NS;
         g_byte_array_unref(data);
+        efr32_rac_prs_tx_events(s);
         return;
     }
     s->tx_end_ns = metadata.air_start_ns +
                    efr32_rf_le1m_airtime_ns(data->len) +
                    EFR32_RAC_FRAMESENT_TO_TX_EXIT_NS;
+    efr32_rac_prs_tx_events(s);
     snapshot = efr32_rf_medium_snapshot_tx(
         s->rf_medium, EFR32_RF_RADIO(s), &metadata, data->data, data->len,
         &error_abort);
@@ -3177,6 +3345,8 @@ static void efr32_burtc_process(Efr32Periph *s)
             trace_efr32bg22_burtc_compare_expire(s->endpoint_id, now,
                                                  efr32_burtc_cnt_at(s, e),
                                                  s->burtc_comp);
+            /* PRS BURTC COMP (RM Table 13.5) with IF.COMP. */
+            efr32_prs_pulse(s, EFR32_PRS_SRC_BURTC, EFR32_PRS_SIG_BURTC_COMP);
         }
         if (e_op == e) {
             efr32_burtc_rebase(s, e);
@@ -3644,6 +3814,8 @@ static void efr32_timer_schedule(Efr32Periph *s, int i)
 #define EFR32_TIMER_STATUS_OCBV_SHIFT 8
 #define EFR32_TIMER_BUF_TOPB (1u << 31)
 
+static void efr32_timer_prs_cc_level(Efr32Periph *s, int i, unsigned n);
+
 static bool efr32_timer_cc_is_pwm(Efr32Periph *s, int i, unsigned n)
 {
     return (efr32_timer_reg(s, i, EFR32_TIMER_CC_CFG(n)) &
@@ -3685,6 +3857,7 @@ static void efr32_timer_pwm_update(Efr32Periph *s, int i)
             qemu_set_irq(s->timer_cc_out[i * EFR32_TIMER0_CHANNELS + n],
                          level);
         }
+        efr32_timer_prs_cc_level(s, i, n);
         if (efr32_timer_counting(s, i) && efr32_timer_cc_is_pwm(s, i, n)) {
             uint64_t oc = efr32_timer_reg(s, i, EFR32_TIMER_CC_OC(n)) &
                           efr32_timers[i].width_mask;
@@ -3757,6 +3930,54 @@ static void efr32_timer0_schedule(Efr32Periph *s)
     }
 }
 
+/*
+ * PRS outputs (RM SS19.3.6, Tables 13.4/13.5): OF and UF are pulses; a CC
+ * channel pulses on its compare match or capture with CCn_CFG.PRSCONF =
+ * PULSE, and with PRSCONF = LEVEL follows its compare output
+ * (efr32_timer_prs_cc_level).  Each goes to both the asynchronous and the
+ * synchronous producer of the timer.
+ */
+static const uint8_t efr32_timer_prs_source[EFR32_TIMER_COUNT] = {
+    EFR32_PRS_SRC_TIMER0, EFR32_PRS_SRC_TIMER1, EFR32_PRS_SRC_TIMER2,
+    EFR32_PRS_SRC_TIMER3, EFR32_PRS_SRC_TIMER4,
+};
+static const uint8_t efr32_timer_prs_sync_source[EFR32_TIMER_COUNT] = {
+    EFR32_PRS_SYNC_SRC_TIMER0, EFR32_PRS_SYNC_SRC_TIMER1,
+    EFR32_PRS_SYNC_SRC_TIMER2, EFR32_PRS_SYNC_SRC_TIMER3,
+    EFR32_PRS_SYNC_SRC_TIMER4,
+};
+#define EFR32_TIMER_CFG_OSMEN (1u << 4)
+#define EFR32_TIMER_CC_CFG_PRSCONF_LEVEL (1u << 19)
+
+static void efr32_timer_prs_event(Efr32Periph *s, int i, unsigned signal)
+{
+    efr32_prs_pulse(s, efr32_timer_prs_source[i], signal);
+    efr32_prs_sync_pulse(s, efr32_timer_prs_sync_source[i], signal);
+}
+
+static void efr32_timer_prs_cc_event(Efr32Periph *s, int i, unsigned n)
+{
+    if (!(efr32_timer_reg(s, i, EFR32_TIMER_CC_CFG(n)) &
+          EFR32_TIMER_CC_CFG_PRSCONF_LEVEL)) {
+        efr32_timer_prs_event(s, i, EFR32_PRS_SIG_TIMER_CC(n));
+    }
+}
+
+static void efr32_timer_prs_cc_level(Efr32Periph *s, int i, unsigned n)
+{
+    bool level = (efr32_timer_reg(s, i, EFR32_TIMER_CC_CFG(n)) &
+                  EFR32_TIMER_CC_CFG_PRSCONF_LEVEL) && s->timer_cc_level[i][n];
+
+    if (level != s->timer_prs_level[i][n]) {
+        s->timer_prs_level[i][n] = level;
+        efr32_prs_level(s, efr32_timer_prs_source[i],
+                        EFR32_PRS_SIG_TIMER_CC(n), level);
+        qemu_set_irq(s->prs_sync[EFR32_PRS_LINE(
+                         efr32_timer_prs_sync_source[i],
+                         EFR32_PRS_SIG_TIMER_CC(n))], level);
+    }
+}
+
 static void efr32_timer_event(Efr32Periph *s, int i)
 {
     uint32_t flags = s->timers[i].pending_flags;
@@ -3771,8 +3992,280 @@ static void efr32_timer_event(Efr32Periph *s, int i)
                                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
                                      efr32_timer_counter(s, i), flags);
     }
+    /*
+     * One-shot (CFG.OSMEN, RM SS19.3.2.7): the hardware disables the
+     * counter on the first update event, the overflow in up-count mode.
+     * [I] It holds TOP afterwards (owo-open-fw scripts/bg22-tifs-probe.tcl:
+     * "a capture long after EOF reads TOP"); the RM does not say.
+     */
+    if ((flags & EFR32_TIMER_IF_OF) &&
+        (efr32_timer_reg(s, i, EFR32_TIMER_CFG) & EFR32_TIMER_CFG_OSMEN)) {
+        efr32_timer_rebase(s, i);
+        s->timers[i].running = false;
+        s->timers[i].base_count = efr32_timer_period(s, i) - 1;
+    }
     efr32_timer_update_irq(s, i);
     efr32_timer_schedule(s, i);
+    if (flags & EFR32_TIMER_IF_OF) {
+        efr32_timer_prs_event(s, i, EFR32_PRS_SIG_TIMER_OF);
+        /* RM SS19.3.6: each event also sets a DMA request; [I] a pulse. */
+        qemu_irq_pulse(s->timer_dma[i][EFR32_LDMA_SIG_TIMER_UFOF]);
+    }
+    for (unsigned n = 0; n < EFR32_TIMER0_CHANNELS; n++) {
+        if (flags & EFR32_TIMER_IF_CC(n)) {
+            efr32_timer_prs_cc_event(s, i, n);
+            qemu_irq_pulse(s->timer_dma[i][EFR32_LDMA_SIG_TIMER_CC(n)]);
+        }
+    }
+}
+
+/*
+ * ------------------------------------------------- TIMER input capture
+ *
+ * RM SS19.3.3.1-19.3.3.4 and SS19.3.2.2.  CCn_CFG.INSEL picks the channel
+ * input: PRSSYNC (the synchronous channel PRS_CONSUMER_TIMERn_CCx.SPRSSEL
+ * selects), PRSASYNCLEVEL or PRSASYNCPULSE (the asynchronous channel
+ * PRSSEL selects).
+ *  - PRSASYNCPULSE recognises edges directly (no level qualification).
+ *  - PRSASYNCLEVEL passes through the 2-clock input sampler: the new level
+ *    must hold for 2 HFPERCLKTIMERn (EM01GRPACLK) cycles, 7 with
+ *    CCn_CFG.FILT, and is recognised when it has.  A producer's pulse is
+ *    never seen in this mode, which is what silicon shows for the MODEM
+ *    events ("PRSASYNCLEVEL captured nothing", owo-open-fw
+ *    docs/radio-tables.md SS7.71).
+ *  - PRSSYNC is synchronous already: no sampler; [I] FILT's 5 cycles are
+ *    applied like the sampler's.
+ * A recognised edge that matches CCn_CTRL.ICEDGE captures CNT in input
+ * capture mode: a 2-entry FIFO read through CCn_ICF (popping; underflow
+ * sets IF.ICFUFn), CCn_ICOF the newest capture (overwritten on overflow,
+ * IF.ICFOFn), IF.ICFWLFULLn when the free entries are <= CCn_CFG.ICFWL,
+ * STATUS.ICFEMPTYn and CCPOLn (the edge of the oldest entry).  IF.CCn only
+ * while the timer runs ("the timer will only trigger interrupts when it is
+ * running"); the capture itself happens either way, as the probe's
+ * one-shot timer on silicon shows (captures after it stopped read TOP).
+ * Channel 0's input edges also run CTRL.RISEA / FALLA (start, stop,
+ * reload-and-start, the reload value being 0 in up-count), after the
+ * capture so a period capture reads the period (Figure 19.13).
+ * Debugger reads of CCn_ICF do not pop the FIFO (silicon, SS7.71).
+ * Timing: silicon puts CMD.START and a PRS SWPULSE reload-start within +-1
+ * timer cycle of each other (SS7.73); the edge acts at once here.
+ * [U] Not modelled: INSEL = PIN (no input path from the GPIO routes),
+ * the quadrature decoder, CC1 as the counter clock, DTI fault inputs, and
+ * the 3-clock minimum spacing of PRSASYNCPULSE events.
+ */
+#define EFR32_TIMER_CTRL_RISEA_SHIFT 0
+#define EFR32_TIMER_CTRL_FALLA_SHIFT 2
+#define EFR32_TIMER_CTRL_ACTION_MASK 0x3u
+#define EFR32_TIMER_ACTION_START 1u
+#define EFR32_TIMER_ACTION_STOP 2u
+#define EFR32_TIMER_ACTION_RELOADSTART 3u
+#define EFR32_TIMER_CC_CFG_MODE_INPUTCAPTURE 0x1u
+#define EFR32_TIMER_CC_CFG_INSEL_SHIFT 17
+#define EFR32_TIMER_CC_CFG_INSEL_MASK 0x3u
+#define EFR32_TIMER_INSEL_PIN 0u
+#define EFR32_TIMER_INSEL_PRSSYNC 1u
+#define EFR32_TIMER_INSEL_PRSASYNCLEVEL 2u
+#define EFR32_TIMER_INSEL_PRSASYNCPULSE 3u
+#define EFR32_TIMER_CC_CFG_FILT (1u << 20)
+#define EFR32_TIMER_CC_CFG_ICFWL (1u << 21)
+#define EFR32_TIMER_CC_CTRL_ICEDGE_SHIFT 24
+#define EFR32_TIMER_CC_CTRL_ICEDGE_MASK 0x3u
+#define EFR32_TIMER_ICEDGE_RISING 0u
+#define EFR32_TIMER_ICEDGE_FALLING 1u
+#define EFR32_TIMER_ICEDGE_BOTH 2u
+#define EFR32_TIMER_CC_ICF(n) (0x074u + 0x20u * (n))
+#define EFR32_TIMER_CC_ICOF(n) (0x078u + 0x20u * (n))
+#define EFR32_TIMER_IF_ICFWLFULL(n) (1u << (16 + (n)))
+#define EFR32_TIMER_IF_ICFOF(n) (1u << (20 + (n)))
+#define EFR32_TIMER_IF_ICFUF(n) (1u << (24 + (n)))
+#define EFR32_TIMER_STATUS_ICFEMPTY(n) (1u << (16 + (n)))
+#define EFR32_TIMER_STATUS_CCPOL(n) (1u << (24 + (n)))
+#define EFR32_TIMER_IC_FIFO_DEPTH 2u
+#define EFR32_TIMER_SAMPLER_CYCLES 2u
+#define EFR32_TIMER_FILTER_CYCLES 5u
+
+typedef typeof(((Efr32Periph *)0)->timer_ic[0][0]) Efr32TimerIc;
+
+static unsigned efr32_timer_insel(Efr32Periph *s, int i, unsigned n)
+{
+    return (efr32_timer_reg(s, i, EFR32_TIMER_CC_CFG(n)) >>
+            EFR32_TIMER_CC_CFG_INSEL_SHIFT) & EFR32_TIMER_CC_CFG_INSEL_MASK;
+}
+
+static void efr32_timer_ic_capture(Efr32Periph *s, int i, unsigned n,
+                                   bool rising)
+{
+    Efr32TimerIc *ic = &s->timer_ic[i][n];
+    uint32_t value = efr32_timer_counter(s, i);
+    uint32_t flags = 0;
+    unsigned free_entries;
+
+    if (ic->count < EFR32_TIMER_IC_FIFO_DEPTH) {
+        ic->fifo[ic->count] = value;
+        ic->fifo_falling[ic->count] = !rising;
+        ic->count++;
+    } else {
+        flags |= EFR32_TIMER_IF_ICFOF(n);
+    }
+    ic->icof = value;
+    free_entries = EFR32_TIMER_IC_FIFO_DEPTH - ic->count;
+    if (free_entries <= !!(efr32_timer_reg(s, i, EFR32_TIMER_CC_CFG(n)) &
+                           EFR32_TIMER_CC_CFG_ICFWL)) {
+        flags |= EFR32_TIMER_IF_ICFWLFULL(n);
+    }
+    if (efr32_timer_started(s, i)) {
+        flags |= EFR32_TIMER_IF_CC(n);
+    }
+    efr32_register_put(s, efr32_timers[i].base + EFR32_TIMER_IF,
+                       efr32_timer_reg(s, i, EFR32_TIMER_IF) | flags);
+    efr32_timer_update_irq(s, i);
+    efr32_timer_prs_cc_event(s, i, n);
+    qemu_irq_pulse(s->timer_dma[i][EFR32_LDMA_SIG_TIMER_CC(n)]);
+}
+
+static void efr32_timer_counter_action(Efr32Periph *s, int i, unsigned action)
+{
+    switch (action) {
+    case EFR32_TIMER_ACTION_START:
+        efr32_timer_rebase(s, i);
+        s->timers[i].running = true;
+        break;
+    case EFR32_TIMER_ACTION_STOP:
+        efr32_timer_rebase(s, i);
+        s->timers[i].running = false;
+        break;
+    case EFR32_TIMER_ACTION_RELOADSTART:
+        efr32_timer_rebase(s, i);
+        s->timers[i].base_count = 0;
+        s->timers[i].running = true;
+        break;
+    default:
+        return;
+    }
+    efr32_timer_schedule(s, i);
+    efr32_timer_pwm_update(s, i);
+}
+
+/* A recognised edge of channel @n's selected input. */
+static void efr32_timer_ic_edge(Efr32Periph *s, int i, unsigned n,
+                                bool rising)
+{
+    uint32_t cfg = efr32_timer_reg(s, i, EFR32_TIMER_CC_CFG(n));
+    unsigned edge = (efr32_timer_reg(s, i, EFR32_TIMER_CC_CTRL(n)) >>
+                     EFR32_TIMER_CC_CTRL_ICEDGE_SHIFT) &
+                    EFR32_TIMER_CC_CTRL_ICEDGE_MASK;
+
+    if (!efr32_timer_enabled(s, i)) {
+        return;
+    }
+    if ((cfg & EFR32_TIMER_CC_CFG_MODE_MASK) ==
+            EFR32_TIMER_CC_CFG_MODE_INPUTCAPTURE &&
+        (edge == EFR32_TIMER_ICEDGE_BOTH ||
+         (edge == EFR32_TIMER_ICEDGE_RISING && rising) ||
+         (edge == EFR32_TIMER_ICEDGE_FALLING && !rising))) {
+        efr32_timer_ic_capture(s, i, n, rising);
+    }
+    if (n == 0) {
+        uint32_t ctrl = efr32_timer_reg(s, i, EFR32_TIMER_CTRL);
+        unsigned action = (ctrl >> (rising ? EFR32_TIMER_CTRL_RISEA_SHIFT
+                                           : EFR32_TIMER_CTRL_FALLA_SHIFT)) &
+                          EFR32_TIMER_CTRL_ACTION_MASK;
+
+        efr32_timer_counter_action(s, i, action);
+    }
+}
+
+static void efr32_timer_ic_sampled(void *opaque)
+{
+    Efr32TimerIc *ic = opaque;
+    Efr32Periph *s = ic->owner;
+    unsigned insel = efr32_timer_insel(s, ic->timer, ic->channel);
+    bool level = insel == EFR32_TIMER_INSEL_PRSSYNC ? ic->sync_level
+                                                    : ic->async_level;
+
+    if (level != ic->sampled) {
+        ic->sampled = level;
+        efr32_timer_ic_edge(s, ic->timer, ic->channel, level);
+    }
+}
+
+static void efr32_timer_ic_input(Efr32Periph *s, int i, unsigned n,
+                                 bool sync, bool level)
+{
+    Efr32TimerIc *ic = &s->timer_ic[i][n];
+    unsigned insel = efr32_timer_insel(s, i, n);
+    unsigned cycles = 0;
+
+    if (sync) {
+        ic->sync_level = level;
+    } else {
+        ic->async_level = level;
+    }
+    if (sync != (insel == EFR32_TIMER_INSEL_PRSSYNC) ||
+        insel == EFR32_TIMER_INSEL_PIN) {
+        return;
+    }
+    if (insel == EFR32_TIMER_INSEL_PRSASYNCLEVEL) {
+        cycles = EFR32_TIMER_SAMPLER_CYCLES;
+    }
+    if (efr32_timer_reg(s, i, EFR32_TIMER_CC_CFG(n)) &
+        EFR32_TIMER_CC_CFG_FILT && insel != EFR32_TIMER_INSEL_PRSASYNCPULSE) {
+        cycles += EFR32_TIMER_FILTER_CYCLES;
+    }
+    if (!cycles) {
+        ic->sampled = level;
+        efr32_timer_ic_edge(s, i, n, level);
+        return;
+    }
+    timer_mod(ic->sampler, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                               efr32_cycles_ns(cycles, efr32_em01grpa_hz(s)));
+}
+
+static uint32_t efr32_timer_ic_status(Efr32Periph *s, int i)
+{
+    uint32_t status = 0;
+
+    /*
+     * [I] ICFEMPTYn resets to 0 (efr32bg22_timer.h, RM SS19.5.5), so it is
+     * taken to report an empty FIFO only for an enabled capture channel.
+     */
+    for (unsigned n = 0; n < EFR32_TIMER0_CHANNELS; n++) {
+        bool capture = efr32_timer_enabled(s, i) &&
+                       (efr32_timer_reg(s, i, EFR32_TIMER_CC_CFG(n)) &
+                        EFR32_TIMER_CC_CFG_MODE_MASK) ==
+                           EFR32_TIMER_CC_CFG_MODE_INPUTCAPTURE;
+
+        if (!s->timer_ic[i][n].count) {
+            status |= capture ? EFR32_TIMER_STATUS_ICFEMPTY(n) : 0;
+        } else if (s->timer_ic[i][n].fifo_falling[0]) {
+            status |= EFR32_TIMER_STATUS_CCPOL(n);
+        }
+    }
+    return status;
+}
+
+static uint32_t efr32_timer_ic_pop(Efr32Periph *s, int i, unsigned n)
+{
+    Efr32TimerIc *ic = &s->timer_ic[i][n];
+    uint32_t value;
+
+    if (!ic->count) {
+        /* [I] An empty FIFO reads the newest capture. */
+        if (!s->debugger_access) {
+            efr32_register_put(s, efr32_timers[i].base + EFR32_TIMER_IF,
+                               efr32_timer_reg(s, i, EFR32_TIMER_IF) |
+                                   EFR32_TIMER_IF_ICFUF(n));
+            efr32_timer_update_irq(s, i);
+        }
+        return ic->icof;
+    }
+    value = ic->fifo[0];
+    if (!s->debugger_access) {
+        ic->fifo[0] = ic->fifo[1];
+        ic->fifo_falling[0] = ic->fifo_falling[1];
+        ic->count--;
+    }
+    return value;
 }
 
 static void efr32_timer0_expired(void *opaque) { efr32_timer_event(EFR32_PERIPH(opaque), 0); }
@@ -3803,8 +4296,20 @@ static bool efr32_timer_read(Efr32Periph *s, uint32_t address, uint32_t *value)
     case EFR32_TIMER_CNT:
         *value = efr32_timer_counter(s, i);
         return true;
+    case EFR32_TIMER_CC_ICF(0):
+    case EFR32_TIMER_CC_ICF(1):
+    case EFR32_TIMER_CC_ICF(2):
+        *value = efr32_timer_ic_pop(s, i, (offset - EFR32_TIMER_CC_ICF(0)) /
+                                              0x20u);
+        return true;
+    case EFR32_TIMER_CC_ICOF(0):
+    case EFR32_TIMER_CC_ICOF(1):
+    case EFR32_TIMER_CC_ICOF(2):
+        *value = s->timer_ic[i][(offset - EFR32_TIMER_CC_ICOF(0)) / 0x20u].icof;
+        return true;
     case EFR32_TIMER_STATUS:
-        *value = (efr32_timer_started(s, i) ? EFR32_TIMER_STATUS_RUNNING : 0) |
+        *value = efr32_timer_ic_status(s, i) |
+                 (efr32_timer_started(s, i) ? EFR32_TIMER_STATUS_RUNNING : 0) |
                  (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) <
                           s->timers[i].sync_until_ns
                       ? EFR32_TIMER_STATUS_SYNCBUSY : 0) |
@@ -3848,9 +4353,21 @@ static void efr32_timer_write(Efr32Periph *s, uint32_t register_address,
         s->timers[i].base_count = (next & width) % efr32_timer_period(s, i);
         break;
     case EFR32_TIMER_STATUS:
+    case EFR32_TIMER_CC_ICF(0):
+    case EFR32_TIMER_CC_ICF(1):
+    case EFR32_TIMER_CC_ICF(2):
+    case EFR32_TIMER_CC_ICOF(0):
+    case EFR32_TIMER_CC_ICOF(1):
+    case EFR32_TIMER_CC_ICOF(2):
         break;
     case EFR32_TIMER_EN:
         efr32_register_put(s, register_address, next & EFR32_TIMER_EN_EN);
+        if (!(next & EFR32_TIMER_EN_EN)) {
+            /* [I] Disabling the TIMER empties its capture FIFOs. */
+            for (unsigned n = 0; n < EFR32_TIMER0_CHANNELS; n++) {
+                s->timer_ic[i][n].count = 0;
+            }
+        }
         break;
     case EFR32_TIMER_CFG:
         efr32_register_put(s, register_address, next & EFR32_TIMER_CFG_MASK);
@@ -3864,10 +4381,16 @@ static void efr32_timer_write(Efr32Periph *s, uint32_t register_address,
         s->timers[i].base_count %= efr32_timer_period(s, i);
         break;
     default:
+        /* Count-wide: TOPB and the CCn OC/OCB values; CCn_CTRL holds ICEDGE
+         * at bits 25:24 (efr32bg22_timer.h). */
         efr32_register_put(s, register_address,
                            efr32_timer_sync_reg(offset) &&
                            offset != EFR32_TIMER_CTRL &&
-                           offset != EFR32_TIMER_DTCTRL ? next & width : next);
+                           offset != EFR32_TIMER_DTCTRL &&
+                           offset != EFR32_TIMER_CC_CTRL(0) &&
+                           offset != EFR32_TIMER_CC_CTRL(1) &&
+                           offset != EFR32_TIMER_CC_CTRL(2)
+                               ? next & width : next);
         if (offset == EFR32_TIMER_TOPB) {
             s->timer_buf_pending[i] |= EFR32_TIMER_BUF_TOPB;
         }
@@ -3902,8 +4425,20 @@ static void efr32_timers_reset(Efr32Periph *s)
         timer_del(s->timer_pwm[i]);
         s->timer_buf_pending[i] = 0;
         for (unsigned n = 0; n < EFR32_TIMER0_CHANNELS; n++) {
+            Efr32TimerIc *ic = &s->timer_ic[i][n];
+
             s->timer_cc_level[i][n] = false;
             qemu_set_irq(s->timer_cc_out[i * EFR32_TIMER0_CHANNELS + n], 0);
+            timer_del(ic->sampler);
+            ic->count = 0;
+            ic->icof = 0;
+            ic->sampled = ic->async_level;
+            s->timer_prs_level[i][n] = false;
+            efr32_prs_level(s, efr32_timer_prs_source[i],
+                            EFR32_PRS_SIG_TIMER_CC(n), false);
+            qemu_set_irq(s->prs_sync[EFR32_PRS_LINE(
+                             efr32_timer_prs_sync_source[i],
+                             EFR32_PRS_SIG_TIMER_CC(n))], 0);
         }
     }
 }
@@ -3935,9 +4470,10 @@ static void efr32_pa_ramp_complete(Efr32Periph *s)
  * registers use the new immediate synchronization scheme" (SS15.3.1): writes
  * take effect at once and SYNCBUSY reads 0.
  * [I] IF.CCn sets on the LF edge where CNT becomes OCVALUE (the figure, not
- * a measurement; BURTC on silicon fires when CNT leaves COMP).  [U] Not
- * modelled: CNTTICK = CCV0MATCH, COMPBASE = PRECNT, CCV1TOP, input
- * capture, PRS outputs, LOCK; the timing of every edge is unmeasured.
+ * a measurement; BURTC on silicon fires when CNT leaves COMP).  Input
+ * capture from the PRS and the CCn PRS outputs: efr32_rtcc_prs_input,
+ * efr32_rtcc_compare_output.  [U] Not modelled: CNTTICK = CCV0MATCH,
+ * COMPBASE = PRECNT, CCV1TOP, LOCK; the timing of every edge is unmeasured.
  */
 #define EFR32_RTCC_IRQ 12
 #define EFR32_RTCC_EN 0x004u
@@ -4055,6 +4591,43 @@ static bool efr32_rtcc_cc_compares(Efr32Periph *s, unsigned channel)
            !(ctrl & EFR32_RTCC_CC_CTRL_COMPBASE_PRECNT);
 }
 
+/*
+ * CCn PRS outputs (RM SS15.3.2-15.3.3, Figure 15.3): on a compare match
+ * CCn_CTRL.CMOA pulses (one LFCLKRTCC cycle on silicon; see efr32-prs.c),
+ * toggles, clears or sets the channel's output, PRS producer RTCC CCVn.
+ */
+#define EFR32_RTCC_CC_CTRL_CMOA_SHIFT 2
+#define EFR32_RTCC_CC_CTRL_CMOA_MASK 0x3u
+#define EFR32_RTCC_CMOA_PULSE 0u
+#define EFR32_RTCC_CMOA_TOGGLE 1u
+#define EFR32_RTCC_CMOA_CLEAR 2u
+#define EFR32_RTCC_CMOA_SET 3u
+
+static void efr32_rtcc_compare_output(Efr32Periph *s, unsigned channel)
+{
+    uint32_t ctrl = efr32_rtcc_get(s, EFR32_RTCC_CC0_CTRL +
+                                          channel * EFR32_RTCC_CC_STRIDE);
+    bool *level = &s->rtcc_ccv[channel];
+
+    switch ((ctrl >> EFR32_RTCC_CC_CTRL_CMOA_SHIFT) &
+            EFR32_RTCC_CC_CTRL_CMOA_MASK) {
+    case EFR32_RTCC_CMOA_PULSE:
+        efr32_prs_pulse(s, EFR32_PRS_SRC_RTCC, EFR32_PRS_SIG_RTCC_CCV(channel));
+        return;
+    case EFR32_RTCC_CMOA_TOGGLE:
+        *level = !*level;
+        break;
+    case EFR32_RTCC_CMOA_CLEAR:
+        *level = false;
+        break;
+    default:
+        *level = true;
+        break;
+    }
+    efr32_prs_level(s, EFR32_PRS_SRC_RTCC, EFR32_PRS_SIG_RTCC_CCV(channel),
+                    *level);
+}
+
 /* Latch every event up to now, then arm the timer for the next one. */
 static void efr32_rtcc_process(Efr32Periph *s)
 {
@@ -4095,6 +4668,12 @@ static void efr32_rtcc_process(Efr32Periph *s)
         efr32_register_put(s, EFR32_RTCC_BASE + EFR32_RTCC_IF,
                            efr32_rtcc_get(s, EFR32_RTCC_IF) | flags);
         efr32_rtcc_update_irq(s);
+    }
+    for (unsigned channel = 0; channel < EFR32_RTCC_CC_COUNT; channel++) {
+        if (flags & (EFR32_RTCC_IF_CC0 << (channel *
+                                           EFR32_RTCC_IF_CC_STRIDE))) {
+            efr32_rtcc_compare_output(s, channel);
+        }
     }
     if (next != INT64_MAX) {
         timer_mod(s->rtcc_timer,
@@ -4194,9 +4773,52 @@ static bool efr32_rtcc_write(Efr32Periph *s, uint32_t offset, uint32_t next)
     return true;
 }
 
+/*
+ * Input capture (RM SS15.3.2): with CCn_CTRL.MODE = INPUTCAPTURE an edge of
+ * the PRS channel PRS_CONSUMER_RTCC_CCn selects that matches ICEDGE
+ * captures CNT into CCn_ICVALUE and sets IF.CCn.  [I] The edge acts at once
+ * (on silicon the PRS input is synchronised to LFCLKRTCC first).
+ */
+#define EFR32_RTCC_CC_ICVALUE 0x008u
+#define EFR32_RTCC_CC_CTRL_MODE_INPUTCAPTURE 0x1u
+#define EFR32_RTCC_CC_CTRL_ICEDGE_SHIFT 5
+#define EFR32_RTCC_CC_CTRL_ICEDGE_MASK 0x3u
+
+static void efr32_rtcc_prs_input(Efr32Periph *s, unsigned channel,
+                                 bool rising)
+{
+    uint32_t base = EFR32_RTCC_CC0_CTRL + channel * EFR32_RTCC_CC_STRIDE;
+    uint32_t ctrl = efr32_rtcc_get(s, base);
+    unsigned edge = (ctrl >> EFR32_RTCC_CC_CTRL_ICEDGE_SHIFT) &
+                    EFR32_RTCC_CC_CTRL_ICEDGE_MASK;
+
+    if ((ctrl & EFR32_RTCC_CC_CTRL_MODE_MASK) !=
+            EFR32_RTCC_CC_CTRL_MODE_INPUTCAPTURE ||
+        !(efr32_rtcc_get(s, EFR32_RTCC_EN) & EFR32_RTCC_EN_EN) ||
+        !(edge == EFR32_TIMER_ICEDGE_BOTH ||
+          (edge == EFR32_TIMER_ICEDGE_RISING && rising) ||
+          (edge == EFR32_TIMER_ICEDGE_FALLING && !rising))) {
+        return;
+    }
+    efr32_rtcc_process(s);
+    efr32_register_put(s, EFR32_RTCC_BASE + base + EFR32_RTCC_CC_ICVALUE,
+                       efr32_rtcc_cnt_of(s, efr32_rtcc_pos_at(
+                                                s, s->rtcc_last_edge)));
+    efr32_register_put(s, EFR32_RTCC_BASE + EFR32_RTCC_IF,
+                       efr32_rtcc_get(s, EFR32_RTCC_IF) |
+                           (EFR32_RTCC_IF_CC0 << (channel *
+                                                  EFR32_RTCC_IF_CC_STRIDE)));
+    efr32_rtcc_update_irq(s);
+}
+
 static void efr32_rtcc_reset(Efr32Periph *s)
 {
     timer_del(s->rtcc_timer);
+    for (unsigned channel = 0; channel < EFR32_RTCC_CC_COUNT; channel++) {
+        s->rtcc_ccv[channel] = false;
+        efr32_prs_level(s, EFR32_PRS_SRC_RTCC, EFR32_PRS_SIG_RTCC_CCV(channel),
+                        false);
+    }
     s->rtcc_run = false;
     s->rtcc_pos_base = 0;
     s->rtcc_edge_base = 0;
@@ -4704,8 +5326,11 @@ static bool efr32_cmu_wdoglock_write(Efr32Periph *s, uint32_t key,
  * complete: commands are accepted and nothing ever comes out.
  * Results arrive after the RM's warm-up and conversion times
  * (efr32_iadc_queue: OSR, ADC_CLK, WARMUPMODE, TIMEBASE; [I] unmeasured).
- * [U] Not modelled: timer and PRS triggers, oversampling's effect on the
- * value and 16/20-bit results, the window comparator, SUPPLY inputs.
+ * Triggers (local timer, PRS, continuous): efr32_iadc_request and around.
+ * Output resolution, 16/20-bit alignment and the window comparator:
+ * efr32_iadc_convert, efr32_iadc_window_hit.
+ * [U] Not modelled: bipolar output (TWOSCOMPL, differential inputs below
+ * 0 read 0), gain/offset calibration (SCALEx), SUPPLY inputs.
  */
 #define EFR32_IADC_BASE 0x4a004000u
 #define EFR32_IADC_IRQ 48
@@ -4721,6 +5346,7 @@ static bool efr32_cmu_wdoglock_write(Efr32Periph *s, uint32_t key,
 #define EFR32_IADC_STATUS_SCANQEN (1u << 3)
 #define EFR32_IADC_STATUS_CONVERTING (1u << 6)
 #define EFR32_IADC_STATUS_ADCWARM (1u << 30)
+#define EFR32_IADC_STATUS_TIMERACTIVE (1u << 16)
 #define EFR32_IADC_MASKREQ 0x018u
 #define EFR32_IADC_MASKREQ_MASK 0xffffu
 #define EFR32_IADC_IF 0x024u
@@ -4767,7 +5393,15 @@ static bool efr32_cmu_wdoglock_write(Efr32Periph *s, uint32_t key,
 #define EFR32_IADC_PORT_GPIO_FIRST 8u /* PORTA; PORTB 9, PORTC 10, PORTD 11 */
 #define EFR32_IADC_FIFO_DEPTH 4
 #define EFR32_IADC_RESULT_BITS 12
-#define EFR32_IADC_LEFT12_SHIFT 4
+#define EFR32_IADC_WORD_BITS 20
+#define EFR32_IADC_CFG_OSRHS_SHIFT 2
+#define EFR32_IADC_CFG_OSRHS_MASK 0x7u
+#define EFR32_IADC_CFG_DIGAVG_SHIFT 21
+#define EFR32_IADC_CFG_DIGAVG_MASK 0x7u
+#define EFR32_IADC_FIFOCFG_ALIGNMENT_RIGHT16 1u
+#define EFR32_IADC_FIFOCFG_ALIGNMENT_RIGHT20 2u
+#define EFR32_IADC_FIFOCFG_ALIGNMENT_LEFT16 4u
+#define EFR32_IADC_FIFOCFG_ALIGNMENT_LEFT20 5u
 /* SHOWID: entry index in bits 31:24 (right-aligned), 7:0 (left-aligned). */
 #define EFR32_IADC_ID_RIGHT_SHIFT 24
 #define EFR32_IADC_SINGLE_ID 0x20u
@@ -4815,8 +5449,18 @@ static void efr32_iadc_update(Efr32Periph *s)
                         EFR32_IADC_STATUS_SINGLEQEN |
                         EFR32_IADC_STATUS_SCANQEN |
                         EFR32_IADC_STATUS_CONVERTING |
-                        EFR32_IADC_STATUS_ADCWARM);
+                        EFR32_IADC_STATUS_ADCWARM |
+                        EFR32_IADC_STATUS_TIMERACTIVE);
 
+    if (s->iadc_qen[0]) {
+        status |= EFR32_IADC_STATUS_SINGLEQEN;
+    }
+    if (s->iadc_qen[1]) {
+        status |= EFR32_IADC_STATUS_SCANQEN;
+    }
+    if (s->iadc_timer_on) {
+        status |= EFR32_IADC_STATUS_TIMERACTIVE;
+    }
     for (unsigned i = 0; i < s->iadc_nconv; i++) {
         status |= EFR32_IADC_STATUS_CONVERTING |
                   (s->iadc_conv[i].queue ? EFR32_IADC_STATUS_SCANQEN
@@ -4864,7 +5508,7 @@ static uint32_t efr32_iadc_input_mv(Efr32Periph *s, uint32_t port,
 
 /* Convert the input an entry (SINGLE or a SCANTABLE word) selects. */
 static uint32_t efr32_iadc_convert(Efr32Periph *s, uint32_t input,
-                                   uint32_t fifocfg)
+                                   uint32_t fifocfg, uint32_t *code12)
 {
     uint32_t cfg = efr32_iadc_get(s, EFR32_IADC_CFG0 +
                                          ((input & EFR32_IADC_INPUT_CFG)
@@ -4878,7 +5522,7 @@ static uint32_t efr32_iadc_convert(Efr32Periph *s, uint32_t input,
                     : refsel == EFR32_IADC_CFG_REFSEL_VBGR
                         ? EFR32_IADC_VBGR_MV
                         : 0;
-    uint32_t full = (1u << EFR32_IADC_RESULT_BITS) - 1;
+    uint32_t full;
     uint64_t pos = efr32_iadc_input_mv(
         s, (input >> EFR32_IADC_INPUT_PORTPOS_SHIFT) &
                EFR32_IADC_INPUT_FIELD_MASK,
@@ -4889,8 +5533,21 @@ static uint32_t efr32_iadc_convert(Efr32Periph *s, uint32_t input,
                EFR32_IADC_INPUT_FIELD_MASK,
         (input >> EFR32_IADC_INPUT_PINNEG_SHIFT) &
             EFR32_IADC_INPUT_FIELD_MASK);
+    /*
+     * Output resolution (RM SS24.3.7.4): 11 + log2(OSR x DIGAVG) bits, at
+     * most 20, MSB-aligned in the 20-bit word and truncated to the 12, 16
+     * or 20 bits ALIGNMENT asks for (Figure 24.17).
+     */
+    unsigned osr_log2 = 1 + ((cfg >> EFR32_IADC_CFG_OSRHS_SHIFT) &
+                             EFR32_IADC_CFG_OSRHS_MASK);
+    unsigned avg_log2 = MIN((cfg >> EFR32_IADC_CFG_DIGAVG_SHIFT) &
+                            EFR32_IADC_CFG_DIGAVG_MASK, 4u);
+    unsigned bits = MIN(EFR32_IADC_RESULT_BITS - 1 + osr_log2 + avg_log2,
+                        EFR32_IADC_WORD_BITS);
     uint64_t code;
+    uint32_t code20;
 
+    full = (1u << bits) - 1;
     if (!vref || gain >= ARRAY_SIZE(efr32_iadc_gain_half) || pos <= neg) {
         code = 0;
     } else {
@@ -4899,11 +5556,48 @@ static uint32_t efr32_iadc_convert(Efr32Periph *s, uint32_t input,
                    ((pos - neg) * efr32_iadc_gain_half[gain] * full +
                     vref) / (2 * (uint64_t)vref));
     }
-    if ((fifocfg & EFR32_IADC_FIFOCFG_ALIGNMENT_MASK) ==
-        EFR32_IADC_FIFOCFG_ALIGNMENT_LEFT12) {
-        code <<= EFR32_IADC_LEFT12_SHIFT;
+    code20 = code << (EFR32_IADC_WORD_BITS - bits);
+    if (code12) {
+        *code12 = code20 >> (EFR32_IADC_WORD_BITS - EFR32_IADC_RESULT_BITS);
     }
-    return code;
+    switch (fifocfg & EFR32_IADC_FIFOCFG_ALIGNMENT_MASK) {
+    case EFR32_IADC_FIFOCFG_ALIGNMENT_RIGHT16:
+        return code20 >> 4;
+    case EFR32_IADC_FIFOCFG_ALIGNMENT_RIGHT20:
+        return code20;
+    case EFR32_IADC_FIFOCFG_ALIGNMENT_LEFT12:
+        return (code20 >> 8) << 20;
+    case EFR32_IADC_FIFOCFG_ALIGNMENT_LEFT16:
+        return (code20 >> 4) << 16;
+    case EFR32_IADC_FIFOCFG_ALIGNMENT_LEFT20:
+        return code20 << 12;
+    default:
+        return code20 >> 8;
+    }
+}
+
+/*
+ * Window compare (RM SS24.3.8): for an input with its CMP bit, the 12-bit
+ * result against the upper 12 bits of CMPTHR's 16-bit left-justified ADGT
+ * (>=) and ADLT (<=): inside the window when ADLT >= ADGT, outside it
+ * otherwise.
+ */
+#define EFR32_IADC_CMPTHR 0x01cu
+#define EFR32_IADC_CMPTHR_ADGT_SHIFT 16
+#define EFR32_IADC_CMPTHR_FIELD_MASK 0xfff0u
+#define EFR32_IADC_INPUT_CMP (1u << 17)
+#define EFR32_IADC_IF_SINGLECMP (1u << 2)
+#define EFR32_IADC_IF_SCANCMP (1u << 3)
+
+static bool efr32_iadc_window_hit(Efr32Periph *s, uint32_t code12)
+{
+    uint32_t thr = efr32_iadc_get(s, EFR32_IADC_CMPTHR);
+    uint32_t lt = thr & EFR32_IADC_CMPTHR_FIELD_MASK;
+    uint32_t gt = (thr >> EFR32_IADC_CMPTHR_ADGT_SHIFT) &
+                  EFR32_IADC_CMPTHR_FIELD_MASK;
+    uint32_t data = code12 << 4;
+
+    return lt >= gt ? data <= lt && data >= gt : data <= lt || data >= gt;
 }
 
 /* Push one result into a queue's FIFO; returns the IF bits it raises. */
@@ -4917,7 +5611,8 @@ static uint32_t efr32_iadc_push(Efr32Periph *s, unsigned q,
     uint32_t flags = 0;
 
     if (fifocfg & EFR32_IADC_FIFOCFG_SHOWID) {
-        result |= (fifocfg & EFR32_IADC_FIFOCFG_ALIGNMENT_MASK) ==
+        /* Figure 24.18: bits 7:0 when left-aligned, 31:24 when right. */
+        result |= (fifocfg & EFR32_IADC_FIFOCFG_ALIGNMENT_MASK) >=
                           EFR32_IADC_FIFOCFG_ALIGNMENT_LEFT12
                       ? id
                       : id << EFR32_IADC_ID_RIGHT_SHIFT;
@@ -4948,9 +5643,8 @@ static uint32_t efr32_iadc_push(Efr32Periph *s, unsigned q,
  *  - Each conversion: ((4 * OSR) + 2) ADC_CLK cycles, OSR = 2 << OSRHS, plus
  *    2 ADC_CLK cycles when the input changes from the previous conversion.
  *  - Requests are served in the order they arrive (SINGLETAILGATE off); the
- *    input is sampled when its conversion completes.  [U] TIMER and PRS
- *    triggers, continuous trigger actions, tailgating, 16/20-bit modes and
- *    the window comparator are not modelled (IMMEDIATE, ONCE).
+ *    input is sampled when its conversion completes.  Triggers: see
+ *    efr32_iadc_command.
  */
 #define EFR32_IADC_CTRL 0x008u
 #define EFR32_IADC_CTRL_WARMUPMODE_SHIFT 4
@@ -5015,7 +5709,8 @@ static void efr32_iadc_queue(Efr32Periph *s, unsigned queue, unsigned id,
     if (!adc_hz || s->iadc_nconv == ARRAY_SIZE(s->iadc_conv)) {
         return;
     }
-    t = MAX(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), s->iadc_busy_until_ns);
+    t = MAX(MAX(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), s->iadc_request_ns),
+            s->iadc_busy_until_ns);
     key = prescale | (cfg & EFR32_IADC_CFG_ADCMODE_MASK) << 10 |
           ((cfg >> EFR32_IADC_CFG_REFSEL_SHIFT) &
            EFR32_IADC_CFG_REFSEL_MASK) << 12;
@@ -5033,7 +5728,9 @@ static void efr32_iadc_queue(Efr32Periph *s, unsigned queue, unsigned id,
     }
     osr = 2u << ((cfg >> EFR32_IADC_CFG_OSRHS_SHIFT) &
                  EFR32_IADC_CFG_OSRHS_MASK);
-    cycles = 4 * osr + 2;
+    /* DIGAVG: 1-16 conversions back to back per result (SS24.3.7.3). */
+    cycles = (4 * osr + 2) << MIN((cfg >> EFR32_IADC_CFG_DIGAVG_SHIFT) &
+                                  EFR32_IADC_CFG_DIGAVG_MASK, 4u);
     if (s->iadc_have_input && input != s->iadc_last_input) {
         cycles += EFR32_IADC_CONV_SWITCH_CYCLES;
     }
@@ -5052,6 +5749,9 @@ static void efr32_iadc_queue(Efr32Periph *s, unsigned queue, unsigned id,
     timer_mod(s->iadc_timer, s->iadc_conv[0].done_ns);
 }
 
+static bool efr32_iadc_continuous(Efr32Periph *s, unsigned q);
+static void efr32_iadc_request(Efr32Periph *s, unsigned q, int64_t at);
+
 /* Conversions whose time has come deliver their results. */
 static void efr32_iadc_complete(void *opaque)
 {
@@ -5059,15 +5759,25 @@ static void efr32_iadc_complete(void *opaque)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     uint32_t flags = 0;
     unsigned done = 0;
+    bool request_done[2] = { false, false };
 
     while (done < s->iadc_nconv && s->iadc_conv[done].done_ns <= now) {
         typeof(s->iadc_conv[0]) *c = &s->iadc_conv[done++];
         const Efr32IadcQueue *queue = c->queue ? &efr32_iadc_scan
                                                : &efr32_iadc_single;
+        uint32_t code12;
         uint32_t result = efr32_iadc_convert(s, c->input,
                                              efr32_iadc_get(s,
-                                                            queue->fifocfg));
+                                                            queue->fifocfg),
+                                             &code12);
 
+        if ((c->input & EFR32_IADC_INPUT_CMP) &&
+            efr32_iadc_window_hit(s, code12)) {
+            flags |= c->queue ? EFR32_IADC_IF_SCANCMP
+                              : EFR32_IADC_IF_SINGLECMP;
+        }
+
+        request_done[c->queue] |= c->last;
         flags |= efr32_iadc_push(s, c->queue, queue, result, c->id);
         if (c->queue) {
             flags |= EFR32_IADC_IF_SCANENTRYDONE;
@@ -5079,26 +5789,110 @@ static void efr32_iadc_complete(void *opaque)
     memmove(s->iadc_conv, s->iadc_conv + done,
             (s->iadc_nconv - done) * sizeof(s->iadc_conv[0]));
     s->iadc_nconv -= done;
+    for (unsigned q = 0; q < 2; q++) {
+        if (request_done[q] && s->iadc_qen[q] && efr32_iadc_continuous(s, q)) {
+            efr32_iadc_request(s, q, now);
+        }
+    }
     if (s->iadc_nconv) {
         timer_mod(s->iadc_timer, s->iadc_conv[0].done_ns);
     }
     efr32_iadc_put(s, EFR32_IADC_IF, efr32_iadc_get(s, EFR32_IADC_IF) | flags);
     efr32_iadc_update(s);
+    /* PRS IADC0 producers, both tables (RM 13.4, 13.5), with their flags. */
+    {
+        static const struct {
+            uint32_t flag;
+            unsigned signal;
+        } prs[] = {
+            { EFR32_IADC_IF_SCANENTRYDONE, EFR32_PRS_SIG_IADC_SCANENTRYDONE },
+            { EFR32_IADC_IF_SCANTABLEDONE, EFR32_PRS_SIG_IADC_SCANTABLEDONE },
+            { EFR32_IADC_IF_SINGLEDONE, EFR32_PRS_SIG_IADC_SINGLEDONE },
+        };
+
+        for (unsigned n = 0; n < ARRAY_SIZE(prs); n++) {
+            if (flags & prs[n].flag) {
+                efr32_prs_pulse(s, EFR32_PRS_SRC_IADC0, prs[n].signal);
+                efr32_prs_sync_pulse(s, EFR32_PRS_SYNC_SRC_IADC0,
+                                     prs[n].signal);
+            }
+        }
+    }
 }
 
-static void efr32_iadc_command(Efr32Periph *s, uint32_t command)
+/*
+ * Triggers (RM SS24.3.3.3, SS24.5.4, SS24.5.12).  CMD.SINGLESTART /
+ * SCANSTART enable a queue's trigger and xSTOP disables it (STATUS.xQEN),
+ * dropping its conversions not yet started.  TRIGGER.xTRIGSEL:
+ *  - IMMEDIATE: START itself is the trigger; with xTRIGACTION = ONCE the
+ *    queue is disabled again once its request is converted.
+ *  - TIMER: the local timer (CMD.TIMEREN / TIMERDIS, STATUS.TIMERACTIVE)
+ *    triggers every IADC_TIMER.TIMER CLK_SRC_ADC cycles.  [I] Its first
+ *    event comes one period after TIMEREN.
+ *  - PRSCLKGRP: a rising edge of the synchronous PRS channel
+ *    (PRS_CONSUMER_IADC0_xTRIGGER.SPRSSEL), at once.
+ *  - PRSPOS / PRSNEG: a rising / falling edge of the asynchronous channel
+ *    (PRSSEL), "an additional delay of 1 to 2 CLK_SRC_ADC cycles for
+ *    synchronization" ([I] 2 here).
+ * PRS0 (the scan trigger) is PRS_CONSUMER_IADC0_SCANTRIGGER, PRS1 the
+ * single one.  xTRIGACTION = CONTINUOUS requests again as soon as a request
+ * has been converted, while the queue stays enabled.
+ * [U] Not modelled: SINGLETAILGATE (requests are served in arrival order),
+ * the 3-ADC_CLK re-arm time of PRSPOS/PRSNEG.
+ */
+#define EFR32_IADC_TIMER 0x010u
+#define EFR32_IADC_TIMER_MASK 0xffffu
+#define EFR32_IADC_TRIGGER 0x02cu
+#define EFR32_IADC_TRIGGER_SCANTRIGSEL_SHIFT 0
+#define EFR32_IADC_TRIGGER_SINGLETRIGSEL_SHIFT 8
+#define EFR32_IADC_TRIGGER_TRIGSEL_MASK 0x7u
+#define EFR32_IADC_TRIGGER_SCANTRIGACTION (1u << 4)
+#define EFR32_IADC_TRIGGER_SINGLETRIGACTION (1u << 12)
+#define EFR32_IADC_TRIGSEL_IMMEDIATE 0u
+#define EFR32_IADC_TRIGSEL_TIMER 1u
+#define EFR32_IADC_TRIGSEL_PRSCLKGRP 2u
+#define EFR32_IADC_TRIGSEL_PRSPOS 3u
+#define EFR32_IADC_TRIGSEL_PRSNEG 4u
+#define EFR32_IADC_CMD_SINGLESTOP (1u << 1)
+#define EFR32_IADC_CMD_SCANSTOP (1u << 4)
+#define EFR32_IADC_CMD_TIMEREN (1u << 16)
+#define EFR32_IADC_CMD_TIMERDIS (1u << 17)
+#define EFR32_IADC_PRS_SYNC_CYCLES 2u
+
+static uint64_t efr32_iadc_src_hz(Efr32Periph *s)
 {
-    if (command & EFR32_IADC_CMD_SINGLEFIFOFLUSH) {
-        s->iadc_fifo[0].count = 0;
+    return efr32_iadc_cmu_hz(s) /
+           (((efr32_iadc_get(s, EFR32_IADC_CTRL) >>
+              EFR32_IADC_CTRL_HSCLKRATE_SHIFT) &
+             EFR32_IADC_CTRL_HSCLKRATE_MASK) + 1);
+}
+
+static unsigned efr32_iadc_trigsel(Efr32Periph *s, unsigned q)
+{
+    return (efr32_iadc_get(s, EFR32_IADC_TRIGGER) >>
+            (q ? EFR32_IADC_TRIGGER_SCANTRIGSEL_SHIFT
+               : EFR32_IADC_TRIGGER_SINGLETRIGSEL_SHIFT)) &
+           EFR32_IADC_TRIGGER_TRIGSEL_MASK;
+}
+
+static bool efr32_iadc_continuous(Efr32Periph *s, unsigned q)
+{
+    return efr32_iadc_get(s, EFR32_IADC_TRIGGER) &
+           (q ? EFR32_IADC_TRIGGER_SCANTRIGACTION
+              : EFR32_IADC_TRIGGER_SINGLETRIGACTION);
+}
+
+/* One request of queue @q (single: SINGLE; scan: the MASKREQ entries). */
+static void efr32_iadc_request(Efr32Periph *s, unsigned q, int64_t at)
+{
+    if (s->iadc_stall) {
+        return;
     }
-    if (command & EFR32_IADC_CMD_SCANFIFOFLUSH) {
-        s->iadc_fifo[1].count = 0;
-    }
-    if ((command & EFR32_IADC_CMD_SINGLESTART) && !s->iadc_stall) {
+    s->iadc_request_ns = at;
+    if (!q) {
         efr32_iadc_queue(s, 0, EFR32_IADC_SINGLE_ID,
                          efr32_iadc_get(s, EFR32_IADC_SINGLE), true);
-    }
-    if ((command & EFR32_IADC_CMD_SCANSTART) && !s->iadc_stall) {
+    } else {
         uint32_t mask = efr32_iadc_get(s, EFR32_IADC_MASKREQ) &
                         EFR32_IADC_MASKREQ_MASK;
 
@@ -5110,6 +5904,124 @@ static void efr32_iadc_command(Efr32Periph *s, uint32_t command)
                                  !(mask >> (id + 1)));
             }
         }
+    }
+    s->iadc_request_ns = 0;
+}
+
+static void efr32_iadc_local_timer_arm(Efr32Periph *s)
+{
+    uint32_t period = efr32_iadc_get(s, EFR32_IADC_TIMER) &
+                      EFR32_IADC_TIMER_MASK;
+    uint64_t hz = efr32_iadc_src_hz(s);
+
+    timer_del(s->iadc_local_timer);
+    if (s->iadc_timer_on && period && hz) {
+        timer_mod(s->iadc_local_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      efr32_cycles_ns(period, hz));
+    }
+}
+
+static void efr32_iadc_local_timer_expired(void *opaque)
+{
+    Efr32Periph *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    for (unsigned q = 0; q < 2; q++) {
+        if (s->iadc_qen[q] &&
+            efr32_iadc_trigsel(s, q) == EFR32_IADC_TRIGSEL_TIMER) {
+            efr32_iadc_request(s, q, now);
+        }
+    }
+    efr32_iadc_local_timer_arm(s);
+    efr32_iadc_update(s);
+}
+
+/* PRS consumer lines of the IADC (efr32-prs.h numbering). */
+static void efr32_iadc_prs_trigger(Efr32Periph *s, int n, bool sync,
+                                   bool level)
+{
+    unsigned q, trigsel;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (n == EFR32_PRS_CON_IADC0_SCANTRIGGER) {
+        q = 1;
+    } else if (n == EFR32_PRS_CON_IADC0_SINGLETRIGGER) {
+        q = 0;
+    } else {
+        return;
+    }
+    if (!s->iadc_qen[q]) {
+        return;
+    }
+    trigsel = efr32_iadc_trigsel(s, q);
+    if (sync) {
+        if (trigsel == EFR32_IADC_TRIGSEL_PRSCLKGRP && level) {
+            efr32_iadc_request(s, q, now);
+        }
+    } else if ((trigsel == EFR32_IADC_TRIGSEL_PRSPOS && level) ||
+               (trigsel == EFR32_IADC_TRIGSEL_PRSNEG && !level)) {
+        uint64_t hz = efr32_iadc_src_hz(s);
+
+        if (hz) {
+            efr32_iadc_request(s, q, now + efr32_cycles_ns(
+                                              EFR32_IADC_PRS_SYNC_CYCLES, hz));
+        }
+    }
+    efr32_iadc_update(s);
+}
+
+/* Drop queue @q's conversions that have not started (xSTOP). */
+static void efr32_iadc_drop_pending(Efr32Periph *s, unsigned q)
+{
+    unsigned kept = 0;
+
+    for (unsigned i = 0; i < s->iadc_nconv; i++) {
+        /* [I] The head of the list is the conversion in progress. */
+        if (i == 0 || s->iadc_conv[i].queue != q) {
+            s->iadc_conv[kept++] = s->iadc_conv[i];
+        }
+    }
+    s->iadc_nconv = kept;
+    if (kept) {
+        s->iadc_busy_until_ns = s->iadc_conv[kept - 1].done_ns;
+    }
+}
+
+static void efr32_iadc_command(Efr32Periph *s, uint32_t command)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (command & EFR32_IADC_CMD_SINGLEFIFOFLUSH) {
+        s->iadc_fifo[0].count = 0;
+    }
+    if (command & EFR32_IADC_CMD_SCANFIFOFLUSH) {
+        s->iadc_fifo[1].count = 0;
+    }
+    for (unsigned q = 0; q < 2; q++) {
+        uint32_t stop = q ? EFR32_IADC_CMD_SCANSTOP : EFR32_IADC_CMD_SINGLESTOP;
+        uint32_t start = q ? EFR32_IADC_CMD_SCANSTART
+                           : EFR32_IADC_CMD_SINGLESTART;
+
+        if (command & stop) {
+            s->iadc_qen[q] = false;
+            efr32_iadc_drop_pending(s, q);
+        } else if (command & start) {
+            bool immediate = efr32_iadc_trigsel(s, q) ==
+                             EFR32_IADC_TRIGSEL_IMMEDIATE;
+
+            s->iadc_qen[q] = !immediate || efr32_iadc_continuous(s, q);
+            if (immediate) {
+                efr32_iadc_request(s, q, now);
+            }
+        }
+    }
+    if (command & EFR32_IADC_CMD_TIMERDIS) {
+        s->iadc_timer_on = false;
+        efr32_iadc_local_timer_arm(s);
+    } else if (command & EFR32_IADC_CMD_TIMEREN) {
+        s->iadc_timer_on = true;
+        efr32_iadc_local_timer_arm(s);
     }
     efr32_iadc_update(s);
 }
@@ -6193,6 +7105,17 @@ static bool efr32_bus_error(Efr32Periph *s, uint32_t address)
     if (block >= EFR32_CRYPTOACC_BASE && block < EFR32_CRYPTOACC_END) {
         return !(clken1 & EFR32_CMU_CLKEN1_CRYPTOACC);
     }
+    /*
+     * RADIOAES behind CMU_CLKEN0.RADIOAES (bit 2) and the radio bridge clock
+     * CMU_RADIOCLKCTRL.EN (RM 8.5, 8.5.25; owo-open-fw docs/crypto.md:
+     * Silicon Labs' sli_radioaes_acquire sets both, and so does the open
+     * firmware).  [I] Unmeasured: a gated access faults as RM SS4.2.1.2
+     * says (reads; writes are dropped like the other gated blocks here).
+     */
+    if (block == EFR32_RADIOAES_BASE) {
+        return !(efr32_register_get(s, EFR32_CMU_BASE + EFR32_CMU_CLKEN0) &
+                 EFR32_CMU_CLKEN0_RADIOAES) || !radio_clock;
+    }
     /* GPCRC behind CMU_CLKEN0.GPCRC (bit 3, efr32bg22_cmu.h), as above. */
     if (block == EFR32_GPCRC_BASE) {
         return !(efr32_register_get(s, EFR32_CMU_BASE + EFR32_CMU_CLKEN0) &
@@ -6450,7 +7373,9 @@ static MemTxResult efr32_peripheral_mmio_read(void *opaque, hwaddr offset,
                          MEMTX_ERROR);
         return MEMTX_ERROR;
     }
+    s->debugger_access = attrs.requester_id == EFR32_REQUESTER_DEBUG_AP;
     *data = efr32_peripheral_read(s, PERIPH_BASE + offset, size);
+    s->debugger_access = false;
     efr32_trace_mmio(s, false, PERIPH_BASE + offset, size, *data, MEMTX_OK);
     return MEMTX_OK;
 }
@@ -6552,9 +7477,123 @@ static void efr32_periph_realize(DeviceState *dev, Error **errp)
     s->dma_as_initialized = true;
 }
 
+/* ------------------------------------------- SoC link (efr32-soc-link.h) */
+#define EFR32_CMU_EUART0CLKCTRL 0x220u
+#define EFR32_CMU_EUART0CLKCTRL_RESET 1u
+#define EFR32_CMU_EUART0CLKCTRL_EM01GRPACLK 1u
+#define EFR32_CMU_EUART0CLKCTRL_EM23GRPACLK 2u
+
+static bool efr32_link_bus_clock_enabled(void *opaque, uint32_t offset,
+                                         uint32_t bit)
+{
+    return efr32_cmu_get(EFR32_PERIPH(opaque), offset) & bit;
+}
+
+/* An LF clock group (EM23GRPACLK, ...) from its CMU CLKSEL register. */
+static uint64_t efr32_lf_group_hz(Efr32Periph *s, uint32_t clkctrl)
+{
+    switch (efr32_cmu_get(s, clkctrl) & EFR32_CMU_LFCLKSEL_MASK) {
+    case EFR32_CMU_LFCLKSEL_LFRCO:
+    case EFR32_CMU_LFCLKSEL_LFXO:
+        return clock_get_hz(s->burtc_clk);
+    case EFR32_CMU_LFCLKSEL_ULFRCO:
+        return EFR32_ULFRCO_HZ;
+    default:
+        return 0;
+    }
+}
+
+static uint64_t efr32_soc_tree_hz(void *opaque, Efr32ClockTree tree)
+{
+    Efr32Periph *s = EFR32_PERIPH(opaque);
+
+    switch (tree) {
+    case EFR32_TREE_HCLK:
+        return clock_get_hz(s->m33_cpuclk);
+    case EFR32_TREE_PCLK:
+        return clock_get_hz(s->pclk);
+    case EFR32_TREE_EM01GRPACLK:
+        return efr32_em01grpa_hz(s);
+    case EFR32_TREE_EM23GRPACLK:
+        return efr32_lf_group_hz(s, EFR32_CMU_EM23GRPACLKCTRL);
+    case EFR32_TREE_EUSART0CLK:
+        switch (efr32_cmu_get(s, EFR32_CMU_EUART0CLKCTRL) & 0x3u) {
+        case EFR32_CMU_EUART0CLKCTRL_EM01GRPACLK:
+            return efr32_em01grpa_hz(s);
+        case EFR32_CMU_EUART0CLKCTRL_EM23GRPACLK:
+            return efr32_lf_group_hz(s, EFR32_CMU_EM23GRPACLKCTRL);
+        default:
+            return 0;
+        }
+    }
+    return 0;
+}
+
+/* A PRS consumer line this model serves (efr32-prs.h numbering). */
+static void efr32_prs_consume(Efr32Periph *s, int n, bool sync, bool level)
+{
+    if (n >= EFR32_PRS_CON_TIMER_CC(0, 0) &&
+        n < EFR32_PRS_CON_TIMER_CC(EFR32_TIMER_COUNT, 0)) {
+        unsigned k = n - EFR32_PRS_CON_TIMER0_CC0;
+        unsigned channel = k % EFR32_PRS_TIMER_CONSUMERS;
+
+        if (channel < EFR32_TIMER0_CHANNELS) {
+            efr32_timer_ic_input(s, k / EFR32_PRS_TIMER_CONSUMERS, channel,
+                                 sync, level);
+        }
+        return;
+    }
+    if (!sync && n >= EFR32_PRS_CON_RTCC_CC(0) &&
+        n < EFR32_PRS_CON_RTCC_CC(EFR32_RTCC_CC_COUNT)) {
+        efr32_rtcc_prs_input(s, n - EFR32_PRS_CON_RTCC_CC(0), level);
+        return;
+    }
+    efr32_iadc_prs_trigger(s, n, sync, level);
+}
+
+static void efr32_prs_consumer_in(void *opaque, int n, int level)
+{
+    efr32_prs_consume(EFR32_PERIPH(opaque), n, false, level);
+}
+
+static void efr32_prs_consumer_sync_in(void *opaque, int n, int level)
+{
+    efr32_prs_consume(EFR32_PERIPH(opaque), n, true, level);
+}
+
 static void efr32_periph_init(Object *o)
 {
     Efr32Periph *s = EFR32_PERIPH(o);
+
+    s->prs_radio_timer =
+        timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_rac_prs_expired, s);
+    s->prs_syncsent_ns = s->prs_framesent_ns = INT64_MAX;
+    s->link.opaque = s;
+    s->link.bus_clock = efr32_link_bus_clock_enabled;
+    s->link.tree_hz = efr32_soc_tree_hz;
+    s->link.bus_model = &s->bus_model;
+    s->link.dma_as = &s->dma_as;
+    qdev_init_gpio_out_named(DEVICE(o), s->prs_async, "prs-async",
+                             EFR32_PRS_ASYNC_INPUTS);
+    qdev_init_gpio_out_named(DEVICE(o), s->prs_sync, "prs-sync",
+                             EFR32_PRS_SYNC_INPUTS);
+    qdev_init_gpio_in_named(DEVICE(o), efr32_prs_consumer_in, "prs-consumer",
+                            EFR32_PRS_CONSUMERS);
+    qdev_init_gpio_out_named(DEVICE(o), &s->timer_dma[0][0], "timer-dma",
+                             EFR32_TIMER_COUNT * 4);
+    qdev_init_gpio_in_named(DEVICE(o), efr32_prs_consumer_sync_in,
+                            "prs-consumer-sync", EFR32_PRS_CONSUMERS);
+    for (int i = 0; i < EFR32_TIMER_COUNT; i++) {
+        for (unsigned n = 0; n < EFR32_TIMER0_CHANNELS; n++) {
+            Efr32TimerIc *ic = &s->timer_ic[i][n];
+
+            ic->owner = s;
+            ic->timer = i;
+            ic->channel = n;
+            ic->sampler = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                       efr32_timer_ic_sampled, ic);
+        }
+    }
     s->registers = g_hash_table_new(g_direct_hash, g_direct_equal);
     s->rstcause = EFR32_EMU_RSTCAUSE_POR;
     s->rstctrl = EFR32_EMU_RSTCTRL_RESET;
@@ -6591,6 +7630,8 @@ static void efr32_periph_init(Object *o)
     }
     s->wdog_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_wdog_expired, s);
     s->iadc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_iadc_complete, s);
+    s->iadc_local_timer =
+        timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_iadc_local_timer_expired, s);
     s->wdog_sync_timer =
         timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_wdog_sync_done, s);
     /* DHCSR.S_HALT of the M33, from its debug unit (WDOG0 DEBUGRUN). */
@@ -6636,6 +7677,7 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     efr32_gpcrc_reset(&s->gpcrc);
     efr32_radioaes_reset(&s->radioaes);
     s->rac_state = EFR32_RAC_STATE_OFF;
+    efr32_rac_prs_state(s, EFR32_RAC_STATE_OFF);
     s->seq_released = false;
     s->hfxo_fsm_locked = true;
     if (s->m33_radio_secure && s->m33_radio_nonsecure) {
@@ -6707,6 +7749,11 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     s->iadc_nconv = 0;
     s->iadc_busy_until_ns = 0;
     s->iadc_warm = s->iadc_standby = s->iadc_have_input = false;
+    s->iadc_qen[0] = s->iadc_qen[1] = false;
+    s->iadc_timer_on = false;
+    timer_del(s->iadc_local_timer);
+    efr32_register_put(s, EFR32_CMU_BASE + EFR32_CMU_EUART0CLKCTRL,
+                       EFR32_CMU_EUART0CLKCTRL_RESET);
     efr32_wdog_reset(s);
     efr32_register_put(s, EFR32_SYSCFG_BASE + EFR32_SYSCFG_CHIPREV,
                        s->chiprev);
@@ -7463,6 +8510,156 @@ static const Efr32UsartConfig efr32_usarts[] = {
      .tx_irq = EFR32_USART1_TX_IRQ},
 };
 
+/*
+ * The PRS and its wiring: every producer of the core model and the GPIO
+ * EXTI pins into it, its consumer lines to the blocks that serve them, its
+ * channel outputs to the GPIO PRS routes.
+ */
+static void efr32_soc_create_reflex(Efr32Bg22SoCState *s, DeviceState *gpio)
+{
+    DeviceState *periph = DEVICE(&s->periph);
+    DeviceState *prs = efr32_prs_create(OBJECT(s), s->memory,
+                                        &s->periph.link, EFR32_PRS_BASE,
+                                        PERIPH_NONSECURE_OFFSET);
+    DeviceState *letimer = efr32_letimer_create(
+        OBJECT(s), s->memory, &s->periph.link, EFR32_LETIMER0_BASE,
+        PERIPH_NONSECURE_OFFSET,
+        qdev_get_gpio_in(DEVICE(&s->armv7m), EFR32_LETIMER0_IRQ));
+    DeviceState *euart = efr32_eusart_create(
+        OBJECT(s), s->memory, &s->periph.link, EFR32_EUART0_BASE,
+        PERIPH_NONSECURE_OFFSET,
+        qdev_get_gpio_in(DEVICE(&s->armv7m), EFR32_EUART0_RX_IRQ),
+        qdev_get_gpio_in(DEVICE(&s->armv7m), EFR32_EUART0_TX_IRQ));
+    DeviceState *ldma = efr32_ldma_create(
+        OBJECT(s), s->memory, &s->periph.link, PERIPH_NONSECURE_OFFSET,
+        qdev_get_gpio_in(DEVICE(&s->armv7m), EFR32_LDMA_IRQ));
+    static const uint8_t timer_dma_source[EFR32_TIMER_COUNT] = {
+        EFR32_LDMA_SRC_TIMER0, EFR32_LDMA_SRC_TIMER1, EFR32_LDMA_SRC_TIMER2,
+        EFR32_LDMA_SRC_TIMER3, EFR32_LDMA_SRC_TIMER4,
+    };
+    /* Consumer lines served outside the core model, and by whom. */
+    struct {
+        unsigned consumer;
+        DeviceState *dev;
+        const char *line;
+        unsigned n;
+    } served[] = {
+        { EFR32_PRS_CON_LETIMER0_START, letimer, EFR32_LETIMER_PRS_IN, 0 },
+        { EFR32_PRS_CON_LETIMER0_STOP, letimer, EFR32_LETIMER_PRS_IN, 1 },
+        { EFR32_PRS_CON_LETIMER0_CLEAR, letimer, EFR32_LETIMER_PRS_IN, 2 },
+        { EFR32_PRS_CON_EUART0_TRIGGER, euart, EFR32_EUSART_PRS_TRIGGER, 0 },
+        { EFR32_PRS_CON_LDMAXBAR_DMAREQ0, ldma, EFR32_LDMA_REQ,
+          EFR32_LDMA_REQ_LINE(EFR32_LDMA_SRC_LDMAXBAR, 0) },
+        { EFR32_PRS_CON_LDMAXBAR_DMAREQ1, ldma, EFR32_LDMA_REQ,
+          EFR32_LDMA_REQ_LINE(EFR32_LDMA_SRC_LDMAXBAR, 1) },
+    };
+
+    for (unsigned t = 0; t < EFR32_TIMER_COUNT; t++) {
+        for (unsigned n = 0; n < 4; n++) {
+            qdev_connect_gpio_out_named(periph, "timer-dma", t * 4 + n,
+                                        qdev_get_gpio_in_named(
+                                            ldma, EFR32_LDMA_REQ,
+                                            EFR32_LDMA_REQ_LINE(
+                                                timer_dma_source[t], n)));
+        }
+    }
+    qdev_connect_gpio_out_named(euart, EFR32_EUSART_DMA_REQ, 0,
+                                qdev_get_gpio_in_named(
+                                    ldma, EFR32_LDMA_REQ,
+                                    EFR32_LDMA_REQ_LINE(
+                                        EFR32_LDMA_SRC_EUART0,
+                                        EFR32_LDMA_SIG_EUART_TXFL)));
+    qdev_connect_gpio_out_named(euart, EFR32_EUSART_DMA_REQ, 1,
+                                qdev_get_gpio_in_named(
+                                    ldma, EFR32_LDMA_REQ,
+                                    EFR32_LDMA_REQ_LINE(
+                                        EFR32_LDMA_SRC_EUART0,
+                                        EFR32_LDMA_SIG_EUART_RXFL)));
+    for (unsigned u = 0; u < 2; u++) {
+        DeviceState *usart = DEVICE(object_resolve_path_component(
+            OBJECT(s), u ? "usart1" : "usart0"));
+
+        for (unsigned n = 0; n < EFR32_USART_DMA_REQS; n++) {
+            qdev_connect_gpio_out_named(usart, EFR32_USART_DMA_REQ, n,
+                                        qdev_get_gpio_in_named(
+                                            ldma, EFR32_LDMA_REQ,
+                                            EFR32_LDMA_REQ_LINE(
+                                                EFR32_LDMA_SRC_USART0 + u,
+                                                n)));
+        }
+    }
+    for (unsigned ch = 0; ch < EFR32_PRS_LDMA_SYNC_CHANNELS; ch++) {
+        qdev_connect_gpio_out_named(prs, EFR32_PRS_ASYNC_CH_LDMA, ch,
+                                    qdev_get_gpio_in_named(
+                                        ldma, EFR32_LDMA_PRS_SYNC, ch));
+    }
+
+    qdev_connect_gpio_out_named(euart, EFR32_EUSART_PRS_TXC, 0,
+                                qdev_get_gpio_in_named(
+                                    prs, EFR32_PRS_ASYNC_IN,
+                                    EFR32_PRS_LINE(EFR32_PRS_SRC_EUART0,
+                                                   EFR32_PRS_SIG_EUART_TXC)));
+    qdev_connect_gpio_out_named(euart, EFR32_EUSART_PRS_RXFL, 0,
+                                qdev_get_gpio_in_named(
+                                    prs, EFR32_PRS_ASYNC_IN,
+                                    EFR32_PRS_LINE(EFR32_PRS_SRC_EUART0,
+                                                   EFR32_PRS_SIG_EUART_RXFL)));
+
+    s->periph.prs = prs;
+    for (unsigned n = 0; n < EFR32_PRS_ASYNC_INPUTS; n++) {
+        qdev_connect_gpio_out_named(periph, "prs-async", n,
+                                    qdev_get_gpio_in_named(
+                                        prs, EFR32_PRS_ASYNC_IN, n));
+    }
+    for (unsigned n = 0; n < EFR32_PRS_SYNC_INPUTS; n++) {
+        qdev_connect_gpio_out_named(periph, "prs-sync", n,
+                                    qdev_get_gpio_in_named(
+                                        prs, EFR32_PRS_SYNC_IN, n));
+    }
+    for (unsigned n = 0; n < EFR32_GPIO_PRS_PINS; n++) {
+        qdev_connect_gpio_out_named(gpio, EFR32_GPIO_PRS_PIN, n,
+                                    qdev_get_gpio_in_named(
+                                        prs, EFR32_PRS_ASYNC_IN,
+                                        EFR32_PRS_LINE(EFR32_PRS_SRC_GPIO,
+                                                       n)));
+    }
+    for (unsigned n = 0; n < EFR32_GPIO_LETIMER_OUTS; n++) {
+        qdev_connect_gpio_out_named(letimer, EFR32_LETIMER_OUT, n,
+                                    qdev_get_gpio_in_named(
+                                        gpio, EFR32_GPIO_LETIMER_OUT, n));
+        qdev_connect_gpio_out_named(letimer, EFR32_LETIMER_PRS, n,
+                                    qdev_get_gpio_in_named(
+                                        prs, EFR32_PRS_ASYNC_IN,
+                                        EFR32_PRS_LINE(EFR32_PRS_SRC_LETIMER0,
+                                                       n)));
+    }
+    for (unsigned n = 0; n < EFR32_PRS_CONSUMERS; n++) {
+        qemu_irq target = qdev_get_gpio_in_named(periph, "prs-consumer", n);
+
+        for (unsigned i = 0; i < ARRAY_SIZE(served); i++) {
+            if (served[i].consumer == n) {
+                target = qdev_get_gpio_in_named(served[i].dev, served[i].line,
+                                                served[i].n);
+            }
+        }
+        qdev_connect_gpio_out_named(prs, EFR32_PRS_CONSUMER, n, target);
+        qdev_connect_gpio_out_named(prs, EFR32_PRS_CONSUMER_SYNC, n,
+                                    qdev_get_gpio_in_named(
+                                        periph, "prs-consumer-sync", n));
+    }
+    for (unsigned ch = 0; ch < EFR32_PRS_ASYNC_CHANNELS; ch++) {
+        qdev_connect_gpio_out_named(prs, EFR32_PRS_ASYNC_CH, ch,
+                                    qdev_get_gpio_in_named(
+                                        gpio, EFR32_GPIO_PRS_CH, ch));
+    }
+    for (unsigned ch = 0; ch < EFR32_PRS_SYNC_CHANNELS; ch++) {
+        qdev_connect_gpio_out_named(prs, EFR32_PRS_SYNC_CH, ch,
+                                    qdev_get_gpio_in_named(
+                                        gpio, EFR32_GPIO_PRS_CH,
+                                        EFR32_PRS_ASYNC_CHANNELS + ch));
+    }
+}
+
 static void efr32_soc_realize(DeviceState *dev, Error **errp)
 {
     Efr32Bg22SoCState *s = EFR32BG22_SOC(dev);
@@ -7721,7 +8918,10 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
         efr32_i2c_create(OBJECT(s), s->memory, nvic, s->pclk,
                          &s->periph.bus_model, 0, EFR32_I2C0_BASE,
                          PERIPH_NONSECURE_OFFSET, EFR32_I2C0_IRQ);
+        efr32_soc_create_reflex(s, gpio);
     }
+    efr32_buram_create(OBJECT(s), s->memory, &s->periph.link,
+                       EFR32_BURAM_BASE, PERIPH_NONSECURE_OFFSET);
     for (unsigned state = 0; state < EFR32_RAC_SEQ_STATE_EVENTS; state++) {
         s->periph.seq_irq_state[state] =
             qdev_get_gpio_in(DEVICE(&s->seq_armv7m), state);

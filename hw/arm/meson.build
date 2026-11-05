@@ -34,7 +34,7 @@ arm_ss.add(when: 'CONFIG_STM32F405_SOC', if_true: files('stm32f405_soc.c'))
 arm_ss.add(when: 'CONFIG_EFR32BG22',
            if_true: files('efr32-rf-medium.c', 'efr32-usart.c',
                           'efr32-gpio.c', 'efr32-i2c.c', 'efr32-radioaes.c', 'efr32-trng.c', 'efr32-gpcrc.c',
-                          'efr32-interconnect.c',
+                          'efr32-interconnect.c', 'efr32-prs.c', 'efr32-buram.c', 'efr32-letimer.c', 'efr32-eusart.c', 'efr32-ldma.c',
                           'efr32bg22.c', 'efr32bg22-debug.c'))
 arm_ss.add(when: 'CONFIG_B_L475E_IOT01A', if_true: files('b-l475e-iot01a.c'))
 arm_ss.add(when: 'CONFIG_STM32L4X5_SOC', if_true: files('stm32l4x5_soc.c'))

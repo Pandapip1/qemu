@@ -21,8 +21,10 @@
  *    (even n), RM "The even interrupt line is triggered by any enabled even
  *    numbered interrupt flag index";
  *  - TIMERn CCm routes (GPIO_TIMERROUTE: ROUTEEN.CCmPEN, CCmROUTE.PORT bits
- *    1:0 and PIN bits 19:16): an enabled route replaces DOUT as the value
- *    an output-mode pin drives;
+ *    1:0 and PIN bits 19:16), the PRS channel routes (GPIO_PRSROUTE) and
+ *    the LETIMER0 outputs (GPIO_LETIMERROUTE): an enabled route replaces
+ *    DOUT as the value an output-mode pin drives;
+ *  - the PRS producers GPIO PIN0-7 (the EXTI0-7 pins' levels);
  *  - the configuration lock (RM SS25.3.5): any value but 0xA534 written to
  *    LOCK freezes CTRL, MODEL/MODEH, the bus allocations, the external
  *    interrupt selects and the routes; GPIOLOCKSTATUS reports it.
@@ -80,6 +82,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32GpioState, EFR32_GPIO)
 /* GPIO_CMUROUTE is the first route block; GPIO_USARTROUTE[1] the last. */
 #define GPIO_ROUTES_BEGIN 0x450u
 #define GPIO_ROUTES_END 0x65cu
+#define GPIO_LETIMERROUTE 0x4b0u
+#define GPIO_PRSROUTE 0x534u
 #define GPIO_TIMERROUTE 0x57cu
 #define GPIO_TIMERROUTE_STRIDE 0x20u
 #define GPIO_TIMERROUTE_ROUTEEN 0x00u
@@ -135,6 +139,11 @@ struct Efr32GpioState {
     bool ext_level[EFR32_GPIO_LINES];
     /* Peripheral outputs that a route may put on a pin. */
     bool timer_cc[EFR32_GPIO_TIMERS * EFR32_GPIO_TIMER_CCS];
+    bool prs_ch[EFR32_GPIO_PRS_CHANNELS];
+    bool letimer_out[EFR32_GPIO_LETIMER_OUTS];
+    /* EXTI0-7 levels as the PRS producers GPIO PIN0-7 see them. */
+    qemu_irq prs_pin[EFR32_GPIO_PRS_PINS];
+    bool prs_pin_sent[EFR32_GPIO_PRS_PINS];
     /* Last values sent on the output lines, and the last pin levels. */
     bool out_sent[EFR32_GPIO_LINES];
     bool oe_sent[EFR32_GPIO_LINES];
@@ -166,9 +175,36 @@ static bool gpio_dout(Efr32GpioState *s, unsigned line)
                      line % EFR32_GPIO_PINS_PER_PORT, 1);
 }
 
+/* Route register @route (PORT bits 1:0, PIN bits 19:16) names @line. */
+static bool gpio_route_is(Efr32GpioState *s, uint32_t route, unsigned line)
+{
+    uint32_t sel = gpio_reg(s, route);
+
+    return EFR32_GPIO_LINE(sel & GPIO_ROUTE_PORT_MASK,
+                           (sel >> GPIO_ROUTE_PIN_SHIFT) &
+                               GPIO_ROUTE_PIN_MASK) == line;
+}
+
 /* The value an output-mode pin drives: its routed peripheral, else DOUT. */
 static bool gpio_out_value(Efr32GpioState *s, unsigned line)
 {
+    /*
+     * GPIO_PRSROUTE (efr32bg22_gpio.h): ROUTEEN bits 0-11 ASYNCHnPEN,
+     * 12-15 SYNCHnPEN, then one route word per channel.  GPIO_LETIMERROUTE:
+     * ROUTEEN.OUTnPEN, OUTnROUTE.
+     */
+    for (unsigned ch = 0; ch < EFR32_GPIO_PRS_CHANNELS; ch++) {
+        if ((gpio_reg(s, GPIO_PRSROUTE) & (1u << ch)) &&
+            gpio_route_is(s, GPIO_PRSROUTE + 4 + 4 * ch, line)) {
+            return s->prs_ch[ch];
+        }
+    }
+    for (unsigned n = 0; n < EFR32_GPIO_LETIMER_OUTS; n++) {
+        if ((gpio_reg(s, GPIO_LETIMERROUTE) & (1u << n)) &&
+            gpio_route_is(s, GPIO_LETIMERROUTE + 4 + 4 * n, line)) {
+            return s->letimer_out[n];
+        }
+    }
     for (unsigned t = 0; t < EFR32_GPIO_TIMERS; t++) {
         uint32_t route = GPIO_TIMERROUTE + t * GPIO_TIMERROUTE_STRIDE;
         uint32_t enable = gpio_reg(s, route + GPIO_TIMERROUTE_ROUTEEN);
@@ -335,6 +371,21 @@ static void gpio_update(Efr32GpioState *s)
         s->regs[GPIO_IF / 4] |= flags;
     }
     gpio_update_irq(s);
+    /*
+     * PRS producers GPIO PIN0-7 (RM SS13.3.3): "PIN0 uses settings for the
+     * EXTI0 interrupt, PIN1 uses settings for EXTI1": the level of the pin
+     * EXTIn selects.  [I] The edge selects (EXTIRISE/EXTIFALL) do not
+     * gate it.
+     */
+    for (unsigned n = 0; n < EFR32_GPIO_PRS_PINS; n++) {
+        unsigned line = gpio_exti_line(s, n);
+        bool level = s->level[line] && gpio_input_enabled(s, line);
+
+        if (level != s->prs_pin_sent[n]) {
+            s->prs_pin_sent[n] = level;
+            qemu_set_irq(s->prs_pin[n], level);
+        }
+    }
 }
 
 static uint32_t gpio_din(Efr32GpioState *s, unsigned port)
@@ -457,6 +508,22 @@ static void gpio_timer_cc(void *opaque, int n, int level)
     gpio_update(s);
 }
 
+static void gpio_prs_ch(void *opaque, int n, int level)
+{
+    Efr32GpioState *s = opaque;
+
+    s->prs_ch[n] = level != 0;
+    gpio_update(s);
+}
+
+static void gpio_letimer_out(void *opaque, int n, int level)
+{
+    Efr32GpioState *s = opaque;
+
+    s->letimer_out[n] = level != 0;
+    gpio_update(s);
+}
+
 static void gpio_reset_hold(Object *obj, ResetType type)
 {
     Efr32GpioState *s = EFR32_GPIO(obj);
@@ -494,6 +561,12 @@ static void gpio_init(Object *obj)
                             EFR32_GPIO_LINES);
     qdev_init_gpio_in_named(dev, gpio_timer_cc, EFR32_GPIO_TIMER_CC,
                             EFR32_GPIO_TIMERS * EFR32_GPIO_TIMER_CCS);
+    qdev_init_gpio_in_named(dev, gpio_prs_ch, EFR32_GPIO_PRS_CH,
+                            EFR32_GPIO_PRS_CHANNELS);
+    qdev_init_gpio_in_named(dev, gpio_letimer_out, EFR32_GPIO_LETIMER_OUT,
+                            EFR32_GPIO_LETIMER_OUTS);
+    qdev_init_gpio_out_named(dev, s->prs_pin, EFR32_GPIO_PRS_PIN,
+                             EFR32_GPIO_PRS_PINS);
 }
 
 static void gpio_class_init(ObjectClass *klass, void *data)

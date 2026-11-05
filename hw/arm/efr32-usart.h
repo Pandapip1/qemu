@@ -17,6 +17,9 @@
 #include "sysemu/cpu-timers.h"
 
 #define TYPE_EFR32_USART "efr32-usart"
+/* LDMA request lines: RXDATAV, RXDATAVRIGHT, TXBL, TXBLRIGHT, TXEMPTY. */
+#define EFR32_USART_DMA_REQ "dma-req"
+#define EFR32_USART_DMA_REQS 5
 
 /* The register block, including its SET, CLR and TGL aliases. */
 #define EFR32_USART_BLOCK_SIZE 0x4000u

@@ -38,6 +38,14 @@
 #define EFR32_GPIO_PIN_OE "pin-oe"
 #define EFR32_GPIO_PIN_IN "pin-in"
 #define EFR32_GPIO_TIMER_CC "timer-cc"
+/* PRS channel outputs (async 0-11, then sync 0-3) for GPIO_PRSROUTE. */
+#define EFR32_GPIO_PRS_CH "prs-ch"
+#define EFR32_GPIO_PRS_CHANNELS 16
+#define EFR32_GPIO_LETIMER_OUT "letimer-out"
+#define EFR32_GPIO_LETIMER_OUTS 2
+/* Outputs: the PRS producers GPIO PIN0-7. */
+#define EFR32_GPIO_PRS_PIN "prs-pin"
+#define EFR32_GPIO_PRS_PINS 8
 
 /* The register block, including its SET, CLR and TGL aliases. */
 #define EFR32_GPIO_BLOCK_SIZE 0x4000u

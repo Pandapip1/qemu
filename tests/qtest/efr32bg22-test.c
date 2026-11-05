@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "qemu/osdep.h"
+#include <sys/un.h>
 #include "libqtest-single.h"
 #include "qemu/bswap.h"
 
@@ -1001,6 +1002,106 @@ static void test_usart_tx_polling(void)
                     USART_STATUS_TXC);
     g_assert_cmphex(readl(USART1_BASE + USART_STATUS), ==,
                     USART_STATUS_TXIDLE | USART_STATUS_TXBL);
+}
+
+/*
+ * An 8N1 frame at PCLK = HFXO 38.4 MHz, OVS x16, CLKDIV 0 (2.4 Mbaud) lasts
+ * 10 bit periods, 4.167 us (emlib's br = 256 fPCLK / (ovs (256 + DIV))).
+ */
+#define CMU_SYSCLKCTRL_HFXO   3
+#define USART_FRAME_2M4_NS    4166
+
+static void test_usart_frame_time(void)
+{
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel qtest");
+
+    qtest_writel(qts, CMU_BASE + CMU_SYSCLKCTRL, CMU_SYSCLKCTRL_HFXO);
+    qtest_writel(qts, USART0_BASE + USART_CMD, USART_CMD_TXEN);
+    qtest_writel(qts, USART0_BASE + USART_TXDATA, 0x5a);
+    qtest_clock_step(qts, USART_FRAME_2M4_NS - 1);
+    g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_STATUS) &
+                    USART_STATUS_TXC, ==, 0);
+    qtest_clock_step(qts, 1);
+    g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_STATUS) &
+                    USART_STATUS_TXC, ==, USART_STATUS_TXC);
+    qtest_quit(qts);
+}
+
+/*
+ * The USART timer as Zephyr's async driver sets it (RM Table 21.10,
+ * receiver timeout): TIMECMP1 = TSTART RXEOF, TSTOP RXACT, RESTARTEN,
+ * TCMPVAL 8 raises IF.TCMP1 8 bit times after a received frame ends.
+ * A break from the host (telnet IAC BREAK on the chardev) is a frame of 0
+ * with a framing error (RM SS21.3.2.13).  2.4 Mbaud: bit 416 ns.
+ */
+#define USART_RXDATAX         0x020
+#define USART_IF              0x048
+#define USART_TIMECMP1        0x064
+#define USART_CMD_RXEN        (1u << 0)
+#define USART_STATUS_RXDATAV  (1u << 7)
+#define USART_IF_FERR         (1u << 9)
+#define USART_IF_TCMP1        (1u << 15)
+#define USART_RXDATAX_FERR    (1u << 15)
+#define USART_BIT_NS          416
+#define USART_TIMECMP1_RXTIMEOUT ((2u << 20) | (4u << 16) | (1u << 24) | 8)
+
+static int unix_connect(const char *path)
+{
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+
+    g_assert_cmpint(fd, >=, 0);
+    g_strlcpy(addr.sun_path, path, sizeof(addr.sun_path));
+    g_assert_cmpint(connect(fd, (struct sockaddr *)&addr, sizeof(addr)), ==,
+                    0);
+    return fd;
+}
+
+static void usart_wait_rx(QTestState *qts)
+{
+    for (int i = 0; i < 1000 &&
+                    !(qtest_readl(qts, USART0_BASE + USART_STATUS) &
+                      USART_STATUS_RXDATAV); i++) {
+        qtest_clock_step(qts, 100);
+    }
+    g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_STATUS) &
+                    USART_STATUS_RXDATAV, ==, USART_STATUS_RXDATAV);
+}
+
+static void test_usart_timer_and_break(void)
+{
+    g_autofree char *path = g_strdup_printf("%s/efr32-usart-%d.sock",
+                                            g_get_tmp_dir(), getpid());
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel qtest "
+                                  "-chardev socket,id=soc.usart0,path=%s,"
+                                  "server=on,wait=off,telnet=on", path);
+    const uint8_t brk[2] = { 0xff, 0xf3 };
+    int fd = unix_connect(path);
+
+    qtest_writel(qts, CMU_BASE + CMU_SYSCLKCTRL, CMU_SYSCLKCTRL_HFXO);
+    qtest_writel(qts, USART0_BASE + USART_TIMECMP1, USART_TIMECMP1_RXTIMEOUT);
+    qtest_writel(qts, USART0_BASE + USART_CMD, USART_CMD_RXEN);
+    g_assert_cmpint(write(fd, "A", 1), ==, 1);
+    usart_wait_rx(qts);
+    g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_IF) &
+                    USART_IF_TCMP1, ==, 0);
+    qtest_clock_step(qts, 8 * USART_BIT_NS - 200);
+    g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_IF) &
+                    USART_IF_TCMP1, ==, 0);
+    qtest_clock_step(qts, 200);
+    g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_IF) &
+                    USART_IF_TCMP1, ==, USART_IF_TCMP1);
+    g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_RXDATAX), ==, 'A');
+
+    g_assert_cmpint(write(fd, brk, sizeof(brk)), ==, sizeof(brk));
+    usart_wait_rx(qts);
+    g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_IF) & USART_IF_FERR,
+                    ==, USART_IF_FERR);
+    g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_RXDATAX), ==,
+                    USART_RXDATAX_FERR);
+    close(fd);
+    unlink(path);
+    qtest_quit(qts);
 }
 
 static void test_modem_masks(void)
@@ -2472,6 +2573,51 @@ static void test_iadc_single_conversion(void)
     qtest_quit(qts);
 }
 
+/*
+ * Output resolution 11 + log2(OSR x DIGAVG) bits (RM SS24.3.7.4): OSR 4 and
+ * 4-sample averaging give 15 bits, 968 mV of 3.3 V = 9612, read RIGHT16 as
+ * 9612 << 1 = 19224 (its 12 MSBs are still 1201); the window comparator
+ * (SS24.3.8) flags it inside ADGT 0x4000..ADLT 0x5000, not outside it.
+ */
+#define IADC_CMPTHR           0x01c
+#define IADC_SINGLEFIFOCFG    0x070
+#define IADC_CFG_OSR4         (1u << 2)
+#define IADC_CFG_AVG4         (2u << 21)
+#define IADC_ALIGN_RIGHT16    1u
+#define IADC_SINGLE_CMP       (1u << 17)
+#define IADC_IF_SINGLECMP     (1u << 2)
+
+static void test_iadc_resolution_and_window(void)
+{
+    QTestState *qts = qtest_initf("-machine efr32bg22,analog=PD02=968 "
+                                  "-accel qtest");
+
+    qtest_writel(qts, IADC_BASE + IADC_CTRL, IADC_CTRL_TIMEBASE_1US);
+    qtest_writel(qts, IADC_BASE + IADC_SCHED0, 1);
+    qtest_writel(qts, IADC_BASE + IADC_CFG0, IADC_CFG0_VDDX_GAIN1 |
+                                                 IADC_CFG_OSR4 | IADC_CFG_AVG4);
+    qtest_writel(qts, IADC_BASE + IADC_SINGLEFIFOCFG, IADC_ALIGN_RIGHT16);
+    qtest_writel(qts, IADC_BASE + IADC_SINGLE,
+                 IADC_SINGLE_PD02_GND | IADC_SINGLE_CMP);
+    qtest_writel(qts, IADC_BASE + IADC_CMPTHR, (0x4000u << 16) | 0x5000u);
+    qtest_writel(qts, IADC_BASE + IADC_CMD, 1);
+    qtest_clock_step(qts, 20000);
+    g_assert_cmpuint(qtest_readl(qts, IADC_BASE + IADC_SINGLEFIFODATA), ==,
+                     19224);
+    g_assert_cmphex(qtest_readl(qts, IADC_BASE + IADC_IF) & IADC_IF_SINGLECMP,
+                    ==, IADC_IF_SINGLECMP);
+    qtest_writel(qts, IADC_BASE + IADC_IF + REGISTER_CLEAR_WINDOW,
+                 IADC_IF_SINGLECMP);
+    qtest_writel(qts, IADC_BASE + IADC_CMPTHR, (0x5000u << 16) | 0x4000u);
+    qtest_writel(qts, IADC_BASE + IADC_CMD, 1);
+    qtest_clock_step(qts, 20000);
+    g_assert_cmpuint(qtest_readl(qts, IADC_BASE + IADC_SINGLEFIFODATA), ==,
+                     19224);
+    g_assert_cmphex(qtest_readl(qts, IADC_BASE + IADC_IF) & IADC_IF_SINGLECMP,
+                    ==, 0);
+    qtest_quit(qts);
+}
+
 /* EMU.RSTCAUSE: POR after power-up, cleared by EMU_CMD.RSTCAUSECLR. */
 #define EMU_CMD               0x070
 #define EMU_CMD_RSTCAUSECLR   (1u << 17)
@@ -3752,6 +3898,37 @@ static void radioaes_ecb(QTestState *qts, uint32_t mode, const uint8_t *key,
     qtest_writel(qts, RADIOAES_BASE + RADIOAES_CMD, RADIOAES_CMD_START);
 }
 
+/*
+ * RADIOAES needs CMU_CLKEN0.RADIOAES and CMU_RADIOCLKCTRL.EN (RM 8.5,
+ * 8.5.25; what sli_radioaes_acquire and the open firmware set): a gated
+ * access faults.
+ */
+#define CMU_CLKEN0_RADIOAES    (1u << 2)
+
+static void setup_radioaes_clocks(QTestState *qts)
+{
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_RADIOAES);
+    qtest_writel(qts, CMU_BASE + CMU_RADIOCLKCTRL + REGISTER_SET_WINDOW,
+                 CMU_RADIOCLKCTRL_EN);
+}
+
+static void setup_radioaes_bus_clock_only(QTestState *qts)
+{
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_RADIOAES);
+}
+
+static void test_radioaes_clock_gate(void)
+{
+    g_assert_true(m33_load_faults(RADIOAES_BASE + RADIOAES_STATUS,
+                                  setup_no_clocks));
+    g_assert_true(m33_load_faults(RADIOAES_BASE + RADIOAES_STATUS,
+                                  setup_radioaes_bus_clock_only));
+    g_assert_false(m33_load_faults(RADIOAES_BASE + RADIOAES_STATUS,
+                                   setup_radioaes_clocks));
+}
+
 static void test_radioaes_ecb_and_key_sizes(void)
 {
     /* FIPS-197 Appendix C.1 (AES-128) and C.2 (AES-192). */
@@ -3776,6 +3953,7 @@ static void test_radioaes_ecb_and_key_sizes(void)
     QTestState *qts = qtest_init("-machine efr32bg22 -accel qtest");
     uint8_t out[16];
 
+    setup_radioaes_clocks(qts);
     g_assert_cmphex(qtest_readl(qts, RADIOAES_BASE + RADIOAES_HW_CFG_1), ==,
                     0x05010127);
     radioaes_ecb(qts, RADIOAES_MODE_ECB, key, 16, plain);
@@ -3932,6 +4110,839 @@ static void test_gpcrc_crc_vectors(void)
     qtest_quit(qts);
 }
 
+/*
+ * PRS (RM ch. 13) and the TIMER input logic it feeds (RM SS19.3.3).
+ * TIMER1 runs from EM01GRPACLK, set to the HFXO's 38.4 MHz here.
+ */
+#define PRS_BASE                0x40038000
+#define PRS_IPVERSION           0x000
+#define PRS_ASYNC_SWPULSE       0x008
+#define PRS_ASYNC_SWLEVEL       0x00c
+#define PRS_ASYNC_PEEK          0x010
+#define PRS_SYNC_PEEK           0x014
+#define PRS_ASYNC_CH_CTRL(n)    (0x018 + 4 * (n))
+#define PRS_SYNC_CH_CTRL(n)     (0x048 + 4 * (n))
+#define PRS_CH_SIGSEL(n)        (n)
+#define PRS_CH_SOURCESEL(n)     ((n) << 8)
+#define PRS_CH_FNSEL(n)         ((n) << 16)
+#define PRS_CH_AUXSEL(n)        ((n) << 24)
+#define PRS_FNSEL_A             0xc
+#define PRS_SRC_PRSL            0x0a
+#define PRS_SRC_TIMER0          0x22
+#define PRS_SYNC_SRC_TIMER0     0x01
+#define PRS_SIG_TIMER_OF        1
+#define PRS_CONSUMER_TIMER1_CC(n) (0x124 + 4 * (n))
+#define PRS_CONSUMER_RTCC_CC(n) (0x0e8 + 4 * (n))
+#define PRS_CONSUMER_IADC0_SINGLETRIGGER 0x068
+#define PRS_CONSUMER_LETIMER0_START 0x078
+#define PRS_CONSUMER_SPRSSEL(n) ((n) << 8)
+#define CMU_CLKEN0_TIMER0       (1u << 4)
+#define CMU_CLKEN0_TIMER1       (1u << 5)
+#define CMU_CLKEN0_IADC0        (1u << 10)
+#define CMU_CLKEN0_PRS          (1u << 27)
+#define TIMER_CTRL              0x008
+#define TIMER_CTRL_RISEA_RELOADSTART 3
+#define TIMER_CFG_OSMEN         (1u << 4)
+#define TIMER_CC_CTRL(n)        (0x064 + 0x20 * (n))
+#define TIMER_CC_CTRL_ICEDGE_BOTH (2u << 24)
+#define TIMER_CC_ICF(n)         (0x074 + 0x20 * (n))
+#define TIMER_CC_ICOF(n)        (0x078 + 0x20 * (n))
+#define TIMER_CC_CFG_INPUTCAPTURE 0x1
+#define TIMER_CC_CFG_PRSSYNC    (1u << 17)
+#define TIMER_CC_CFG_PRSASYNCLEVEL (2u << 17)
+#define TIMER_CC_CFG_PRSASYNCPULSE (3u << 17)
+#define TIMER_CC_CFG_FILT       (1u << 20)
+#define TIMER_IF_ICFOF(n)       (1u << (20 + (n)))
+#define TIMER_IF_ICFUF(n)       (1u << (24 + (n)))
+#define TIMER_STATUS_ICFEMPTY(n) (1u << (16 + (n)))
+#define TIMER_STATUS_CCPOL(n)   (1u << (24 + (n)))
+
+static QTestState *prs_start(void)
+{
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel qtest");
+
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_PRS | CMU_CLKEN0_TIMER0 | CMU_CLKEN0_TIMER1 |
+                     CMU_CLKEN0_RTCC | CMU_CLKEN0_IADC0);
+    qtest_writel(qts, CMU_BASE_ADDR + CMU_EM01GRPACLKCTRL,
+                 CMU_EM01GRPACLK_HFXO);
+    return qts;
+}
+
+/* TIMER1 CCn in input capture from PRS channel @ch, input @insel. */
+static void prs_timer1_capture(QTestState *qts, unsigned n, unsigned ch,
+                               uint32_t insel)
+{
+    qtest_writel(qts, PRS_BASE + PRS_CONSUMER_TIMER1_CC(n), ch);
+    qtest_writel(qts, TIMER1_BASE + TIMER_EN, 0);
+    qtest_writel(qts, TIMER1_BASE + TIMER_CC_CFG(n),
+                 TIMER_CC_CFG_INPUTCAPTURE | insel);
+    qtest_writel(qts, TIMER1_BASE + TIMER_EN, TIMER_EN_EN);
+}
+
+/*
+ * Every FNSEL against every A/B pair (RM Table 13.1: output FNSEL[2A + B]),
+ * with A and B from other channels' SWLEVEL through the PRSL producer and
+ * AUXSEL; then SWLEVEL inverting a channel's own output (SS13.3.1).
+ */
+static void test_prs_logic_table(void)
+{
+    QTestState *qts = prs_start();
+
+    g_assert_cmphex(qtest_readl(qts, PRS_BASE + PRS_IPVERSION), ==, 1);
+    g_assert_cmphex(qtest_readl(qts, PRS_BASE + PRS_ASYNC_CH_CTRL(0)), ==,
+                    PRS_CH_FNSEL(PRS_FNSEL_A));
+    g_assert_cmphex(qtest_readl(qts, PRS_BASE + PRS_ASYNC_PEEK), ==, 0);
+    for (unsigned fnsel = 0; fnsel < 16; fnsel++) {
+        qtest_writel(qts, PRS_BASE + PRS_ASYNC_CH_CTRL(0),
+                     PRS_CH_SOURCESEL(PRS_SRC_PRSL) | PRS_CH_SIGSEL(1) |
+                         PRS_CH_FNSEL(fnsel) | PRS_CH_AUXSEL(2));
+        for (unsigned a = 0; a < 2; a++) {
+            for (unsigned b = 0; b < 2; b++) {
+                qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWLEVEL,
+                             (a << 1) | (b << 2));
+                g_assert_cmpuint(qtest_readl(qts, PRS_BASE + PRS_ASYNC_PEEK) &
+                                 1, ==, (fnsel >> (2 * a + b)) & 1);
+            }
+        }
+    }
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_CH_CTRL(0),
+                 PRS_CH_FNSEL(PRS_FNSEL_A));
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWLEVEL, 0x801);
+    g_assert_cmphex(qtest_readl(qts, PRS_BASE + PRS_ASYNC_PEEK), ==, 0x801);
+    g_assert_cmphex(qtest_readl(qts, PRS_BASE + PRS_ASYNC_SWPULSE), ==, 0);
+    qtest_quit(qts);
+}
+
+/* Reads and writes fault while CMU_CLKEN0.PRS is clear (SS7.71, SS7.73). */
+static void setup_prs_clock(QTestState *qts)
+{
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_PRS);
+}
+
+static void test_prs_bus_gate(void)
+{
+    g_assert_true(m33_load_faults(PRS_BASE + PRS_ASYNC_PEEK,
+                                  setup_no_clocks));
+    g_assert_true(m33_store_faults(PRS_BASE + PRS_ASYNC_SWLEVEL,
+                                   setup_no_clocks));
+    g_assert_false(m33_load_faults(PRS_BASE + PRS_ASYNC_PEEK,
+                                   setup_prs_clock));
+    g_assert_false(m33_store_faults(PRS_BASE + PRS_ASYNC_SWLEVEL,
+                                    setup_prs_clock));
+}
+
+/*
+ * SWPULSE into TIMER1 input capture, INSEL = PRSASYNCPULSE: each pulse
+ * captures CNT; one store pulsing two channels is captured on the same
+ * tick by both (silicon, SS7.73); the 2-entry FIFO, ICOF and the overflow
+ * and underflow flags (RM SS19.3.3.3).
+ */
+static void test_prs_swpulse_timer_capture(void)
+{
+    QTestState *qts = prs_start();
+    uint32_t first, second;
+
+    prs_timer1_capture(qts, 0, 9, TIMER_CC_CFG_PRSASYNCPULSE);
+    qtest_writel(qts, PRS_BASE + PRS_CONSUMER_TIMER1_CC(1), 10);
+    qtest_writel(qts, TIMER1_BASE + TIMER_EN, 0);
+    qtest_writel(qts, TIMER1_BASE + TIMER_CC_CFG(1),
+                 TIMER_CC_CFG_INPUTCAPTURE | TIMER_CC_CFG_PRSASYNCPULSE);
+    qtest_writel(qts, TIMER1_BASE + TIMER_EN, TIMER_EN_EN);
+    g_assert_cmphex(qtest_readl(qts, TIMER1_BASE + TIMER_STATUS) &
+                    (TIMER_STATUS_ICFEMPTY(0) | TIMER_STATUS_ICFEMPTY(1)), ==,
+                    TIMER_STATUS_ICFEMPTY(0) | TIMER_STATUS_ICFEMPTY(1));
+    qtest_writel(qts, TIMER1_BASE + TIMER_CMD, TIMER_CMD_START);
+    qtest_clock_step(qts, 10000);
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWPULSE, (1u << 9) | (1u << 10));
+    qtest_clock_step(qts, 10000);
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWPULSE, 1u << 9);
+    g_assert_cmphex(qtest_readl(qts, TIMER1_BASE + TIMER_STATUS) &
+                    TIMER_STATUS_ICFEMPTY(0), ==, 0);
+    first = qtest_readl(qts, TIMER1_BASE + TIMER_CC_ICF(0));
+    g_assert_cmpuint(qtest_readl(qts, TIMER1_BASE + TIMER_CC_ICF(1)), ==,
+                     first);
+    g_assert_cmpuint(abs((int)first - 384), <=, 1);
+    second = qtest_readl(qts, TIMER1_BASE + TIMER_CC_ICF(0));
+    g_assert_cmpuint(abs((int)(second - first) - 384), <=, 1);
+    g_assert_cmpuint(qtest_readl(qts, TIMER1_BASE + TIMER_CC_ICOF(0)), ==,
+                     second);
+    g_assert_cmphex(qtest_readl(qts, TIMER1_BASE + TIMER_IF) &
+                    (TIMER_IF_CC(0) | TIMER_IF_CC(1)), ==,
+                    TIMER_IF_CC(0) | TIMER_IF_CC(1));
+    /* Empty: an underflow; three more pulses: an overflow into ICOF. */
+    qtest_readl(qts, TIMER1_BASE + TIMER_CC_ICF(0));
+    g_assert_cmphex(qtest_readl(qts, TIMER1_BASE + TIMER_IF) &
+                    TIMER_IF_ICFUF(0), ==, TIMER_IF_ICFUF(0));
+    for (unsigned i = 0; i < 3; i++) {
+        qtest_clock_step(qts, 1000);
+        qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWPULSE, 1u << 9);
+    }
+    g_assert_cmphex(qtest_readl(qts, TIMER1_BASE + TIMER_IF) &
+                    TIMER_IF_ICFOF(0), ==, TIMER_IF_ICFOF(0));
+    first = qtest_readl(qts, TIMER1_BASE + TIMER_CC_ICF(0));
+    second = qtest_readl(qts, TIMER1_BASE + TIMER_CC_ICF(0));
+    g_assert_cmpuint(abs((int)(qtest_readl(qts, TIMER1_BASE +
+                                                TIMER_CC_ICOF(0)) -
+                               second) - 38), <=, 1);
+    g_assert_cmpuint(abs((int)(second - first) - 38), <=, 1);
+    qtest_quit(qts);
+}
+
+/*
+ * INSEL = PRSASYNCLEVEL qualifies the level for 2 HFPERCLK cycles (7 with
+ * FILT): a pulse is never captured -- silicon's "PRSASYNCLEVEL captured
+ * nothing" for the MODEM events (SS7.71) -- while a SWLEVEL step is, 2
+ * cycles late.  INSEL = PRSSYNC follows the synchronous channel.
+ */
+static void test_prs_timer_input_qualification(void)
+{
+    QTestState *qts = prs_start();
+    uint32_t value;
+
+    prs_timer1_capture(qts, 0, 3, TIMER_CC_CFG_PRSASYNCLEVEL);
+    qtest_writel(qts, TIMER1_BASE + TIMER_CMD, TIMER_CMD_START);
+    qtest_clock_step(qts, 10000);
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWPULSE, 1u << 3);
+    qtest_clock_step(qts, 1000);
+    g_assert_cmphex(qtest_readl(qts, TIMER1_BASE + TIMER_IF) &
+                    TIMER_IF_CC(0), ==, 0);
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWLEVEL, 1u << 3);
+    value = qtest_readl(qts, TIMER1_BASE + TIMER_CNT);
+    qtest_clock_step(qts, 2 * 27);
+    value = qtest_readl(qts, TIMER1_BASE + TIMER_CC_ICF(0)) - value;
+    g_assert_cmpuint(value, >=, 2);
+    g_assert_cmpuint(value, <=, 3);
+    /* FILT: 2 + 5 cycles, and both edges with ICEDGE = BOTH. */
+    qtest_writel(qts, TIMER1_BASE + TIMER_CC_CTRL(0),
+                 TIMER_CC_CTRL_ICEDGE_BOTH);
+    qtest_writel(qts, TIMER1_BASE + TIMER_EN, 0);
+    qtest_writel(qts, TIMER1_BASE + TIMER_CC_CFG(0),
+                 TIMER_CC_CFG_INPUTCAPTURE | TIMER_CC_CFG_PRSASYNCLEVEL |
+                     TIMER_CC_CFG_FILT);
+    qtest_writel(qts, TIMER1_BASE + TIMER_EN, TIMER_EN_EN);
+    qtest_writel(qts, TIMER1_BASE + TIMER_CMD, TIMER_CMD_START);
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWLEVEL, 0);
+    value = qtest_readl(qts, TIMER1_BASE + TIMER_CNT);
+    qtest_clock_step(qts, 7 * 27);
+    value = qtest_readl(qts, TIMER1_BASE + TIMER_CC_ICF(0)) - value;
+    g_assert_cmpuint(value, >=, 7);
+    g_assert_cmpuint(value, <=, 8);
+    g_assert_cmphex(qtest_readl(qts, TIMER1_BASE + TIMER_STATUS) &
+                    TIMER_STATUS_ICFEMPTY(0), ==, TIMER_STATUS_ICFEMPTY(0));
+
+    /* PRSSYNC: TIMER0 OF through synchronous channel 2, TOP = 99. */
+    qtest_writel(qts, PRS_BASE + PRS_SYNC_CH_CTRL(2),
+                 PRS_CH_SOURCESEL(PRS_SYNC_SRC_TIMER0) |
+                     PRS_CH_SIGSEL(PRS_SIG_TIMER_OF));
+    qtest_writel(qts, PRS_BASE + PRS_CONSUMER_TIMER1_CC(2),
+                 PRS_CONSUMER_SPRSSEL(2));
+    qtest_writel(qts, TIMER1_BASE + TIMER_EN, 0);
+    qtest_writel(qts, TIMER1_BASE + TIMER_CC_CFG(2),
+                 TIMER_CC_CFG_INPUTCAPTURE | TIMER_CC_CFG_PRSSYNC);
+    qtest_writel(qts, TIMER1_BASE + TIMER_EN, TIMER_EN_EN);
+    qtest_writel(qts, TIMER1_BASE + TIMER_CMD, TIMER_CMD_START);
+    qtest_writel(qts, TIMER0_BASE + TIMER_EN, TIMER_EN_EN);
+    qtest_writel(qts, TIMER0_BASE + TIMER_TOP, 99);
+    qtest_writel(qts, TIMER0_BASE + TIMER_CMD, TIMER_CMD_START);
+    value = qtest_readl(qts, TIMER1_BASE + TIMER_CNT);
+    qtest_clock_step(qts, 2 * 100 * 27);
+    g_assert_cmpuint(abs((int)(qtest_readl(qts, TIMER1_BASE +
+                                                TIMER_CC_ICF(2)) - value) -
+                         100), <=, 1);
+    g_assert_cmpuint(abs((int)(qtest_readl(qts, TIMER1_BASE +
+                                                TIMER_CC_ICF(2)) - value) -
+                         200), <=, 1);
+    qtest_quit(qts);
+}
+
+/*
+ * The probe route of scripts/bg22-tifs-probe.tcl (SS7.71): CC0's PRS edge
+ * reload-starts a one-shot TIMER1 (CTRL.RISEA = RELOADSTART, CFG.OSMEN)
+ * that stops at TOP; captures after that read TOP.
+ */
+static void test_prs_timer_reloadstart_oneshot(void)
+{
+    QTestState *qts = prs_start();
+
+    qtest_writel(qts, PRS_BASE + PRS_CONSUMER_TIMER1_CC(0), 9);
+    qtest_writel(qts, PRS_BASE + PRS_CONSUMER_TIMER1_CC(1), 10);
+    qtest_writel(qts, TIMER1_BASE + TIMER_CFG, TIMER_CFG_OSMEN);
+    qtest_writel(qts, TIMER1_BASE + TIMER_CC_CFG(0),
+                 TIMER_CC_CFG_INPUTCAPTURE | TIMER_CC_CFG_PRSASYNCPULSE);
+    qtest_writel(qts, TIMER1_BASE + TIMER_CC_CFG(1),
+                 TIMER_CC_CFG_INPUTCAPTURE | TIMER_CC_CFG_PRSASYNCPULSE);
+    qtest_writel(qts, TIMER1_BASE + TIMER_EN, TIMER_EN_EN);
+    qtest_writel(qts, TIMER1_BASE + TIMER_TOP, 999);
+    qtest_writel(qts, TIMER1_BASE + TIMER_CTRL, TIMER_CTRL_RISEA_RELOADSTART);
+    g_assert_cmphex(qtest_readl(qts, TIMER1_BASE + TIMER_STATUS) &
+                    TIMER_STATUS_RUNNING, ==, 0);
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWPULSE, 1u << 9);
+    g_assert_cmphex(qtest_readl(qts, TIMER1_BASE + TIMER_STATUS) &
+                    TIMER_STATUS_RUNNING, ==, TIMER_STATUS_RUNNING);
+    qtest_clock_step(qts, 5000);
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWPULSE, 1u << 10);
+    g_assert_cmpuint(abs((int)qtest_readl(qts, TIMER1_BASE + TIMER_CC_ICF(1)) -
+                         192), <=, 1);
+    qtest_clock_step(qts, 50000);
+    g_assert_cmphex(qtest_readl(qts, TIMER1_BASE + TIMER_STATUS) &
+                    TIMER_STATUS_RUNNING, ==, 0);
+    g_assert_cmpuint(qtest_readl(qts, TIMER1_BASE + TIMER_CNT), ==, 999);
+    g_assert_cmphex(qtest_readl(qts, TIMER1_BASE + TIMER_IF) & TIMER_IF_OF,
+                    ==, TIMER_IF_OF);
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWPULSE, 1u << 10);
+    g_assert_cmpuint(qtest_readl(qts, TIMER1_BASE + TIMER_CC_ICF(1)), ==, 999);
+    /* The CC0 capture of the start edge read 0 counts. */
+    g_assert_cmpuint(qtest_readl(qts, TIMER1_BASE + TIMER_CC_ICF(0)), ==, 0);
+    qtest_quit(qts);
+}
+
+/*
+ * RTCC input capture from the PRS (RM SS15.3.2): an edge on the selected
+ * channel captures CNT into CCn_ICVALUE and sets IF.CCn.
+ */
+#define RTCC_CC_CTRL(n)         (0x030 + 0xc * (n))
+#define RTCC_CC_ICVALUE(n)      (0x038 + 0xc * (n))
+#define RTCC_CC_INPUTCAPTURE    0x1
+#define RTCC_IF_CC(n)           (1u << (4 + 2 * (n)))
+
+static void test_prs_rtcc_capture(void)
+{
+    QTestState *qts = prs_start();
+    uint32_t cnt;
+
+    qtest_writel(qts, RTCC_BASE + RTCC_EN, 1);
+    qtest_writel(qts, RTCC_BASE + RTCC_CC_CTRL(2), RTCC_CC_INPUTCAPTURE);
+    qtest_writel(qts, PRS_BASE + PRS_CONSUMER_RTCC_CC(2), 5);
+    qtest_writel(qts, RTCC_BASE + RTCC_CMD, RTCC_CMD_START);
+    qtest_clock_step(qts, 100 * LF_PERIOD_NS);
+    cnt = qtest_readl(qts, RTCC_BASE + RTCC_CNT);
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWPULSE, 1u << 5);
+    g_assert_cmpuint(qtest_readl(qts, RTCC_BASE + RTCC_CC_ICVALUE(2)), ==,
+                     cnt);
+    g_assert_cmphex(qtest_readl(qts, RTCC_BASE + RTCC_IF) & RTCC_IF_CC(2), ==,
+                    RTCC_IF_CC(2));
+    qtest_quit(qts);
+}
+
+/*
+ * IADC triggers (RM SS24.3.3.3): SINGLESTART only enables the queue for a
+ * PRSPOS trigger, which converts after the 2 CLK_SRC_ADC synchronisation
+ * cycles; the local timer triggers every IADC_TIMER CLK_SRC_ADC cycles.
+ * CLK_SRC_ADC is EM01GRPACLK, HFRCODPLL's 19 MHz at reset.
+ */
+#define IADC_TIMER            0x010
+#define IADC_TRIGGER          0x02c
+#define IADC_TRIGGER_SINGLE_TIMER  (1u << 8)
+#define IADC_TRIGGER_SINGLE_PRSPOS (3u << 8)
+#define IADC_CMD_SINGLESTART  (1u << 0)
+#define IADC_CMD_SINGLESTOP   (1u << 1)
+#define IADC_CMD_TIMEREN      (1u << 16)
+#define IADC_STATUS_SINGLEQEN (1u << 0)
+#define IADC_STATUS_TIMERACTIVE (1u << 16)
+#define IADC_SINGLEFIFOSTAT   0x078
+#define IADC_PRS_SYNC_NS      (2 * 1000000000ull / 19000000 + 1)
+#define IADC_TIMER_PERIOD_NS  100000ull
+
+static void test_iadc_triggers(void)
+{
+    QTestState *qts = prs_start();
+
+    qtest_writel(qts, CMU_BASE_ADDR + CMU_EM01GRPACLKCTRL, 1);
+    qtest_writel(qts, IADC_BASE + IADC_CTRL,
+                 IADC_CTRL_TIMEBASE_1US | IADC_CTRL_KEEPWARM);
+    qtest_writel(qts, IADC_BASE + IADC_SCHED0, 1);
+    qtest_writel(qts, IADC_BASE + IADC_CFG0, IADC_CFG0_VDDX_GAIN1);
+    qtest_writel(qts, IADC_BASE + IADC_SINGLE, IADC_SINGLE_PD02_GND);
+    qtest_writel(qts, IADC_BASE + IADC_TRIGGER, IADC_TRIGGER_SINGLE_PRSPOS);
+    qtest_writel(qts, PRS_BASE + PRS_CONSUMER_IADC0_SINGLETRIGGER, 4);
+    qtest_writel(qts, IADC_BASE + IADC_CMD, IADC_CMD_SINGLESTART);
+    g_assert_cmphex(qtest_readl(qts, IADC_BASE + IADC_STATUS) &
+                    (IADC_STATUS_SINGLEQEN | IADC_STATUS_CONVERTING), ==,
+                    IADC_STATUS_SINGLEQEN);
+    qtest_clock_step(qts, 100000);
+    g_assert_cmpuint(qtest_readl(qts, IADC_BASE + IADC_SINGLEFIFOSTAT), ==, 0);
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWPULSE, 1u << 4);
+    qtest_clock_step(qts, IADC_PRS_SYNC_NS + IADC_WARMUP_NS + IADC_CONV_NS -
+                              1);
+    g_assert_cmpuint(qtest_readl(qts, IADC_BASE + IADC_SINGLEFIFOSTAT), ==, 0);
+    qtest_clock_step(qts, 1);
+    g_assert_cmpuint(qtest_readl(qts, IADC_BASE + IADC_SINGLEFIFOSTAT), ==, 1);
+    qtest_writel(qts, IADC_BASE + IADC_CMD, IADC_CMD_SINGLESTOP);
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWPULSE, 1u << 4);
+    qtest_clock_step(qts, 100000);
+    g_assert_cmpuint(qtest_readl(qts, IADC_BASE + IADC_SINGLEFIFOSTAT), ==, 1);
+
+    /* Local timer, 1900 cycles = 100 us; warm already (KEEPWARM). */
+    qtest_writel(qts, IADC_BASE + IADC_TRIGGER, IADC_TRIGGER_SINGLE_TIMER);
+    qtest_writel(qts, IADC_BASE + IADC_TIMER, 1900);
+    qtest_writel(qts, IADC_BASE + IADC_CMD,
+                 IADC_CMD_SINGLESTART | IADC_CMD_TIMEREN);
+    g_assert_cmphex(qtest_readl(qts, IADC_BASE + IADC_STATUS) &
+                    IADC_STATUS_TIMERACTIVE, ==, IADC_STATUS_TIMERACTIVE);
+    qtest_clock_step(qts, IADC_TIMER_PERIOD_NS + IADC_CONV_NS);
+    g_assert_cmpuint(qtest_readl(qts, IADC_BASE + IADC_SINGLEFIFOSTAT), ==, 2);
+    qtest_clock_step(qts, IADC_TIMER_PERIOD_NS);
+    g_assert_cmpuint(qtest_readl(qts, IADC_BASE + IADC_SINGLEFIFOSTAT), ==, 3);
+    qtest_quit(qts);
+}
+
+/*
+ * BURAM (RM ch. 17): 32 retention words with SET/CLR/TGL aliases, byte
+ * lanes, kept through resets other than power-on; gated by CLKEN0.BURAM.
+ */
+#define BURAM_BASE              0x40080000
+#define BURAM_NS_BASE           0x50080000
+#define CMU_CLKEN0_BURAM        (1u << 28)
+
+static void setup_buram_clock(QTestState *qts)
+{
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_BURAM);
+}
+
+static void test_buram_retention(void)
+{
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel qtest -S");
+
+    setup_buram_clock(qts);
+    for (unsigned n = 0; n < 32; n++) {
+        g_assert_cmphex(qtest_readl(qts, BURAM_BASE + 4 * n), ==, 0);
+        qtest_writel(qts, BURAM_BASE + 4 * n, 0x01010101u * n);
+    }
+    qtest_writeb(qts, BURAM_NS_BASE + 4 * 3 + 2, 0xa5);
+    g_assert_cmphex(qtest_readl(qts, BURAM_BASE + 4 * 3), ==, 0x03a50303);
+    qtest_writel(qts, BURAM_BASE + 4 * 5 + REGISTER_SET_WINDOW, 0xf0000000);
+    qtest_writel(qts, BURAM_BASE + 4 * 5 + REGISTER_CLEAR_WINDOW, 0x5);
+    g_assert_cmphex(qtest_readl(qts, BURAM_BASE + 4 * 5), ==, 0xf5050500);
+    g_assert_cmphex(qtest_readw(qts, BURAM_BASE + 4 * 31 + 2), ==, 0x1f1f);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    qtest_qmp_eventwait(qts, "RESET");
+    setup_buram_clock(qts);
+    g_assert_cmphex(qtest_readl(qts, BURAM_BASE + 4 * 3), ==, 0x03a50303);
+    g_assert_cmphex(qtest_readl(qts, BURAM_BASE + 4 * 31), ==, 0x1f1f1f1f);
+    qtest_quit(qts);
+    g_assert_true(m33_load_faults(BURAM_BASE, setup_no_clocks));
+    g_assert_false(m33_load_faults(BURAM_BASE, setup_buram_clock));
+}
+
+/*
+ * LETIMER0 (RM ch. 18) at EM23GRPACLK = LFRCO, 32.768 kHz: LFSYNC writes
+ * land at the third LF edge (SYNCBUSY meanwhile); the start edge loads
+ * TOP; UF when the counter reaches 0, the toggle output with it (seen
+ * through PRS producer LETIMER0 CH0); one-shot stops after REP0
+ * underflows; PRS START.
+ */
+#define LETIMER0_BASE           0x4a000000
+#define LT_EN                   0x004
+#define LT_CTRL                 0x008
+#define LT_CMD                  0x00c
+#define LT_STATUS               0x010
+#define LT_CNT                  0x018
+#define LT_COMP0                0x01c
+#define LT_TOP                  0x024
+#define LT_REP0                 0x02c
+#define LT_IF                   0x034
+#define LT_SYNCBUSY             0x040
+#define LT_PRSMODE              0x050
+#define LT_CTRL_ONESHOT         0x1
+#define LT_CTRL_UFOA0_TOGGLE    (1u << 2)
+#define LT_CTRL_UFOA0_PWM       (3u << 2)
+#define LT_CTRL_CNTTOPEN        (1u << 9)
+#define LT_CMD_START            (1u << 0)
+#define LT_IF_COMP0             (1u << 0)
+#define LT_IF_UF                (1u << 2)
+#define LT_IF_REP0              (1u << 3)
+#define LT_SYNCBUSY_TOP         (1u << 2)
+#define LT_SYNCBUSY_START       (1u << 5)
+#define LT_PRSMODE_START_RISING (1u << 18)
+#define CMU_CLKEN0_LETIMER0     (1u << 12)
+#define PRS_SRC_LETIMER0        0x02
+
+static uint64_t lf_edge_ns(uint64_t edge)
+{
+    return (edge * 1000000000ull + 32767) / 32768;
+}
+
+/* Step @qts to just after LF edge number @edge. */
+static void lf_step_to(QTestState *qts, uint64_t edge)
+{
+    uint64_t now = qtest_clock_step(qts, 0);
+
+    qtest_clock_step(qts, lf_edge_ns(edge) + 1 - now);
+}
+
+static uint64_t lf_now(QTestState *qts)
+{
+    return qtest_clock_step(qts, 0) * 32768 / 1000000000ull;
+}
+
+static QTestState *letimer_start(void)
+{
+    QTestState *qts = prs_start();
+
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_LETIMER0);
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_CH_CTRL(0),
+                 PRS_CH_SOURCESEL(PRS_SRC_LETIMER0) | PRS_CH_SIGSEL(0) |
+                     PRS_CH_FNSEL(PRS_FNSEL_A));
+    lf_step_to(qts, lf_now(qts) + 1);
+    return qts;
+}
+
+static void test_letimer_free_running_toggle(void)
+{
+    QTestState *qts = letimer_start();
+    uint64_t e0 = lf_now(qts);
+
+    qtest_writel(qts, LETIMER0_BASE + LT_EN, 1);
+    qtest_writel(qts, LETIMER0_BASE + LT_CTRL,
+                 LT_CTRL_CNTTOPEN | LT_CTRL_UFOA0_TOGGLE);
+    qtest_writel(qts, LETIMER0_BASE + LT_TOP, 3);
+    qtest_writel(qts, LETIMER0_BASE + LT_CMD, LT_CMD_START);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_SYNCBUSY), ==,
+                    LT_SYNCBUSY_TOP | LT_SYNCBUSY_START);
+    g_assert_cmpuint(qtest_readl(qts, LETIMER0_BASE + LT_TOP), ==, 3);
+    lf_step_to(qts, e0 + 2);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_SYNCBUSY), ==,
+                    LT_SYNCBUSY_TOP | LT_SYNCBUSY_START);
+    lf_step_to(qts, e0 + 3);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_SYNCBUSY), ==, 0);
+    g_assert_cmpuint(qtest_readl(qts, LETIMER0_BASE + LT_CNT), ==, 3);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_STATUS), ==, 1);
+    lf_step_to(qts, e0 + 5);
+    g_assert_cmpuint(qtest_readl(qts, LETIMER0_BASE + LT_CNT), ==, 1);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_IF), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, PRS_BASE + PRS_ASYNC_PEEK) & 1, ==, 0);
+    lf_step_to(qts, e0 + 6);
+    g_assert_cmpuint(qtest_readl(qts, LETIMER0_BASE + LT_CNT), ==, 0);
+    /* COMP0 and COMP1 are 0: they match with the underflow. */
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_IF), ==,
+                    LT_IF_UF | LT_IF_COMP0 | (LT_IF_COMP0 << 1));
+    g_assert_cmphex(qtest_readl(qts, PRS_BASE + PRS_ASYNC_PEEK) & 1, ==, 1);
+    lf_step_to(qts, e0 + 7);
+    g_assert_cmpuint(qtest_readl(qts, LETIMER0_BASE + LT_CNT), ==, 3);
+    /* INTFLAG: a plain write does nothing, the CLR alias clears. */
+    qtest_writel(qts, LETIMER0_BASE + LT_IF, 0);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_IF) & LT_IF_UF, ==,
+                    LT_IF_UF);
+    qtest_writel(qts, LETIMER0_BASE + LT_IF + REGISTER_CLEAR_WINDOW, LT_IF_UF);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_IF) & LT_IF_UF, ==, 0);
+    lf_step_to(qts, e0 + 10);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_IF) & LT_IF_UF, ==,
+                    LT_IF_UF);
+    g_assert_cmphex(qtest_readl(qts, PRS_BASE + PRS_ASYNC_PEEK) & 1, ==, 0);
+    lf_step_to(qts, e0 + 10 + 4 * 1000);
+    g_assert_cmpuint(qtest_readl(qts, LETIMER0_BASE + LT_CNT), ==, 0);
+    qtest_quit(qts);
+}
+
+/* PWM (Table 18.2): idle at underflow, active at the COMP0 match. */
+static void test_letimer_oneshot_pwm(void)
+{
+    QTestState *qts = letimer_start();
+    uint64_t e0 = lf_now(qts);
+
+    qtest_writel(qts, LETIMER0_BASE + LT_EN, 1);
+    qtest_writel(qts, LETIMER0_BASE + LT_CTRL,
+                 LT_CTRL_CNTTOPEN | LT_CTRL_UFOA0_PWM | LT_CTRL_ONESHOT);
+    qtest_writel(qts, LETIMER0_BASE + LT_TOP, 3);
+    qtest_writel(qts, LETIMER0_BASE + LT_COMP0, 2);
+    qtest_writel(qts, LETIMER0_BASE + LT_REP0, 3);
+    qtest_writel(qts, LETIMER0_BASE + LT_PRSMODE, LT_PRSMODE_START_RISING);
+    qtest_writel(qts, PRS_BASE + PRS_CONSUMER_LETIMER0_START, 5);
+    lf_step_to(qts, e0 + 3);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_STATUS), ==, 0);
+    /* The PRS START acts at the next edge: e0 + 4 loads TOP = 3. */
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWPULSE, 1u << 5);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_STATUS), ==, 1);
+    lf_step_to(qts, e0 + 4);
+    g_assert_cmpuint(qtest_readl(qts, LETIMER0_BASE + LT_CNT), ==, 3);
+    lf_step_to(qts, e0 + 5);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_IF), ==, LT_IF_COMP0);
+    g_assert_cmphex(qtest_readl(qts, PRS_BASE + PRS_ASYNC_PEEK) & 1, ==, 1);
+    lf_step_to(qts, e0 + 7);
+    g_assert_cmphex(qtest_readl(qts, PRS_BASE + PRS_ASYNC_PEEK) & 1, ==, 0);
+    /* Three underflows (e0 + 7, 11, 15), then the stop at e0 + 16. */
+    lf_step_to(qts, e0 + 15);
+    g_assert_cmpuint(qtest_readl(qts, LETIMER0_BASE + LT_REP0), ==, 1);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_STATUS), ==, 1);
+    lf_step_to(qts, e0 + 16);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_STATUS), ==, 0);
+    g_assert_cmpuint(qtest_readl(qts, LETIMER0_BASE + LT_REP0), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_IF) & LT_IF_REP0, ==,
+                    LT_IF_REP0);
+    lf_step_to(qts, e0 + 40);
+    g_assert_cmpuint(qtest_readl(qts, LETIMER0_BASE + LT_CNT), ==, 0);
+    qtest_quit(qts);
+    /* A gated LETIMER0 read faults (silicon, SS7.73). */
+    g_assert_true(m33_load_faults(LETIMER0_BASE + LT_CNT, setup_no_clocks));
+}
+
+/*
+ * EUART0 (RM ch. 22) on EM01GRPACLK = HFXO, 38.4 MHz, 8N1 at CLKDIV 5072
+ * (115.3 kbaud with OVS x16): one frame is 10 x 16 x (256 + 5072) /
+ * (256 x 38.4 MHz) = 86.72 us.  CMD is LFSYNC (SYNCBUSY for 3 kernel
+ * clocks), CFG0 a CONFIG register (faults with EN set), loopback, the FIFO
+ * level flags, INTFLAG IF; the chardev line side both ways.
+ */
+#define EUART0_BASE             0x4a030000
+#define EU_EN                   0x004
+#define EU_CFG0                 0x008
+#define EU_CLKDIV               0x028
+#define EU_CMD                  0x030
+#define EU_RXDATA               0x034
+#define EU_TXDATA               0x03c
+#define EU_STATUS               0x040
+#define EU_IF                   0x044
+#define EU_SYNCBUSY             0x04c
+#define EU_CFG0_LOOPBK          (1u << 1)
+#define EU_CMD_RXEN             (1u << 0)
+#define EU_CMD_TXEN             (1u << 2)
+#define EU_STATUS_RXENS         (1u << 0)
+#define EU_STATUS_TXENS         (1u << 1)
+#define EU_STATUS_TXC           (1u << 5)
+#define EU_STATUS_TXFL          (1u << 6)
+#define EU_STATUS_RXFL          (1u << 7)
+#define EU_STATUS_TXIDLE        (1u << 13)
+#define EU_IF_TXC               (1u << 0)
+#define EU_IF_RXFL              (1u << 2)
+#define EU_IF_RXUF              (1u << 5)
+#define EU_CLKDIV_115200        5072
+#define EU_FRAME_NS             86718
+#define CMU_CLKEN0_EUART0       (1u << 24)
+
+static void setup_euart_enabled(QTestState *qts)
+{
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_EUART0);
+    qtest_writel(qts, EUART0_BASE + EU_EN, 1);
+}
+
+static void setup_euart_clock(QTestState *qts)
+{
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_EUART0);
+}
+
+static QTestState *euart_start(const char *extra, bool loopback)
+{
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel qtest %s",
+                                  extra);
+
+    setup_euart_clock(qts);
+    qtest_writel(qts, CMU_BASE_ADDR + CMU_EM01GRPACLKCTRL,
+                 CMU_EM01GRPACLK_HFXO);
+    qtest_writel(qts, EUART0_BASE + EU_CFG0, loopback ? EU_CFG0_LOOPBK : 0);
+    qtest_writel(qts, EUART0_BASE + EU_CLKDIV, EU_CLKDIV_115200);
+    qtest_writel(qts, EUART0_BASE + EU_EN, 1);
+    qtest_writel(qts, EUART0_BASE + EU_CMD, EU_CMD_RXEN | EU_CMD_TXEN);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_SYNCBUSY), ==,
+                    (EU_CMD_RXEN | EU_CMD_TXEN) << 3);
+    qtest_clock_step(qts, 3 * 27);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_SYNCBUSY), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_STATUS) &
+                    (EU_STATUS_RXENS | EU_STATUS_TXENS), ==,
+                    EU_STATUS_RXENS | EU_STATUS_TXENS);
+    return qts;
+}
+
+static void test_euart_loopback(void)
+{
+    QTestState *qts = euart_start("", true);
+
+    qtest_writel(qts, EUART0_BASE + EU_TXDATA, 0x55);
+    qtest_writel(qts, EUART0_BASE + EU_TXDATA, 0xaa);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_STATUS) &
+                    (EU_STATUS_TXC | EU_STATUS_TXIDLE | EU_STATUS_RXFL), ==,
+                    0);
+    qtest_clock_step(qts, 2 * EU_FRAME_NS - 100);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_STATUS) &
+                    (EU_STATUS_TXC | EU_STATUS_RXFL), ==, EU_STATUS_RXFL);
+    qtest_clock_step(qts, 100);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_STATUS) &
+                    (EU_STATUS_TXC | EU_STATUS_TXFL | EU_STATUS_TXIDLE), ==,
+                    EU_STATUS_TXC | EU_STATUS_TXFL | EU_STATUS_TXIDLE);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_IF) &
+                    (EU_IF_TXC | EU_IF_RXFL), ==, EU_IF_TXC | EU_IF_RXFL);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_RXDATA), ==, 0x55);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_RXDATA), ==, 0xaa);
+    /* RXFL is a level flag: cleared, it stays clear with the FIFO empty. */
+    qtest_writel(qts, EUART0_BASE + EU_IF + REGISTER_CLEAR_WINDOW, EU_IF_RXFL);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_IF) & EU_IF_RXFL, ==,
+                    0);
+    qtest_readl(qts, EUART0_BASE + EU_RXDATA);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_IF) & EU_IF_RXUF, ==,
+                    EU_IF_RXUF);
+    qtest_quit(qts);
+    /* CONFIG: CFG0 written with EN set is a bus fault (RM SS4.2.4.4.2). */
+    g_assert_true(m33_store_faults(EUART0_BASE + EU_CFG0,
+                                   setup_euart_enabled));
+    g_assert_false(m33_store_faults(EUART0_BASE + EU_CFG0,
+                                    setup_euart_clock));
+}
+
+static void test_euart_chardev(void)
+{
+    g_autofree char *path = g_strdup_printf("%s/efr32-euart-%d.sock",
+                                            g_get_tmp_dir(), getpid());
+    g_autofree char *args = g_strdup_printf(
+        "-chardev socket,id=soc.euart0,path=%s", path);
+    int server = qtest_socket_server(path);
+    QTestState *qts;
+    int fd;
+    char byte = 0;
+
+    qts = euart_start(args, false);
+    fd = accept(server, NULL, NULL);
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_cmpint(write(fd, "Q", 1), ==, 1);
+    /* The byte is on the wire for one frame time. */
+    for (int i = 0; i < 100 &&
+                    !(qtest_readl(qts, EUART0_BASE + EU_STATUS) &
+                      EU_STATUS_RXFL); i++) {
+        qtest_clock_step(qts, EU_FRAME_NS);
+    }
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_RXDATA), ==, 'Q');
+    qtest_writel(qts, EUART0_BASE + EU_TXDATA, 'z');
+    qtest_clock_step(qts, EU_FRAME_NS);
+    g_assert_cmpint(read(fd, &byte, 1), ==, 1);
+    g_assert_cmpint(byte, ==, 'z');
+    close(fd);
+    close(server);
+    unlink(path);
+    qtest_quit(qts);
+}
+
+/*
+ * LDMA (RM ch. 26): a software-requested memory copy, a linked list loaded
+ * with LINKLOAD (XFER, relative link, WRI), a peripheral-paced transfer
+ * (EUART0 TXFL into TXDATA, looped back into the RX FIFO), and the bus
+ * error of a radio-register source (silicon, SS7.74).
+ */
+#define LDMA_BASE               0x40040000
+#define LDMAXBAR_BASE           0x40044000
+#define LD_STATUS               0x00c
+#define LD_CHEN                 0x024
+#define LD_CHSTATUS             0x02c
+#define LD_CHDONE               0x034
+#define LD_SWREQ                0x03c
+#define LD_LINKLOAD             0x048
+#define LD_IF                   0x050
+#define LD_CH(n)                (0x058 + 0x30 * (n))
+#define LD_CH_CTRL              0x0c
+#define LD_CH_SRC               0x10
+#define LD_CH_DST               0x14
+#define LD_CH_LINK              0x18
+#define LD_IF_ERROR             (1u << 31)
+#define LD_CTRL_XFERCNT(n)      (((n) - 1) << 4)
+#define LD_CTRL_STRUCTREQ       (1u << 3)
+#define LD_CTRL_BLOCK_ALL       (15u << 16)
+#define LD_CTRL_DONEIEN         (1u << 20)
+#define LD_CTRL_REQMODE_ALL     (1u << 21)
+#define LD_CTRL_SRCINC_NONE     (3u << 24)
+#define LD_CTRL_SIZE_WORD       (2u << 26)
+#define LD_CTRL_DSTINC_NONE     (3u << 28)
+#define LD_STRUCT_WRI           2u
+#define LD_LINK_REL_NEXT        (0x10 | 0x2 | 0x1)
+#define CMU_CLKEN0_LDMA         ((1u << 0) | (1u << 1))
+#define LD_SRAM                 0x20004000
+
+static QTestState *ldma_start(void)
+{
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel qtest");
+
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_LDMA | CMU_CLKEN0_EUART0);
+    return qts;
+}
+
+static void test_ldma_memory_copy(void)
+{
+    QTestState *qts = ldma_start();
+
+    for (unsigned i = 0; i < 16; i++) {
+        qtest_writeb(qts, LD_SRAM + i, 0x30 + i);
+    }
+    qtest_writel(qts, LDMA_BASE + LD_CH(0) + LD_CH_CTRL,
+                 LD_CTRL_XFERCNT(16) | LD_CTRL_BLOCK_ALL |
+                     LD_CTRL_REQMODE_ALL | LD_CTRL_DONEIEN);
+    qtest_writel(qts, LDMA_BASE + LD_CH(0) + LD_CH_SRC, LD_SRAM);
+    qtest_writel(qts, LDMA_BASE + LD_CH(0) + LD_CH_DST, LD_SRAM + 0x100);
+    qtest_writel(qts, LDMA_BASE + LD_CHEN, 1);
+    qtest_writel(qts, LDMA_BASE + LD_SWREQ, 1);
+    g_assert_cmphex(qtest_readl(qts, LDMA_BASE + LD_CHDONE), ==, 0);
+    qtest_clock_step(qts, 10000);
+    g_assert_cmphex(qtest_readl(qts, LDMA_BASE + LD_CHDONE), ==, 1);
+    g_assert_cmphex(qtest_readl(qts, LDMA_BASE + LD_IF), ==, 1);
+    g_assert_cmphex(qtest_readl(qts, LDMA_BASE + LD_CHSTATUS), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, LD_SRAM + 0x10c), ==, 0x3f3e3d3c);
+    g_assert_cmphex(qtest_readl(qts, LDMA_BASE + LD_CH(0) + LD_CH_SRC), ==,
+                    LD_SRAM + 16);
+
+    /* LINKLOAD a two-entry list: 4 words, then a write-immediate. */
+    qtest_writel(qts, LD_SRAM + 0x200, LD_CTRL_XFERCNT(4) | LD_CTRL_BLOCK_ALL |
+                                           LD_CTRL_REQMODE_ALL |
+                                           LD_CTRL_SIZE_WORD |
+                                           LD_CTRL_STRUCTREQ);
+    qtest_writel(qts, LD_SRAM + 0x204, LD_SRAM);
+    qtest_writel(qts, LD_SRAM + 0x208, LD_SRAM + 0x300);
+    qtest_writel(qts, LD_SRAM + 0x20c, LD_LINK_REL_NEXT);
+    qtest_writel(qts, LD_SRAM + 0x210, LD_STRUCT_WRI | LD_CTRL_DONEIEN);
+    qtest_writel(qts, LD_SRAM + 0x214, 0xcafef00d);
+    qtest_writel(qts, LD_SRAM + 0x218, LD_SRAM + 0x320);
+    qtest_writel(qts, LD_SRAM + 0x21c, 0);
+    qtest_writel(qts, LDMA_BASE + LD_IF + REGISTER_CLEAR_WINDOW, ~0u);
+    qtest_writel(qts, LDMA_BASE + LD_CHDONE, 0);
+    qtest_writel(qts, LDMA_BASE + LD_CH(2) + LD_CH_LINK, LD_SRAM + 0x200);
+    qtest_writel(qts, LDMA_BASE + LD_LINKLOAD, 1u << 2);
+    g_assert_cmphex(qtest_readl(qts, LDMA_BASE + LD_CHSTATUS), ==, 1u << 2);
+    qtest_clock_step(qts, 10000);
+    g_assert_cmphex(qtest_readl(qts, LD_SRAM + 0x30c), ==, 0x3f3e3d3c);
+    g_assert_cmphex(qtest_readl(qts, LD_SRAM + 0x320), ==, 0xcafef00d);
+    g_assert_cmphex(qtest_readl(qts, LDMA_BASE + LD_CHDONE), ==, 1u << 2);
+    g_assert_cmphex(qtest_readl(qts, LDMA_BASE + LD_IF), ==, 1u << 2);
+
+    /* A radio register source: IF.ERROR, STATUS.CHERROR = 3. */
+    qtest_writel(qts, LDMA_BASE + LD_CH(3) + LD_CH_CTRL,
+                 LD_CTRL_XFERCNT(1) | LD_CTRL_SIZE_WORD);
+    qtest_writel(qts, LDMA_BASE + LD_CH(3) + LD_CH_SRC, RAC_BASE + RAC_STATUS);
+    qtest_writel(qts, LDMA_BASE + LD_CH(3) + LD_CH_DST, LD_SRAM + 0x400);
+    qtest_writel(qts, LDMA_BASE + LD_CHEN, 1u << 3);
+    qtest_writel(qts, LDMA_BASE + LD_SWREQ, 1u << 3);
+    qtest_clock_step(qts, 10000);
+    g_assert_cmphex(qtest_readl(qts, LDMA_BASE + LD_IF) & LD_IF_ERROR, ==,
+                    LD_IF_ERROR);
+    g_assert_cmphex((qtest_readl(qts, LDMA_BASE + LD_STATUS) >> 8) & 0x1f,
+                    ==, 3);
+    qtest_quit(qts);
+}
+
+static void test_ldma_peripheral_request(void)
+{
+    QTestState *qts = euart_start("", true);
+
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_LDMA);
+    qtest_writel(qts, LD_SRAM, 0x44332211);
+    /* EUART0 TXFL: SOURCESEL 0x10, SIGSEL 1; one byte per request. */
+    qtest_writel(qts, LDMAXBAR_BASE + 4 * 1, (0x10u << 16) | 1);
+    qtest_writel(qts, LDMA_BASE + LD_CH(1) + LD_CH_CTRL,
+                 LD_CTRL_XFERCNT(4) | LD_CTRL_DSTINC_NONE | LD_CTRL_DONEIEN);
+    qtest_writel(qts, LDMA_BASE + LD_CH(1) + LD_CH_SRC, LD_SRAM);
+    qtest_writel(qts, LDMA_BASE + LD_CH(1) + LD_CH_DST,
+                 EUART0_BASE + EU_TXDATA);
+    qtest_writel(qts, LDMA_BASE + LD_CHEN, 1u << 1);
+    qtest_clock_step(qts, 4 * EU_FRAME_NS + 1000);
+    g_assert_cmphex(qtest_readl(qts, LDMA_BASE + LD_CHDONE), ==, 1u << 1);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_RXDATA), ==, 0x11);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_RXDATA), ==, 0x22);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_RXDATA), ==, 0x33);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_RXDATA), ==, 0x44);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     int result;
@@ -3968,10 +4979,32 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/timer-sync-registers-read-zero-when-disabled",
                    test_timer_sync_registers_read_zero_when_disabled);
     qtest_add_func("/efr32bg22/timer-bus-faults", test_timer_bus_faults);
+    qtest_add_func("/efr32bg22/prs-logic-table", test_prs_logic_table);
+    qtest_add_func("/efr32bg22/prs-bus-gate", test_prs_bus_gate);
+    qtest_add_func("/efr32bg22/prs-swpulse-timer-capture",
+                   test_prs_swpulse_timer_capture);
+    qtest_add_func("/efr32bg22/prs-timer-input-qualification",
+                   test_prs_timer_input_qualification);
+    qtest_add_func("/efr32bg22/prs-timer-reloadstart-oneshot",
+                   test_prs_timer_reloadstart_oneshot);
+    qtest_add_func("/efr32bg22/prs-rtcc-capture", test_prs_rtcc_capture);
+    qtest_add_func("/efr32bg22/iadc-triggers", test_iadc_triggers);
+    qtest_add_func("/efr32bg22/iadc-resolution-and-window",
+                   test_iadc_resolution_and_window);
+    qtest_add_func("/efr32bg22/buram-retention", test_buram_retention);
+    qtest_add_func("/efr32bg22/letimer-free-running-toggle",
+                   test_letimer_free_running_toggle);
+    qtest_add_func("/efr32bg22/letimer-oneshot-pwm", test_letimer_oneshot_pwm);
+    qtest_add_func("/efr32bg22/euart-loopback", test_euart_loopback);
+    qtest_add_func("/efr32bg22/euart-chardev", test_euart_chardev);
+    qtest_add_func("/efr32bg22/ldma-memory-copy", test_ldma_memory_copy);
+    qtest_add_func("/efr32bg22/ldma-peripheral-request",
+                   test_ldma_peripheral_request);
     qtest_add_func("/efr32bg22/trng-fifo", test_trng_fifo);
     qtest_add_func("/efr32bg22/gpcrc-crc-vectors", test_gpcrc_crc_vectors);
     qtest_add_func("/efr32bg22/radioaes-ecb-and-key-sizes",
                    test_radioaes_ecb_and_key_sizes);
+    qtest_add_func("/efr32bg22/radioaes-clock-gate", test_radioaes_clock_gate);
     qtest_add_func("/efr32bg22/lfxo-ready-timeout", test_lfxo_ready_timeout);
     qtest_add_func("/efr32bg22/timer4-counter-and-aliases",
                    test_timer4_counter_and_aliases);
@@ -3990,6 +5023,9 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/cmu-nonsecure-alias", test_cmu_nonsecure_alias);
     qtest_add_func("/efr32bg22/dpll-lock", test_dpll_lock);
     qtest_add_func("/efr32bg22/usart-tx-polling", test_usart_tx_polling);
+    qtest_add_func("/efr32bg22/usart-frame-time", test_usart_frame_time);
+    qtest_add_func("/efr32bg22/usart-timer-and-break",
+                   test_usart_timer_and_break);
     qtest_add_func("/efr32bg22/modem-masks", test_modem_masks);
     qtest_add_func("/efr32bg22/modem-pa-ramp-registers",
                    test_modem_pa_ramp_registers);

@@ -24,6 +24,7 @@
 #include "qapi/error.h"
 #include "hw/irq.h"
 #include "hw/misc/efr32-dap.h"
+#include "hw/arm/efr32-soc-link.h"
 #include "hw/misc/swd.h"
 #include "hw/qdev-properties.h"
 #include "sysemu/runstate.h"
@@ -366,6 +367,7 @@ static MemTxAttrs mem_ap_attrs(Efr32MemAp *ap)
     return (MemTxAttrs) {
         .secure = !(ap->csw & CSW_HNONSEC),
         .user = !(ap->csw & CSW_HPROT_PRIV),
+        .requester_id = EFR32_REQUESTER_DEBUG_AP,
     };
 }
 

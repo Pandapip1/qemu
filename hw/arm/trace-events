@@ -94,6 +94,17 @@ efr32_usart_rx(unsigned index, uint8_t value) "USART%u RX=0x%02x"
 efr32_usart_rx_overflow(unsigned index, uint8_t value) "USART%u RX overflow, lost 0x%02x"
 efr32_usart_sync(unsigned index, uint8_t tx, uint8_t rx) "USART%u SPI TX=0x%02x RX=0x%02x"
 
+# efr32-eusart.c
+efr32_eusart_tx(uint8_t value) "EUART0 TX=0x%02x"
+efr32_eusart_rx(uint32_t value) "EUART0 RX=0x%03x"
+
+# efr32-ldma.c
+efr32_ldma_block(unsigned channel, unsigned units, unsigned remaining) "ch%u block of %u units, %u left"
+
+# efr32-prs.c
+efr32_prs_async(unsigned channel, bool level) "async ch%u=%d"
+efr32_prs_swpulse(uint32_t channels) "SWPULSE 0x%03x"
+
 # efr32-gpio.c
 efr32_gpio_pin(unsigned port, unsigned pin, bool oe, bool level) "port=%u pin=%u oe=%d level=%d"
 

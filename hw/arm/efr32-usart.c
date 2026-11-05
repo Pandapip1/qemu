@@ -15,11 +15,14 @@
  * Modelled: EN, CTRL (OVS, TXBIL, LOOPBK), FRAME, CMD (RX/TX enable and
  * disable, CLEARRX/CLEARTX), STATUS, CLKDIV, the RX/TX data registers
  * including the DOUBLE and peek forms, IF/IEN with the SET/CLR/TGL aliases,
- * and the RX and TX interrupt lines.  Not modelled: synchronous secondary
- * mode, AUTOCS, IrDA, I2S, the USART timer (TIMECMPn), multi-processor and
- * 9-bit frames, parity/framing errors (the chardev carries bytes, not line
- * levels) and PRS triggers; enabling any of them is reported as
- * unimplemented.
+ * the RX and TX interrupt lines, and the USART timer (RM SS21.3.10,
+ * usart_timer_*).  A break from the host side (a chardev break event) is
+ * received as a frame of 0 with a framing error (RM SS21.3.2.13): IF.FERR
+ * and RXDATAX.FERR.  IrDA (IRCTRL.IREN) shapes the pulses on the pin; the
+ * chardev carries bytes, so it passes them unchanged.  Not modelled:
+ * synchronous secondary mode, AUTOCS, I2S, multi-processor and 9-bit
+ * frames, parity errors (no bits on the chardev), the TX sequencer delays
+ * (TIMING) and PRS triggers; enabling them is reported as unimplemented.
  *
  * Synchronous main mode (CTRL.SYNC with CMD.MASTEREN, RM SS21.3.3): the
  * line side is the USART's SSI bus ("ssi"), to which SPI devices attach as
@@ -202,6 +205,8 @@ struct Efr32UsartState {
     MemoryRegion mmio_ns;
     qemu_irq rx_irq;
     qemu_irq tx_irq;
+    /* LDMA requests RXDATAV, RXDATAVRIGHT, TXBL, TXBLRIGHT, TXEMPTY. */
+    qemu_irq dma_req[EFR32_USART_DMA_REQS];
     Clock *pclk;
     CharBackend chr;
     IcountBusModel *bus_model;
@@ -225,8 +230,43 @@ struct Efr32UsartState {
     /* A frame from the host is on the wire into the receiver. */
     bool rx_shifting;
     uint8_t rx_shift;
+    bool rx_shift_ferr;
     QEMUTimer *rx_timer;
+    /* RXDATAX.FERR of each frame in rx_fifo, oldest first. */
+    bool rx_ferr[USART_BUFFER_FRAMES];
+    /* The USART timer: counter start, enabled comparators. */
+    int64_t timer_start_ns;
+    bool timer_running;
+    bool tcmp_enabled[3];
+    QEMUTimer *tcmp_timer;
 };
+
+/*
+ * USART timer (RM SS21.3.10, Figure 21.25): one 8-bit counter of bit
+ * times shared by three comparators.  A comparator's TSTART event enables
+ * it and (re)starts the counter from 0; its TSTOP event disables it; when
+ * the counter reaches TCMPVAL it raises IF.TCMPn, and TSTOP = TCMPn
+ * disables it, RESTARTEN restarts the counter.  The counter stops at 256
+ * or when no comparator is enabled.  Events: TXEOF (a frame's stop bit
+ * leaves), TXC (the transmitter goes idle), TXST (a frame starts), RXACT
+ * (a start bit arrives), RXEOF (a received frame ends) and [I] RXACTN at
+ * RXEOF (the line goes idle after the frame).
+ */
+#define USART_TIMECMP_TCMPVAL_MASK 0xffu
+#define USART_TIMECMP_TSTART_SHIFT 16
+#define USART_TIMECMP_TSTOP_SHIFT 20
+#define USART_TIMECMP_FIELD_MASK 0x7u
+#define USART_TIMECMP_RESTARTEN (1u << 24)
+#define USART_TIMER_COUNT_LIMIT 256u
+enum { USART_TSTART_DISABLE, USART_TSTART_TXEOF, USART_TSTART_TXC,
+       USART_TSTART_RXACT, USART_TSTART_RXEOF };
+enum { USART_TSTOP_TCMP, USART_TSTOP_TXST, USART_TSTOP_RXACT,
+       USART_TSTOP_RXACTN };
+/* The timer's events, as TSTART values and TSTOP values (-1: neither). */
+typedef enum UsartTimerEvent {
+    USART_EV_TXEOF, USART_EV_TXC, USART_EV_TXST, USART_EV_RXACT,
+    USART_EV_RXEOF,
+} UsartTimerEvent;
 
 static uint32_t usart_reg(Efr32UsartState *s, hwaddr offset)
 {
@@ -262,12 +302,15 @@ static int64_t usart_frame_ns(Efr32UsartState *s)
         /* data_bits * 2 * (256 + DIV) / (256 * fPCLK) seconds. */
         return muldiv64((uint64_t)data_bits * USART_SYNC_PCLK_PER_BIT *
                             divisor,
-                        NANOSECONDS_PER_SECOND,
-                        USART_CLKDIV_UNITY * pclk_hz);
+                        NANOSECONDS_PER_SECOND / USART_CLKDIV_UNITY, pclk_hz);
     }
-    /* half_bits / 2 * ovs * (256 + DIV) / (256 * fPCLK) seconds. */
-    return muldiv64((uint64_t)half_bits * ovs * divisor, NANOSECONDS_PER_SECOND,
-                    2 * USART_CLKDIV_UNITY * pclk_hz);
+    /*
+     * half_bits / 2 * ovs * (256 + DIV) / (256 * fPCLK) seconds.  The
+     * constant 512 is folded into the nanoseconds (10^9 / 512 is exact):
+     * muldiv64's divisor is 32 bits wide.
+     */
+    return muldiv64((uint64_t)half_bits * ovs * divisor,
+                    NANOSECONDS_PER_SECOND / (2 * USART_CLKDIV_UNITY), pclk_hz);
 }
 
 static bool usart_tx_buffer_level(Efr32UsartState *s)
@@ -311,6 +354,22 @@ static void usart_update_irq(Efr32UsartState *s)
 
     qemu_set_irq(s->rx_irq, !!(pending & USART_IF_RX_LINE));
     qemu_set_irq(s->tx_irq, !!(pending & USART_IF_TX_LINE));
+    /*
+     * LDMA requests (LDMAXBAR SIGSEL, efr32bg22_ldmaxbar_defines.h): the
+     * buffer conditions; [I] the RIGHT variants as their plain ones.
+     */
+    {
+        uint32_t status = usart_status(s);
+        bool rx = status & USART_STATUS_RXDATAV;
+        bool tx = s->tx_enabled && (status & USART_STATUS_TXBL);
+
+        qemu_set_irq(s->dma_req[0], rx);
+        qemu_set_irq(s->dma_req[1], rx);
+        qemu_set_irq(s->dma_req[2], tx);
+        qemu_set_irq(s->dma_req[3], tx);
+        qemu_set_irq(s->dma_req[4], s->tx_enabled &&
+                                        (status & USART_STATUS_TXIDLE));
+    }
 }
 
 /* Tell the host side the line format, for a backend that has one (a tty). */
@@ -357,12 +416,132 @@ static void usart_check_unimplemented(Efr32UsartState *s)
         qemu_log_mask(LOG_UNIMP, "efr32-usart%u: %u-bit frames\n", s->index,
                       data_bits + USART_FRAME_DATABITS_BIAS);
     }
-    if (usart_reg(s, USART_IRCTRL) || usart_reg(s, USART_I2SCTRL) ||
-        usart_reg(s, USART_TIMECMP0) || usart_reg(s, USART_TIMECMP1) ||
-        usart_reg(s, USART_TIMECMP2)) {
-        qemu_log_mask(LOG_UNIMP, "efr32-usart%u: IrDA, I2S or USART timer\n",
-                      s->index);
+    if (usart_reg(s, USART_I2SCTRL)) {
+        qemu_log_mask(LOG_UNIMP, "efr32-usart%u: I2S\n", s->index);
     }
+}
+
+static uint32_t usart_timecmp(Efr32UsartState *s, unsigned n)
+{
+    return usart_reg(s, USART_TIMECMP0 + 4 * n);
+}
+
+/* One bit time at the programmed rate, in ns (0: no clock). */
+static int64_t usart_bit_ns(Efr32UsartState *s)
+{
+    static const unsigned oversample[] = {16, 8, 6, 4};
+    uint64_t pclk_hz = clock_get_hz(s->pclk);
+    unsigned ovs = oversample[(usart_reg(s, USART_CTRL) &
+                               USART_CTRL_OVS_MASK) >> USART_CTRL_OVS_SHIFT];
+    uint64_t divisor = USART_CLKDIV_UNITY +
+                       (usart_reg(s, USART_CLKDIV) & USART_CLKDIV_DIV_MASK);
+
+    if (!pclk_hz) {
+        return 0;
+    }
+    /* ovs * (256 + DIV) / (256 * fPCLK) s; 10^9 / 256 is exact. */
+    return muldiv64((uint64_t)ovs * divisor,
+                    NANOSECONDS_PER_SECOND / USART_CLKDIV_UNITY, pclk_hz);
+}
+
+static void usart_timer_schedule(Efr32UsartState *s)
+{
+    int64_t bit_ns = usart_bit_ns(s);
+    int64_t next = INT64_MAX;
+
+    timer_del(s->tcmp_timer);
+    if (!s->timer_running || !bit_ns) {
+        return;
+    }
+    for (unsigned n = 0; n < 3; n++) {
+        if (s->tcmp_enabled[n]) {
+            next = MIN(next, s->timer_start_ns +
+                             (int64_t)(usart_timecmp(s, n) &
+                                       USART_TIMECMP_TCMPVAL_MASK) * bit_ns);
+        }
+    }
+    next = MIN(next, s->timer_start_ns +
+                     (int64_t)USART_TIMER_COUNT_LIMIT * bit_ns);
+    timer_mod(s->tcmp_timer, next);
+}
+
+static void usart_timer_expired(void *opaque)
+{
+    Efr32UsartState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t bit_ns = usart_bit_ns(s);
+    bool restart = false;
+
+    if (!s->timer_running || !bit_ns) {
+        return;
+    }
+    for (unsigned n = 0; n < 3; n++) {
+        uint32_t cmp = usart_timecmp(s, n);
+
+        if (!s->tcmp_enabled[n] ||
+            s->timer_start_ns + (int64_t)(cmp & USART_TIMECMP_TCMPVAL_MASK) *
+                                    bit_ns > now) {
+            continue;
+        }
+        s->if_latched |= USART_IF_TCMP0 << n;
+        if (((cmp >> USART_TIMECMP_TSTOP_SHIFT) & USART_TIMECMP_FIELD_MASK) ==
+            USART_TSTOP_TCMP) {
+            s->tcmp_enabled[n] = false;
+        }
+        if (cmp & USART_TIMECMP_RESTARTEN) {
+            restart = true;
+        }
+    }
+    if (restart) {
+        s->timer_start_ns = now;
+    } else if (now >= s->timer_start_ns +
+                          (int64_t)USART_TIMER_COUNT_LIMIT * bit_ns) {
+        s->timer_running = false;
+    }
+    if (!s->tcmp_enabled[0] && !s->tcmp_enabled[1] && !s->tcmp_enabled[2]) {
+        s->timer_running = false;
+    }
+    usart_timer_schedule(s);
+    usart_update_irq(s);
+}
+
+static void usart_timer_event(Efr32UsartState *s, UsartTimerEvent ev)
+{
+    static const int tstart[] = {
+        [USART_EV_TXEOF] = USART_TSTART_TXEOF,
+        [USART_EV_TXC] = USART_TSTART_TXC,
+        [USART_EV_TXST] = -1,
+        [USART_EV_RXACT] = USART_TSTART_RXACT,
+        [USART_EV_RXEOF] = USART_TSTART_RXEOF,
+    };
+    static const int tstop[] = {
+        [USART_EV_TXEOF] = -1,
+        [USART_EV_TXC] = -1,
+        [USART_EV_TXST] = USART_TSTOP_TXST,
+        [USART_EV_RXACT] = USART_TSTOP_RXACT,
+        [USART_EV_RXEOF] = USART_TSTOP_RXACTN,
+    };
+    bool any = false;
+
+    for (unsigned n = 0; n < 3; n++) {
+        uint32_t cmp = usart_timecmp(s, n);
+
+        if (((cmp >> USART_TIMECMP_TSTOP_SHIFT) & USART_TIMECMP_FIELD_MASK) ==
+            tstop[ev]) {
+            s->tcmp_enabled[n] = false;
+        }
+        if (((cmp >> USART_TIMECMP_TSTART_SHIFT) & USART_TIMECMP_FIELD_MASK) ==
+            tstart[ev] && tstart[ev] != USART_TSTART_DISABLE) {
+            s->tcmp_enabled[n] = true;
+            s->timer_start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            s->timer_running = true;
+        }
+        any |= s->tcmp_enabled[n];
+    }
+    if (!any) {
+        s->timer_running = false;
+    }
+    usart_timer_schedule(s);
 }
 
 static void usart_tx_start(Efr32UsartState *s)
@@ -380,6 +559,7 @@ static void usart_tx_start(Efr32UsartState *s)
     s->tx_shift = fifo8_pop(&s->tx_fifo);
     s->tx_shifting = true;
     timer_mod(s->tx_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + frame_ns);
+    usart_timer_event(s, USART_EV_TXST);
 }
 
 static void usart_receive_frame(Efr32UsartState *s, uint8_t value);
@@ -405,10 +585,12 @@ static void usart_tx_frame_end(void *opaque)
     } else {
         qemu_chr_fe_write_all(&s->chr, &value, 1);
     }
+    usart_timer_event(s, USART_EV_TXEOF);
     usart_tx_start(s);
     if (usart_tx_idle(s)) {
         s->tx_complete = true;
         s->if_latched |= USART_IF_TXC | USART_IF_TXIDLE;
+        usart_timer_event(s, USART_EV_TXC);
     }
     usart_update_irq(s);
 }
@@ -425,10 +607,14 @@ static void usart_tx_push(Efr32UsartState *s, uint8_t value)
 }
 
 /* A complete frame reached the receiver's buffer input. */
-static void usart_receive_frame(Efr32UsartState *s, uint8_t value)
+static void usart_receive_frame_ferr(Efr32UsartState *s, uint8_t value,
+                                     bool ferr)
 {
     if (!s->rx_enabled) {
         return;
+    }
+    if (ferr) {
+        s->if_latched |= USART_IF_FERR;
     }
     if (fifo8_is_full(&s->rx_fifo)) {
         s->if_latched |= USART_IF_RXOF;
@@ -436,7 +622,13 @@ static void usart_receive_frame(Efr32UsartState *s, uint8_t value)
         return;
     }
     trace_efr32_usart_rx(s->index, value);
+    s->rx_ferr[fifo8_num_used(&s->rx_fifo)] = ferr;
     fifo8_push(&s->rx_fifo, value);
+}
+
+static void usart_receive_frame(Efr32UsartState *s, uint8_t value)
+{
+    usart_receive_frame_ferr(s, value, false);
 }
 
 static void usart_rx_frame_end(void *opaque)
@@ -444,7 +636,8 @@ static void usart_rx_frame_end(void *opaque)
     Efr32UsartState *s = opaque;
 
     s->rx_shifting = false;
-    usart_receive_frame(s, s->rx_shift);
+    usart_receive_frame_ferr(s, s->rx_shift, s->rx_shift_ferr);
+    usart_timer_event(s, USART_EV_RXEOF);
     usart_update_irq(s);
     qemu_chr_fe_accept_input(&s->chr);
 }
@@ -467,9 +660,41 @@ static void usart_receive(void *opaque, const uint8_t *buf, int size)
         return;
     }
     s->rx_shift = buf[0];
+    s->rx_shift_ferr = false;
     s->rx_shifting = true;
     timer_mod(s->rx_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + usart_frame_ns(s));
+    usart_timer_event(s, USART_EV_RXACT);
+}
+
+/* A break from the host: a frame of 0 with a framing error. */
+static void usart_event(void *opaque, QEMUChrEvent event)
+{
+    Efr32UsartState *s = opaque;
+
+    if (event != CHR_EVENT_BREAK || !usart_can_receive(s)) {
+        return;
+    }
+    s->rx_shift = 0;
+    s->rx_shift_ferr = true;
+    s->rx_shifting = true;
+    timer_mod(s->rx_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + usart_frame_ns(s));
+    usart_timer_event(s, USART_EV_RXACT);
+}
+
+/* The FERR bit of the oldest frame (RXDATAX bit 15), and pop it. */
+#define USART_RXDATAX_FERR (1u << 15)
+
+static uint32_t usart_rx_ferr(Efr32UsartState *s, bool pop)
+{
+    bool ferr = !fifo8_is_empty(&s->rx_fifo) && s->rx_ferr[0];
+
+    if (pop && !fifo8_is_empty(&s->rx_fifo)) {
+        memmove(s->rx_ferr, s->rx_ferr + 1,
+                sizeof(s->rx_ferr) - sizeof(s->rx_ferr[0]));
+    }
+    return ferr ? USART_RXDATAX_FERR : 0;
 }
 
 static uint8_t usart_rx_pop(Efr32UsartState *s, bool peek)
@@ -546,18 +771,27 @@ static uint64_t usart_read(void *opaque, hwaddr addr, unsigned size)
         value = usart_if(s);
         break;
     case USART_RXDATA:
-    case USART_RXDATAX:
+        usart_rx_ferr(s, true);
         value = usart_rx_pop(s, false) & USART_RXDATAX_RXDATA_MASK;
         break;
+    case USART_RXDATAX:
+        value = usart_rx_ferr(s, true);
+        value |= usart_rx_pop(s, false) & USART_RXDATAX_RXDATA_MASK;
+        break;
     case USART_RXDATAXP:
-        value = usart_rx_pop(s, true) & USART_RXDATAX_RXDATA_MASK;
+        value = usart_rx_ferr(s, false);
+        value |= usart_rx_pop(s, true) & USART_RXDATAX_RXDATA_MASK;
         break;
     case USART_RXDOUBLE:
+        usart_rx_ferr(s, true);
         value = usart_rx_pop(s, false);
+        usart_rx_ferr(s, true);
         value |= (uint32_t)usart_rx_pop(s, false) << USART_DOUBLE_SHIFT;
         break;
     case USART_RXDOUBLEX:
-        value = usart_rx_pop(s, false);
+        value = usart_rx_ferr(s, true);
+        value |= usart_rx_pop(s, false);
+        value |= usart_rx_ferr(s, true) << USART_DOUBLEX_SHIFT;
         value |= (uint32_t)usart_rx_pop(s, false) << USART_DOUBLEX_SHIFT;
         break;
     case USART_RXDOUBLEXP:
@@ -652,6 +886,21 @@ static void usart_write(void *opaque, hwaddr addr, uint64_t data,
                                                 value);
         usart_update_line_params(s);
         break;
+    case USART_TIMECMP0:
+    case USART_TIMECMP1:
+    case USART_TIMECMP2: {
+        unsigned n = (offset - USART_TIMECMP0) / 4;
+
+        s->regs[offset / 4] = usart_apply_alias(alias, usart_reg(s, offset),
+                                                value);
+        /* TSTART = DISABLE stops the comparator (an interval timer). */
+        if (!((usart_reg(s, offset) >> USART_TIMECMP_TSTART_SHIFT) &
+              USART_TIMECMP_FIELD_MASK)) {
+            s->tcmp_enabled[n] = false;
+        }
+        usart_timer_schedule(s);
+        break;
+    }
     default:
         if (offset >= USART_REGISTER_END) {
             qemu_log_mask(LOG_GUEST_ERROR,
@@ -670,7 +919,10 @@ static const MemoryRegionOps usart_ops = {
     .read = usart_read,
     .write = usart_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = {.min_access_size = 4, .max_access_size = 4},
+    /* Byte and half-word accesses act as word accesses (the LDMA writes
+     * TXDATA a byte at a time). */
+    .valid = {.min_access_size = 1, .max_access_size = 4},
+    .impl = {.min_access_size = 4, .max_access_size = 4},
 };
 
 static void usart_reset_hold(Object *obj, ResetType type)
@@ -690,6 +942,10 @@ static void usart_reset_hold(Object *obj, ResetType type)
     fifo8_reset(&s->tx_fifo);
     timer_del(s->tx_timer);
     timer_del(s->rx_timer);
+    timer_del(s->tcmp_timer);
+    s->timer_running = false;
+    memset(s->tcmp_enabled, 0, sizeof(s->tcmp_enabled));
+    memset(s->rx_ferr, 0, sizeof(s->rx_ferr));
 }
 
 static void usart_realize(DeviceState *dev, Error **errp)
@@ -700,7 +956,7 @@ static void usart_realize(DeviceState *dev, Error **errp)
     /* "-device <spi-device>,bus=usart1.ssi" attaches to USART1's SPI bus. */
     s->ssi = ssi_create_bus(dev, bus);
     qemu_chr_fe_set_handlers(&s->chr, usart_can_receive, usart_receive,
-                             NULL, NULL, s, NULL, true);
+                             usart_event, NULL, s, NULL, true);
 }
 
 static void usart_init(Object *obj)
@@ -713,11 +969,14 @@ static void usart_init(Object *obj)
     sysbus_init_mmio(sbd, &s->mmio);
     sysbus_init_irq(sbd, &s->rx_irq);
     sysbus_init_irq(sbd, &s->tx_irq);
+    qdev_init_gpio_out_named(DEVICE(obj), s->dma_req, EFR32_USART_DMA_REQ,
+                             EFR32_USART_DMA_REQS);
     s->pclk = qdev_init_clock_in(DEVICE(obj), "pclk", NULL, NULL, 0);
     fifo8_create(&s->rx_fifo, USART_BUFFER_FRAMES);
     fifo8_create(&s->tx_fifo, USART_BUFFER_FRAMES);
     s->tx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, usart_tx_frame_end, s);
     s->rx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, usart_rx_frame_end, s);
+    s->tcmp_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, usart_timer_expired, s);
 }
 
 static void usart_finalize(Object *obj)
@@ -726,6 +985,7 @@ static void usart_finalize(Object *obj)
 
     timer_free(s->tx_timer);
     timer_free(s->rx_timer);
+    timer_free(s->tcmp_timer);
     fifo8_destroy(&s->rx_fifo);
     fifo8_destroy(&s->tx_fifo);
 }

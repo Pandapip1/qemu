@@ -1659,6 +1659,113 @@ static void test_released_tx_turns_around_to_rx(void)
 }
 
 /*
+ * The silicon probe routes (scripts/bg22-tifs-probe.tcl, SS7.71/SS7.72) on
+ * the model: PRS async channels 9-11 carry RACL.TX, MODEMH.SYNCSENT and
+ * MODEM.FRAMESENT into TIMER1 CC0-2 (INSEL = PRSASYNCPULSE), CC0's edge
+ * reload-starting TIMER1 at the HFXO's 38.4 MHz.  SYNCSENT comes 40.65 us
+ * after TX entry and FRAMESENT the PDU+CRC airtime later, as measured.
+ * RACL.ACTIVE and RACL.RX through PEEK: ACTIVE leaves OFF, RX is up in
+ * RXSEARCH.
+ */
+#define PRS_BASE                 0x40038000
+#define PRS_ASYNC_PEEK           0x010
+#define PRS_ASYNC_CH_CTRL(n)     (0x018 + 4 * (n))
+#define PRS_CH(source, signal)   (((source) << 8) | (signal) | (0xcu << 16))
+#define PRS_CONSUMER_TIMER1_CC(n) (0x124 + 4 * (n))
+#define PRS_SRC_MODEM            0x2b
+#define PRS_SRC_MODEMH           0x2c
+#define PRS_SRC_RACL             0x33
+#define CMU_CLKEN0               0x064
+#define CMU_CLKEN0_TIMER1        (1u << 5)
+#define CMU_CLKEN0_PRS           (1u << 27)
+#define CMU_EM01GRPACLKCTRL      0x120
+#define CMU_EM01GRPACLK_HFXO     2
+#define TIMER1_BASE              0x4004c000
+#define TIMER_CTRL               0x008
+#define TIMER_EN                 0x030
+#define TIMER_CC_CFG(n)          (0x060 + 0x20 * (n))
+#define TIMER_CC_ICF(n)          (0x074 + 0x20 * (n))
+#define TIMER_CC_IC_PRSASYNCPULSE (0x1 | (3u << 17))
+#define TIMER_HZ                 38400000ull
+
+static uint32_t rf_ticks(int64_t ns)
+{
+    return ns * TIMER_HZ / 1000000000ull;
+}
+
+static void test_prs_radio_probe_routes(void)
+{
+    const uint8_t frame[] = { 0x40, 0x06, 1, 2, 3, 4, 5, 6 };
+    uint32_t syncsent, framesent;
+
+    rf_reset_with_clocks();
+    qtest_writel(global_qtest, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_TIMER1 | CMU_CLKEN0_PRS);
+    qtest_writel(global_qtest, CMU_BASE + CMU_EM01GRPACLKCTRL,
+                 CMU_EM01GRPACLK_HFXO);
+    qtest_writel(global_qtest, PRS_BASE + PRS_ASYNC_CH_CTRL(0),
+                 PRS_CH(PRS_SRC_RACL, 0));
+    qtest_writel(global_qtest, PRS_BASE + PRS_ASYNC_CH_CTRL(1),
+                 PRS_CH(PRS_SRC_RACL, 3));
+    qtest_writel(global_qtest, PRS_BASE + PRS_ASYNC_CH_CTRL(9),
+                 PRS_CH(PRS_SRC_RACL, 4));
+    qtest_writel(global_qtest, PRS_BASE + PRS_ASYNC_CH_CTRL(10),
+                 PRS_CH(PRS_SRC_MODEMH, 2));
+    qtest_writel(global_qtest, PRS_BASE + PRS_ASYNC_CH_CTRL(11),
+                 PRS_CH(PRS_SRC_MODEM, 0));
+    for (unsigned n = 0; n < 3; n++) {
+        qtest_writel(global_qtest, PRS_BASE + PRS_CONSUMER_TIMER1_CC(n),
+                     9 + n);
+        qtest_writel(global_qtest, TIMER1_BASE + TIMER_CC_CFG(n),
+                     TIMER_CC_IC_PRSASYNCPULSE);
+    }
+    qtest_writel(global_qtest, TIMER1_BASE + TIMER_EN, 1);
+    qtest_writel(global_qtest, TIMER1_BASE + TIMER_CTRL, 3);
+    g_assert_cmphex(qtest_readl(global_qtest, PRS_BASE + PRS_ASYNC_PEEK), ==,
+                    0);
+
+    rf_release_sequencer(RAC_BASE, SYNTH_BASE);
+    rf_stage_tx(BUFC_BASE + BUFC_CH0, frame, sizeof(frame));
+    qtest_writel(global_qtest, RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+    g_assert_cmphex(qtest_readl(global_qtest, PRS_BASE + PRS_ASYNC_PEEK), ==,
+                    1u << 0);
+    rf_ack(RAC_BASE, RAC_STATE_TXWARM);
+    g_assert_cmpuint(rf_state(RAC_BASE), ==, RAC_STATE_TX);
+    g_assert_cmphex(qtest_readl(global_qtest, PRS_BASE + PRS_ASYNC_PEEK), ==,
+                    (1u << 0) | (1u << 9));
+    rf_ack(RAC_BASE, RAC_STATE_TX);
+    rf_step(MODEL_TX_NS(sizeof(frame)));
+    syncsent = qtest_readl(global_qtest, TIMER1_BASE + TIMER_CC_ICF(1));
+    framesent = qtest_readl(global_qtest, TIMER1_BASE + TIMER_CC_ICF(2));
+    g_assert_cmpuint(syncsent, ==,
+                     rf_ticks(TX_ENTRY_TO_AIR_NS + SYNC_NS));
+    g_assert_cmpuint(framesent - syncsent, >=,
+                     rf_ticks((sizeof(frame) + CRC_OCTETS) * OCTET_NS));
+    g_assert_cmpuint(framesent - syncsent, <=,
+                     rf_ticks((sizeof(frame) + CRC_OCTETS) * OCTET_NS) + 1);
+    g_assert_cmpuint(qtest_readl(global_qtest, TIMER1_BASE + TIMER_CC_ICF(0)),
+                     ==, 0);
+    g_assert_cmphex(qtest_readl(global_qtest, PRS_BASE + PRS_ASYNC_PEEK) &
+                    (1u << 9), ==, 0);
+
+    rf_reset_with_clocks();
+    qtest_writel(global_qtest, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_PRS);
+    qtest_writel(global_qtest, PRS_BASE + PRS_ASYNC_CH_CTRL(1),
+                 PRS_CH(PRS_SRC_RACL, 3));
+    rf_release_sequencer(RAC_BASE, SYNTH_BASE);
+    qtest_writel(global_qtest, RAC_BASE + RAC_RXENSRCEN + REGISTER_SET_WINDOW,
+                 RAC_RXENSRCEN_SWRXEN);
+    g_assert_cmphex(qtest_readl(global_qtest, PRS_BASE + PRS_ASYNC_PEEK) &
+                    (1u << 1), ==, 0);
+    rf_ack(RAC_BASE, RAC_STATE_RXWARM);
+    g_assert_cmpuint(rf_state(RAC_BASE), ==, RAC_STATE_RXSEARCH);
+    g_assert_cmphex(qtest_readl(global_qtest, PRS_BASE + PRS_ASYNC_PEEK) &
+                    (1u << 1), ==, 1u << 1);
+    rf_reset_with_clocks();
+}
+
+/*
  * The receive half of a scan exchange on a released sequencer (SS7.65-7.72):
  * the frame is detected 3.5 us after its access address arrives ([I]) and the
  * receiver enters RXFRAME; the sequencer withdraws SWRXEN and issues TXEN
@@ -2245,6 +2352,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/rf/released-tx-turns-around-to-rx",
                    test_released_tx_turns_around_to_rx);
     qtest_add_func("/efr32bg22/rf/locnt-busy-window", test_locnt_busy_window);
+    qtest_add_func("/efr32bg22/rf/prs-radio-probe-routes",
+                   test_prs_radio_probe_routes);
     qtest_add_func("/efr32bg22/rf/released-rx-srcchf-follows-channel",
                    test_released_rx_srcchf_follows_channel);
     qtest_add_func("/efr32bg22/rf/released-rx-fifo-overflow",
