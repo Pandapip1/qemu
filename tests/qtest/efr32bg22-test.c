@@ -3928,6 +3928,7 @@ static void test_gpcrc_crc_vectors(void)
 #define PRS_CONSUMER_TIMER1_CC(n) (0x124 + 4 * (n))
 #define PRS_CONSUMER_RTCC_CC(n) (0x0e8 + 4 * (n))
 #define PRS_CONSUMER_IADC0_SINGLETRIGGER 0x068
+#define PRS_CONSUMER_LETIMER0_START 0x078
 #define PRS_CONSUMER_SPRSSEL(n) ((n) << 8)
 #define CMU_CLKEN0_TIMER0       (1u << 4)
 #define CMU_CLKEN0_TIMER1       (1u << 5)
@@ -4320,6 +4321,159 @@ static void test_buram_retention(void)
     g_assert_false(m33_load_faults(BURAM_BASE, setup_buram_clock));
 }
 
+/*
+ * LETIMER0 (RM ch. 18) at EM23GRPACLK = LFRCO, 32.768 kHz: LFSYNC writes
+ * land at the third LF edge (SYNCBUSY meanwhile); the start edge loads
+ * TOP; UF when the counter reaches 0, the toggle output with it (seen
+ * through PRS producer LETIMER0 CH0); one-shot stops after REP0
+ * underflows; PRS START.
+ */
+#define LETIMER0_BASE           0x4a000000
+#define LT_EN                   0x004
+#define LT_CTRL                 0x008
+#define LT_CMD                  0x00c
+#define LT_STATUS               0x010
+#define LT_CNT                  0x018
+#define LT_COMP0                0x01c
+#define LT_TOP                  0x024
+#define LT_REP0                 0x02c
+#define LT_IF                   0x034
+#define LT_SYNCBUSY             0x040
+#define LT_PRSMODE              0x050
+#define LT_CTRL_ONESHOT         0x1
+#define LT_CTRL_UFOA0_TOGGLE    (1u << 2)
+#define LT_CTRL_UFOA0_PWM       (3u << 2)
+#define LT_CTRL_CNTTOPEN        (1u << 9)
+#define LT_CMD_START            (1u << 0)
+#define LT_IF_COMP0             (1u << 0)
+#define LT_IF_UF                (1u << 2)
+#define LT_IF_REP0              (1u << 3)
+#define LT_SYNCBUSY_TOP         (1u << 2)
+#define LT_SYNCBUSY_START       (1u << 5)
+#define LT_PRSMODE_START_RISING (1u << 18)
+#define CMU_CLKEN0_LETIMER0     (1u << 12)
+#define PRS_SRC_LETIMER0        0x02
+
+static uint64_t lf_edge_ns(uint64_t edge)
+{
+    return (edge * 1000000000ull + 32767) / 32768;
+}
+
+/* Step @qts to just after LF edge number @edge. */
+static void lf_step_to(QTestState *qts, uint64_t edge)
+{
+    uint64_t now = qtest_clock_step(qts, 0);
+
+    qtest_clock_step(qts, lf_edge_ns(edge) + 1 - now);
+}
+
+static uint64_t lf_now(QTestState *qts)
+{
+    return qtest_clock_step(qts, 0) * 32768 / 1000000000ull;
+}
+
+static QTestState *letimer_start(void)
+{
+    QTestState *qts = prs_start();
+
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_LETIMER0);
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_CH_CTRL(0),
+                 PRS_CH_SOURCESEL(PRS_SRC_LETIMER0) | PRS_CH_SIGSEL(0) |
+                     PRS_CH_FNSEL(PRS_FNSEL_A));
+    lf_step_to(qts, lf_now(qts) + 1);
+    return qts;
+}
+
+static void test_letimer_free_running_toggle(void)
+{
+    QTestState *qts = letimer_start();
+    uint64_t e0 = lf_now(qts);
+
+    qtest_writel(qts, LETIMER0_BASE + LT_EN, 1);
+    qtest_writel(qts, LETIMER0_BASE + LT_CTRL,
+                 LT_CTRL_CNTTOPEN | LT_CTRL_UFOA0_TOGGLE);
+    qtest_writel(qts, LETIMER0_BASE + LT_TOP, 3);
+    qtest_writel(qts, LETIMER0_BASE + LT_CMD, LT_CMD_START);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_SYNCBUSY), ==,
+                    LT_SYNCBUSY_TOP | LT_SYNCBUSY_START);
+    g_assert_cmpuint(qtest_readl(qts, LETIMER0_BASE + LT_TOP), ==, 3);
+    lf_step_to(qts, e0 + 2);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_SYNCBUSY), ==,
+                    LT_SYNCBUSY_TOP | LT_SYNCBUSY_START);
+    lf_step_to(qts, e0 + 3);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_SYNCBUSY), ==, 0);
+    g_assert_cmpuint(qtest_readl(qts, LETIMER0_BASE + LT_CNT), ==, 3);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_STATUS), ==, 1);
+    lf_step_to(qts, e0 + 5);
+    g_assert_cmpuint(qtest_readl(qts, LETIMER0_BASE + LT_CNT), ==, 1);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_IF), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, PRS_BASE + PRS_ASYNC_PEEK) & 1, ==, 0);
+    lf_step_to(qts, e0 + 6);
+    g_assert_cmpuint(qtest_readl(qts, LETIMER0_BASE + LT_CNT), ==, 0);
+    /* COMP0 and COMP1 are 0: they match with the underflow. */
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_IF), ==,
+                    LT_IF_UF | LT_IF_COMP0 | (LT_IF_COMP0 << 1));
+    g_assert_cmphex(qtest_readl(qts, PRS_BASE + PRS_ASYNC_PEEK) & 1, ==, 1);
+    lf_step_to(qts, e0 + 7);
+    g_assert_cmpuint(qtest_readl(qts, LETIMER0_BASE + LT_CNT), ==, 3);
+    /* INTFLAG: a plain write does nothing, the CLR alias clears. */
+    qtest_writel(qts, LETIMER0_BASE + LT_IF, 0);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_IF) & LT_IF_UF, ==,
+                    LT_IF_UF);
+    qtest_writel(qts, LETIMER0_BASE + LT_IF + REGISTER_CLEAR_WINDOW, LT_IF_UF);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_IF) & LT_IF_UF, ==, 0);
+    lf_step_to(qts, e0 + 10);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_IF) & LT_IF_UF, ==,
+                    LT_IF_UF);
+    g_assert_cmphex(qtest_readl(qts, PRS_BASE + PRS_ASYNC_PEEK) & 1, ==, 0);
+    lf_step_to(qts, e0 + 10 + 4 * 1000);
+    g_assert_cmpuint(qtest_readl(qts, LETIMER0_BASE + LT_CNT), ==, 0);
+    qtest_quit(qts);
+}
+
+/* PWM (Table 18.2): idle at underflow, active at the COMP0 match. */
+static void test_letimer_oneshot_pwm(void)
+{
+    QTestState *qts = letimer_start();
+    uint64_t e0 = lf_now(qts);
+
+    qtest_writel(qts, LETIMER0_BASE + LT_EN, 1);
+    qtest_writel(qts, LETIMER0_BASE + LT_CTRL,
+                 LT_CTRL_CNTTOPEN | LT_CTRL_UFOA0_PWM | LT_CTRL_ONESHOT);
+    qtest_writel(qts, LETIMER0_BASE + LT_TOP, 3);
+    qtest_writel(qts, LETIMER0_BASE + LT_COMP0, 2);
+    qtest_writel(qts, LETIMER0_BASE + LT_REP0, 3);
+    qtest_writel(qts, LETIMER0_BASE + LT_PRSMODE, LT_PRSMODE_START_RISING);
+    qtest_writel(qts, PRS_BASE + PRS_CONSUMER_LETIMER0_START, 5);
+    lf_step_to(qts, e0 + 3);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_STATUS), ==, 0);
+    /* The PRS START acts at the next edge: e0 + 4 loads TOP = 3. */
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWPULSE, 1u << 5);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_STATUS), ==, 1);
+    lf_step_to(qts, e0 + 4);
+    g_assert_cmpuint(qtest_readl(qts, LETIMER0_BASE + LT_CNT), ==, 3);
+    lf_step_to(qts, e0 + 5);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_IF), ==, LT_IF_COMP0);
+    g_assert_cmphex(qtest_readl(qts, PRS_BASE + PRS_ASYNC_PEEK) & 1, ==, 1);
+    lf_step_to(qts, e0 + 7);
+    g_assert_cmphex(qtest_readl(qts, PRS_BASE + PRS_ASYNC_PEEK) & 1, ==, 0);
+    /* Three underflows (e0 + 7, 11, 15), then the stop at e0 + 16. */
+    lf_step_to(qts, e0 + 15);
+    g_assert_cmpuint(qtest_readl(qts, LETIMER0_BASE + LT_REP0), ==, 1);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_STATUS), ==, 1);
+    lf_step_to(qts, e0 + 16);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_STATUS), ==, 0);
+    g_assert_cmpuint(qtest_readl(qts, LETIMER0_BASE + LT_REP0), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, LETIMER0_BASE + LT_IF) & LT_IF_REP0, ==,
+                    LT_IF_REP0);
+    lf_step_to(qts, e0 + 40);
+    g_assert_cmpuint(qtest_readl(qts, LETIMER0_BASE + LT_CNT), ==, 0);
+    qtest_quit(qts);
+    /* A gated LETIMER0 read faults (silicon, SS7.73). */
+    g_assert_true(m33_load_faults(LETIMER0_BASE + LT_CNT, setup_no_clocks));
+}
+
 int main(int argc, char **argv)
 {
     int result;
@@ -4367,6 +4521,9 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/prs-rtcc-capture", test_prs_rtcc_capture);
     qtest_add_func("/efr32bg22/iadc-triggers", test_iadc_triggers);
     qtest_add_func("/efr32bg22/buram-retention", test_buram_retention);
+    qtest_add_func("/efr32bg22/letimer-free-running-toggle",
+                   test_letimer_free_running_toggle);
+    qtest_add_func("/efr32bg22/letimer-oneshot-pwm", test_letimer_oneshot_pwm);
     qtest_add_func("/efr32bg22/trng-fifo", test_trng_fifo);
     qtest_add_func("/efr32bg22/gpcrc-crc-vectors", test_gpcrc_crc_vectors);
     qtest_add_func("/efr32bg22/radioaes-ecb-and-key-sizes",

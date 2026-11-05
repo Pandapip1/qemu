@@ -23,6 +23,7 @@
 #include "hw/arm/efr32-interconnect.h"
 #include "hw/arm/efr32-prs.h"
 #include "hw/arm/efr32-buram.h"
+#include "hw/arm/efr32-letimer.h"
 #include "hw/arm/efr32-soc-link.h"
 #include "hw/misc/analog-source.h"
 #include "hw/misc/owo-suit.h"
@@ -8413,6 +8414,21 @@ static void efr32_soc_create_reflex(Efr32Bg22SoCState *s, DeviceState *gpio)
     DeviceState *prs = efr32_prs_create(OBJECT(s), s->memory,
                                         &s->periph.link, EFR32_PRS_BASE,
                                         PERIPH_NONSECURE_OFFSET);
+    DeviceState *letimer = efr32_letimer_create(
+        OBJECT(s), s->memory, &s->periph.link, EFR32_LETIMER0_BASE,
+        PERIPH_NONSECURE_OFFSET,
+        qdev_get_gpio_in(DEVICE(&s->armv7m), EFR32_LETIMER0_IRQ));
+    /* Consumer lines served outside the core model, and by whom. */
+    struct {
+        unsigned consumer;
+        DeviceState *dev;
+        const char *line;
+        unsigned n;
+    } served[] = {
+        { EFR32_PRS_CON_LETIMER0_START, letimer, EFR32_LETIMER_PRS_IN, 0 },
+        { EFR32_PRS_CON_LETIMER0_STOP, letimer, EFR32_LETIMER_PRS_IN, 1 },
+        { EFR32_PRS_CON_LETIMER0_CLEAR, letimer, EFR32_LETIMER_PRS_IN, 2 },
+    };
 
     s->periph.prs = prs;
     for (unsigned n = 0; n < EFR32_PRS_ASYNC_INPUTS; n++) {
@@ -8432,10 +8448,26 @@ static void efr32_soc_create_reflex(Efr32Bg22SoCState *s, DeviceState *gpio)
                                         EFR32_PRS_LINE(EFR32_PRS_SRC_GPIO,
                                                        n)));
     }
-    for (unsigned n = 0; n < EFR32_PRS_CONSUMERS; n++) {
-        qdev_connect_gpio_out_named(prs, EFR32_PRS_CONSUMER, n,
+    for (unsigned n = 0; n < EFR32_GPIO_LETIMER_OUTS; n++) {
+        qdev_connect_gpio_out_named(letimer, EFR32_LETIMER_OUT, n,
                                     qdev_get_gpio_in_named(
-                                        periph, "prs-consumer", n));
+                                        gpio, EFR32_GPIO_LETIMER_OUT, n));
+        qdev_connect_gpio_out_named(letimer, EFR32_LETIMER_PRS, n,
+                                    qdev_get_gpio_in_named(
+                                        prs, EFR32_PRS_ASYNC_IN,
+                                        EFR32_PRS_LINE(EFR32_PRS_SRC_LETIMER0,
+                                                       n)));
+    }
+    for (unsigned n = 0; n < EFR32_PRS_CONSUMERS; n++) {
+        qemu_irq target = qdev_get_gpio_in_named(periph, "prs-consumer", n);
+
+        for (unsigned i = 0; i < ARRAY_SIZE(served); i++) {
+            if (served[i].consumer == n) {
+                target = qdev_get_gpio_in_named(served[i].dev, served[i].line,
+                                                served[i].n);
+            }
+        }
+        qdev_connect_gpio_out_named(prs, EFR32_PRS_CONSUMER, n, target);
         qdev_connect_gpio_out_named(prs, EFR32_PRS_CONSUMER_SYNC, n,
                                     qdev_get_gpio_in_named(
                                         periph, "prs-consumer-sync", n));
