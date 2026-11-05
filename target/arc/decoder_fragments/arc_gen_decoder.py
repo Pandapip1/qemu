@@ -104,7 +104,7 @@ def parse_entry(l, level = 0):
 
 def get_arches(arches_str):
     arches = []
-    exclude_arches = ['ARC700', 'ARC600']
+    exclude_arches = []   # was ['ARC700','ARC600']; enable ARCompact decode
     arches_lst = arches_str.split('|')
     for arch in arches_lst:
         m = re.search(r'^[ ]*([^ ]+)[ ]*$', arch)
@@ -388,10 +388,11 @@ def main():
     arcv2em_file = None
     arcv3hs6x_file = None
     arcv3hs5x_file = None
-    long_opts = ['opcodes=', 'arcv2hs=', 'arcv2em=', 'arcv3hs5x=', 'arcv3hs6x=']
+    arc700_file = None
+    long_opts = ['opcodes=', 'arcv2hs=', 'arcv2em=', 'arcv3hs5x=', 'arcv3hs6x=', 'arc700=']
 
     try:
-        (opts, args) = getopt.gnu_getopt(sys.argv[1:], 'o:a:b:c:d:', long_opts)
+        (opts, args) = getopt.gnu_getopt(sys.argv[1:], 'o:a:b:c:d:e:', long_opts)
     except getopt.GetoptError as err:
         error(0, err)
 
@@ -406,6 +407,8 @@ def main():
             arcv3hs6x_file = a
         elif o in ('-d', '--arcv3hs5x'):
             arcv3hs5x_file = a
+        elif o in ('-e', '--arc700'):
+            arc700_file = a
         else:
             assert False, 'unhandled option'
     
@@ -445,6 +448,10 @@ def main():
     # ARCv3HS5x
     if arcv3hs5x_file:
         gen_tree('ARC32', arcv3hs5x_file)
+
+    # ARCompact (ARC700)
+    if arc700_file:
+        gen_tree('ARC700', arc700_file)
             
 
 if __name__ == "__main__":
