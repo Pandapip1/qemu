@@ -3904,6 +3904,383 @@ static void test_gpcrc_crc_vectors(void)
     qtest_quit(qts);
 }
 
+/*
+ * PRS (RM ch. 13) and the TIMER input logic it feeds (RM SS19.3.3).
+ * TIMER1 runs from EM01GRPACLK, set to the HFXO's 38.4 MHz here.
+ */
+#define PRS_BASE                0x40038000
+#define PRS_IPVERSION           0x000
+#define PRS_ASYNC_SWPULSE       0x008
+#define PRS_ASYNC_SWLEVEL       0x00c
+#define PRS_ASYNC_PEEK          0x010
+#define PRS_SYNC_PEEK           0x014
+#define PRS_ASYNC_CH_CTRL(n)    (0x018 + 4 * (n))
+#define PRS_SYNC_CH_CTRL(n)     (0x048 + 4 * (n))
+#define PRS_CH_SIGSEL(n)        (n)
+#define PRS_CH_SOURCESEL(n)     ((n) << 8)
+#define PRS_CH_FNSEL(n)         ((n) << 16)
+#define PRS_CH_AUXSEL(n)        ((n) << 24)
+#define PRS_FNSEL_A             0xc
+#define PRS_SRC_PRSL            0x0a
+#define PRS_SRC_TIMER0          0x22
+#define PRS_SYNC_SRC_TIMER0     0x01
+#define PRS_SIG_TIMER_OF        1
+#define PRS_CONSUMER_TIMER1_CC(n) (0x124 + 4 * (n))
+#define PRS_CONSUMER_RTCC_CC(n) (0x0e8 + 4 * (n))
+#define PRS_CONSUMER_IADC0_SINGLETRIGGER 0x068
+#define PRS_CONSUMER_SPRSSEL(n) ((n) << 8)
+#define CMU_CLKEN0_TIMER0       (1u << 4)
+#define CMU_CLKEN0_TIMER1       (1u << 5)
+#define CMU_CLKEN0_IADC0        (1u << 10)
+#define CMU_CLKEN0_PRS          (1u << 27)
+#define TIMER_CTRL              0x008
+#define TIMER_CTRL_RISEA_RELOADSTART 3
+#define TIMER_CFG_OSMEN         (1u << 4)
+#define TIMER_CC_CTRL(n)        (0x064 + 0x20 * (n))
+#define TIMER_CC_CTRL_ICEDGE_BOTH (2u << 24)
+#define TIMER_CC_ICF(n)         (0x074 + 0x20 * (n))
+#define TIMER_CC_ICOF(n)        (0x078 + 0x20 * (n))
+#define TIMER_CC_CFG_INPUTCAPTURE 0x1
+#define TIMER_CC_CFG_PRSSYNC    (1u << 17)
+#define TIMER_CC_CFG_PRSASYNCLEVEL (2u << 17)
+#define TIMER_CC_CFG_PRSASYNCPULSE (3u << 17)
+#define TIMER_CC_CFG_FILT       (1u << 20)
+#define TIMER_IF_ICFOF(n)       (1u << (20 + (n)))
+#define TIMER_IF_ICFUF(n)       (1u << (24 + (n)))
+#define TIMER_STATUS_ICFEMPTY(n) (1u << (16 + (n)))
+#define TIMER_STATUS_CCPOL(n)   (1u << (24 + (n)))
+
+static QTestState *prs_start(void)
+{
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel qtest");
+
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_PRS | CMU_CLKEN0_TIMER0 | CMU_CLKEN0_TIMER1 |
+                     CMU_CLKEN0_RTCC | CMU_CLKEN0_IADC0);
+    qtest_writel(qts, CMU_BASE_ADDR + CMU_EM01GRPACLKCTRL,
+                 CMU_EM01GRPACLK_HFXO);
+    return qts;
+}
+
+/* TIMER1 CCn in input capture from PRS channel @ch, input @insel. */
+static void prs_timer1_capture(QTestState *qts, unsigned n, unsigned ch,
+                               uint32_t insel)
+{
+    qtest_writel(qts, PRS_BASE + PRS_CONSUMER_TIMER1_CC(n), ch);
+    qtest_writel(qts, TIMER1_BASE + TIMER_EN, 0);
+    qtest_writel(qts, TIMER1_BASE + TIMER_CC_CFG(n),
+                 TIMER_CC_CFG_INPUTCAPTURE | insel);
+    qtest_writel(qts, TIMER1_BASE + TIMER_EN, TIMER_EN_EN);
+}
+
+/*
+ * Every FNSEL against every A/B pair (RM Table 13.1: output FNSEL[2A + B]),
+ * with A and B from other channels' SWLEVEL through the PRSL producer and
+ * AUXSEL; then SWLEVEL inverting a channel's own output (SS13.3.1).
+ */
+static void test_prs_logic_table(void)
+{
+    QTestState *qts = prs_start();
+
+    g_assert_cmphex(qtest_readl(qts, PRS_BASE + PRS_IPVERSION), ==, 1);
+    g_assert_cmphex(qtest_readl(qts, PRS_BASE + PRS_ASYNC_CH_CTRL(0)), ==,
+                    PRS_CH_FNSEL(PRS_FNSEL_A));
+    g_assert_cmphex(qtest_readl(qts, PRS_BASE + PRS_ASYNC_PEEK), ==, 0);
+    for (unsigned fnsel = 0; fnsel < 16; fnsel++) {
+        qtest_writel(qts, PRS_BASE + PRS_ASYNC_CH_CTRL(0),
+                     PRS_CH_SOURCESEL(PRS_SRC_PRSL) | PRS_CH_SIGSEL(1) |
+                         PRS_CH_FNSEL(fnsel) | PRS_CH_AUXSEL(2));
+        for (unsigned a = 0; a < 2; a++) {
+            for (unsigned b = 0; b < 2; b++) {
+                qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWLEVEL,
+                             (a << 1) | (b << 2));
+                g_assert_cmpuint(qtest_readl(qts, PRS_BASE + PRS_ASYNC_PEEK) &
+                                 1, ==, (fnsel >> (2 * a + b)) & 1);
+            }
+        }
+    }
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_CH_CTRL(0),
+                 PRS_CH_FNSEL(PRS_FNSEL_A));
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWLEVEL, 0x801);
+    g_assert_cmphex(qtest_readl(qts, PRS_BASE + PRS_ASYNC_PEEK), ==, 0x801);
+    g_assert_cmphex(qtest_readl(qts, PRS_BASE + PRS_ASYNC_SWPULSE), ==, 0);
+    qtest_quit(qts);
+}
+
+/* Reads and writes fault while CMU_CLKEN0.PRS is clear (SS7.71, SS7.73). */
+static void setup_prs_clock(QTestState *qts)
+{
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_PRS);
+}
+
+static void test_prs_bus_gate(void)
+{
+    g_assert_true(m33_load_faults(PRS_BASE + PRS_ASYNC_PEEK,
+                                  setup_no_clocks));
+    g_assert_true(m33_store_faults(PRS_BASE + PRS_ASYNC_SWLEVEL,
+                                   setup_no_clocks));
+    g_assert_false(m33_load_faults(PRS_BASE + PRS_ASYNC_PEEK,
+                                   setup_prs_clock));
+    g_assert_false(m33_store_faults(PRS_BASE + PRS_ASYNC_SWLEVEL,
+                                    setup_prs_clock));
+}
+
+/*
+ * SWPULSE into TIMER1 input capture, INSEL = PRSASYNCPULSE: each pulse
+ * captures CNT; one store pulsing two channels is captured on the same
+ * tick by both (silicon, SS7.73); the 2-entry FIFO, ICOF and the overflow
+ * and underflow flags (RM SS19.3.3.3).
+ */
+static void test_prs_swpulse_timer_capture(void)
+{
+    QTestState *qts = prs_start();
+    uint32_t first, second;
+
+    prs_timer1_capture(qts, 0, 9, TIMER_CC_CFG_PRSASYNCPULSE);
+    qtest_writel(qts, PRS_BASE + PRS_CONSUMER_TIMER1_CC(1), 10);
+    qtest_writel(qts, TIMER1_BASE + TIMER_EN, 0);
+    qtest_writel(qts, TIMER1_BASE + TIMER_CC_CFG(1),
+                 TIMER_CC_CFG_INPUTCAPTURE | TIMER_CC_CFG_PRSASYNCPULSE);
+    qtest_writel(qts, TIMER1_BASE + TIMER_EN, TIMER_EN_EN);
+    g_assert_cmphex(qtest_readl(qts, TIMER1_BASE + TIMER_STATUS) &
+                    (TIMER_STATUS_ICFEMPTY(0) | TIMER_STATUS_ICFEMPTY(1)), ==,
+                    TIMER_STATUS_ICFEMPTY(0) | TIMER_STATUS_ICFEMPTY(1));
+    qtest_writel(qts, TIMER1_BASE + TIMER_CMD, TIMER_CMD_START);
+    qtest_clock_step(qts, 10000);
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWPULSE, (1u << 9) | (1u << 10));
+    qtest_clock_step(qts, 10000);
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWPULSE, 1u << 9);
+    g_assert_cmphex(qtest_readl(qts, TIMER1_BASE + TIMER_STATUS) &
+                    TIMER_STATUS_ICFEMPTY(0), ==, 0);
+    first = qtest_readl(qts, TIMER1_BASE + TIMER_CC_ICF(0));
+    g_assert_cmpuint(qtest_readl(qts, TIMER1_BASE + TIMER_CC_ICF(1)), ==,
+                     first);
+    g_assert_cmpuint(abs((int)first - 384), <=, 1);
+    second = qtest_readl(qts, TIMER1_BASE + TIMER_CC_ICF(0));
+    g_assert_cmpuint(abs((int)(second - first) - 384), <=, 1);
+    g_assert_cmpuint(qtest_readl(qts, TIMER1_BASE + TIMER_CC_ICOF(0)), ==,
+                     second);
+    g_assert_cmphex(qtest_readl(qts, TIMER1_BASE + TIMER_IF) &
+                    (TIMER_IF_CC(0) | TIMER_IF_CC(1)), ==,
+                    TIMER_IF_CC(0) | TIMER_IF_CC(1));
+    /* Empty: an underflow; three more pulses: an overflow into ICOF. */
+    qtest_readl(qts, TIMER1_BASE + TIMER_CC_ICF(0));
+    g_assert_cmphex(qtest_readl(qts, TIMER1_BASE + TIMER_IF) &
+                    TIMER_IF_ICFUF(0), ==, TIMER_IF_ICFUF(0));
+    for (unsigned i = 0; i < 3; i++) {
+        qtest_clock_step(qts, 1000);
+        qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWPULSE, 1u << 9);
+    }
+    g_assert_cmphex(qtest_readl(qts, TIMER1_BASE + TIMER_IF) &
+                    TIMER_IF_ICFOF(0), ==, TIMER_IF_ICFOF(0));
+    first = qtest_readl(qts, TIMER1_BASE + TIMER_CC_ICF(0));
+    second = qtest_readl(qts, TIMER1_BASE + TIMER_CC_ICF(0));
+    g_assert_cmpuint(abs((int)(qtest_readl(qts, TIMER1_BASE +
+                                                TIMER_CC_ICOF(0)) -
+                               second) - 38), <=, 1);
+    g_assert_cmpuint(abs((int)(second - first) - 38), <=, 1);
+    qtest_quit(qts);
+}
+
+/*
+ * INSEL = PRSASYNCLEVEL qualifies the level for 2 HFPERCLK cycles (7 with
+ * FILT): a pulse is never captured -- silicon's "PRSASYNCLEVEL captured
+ * nothing" for the MODEM events (SS7.71) -- while a SWLEVEL step is, 2
+ * cycles late.  INSEL = PRSSYNC follows the synchronous channel.
+ */
+static void test_prs_timer_input_qualification(void)
+{
+    QTestState *qts = prs_start();
+    uint32_t value;
+
+    prs_timer1_capture(qts, 0, 3, TIMER_CC_CFG_PRSASYNCLEVEL);
+    qtest_writel(qts, TIMER1_BASE + TIMER_CMD, TIMER_CMD_START);
+    qtest_clock_step(qts, 10000);
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWPULSE, 1u << 3);
+    qtest_clock_step(qts, 1000);
+    g_assert_cmphex(qtest_readl(qts, TIMER1_BASE + TIMER_IF) &
+                    TIMER_IF_CC(0), ==, 0);
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWLEVEL, 1u << 3);
+    value = qtest_readl(qts, TIMER1_BASE + TIMER_CNT);
+    qtest_clock_step(qts, 2 * 27);
+    value = qtest_readl(qts, TIMER1_BASE + TIMER_CC_ICF(0)) - value;
+    g_assert_cmpuint(value, >=, 2);
+    g_assert_cmpuint(value, <=, 3);
+    /* FILT: 2 + 5 cycles, and both edges with ICEDGE = BOTH. */
+    qtest_writel(qts, TIMER1_BASE + TIMER_CC_CTRL(0),
+                 TIMER_CC_CTRL_ICEDGE_BOTH);
+    qtest_writel(qts, TIMER1_BASE + TIMER_EN, 0);
+    qtest_writel(qts, TIMER1_BASE + TIMER_CC_CFG(0),
+                 TIMER_CC_CFG_INPUTCAPTURE | TIMER_CC_CFG_PRSASYNCLEVEL |
+                     TIMER_CC_CFG_FILT);
+    qtest_writel(qts, TIMER1_BASE + TIMER_EN, TIMER_EN_EN);
+    qtest_writel(qts, TIMER1_BASE + TIMER_CMD, TIMER_CMD_START);
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWLEVEL, 0);
+    value = qtest_readl(qts, TIMER1_BASE + TIMER_CNT);
+    qtest_clock_step(qts, 7 * 27);
+    value = qtest_readl(qts, TIMER1_BASE + TIMER_CC_ICF(0)) - value;
+    g_assert_cmpuint(value, >=, 7);
+    g_assert_cmpuint(value, <=, 8);
+    g_assert_cmphex(qtest_readl(qts, TIMER1_BASE + TIMER_STATUS) &
+                    TIMER_STATUS_ICFEMPTY(0), ==, TIMER_STATUS_ICFEMPTY(0));
+
+    /* PRSSYNC: TIMER0 OF through synchronous channel 2, TOP = 99. */
+    qtest_writel(qts, PRS_BASE + PRS_SYNC_CH_CTRL(2),
+                 PRS_CH_SOURCESEL(PRS_SYNC_SRC_TIMER0) |
+                     PRS_CH_SIGSEL(PRS_SIG_TIMER_OF));
+    qtest_writel(qts, PRS_BASE + PRS_CONSUMER_TIMER1_CC(2),
+                 PRS_CONSUMER_SPRSSEL(2));
+    qtest_writel(qts, TIMER1_BASE + TIMER_EN, 0);
+    qtest_writel(qts, TIMER1_BASE + TIMER_CC_CFG(2),
+                 TIMER_CC_CFG_INPUTCAPTURE | TIMER_CC_CFG_PRSSYNC);
+    qtest_writel(qts, TIMER1_BASE + TIMER_EN, TIMER_EN_EN);
+    qtest_writel(qts, TIMER1_BASE + TIMER_CMD, TIMER_CMD_START);
+    qtest_writel(qts, TIMER0_BASE + TIMER_EN, TIMER_EN_EN);
+    qtest_writel(qts, TIMER0_BASE + TIMER_TOP, 99);
+    qtest_writel(qts, TIMER0_BASE + TIMER_CMD, TIMER_CMD_START);
+    value = qtest_readl(qts, TIMER1_BASE + TIMER_CNT);
+    qtest_clock_step(qts, 2 * 100 * 27);
+    g_assert_cmpuint(abs((int)(qtest_readl(qts, TIMER1_BASE +
+                                                TIMER_CC_ICF(2)) - value) -
+                         100), <=, 1);
+    g_assert_cmpuint(abs((int)(qtest_readl(qts, TIMER1_BASE +
+                                                TIMER_CC_ICF(2)) - value) -
+                         200), <=, 1);
+    qtest_quit(qts);
+}
+
+/*
+ * The probe route of scripts/bg22-tifs-probe.tcl (SS7.71): CC0's PRS edge
+ * reload-starts a one-shot TIMER1 (CTRL.RISEA = RELOADSTART, CFG.OSMEN)
+ * that stops at TOP; captures after that read TOP.
+ */
+static void test_prs_timer_reloadstart_oneshot(void)
+{
+    QTestState *qts = prs_start();
+
+    qtest_writel(qts, PRS_BASE + PRS_CONSUMER_TIMER1_CC(0), 9);
+    qtest_writel(qts, PRS_BASE + PRS_CONSUMER_TIMER1_CC(1), 10);
+    qtest_writel(qts, TIMER1_BASE + TIMER_CFG, TIMER_CFG_OSMEN);
+    qtest_writel(qts, TIMER1_BASE + TIMER_CC_CFG(0),
+                 TIMER_CC_CFG_INPUTCAPTURE | TIMER_CC_CFG_PRSASYNCPULSE);
+    qtest_writel(qts, TIMER1_BASE + TIMER_CC_CFG(1),
+                 TIMER_CC_CFG_INPUTCAPTURE | TIMER_CC_CFG_PRSASYNCPULSE);
+    qtest_writel(qts, TIMER1_BASE + TIMER_EN, TIMER_EN_EN);
+    qtest_writel(qts, TIMER1_BASE + TIMER_TOP, 999);
+    qtest_writel(qts, TIMER1_BASE + TIMER_CTRL, TIMER_CTRL_RISEA_RELOADSTART);
+    g_assert_cmphex(qtest_readl(qts, TIMER1_BASE + TIMER_STATUS) &
+                    TIMER_STATUS_RUNNING, ==, 0);
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWPULSE, 1u << 9);
+    g_assert_cmphex(qtest_readl(qts, TIMER1_BASE + TIMER_STATUS) &
+                    TIMER_STATUS_RUNNING, ==, TIMER_STATUS_RUNNING);
+    qtest_clock_step(qts, 5000);
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWPULSE, 1u << 10);
+    g_assert_cmpuint(abs((int)qtest_readl(qts, TIMER1_BASE + TIMER_CC_ICF(1)) -
+                         192), <=, 1);
+    qtest_clock_step(qts, 50000);
+    g_assert_cmphex(qtest_readl(qts, TIMER1_BASE + TIMER_STATUS) &
+                    TIMER_STATUS_RUNNING, ==, 0);
+    g_assert_cmpuint(qtest_readl(qts, TIMER1_BASE + TIMER_CNT), ==, 999);
+    g_assert_cmphex(qtest_readl(qts, TIMER1_BASE + TIMER_IF) & TIMER_IF_OF,
+                    ==, TIMER_IF_OF);
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWPULSE, 1u << 10);
+    g_assert_cmpuint(qtest_readl(qts, TIMER1_BASE + TIMER_CC_ICF(1)), ==, 999);
+    /* The CC0 capture of the start edge read 0 counts. */
+    g_assert_cmpuint(qtest_readl(qts, TIMER1_BASE + TIMER_CC_ICF(0)), ==, 0);
+    qtest_quit(qts);
+}
+
+/*
+ * RTCC input capture from the PRS (RM SS15.3.2): an edge on the selected
+ * channel captures CNT into CCn_ICVALUE and sets IF.CCn.
+ */
+#define RTCC_CC_CTRL(n)         (0x030 + 0xc * (n))
+#define RTCC_CC_ICVALUE(n)      (0x038 + 0xc * (n))
+#define RTCC_CC_INPUTCAPTURE    0x1
+#define RTCC_IF_CC(n)           (1u << (4 + 2 * (n)))
+
+static void test_prs_rtcc_capture(void)
+{
+    QTestState *qts = prs_start();
+    uint32_t cnt;
+
+    qtest_writel(qts, RTCC_BASE + RTCC_EN, 1);
+    qtest_writel(qts, RTCC_BASE + RTCC_CC_CTRL(2), RTCC_CC_INPUTCAPTURE);
+    qtest_writel(qts, PRS_BASE + PRS_CONSUMER_RTCC_CC(2), 5);
+    qtest_writel(qts, RTCC_BASE + RTCC_CMD, RTCC_CMD_START);
+    qtest_clock_step(qts, 100 * LF_PERIOD_NS);
+    cnt = qtest_readl(qts, RTCC_BASE + RTCC_CNT);
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWPULSE, 1u << 5);
+    g_assert_cmpuint(qtest_readl(qts, RTCC_BASE + RTCC_CC_ICVALUE(2)), ==,
+                     cnt);
+    g_assert_cmphex(qtest_readl(qts, RTCC_BASE + RTCC_IF) & RTCC_IF_CC(2), ==,
+                    RTCC_IF_CC(2));
+    qtest_quit(qts);
+}
+
+/*
+ * IADC triggers (RM SS24.3.3.3): SINGLESTART only enables the queue for a
+ * PRSPOS trigger, which converts after the 2 CLK_SRC_ADC synchronisation
+ * cycles; the local timer triggers every IADC_TIMER CLK_SRC_ADC cycles.
+ * CLK_SRC_ADC is EM01GRPACLK, HFRCODPLL's 19 MHz at reset.
+ */
+#define IADC_TIMER            0x010
+#define IADC_TRIGGER          0x02c
+#define IADC_TRIGGER_SINGLE_TIMER  (1u << 8)
+#define IADC_TRIGGER_SINGLE_PRSPOS (3u << 8)
+#define IADC_CMD_SINGLESTART  (1u << 0)
+#define IADC_CMD_SINGLESTOP   (1u << 1)
+#define IADC_CMD_TIMEREN      (1u << 16)
+#define IADC_STATUS_SINGLEQEN (1u << 0)
+#define IADC_STATUS_TIMERACTIVE (1u << 16)
+#define IADC_SINGLEFIFOSTAT   0x078
+#define IADC_PRS_SYNC_NS      (2 * 1000000000ull / 19000000 + 1)
+#define IADC_TIMER_PERIOD_NS  100000ull
+
+static void test_iadc_triggers(void)
+{
+    QTestState *qts = prs_start();
+
+    qtest_writel(qts, CMU_BASE_ADDR + CMU_EM01GRPACLKCTRL, 1);
+    qtest_writel(qts, IADC_BASE + IADC_CTRL,
+                 IADC_CTRL_TIMEBASE_1US | IADC_CTRL_KEEPWARM);
+    qtest_writel(qts, IADC_BASE + IADC_SCHED0, 1);
+    qtest_writel(qts, IADC_BASE + IADC_CFG0, IADC_CFG0_VDDX_GAIN1);
+    qtest_writel(qts, IADC_BASE + IADC_SINGLE, IADC_SINGLE_PD02_GND);
+    qtest_writel(qts, IADC_BASE + IADC_TRIGGER, IADC_TRIGGER_SINGLE_PRSPOS);
+    qtest_writel(qts, PRS_BASE + PRS_CONSUMER_IADC0_SINGLETRIGGER, 4);
+    qtest_writel(qts, IADC_BASE + IADC_CMD, IADC_CMD_SINGLESTART);
+    g_assert_cmphex(qtest_readl(qts, IADC_BASE + IADC_STATUS) &
+                    (IADC_STATUS_SINGLEQEN | IADC_STATUS_CONVERTING), ==,
+                    IADC_STATUS_SINGLEQEN);
+    qtest_clock_step(qts, 100000);
+    g_assert_cmpuint(qtest_readl(qts, IADC_BASE + IADC_SINGLEFIFOSTAT), ==, 0);
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWPULSE, 1u << 4);
+    qtest_clock_step(qts, IADC_PRS_SYNC_NS + IADC_WARMUP_NS + IADC_CONV_NS -
+                              1);
+    g_assert_cmpuint(qtest_readl(qts, IADC_BASE + IADC_SINGLEFIFOSTAT), ==, 0);
+    qtest_clock_step(qts, 1);
+    g_assert_cmpuint(qtest_readl(qts, IADC_BASE + IADC_SINGLEFIFOSTAT), ==, 1);
+    qtest_writel(qts, IADC_BASE + IADC_CMD, IADC_CMD_SINGLESTOP);
+    qtest_writel(qts, PRS_BASE + PRS_ASYNC_SWPULSE, 1u << 4);
+    qtest_clock_step(qts, 100000);
+    g_assert_cmpuint(qtest_readl(qts, IADC_BASE + IADC_SINGLEFIFOSTAT), ==, 1);
+
+    /* Local timer, 1900 cycles = 100 us; warm already (KEEPWARM). */
+    qtest_writel(qts, IADC_BASE + IADC_TRIGGER, IADC_TRIGGER_SINGLE_TIMER);
+    qtest_writel(qts, IADC_BASE + IADC_TIMER, 1900);
+    qtest_writel(qts, IADC_BASE + IADC_CMD,
+                 IADC_CMD_SINGLESTART | IADC_CMD_TIMEREN);
+    g_assert_cmphex(qtest_readl(qts, IADC_BASE + IADC_STATUS) &
+                    IADC_STATUS_TIMERACTIVE, ==, IADC_STATUS_TIMERACTIVE);
+    qtest_clock_step(qts, IADC_TIMER_PERIOD_NS + IADC_CONV_NS);
+    g_assert_cmpuint(qtest_readl(qts, IADC_BASE + IADC_SINGLEFIFOSTAT), ==, 2);
+    qtest_clock_step(qts, IADC_TIMER_PERIOD_NS);
+    g_assert_cmpuint(qtest_readl(qts, IADC_BASE + IADC_SINGLEFIFOSTAT), ==, 3);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     int result;
@@ -3940,6 +4317,16 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/timer-sync-registers-read-zero-when-disabled",
                    test_timer_sync_registers_read_zero_when_disabled);
     qtest_add_func("/efr32bg22/timer-bus-faults", test_timer_bus_faults);
+    qtest_add_func("/efr32bg22/prs-logic-table", test_prs_logic_table);
+    qtest_add_func("/efr32bg22/prs-bus-gate", test_prs_bus_gate);
+    qtest_add_func("/efr32bg22/prs-swpulse-timer-capture",
+                   test_prs_swpulse_timer_capture);
+    qtest_add_func("/efr32bg22/prs-timer-input-qualification",
+                   test_prs_timer_input_qualification);
+    qtest_add_func("/efr32bg22/prs-timer-reloadstart-oneshot",
+                   test_prs_timer_reloadstart_oneshot);
+    qtest_add_func("/efr32bg22/prs-rtcc-capture", test_prs_rtcc_capture);
+    qtest_add_func("/efr32bg22/iadc-triggers", test_iadc_triggers);
     qtest_add_func("/efr32bg22/trng-fifo", test_trng_fifo);
     qtest_add_func("/efr32bg22/gpcrc-crc-vectors", test_gpcrc_crc_vectors);
     qtest_add_func("/efr32bg22/radioaes-ecb-and-key-sizes",

@@ -1,0 +1,179 @@
+/*
+ * EFR32xG22 PRS, Peripheral Reflex System (RM rev. 1.2 chapter 13), at
+ * 0x40038000 (non-secure 0x50038000), bus clock CMU_CLKEN0.PRS (bit 27).
+ *
+ * Producers drive levels into the PRS; a producer's pulse is a raise and a
+ * lower at the same instant (qemu_irq_pulse).  Line numbers are the
+ * producer's SOURCESEL * 8 + SIGSEL from RM Tables 13.4 (synchronous, the
+ * "sync-in" lines) and 13.5 (asynchronous, "async-in").
+ *
+ * Consumers see levels too: "consumer" line n carries the asynchronous
+ * channel PRS_CONSUMER_<n>.PRSSEL selects, "consumer-sync" line n the
+ * synchronous channel its SPRSSEL selects, n being the consumer register's
+ * offset from PRS_CONSUMER_CMU_CALDN in words.  Whether a consumer acts on
+ * edges or qualifies levels is the consumer's business (e.g. TIMER INSEL).
+ * "async-ch" and "sync-ch" carry the channel outputs themselves, for the
+ * GPIO PRS routes.
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+#ifndef HW_ARM_EFR32_PRS_H
+#define HW_ARM_EFR32_PRS_H
+
+#include "hw/arm/efr32-soc-link.h"
+
+#define TYPE_EFR32_PRS "efr32-prs"
+
+#define EFR32_PRS_BASE 0x40038000u
+#define EFR32_PRS_ASYNC_CHANNELS 12
+#define EFR32_PRS_SYNC_CHANNELS 4
+#define EFR32_PRS_SIGNALS_PER_SOURCE 8
+#define EFR32_PRS_ASYNC_SOURCES 0x39
+#define EFR32_PRS_SYNC_SOURCES 0x07
+#define EFR32_PRS_ASYNC_INPUTS \
+    (EFR32_PRS_ASYNC_SOURCES * EFR32_PRS_SIGNALS_PER_SOURCE)
+#define EFR32_PRS_SYNC_INPUTS \
+    (EFR32_PRS_SYNC_SOURCES * EFR32_PRS_SIGNALS_PER_SOURCE)
+#define EFR32_PRS_LINE(source, signal) \
+    ((source) * EFR32_PRS_SIGNALS_PER_SOURCE + (signal))
+
+#define EFR32_PRS_ASYNC_IN "async-in"
+#define EFR32_PRS_SYNC_IN "sync-in"
+#define EFR32_PRS_CONSUMER "consumer"
+#define EFR32_PRS_CONSUMER_SYNC "consumer-sync"
+#define EFR32_PRS_ASYNC_CH "async-ch"
+#define EFR32_PRS_SYNC_CH "sync-ch"
+
+/* Asynchronous producers, RM Table 13.5 (SOURCESEL). */
+enum {
+    EFR32_PRS_SRC_IADC0 = 0x01,
+    EFR32_PRS_SRC_LETIMER0 = 0x02,
+    EFR32_PRS_SRC_RTCC = 0x03,
+    EFR32_PRS_SRC_BURTC = 0x04,
+    EFR32_PRS_SRC_GPIO = 0x05,
+    EFR32_PRS_SRC_CMUL = 0x06,
+    EFR32_PRS_SRC_PRSL = 0x0a,
+    EFR32_PRS_SRC_PRS = 0x0b,
+    EFR32_PRS_SRC_EUART0 = 0x0c,
+    EFR32_PRS_SRC_USART0 = 0x20,
+    EFR32_PRS_SRC_USART1 = 0x21,
+    EFR32_PRS_SRC_TIMER0 = 0x22,
+    EFR32_PRS_SRC_TIMER1 = 0x23,
+    EFR32_PRS_SRC_TIMER2 = 0x24,
+    EFR32_PRS_SRC_TIMER3 = 0x25,
+    EFR32_PRS_SRC_CORE = 0x26,
+    EFR32_PRS_SRC_AGCL = 0x27,
+    EFR32_PRS_SRC_AGC = 0x28,
+    EFR32_PRS_SRC_BUFC = 0x29,
+    EFR32_PRS_SRC_MODEML = 0x2a,
+    EFR32_PRS_SRC_MODEM = 0x2b,
+    EFR32_PRS_SRC_MODEMH = 0x2c,
+    EFR32_PRS_SRC_FRC = 0x2d,
+    EFR32_PRS_SRC_PROTIMERL = 0x2e,
+    EFR32_PRS_SRC_PROTIMER = 0x2f,
+    EFR32_PRS_SRC_SYNTH = 0x30,
+    EFR32_PRS_SRC_PDML = 0x31,
+    EFR32_PRS_SRC_RACL = 0x33,
+    EFR32_PRS_SRC_RAC = 0x34,
+    EFR32_PRS_SRC_TIMER4 = 0x35,
+    EFR32_PRS_SRC_LFRCO = 0x38,
+};
+
+/* TIMERn signals, the same in both tables: UF, OF, CC0, CC1, CC2. */
+#define EFR32_PRS_SIG_TIMER_UF 0
+#define EFR32_PRS_SIG_TIMER_OF 1
+#define EFR32_PRS_SIG_TIMER_CC(n) (2 + (n))
+/* IADC0, both tables. */
+#define EFR32_PRS_SIG_IADC_SCANENTRYDONE 0
+#define EFR32_PRS_SIG_IADC_SCANTABLEDONE 1
+#define EFR32_PRS_SIG_IADC_SINGLEDONE 2
+#define EFR32_PRS_SIG_RTCC_CCV(n) (n)
+#define EFR32_PRS_SIG_BURTC_COMP 0
+#define EFR32_PRS_SIG_BURTC_OVERFLOW 1
+#define EFR32_PRS_SIG_LETIMER_CH(n) (n)
+#define EFR32_PRS_SIG_EUART_IRDATX 0
+#define EFR32_PRS_SIG_EUART_RTS 1
+#define EFR32_PRS_SIG_EUART_TX 2
+#define EFR32_PRS_SIG_EUART_TXC 3
+#define EFR32_PRS_SIG_EUART_RXFL 4
+#define EFR32_PRS_SIG_USART_CS 0
+#define EFR32_PRS_SIG_USART_IRTX 1
+#define EFR32_PRS_SIG_USART_RTS 2
+#define EFR32_PRS_SIG_USART_RXDATA 3
+#define EFR32_PRS_SIG_USART_TX 4
+#define EFR32_PRS_SIG_USART_TXC 5
+#define EFR32_PRS_SIG_RACL_ACTIVE 0
+#define EFR32_PRS_SIG_RACL_LNAEN 1
+#define EFR32_PRS_SIG_RACL_PAEN 2
+#define EFR32_PRS_SIG_RACL_RX 3
+#define EFR32_PRS_SIG_RACL_TX 4
+#define EFR32_PRS_SIG_MODEML_FRAMEDET 7
+#define EFR32_PRS_SIG_MODEM_FRAMESENT 0
+#define EFR32_PRS_SIG_MODEM_PREDET 7
+#define EFR32_PRS_SIG_MODEMH_PRESENT 0
+#define EFR32_PRS_SIG_MODEMH_SYNCSENT 2
+#define EFR32_PRS_SIG_MODEMH_EOF 5
+
+/* Synchronous producers, RM Table 13.4. */
+enum {
+    EFR32_PRS_SYNC_SRC_TIMER0 = 0x01,
+    EFR32_PRS_SYNC_SRC_TIMER1 = 0x02,
+    EFR32_PRS_SYNC_SRC_IADC0 = 0x03,
+    EFR32_PRS_SYNC_SRC_TIMER2 = 0x04,
+    EFR32_PRS_SYNC_SRC_TIMER3 = 0x05,
+    EFR32_PRS_SYNC_SRC_TIMER4 = 0x06,
+};
+
+/* Consumers: (PRS_CONSUMER_x offset - 0x058) / 4 (efr32bg22_prs.h). */
+#define EFR32_PRS_CONSUMER_FIRST 0x058u
+#define EFR32_PRS_CONSUMER_INDEX(offset) \
+    (((offset) - EFR32_PRS_CONSUMER_FIRST) / 4)
+enum {
+    EFR32_PRS_CON_CMU_CALDN = EFR32_PRS_CONSUMER_INDEX(0x058),
+    EFR32_PRS_CON_CMU_CALUP = EFR32_PRS_CONSUMER_INDEX(0x05c),
+    EFR32_PRS_CON_IADC0_SCANTRIGGER = EFR32_PRS_CONSUMER_INDEX(0x064),
+    EFR32_PRS_CON_IADC0_SINGLETRIGGER = EFR32_PRS_CONSUMER_INDEX(0x068),
+    EFR32_PRS_CON_LDMAXBAR_DMAREQ0 = EFR32_PRS_CONSUMER_INDEX(0x06c),
+    EFR32_PRS_CON_LDMAXBAR_DMAREQ1 = EFR32_PRS_CONSUMER_INDEX(0x070),
+    EFR32_PRS_CON_LETIMER0_CLEAR = EFR32_PRS_CONSUMER_INDEX(0x074),
+    EFR32_PRS_CON_LETIMER0_START = EFR32_PRS_CONSUMER_INDEX(0x078),
+    EFR32_PRS_CON_LETIMER0_STOP = EFR32_PRS_CONSUMER_INDEX(0x07c),
+    EFR32_PRS_CON_EUART0_RX = EFR32_PRS_CONSUMER_INDEX(0x080),
+    EFR32_PRS_CON_EUART0_TRIGGER = EFR32_PRS_CONSUMER_INDEX(0x084),
+    EFR32_PRS_CON_MODEM_DIN = EFR32_PRS_CONSUMER_INDEX(0x088),
+    EFR32_PRS_CON_RAC_CLR = EFR32_PRS_CONSUMER_INDEX(0x0c0),
+    EFR32_PRS_CON_RAC_CTIIN0 = EFR32_PRS_CONSUMER_INDEX(0x0c4),
+    EFR32_PRS_CON_RAC_FORCETX = EFR32_PRS_CONSUMER_INDEX(0x0d4),
+    EFR32_PRS_CON_RAC_RXDIS = EFR32_PRS_CONSUMER_INDEX(0x0d8),
+    EFR32_PRS_CON_RAC_RXEN = EFR32_PRS_CONSUMER_INDEX(0x0dc),
+    EFR32_PRS_CON_RAC_SEQ = EFR32_PRS_CONSUMER_INDEX(0x0e0),
+    EFR32_PRS_CON_RAC_TXEN = EFR32_PRS_CONSUMER_INDEX(0x0e4),
+    EFR32_PRS_CON_RTCC_CC0 = EFR32_PRS_CONSUMER_INDEX(0x0e8),
+    EFR32_PRS_CON_CORE_CTIIN0 = EFR32_PRS_CONSUMER_INDEX(0x0f8),
+    EFR32_PRS_CON_CORE_M33RXEV = EFR32_PRS_CONSUMER_INDEX(0x108),
+    EFR32_PRS_CON_TIMER0_CC0 = EFR32_PRS_CONSUMER_INDEX(0x10c),
+    EFR32_PRS_CON_USART0_CLK = EFR32_PRS_CONSUMER_INDEX(0x184),
+    EFR32_PRS_CON_WDOG0_SRC0 = EFR32_PRS_CONSUMER_INDEX(0x1a4),
+    EFR32_PRS_CON_WDOG0_SRC1 = EFR32_PRS_CONSUMER_INDEX(0x1a8),
+    EFR32_PRS_CONSUMERS,
+};
+/* TIMERn: CC0, CC1, CC2, DTI, DTIFS1, DTIFS2, six words per timer. */
+#define EFR32_PRS_TIMER_CONSUMERS 6
+#define EFR32_PRS_CON_TIMER_CC(t, n) \
+    (EFR32_PRS_CON_TIMER0_CC0 + (t) * EFR32_PRS_TIMER_CONSUMERS + (n))
+#define EFR32_PRS_CON_RTCC_CC(n) (EFR32_PRS_CON_RTCC_CC0 + (n))
+/* USARTn: CLK, IR, RX, TRIGGER. */
+#define EFR32_PRS_CON_USART(u, n) (EFR32_PRS_CON_USART0_CLK + 4 * (u) + (n))
+#define EFR32_PRS_USART_CLK 0
+#define EFR32_PRS_USART_IR 1
+#define EFR32_PRS_USART_RX 2
+#define EFR32_PRS_USART_TRIGGER 3
+
+/* An asynchronous channel selects producer @source / @signal. */
+bool efr32_prs_selected(DeviceState *prs, unsigned source, unsigned signal);
+
+DeviceState *efr32_prs_create(Object *soc, MemoryRegion *memory,
+                              const Efr32SocLink *link, hwaddr base,
+                              hwaddr ns_offset);
+
+#endif
