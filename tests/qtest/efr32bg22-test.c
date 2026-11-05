@@ -42,6 +42,8 @@ static char *tx_snapshot_trace_path;
 #define MODEM_IF             0x208
 #define MODEM_IEN            0x20c
 #define MODEM_IRCAL          0x228
+#define MODEM_RAMPCTRL       0x0c4
+#define MODEM_RAMPLEV        0x0cc
 #define MODEM_SEQIF          0x24c
 #define MODEM_IF_TXRAMPDONE  (1u << 3)
 #define RFCRC_BASE           0xa8010000
@@ -1015,6 +1017,32 @@ static void test_modem_masks(void)
     g_assert_cmphex(readl(MODEM_BASE + MODEM_IF), ==, 0x0007ffff);
     g_assert_cmphex(readl(MODEM_BASE + MODEM_IEN), ==, 0x0007ffff);
     g_assert_cmphex(readl(MODEM_BASE + MODEM_IRCAL), ==, 0x0000ffbf);
+}
+
+/*
+ * MODEM.RAMPCTRL and RAMPLEV: the public revB2 reset values and writable
+ * masks.  The open firmware's transmit power sets the 6 dBm PA's level in all
+ * three RAMPLEV fields (owo-open-fw docs/tx-power.md); without it RAMPLEV
+ * keeps 0x9f9f9f.
+ */
+static void test_modem_pa_ramp_registers(void)
+{
+    reset_with_radio_clocks();
+    g_assert_cmphex(readl(MODEM_BASE + MODEM_RAMPCTRL), ==, 0x00000555);
+    g_assert_cmphex(readl(MODEM_BASE + MODEM_RAMPLEV), ==, 0x009f9f9f);
+
+    writel(MODEM_BASE + MODEM_RAMPCTRL, UINT32_MAX);
+    writel(MODEM_BASE + MODEM_RAMPLEV, UINT32_MAX);
+    g_assert_cmphex(readl(MODEM_BASE + MODEM_RAMPCTRL), ==, 0xff800fff);
+    g_assert_cmphex(readl(MODEM_BASE + MODEM_RAMPLEV), ==, 0x00ffffff);
+
+    writel(MODEM_BASE + MODEM_RAMPLEV + REGISTER_CLEAR_WINDOW, 0x00ffffff);
+    writel(MODEM_BASE + MODEM_RAMPLEV + REGISTER_SET_WINDOW, 0x00202020);
+    g_assert_cmphex(readl(MODEM_BASE + MODEM_RAMPLEV), ==, 0x00202020);
+
+    reset_with_radio_clocks();
+    g_assert_cmphex(readl(MODEM_BASE + MODEM_RAMPCTRL), ==, 0x00000555);
+    g_assert_cmphex(readl(MODEM_BASE + MODEM_RAMPLEV), ==, 0x009f9f9f);
 }
 
 static void test_rfcrc_masks(void)
@@ -3963,6 +3991,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/dpll-lock", test_dpll_lock);
     qtest_add_func("/efr32bg22/usart-tx-polling", test_usart_tx_polling);
     qtest_add_func("/efr32bg22/modem-masks", test_modem_masks);
+    qtest_add_func("/efr32bg22/modem-pa-ramp-registers",
+                   test_modem_pa_ramp_registers);
     qtest_add_func("/efr32bg22/rfcrc-masks", test_rfcrc_masks);
     qtest_add_func("/efr32bg22/rfcrc-cmd-initialize",
                    test_rfcrc_cmd_initialize);

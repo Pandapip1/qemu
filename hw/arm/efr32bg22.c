@@ -158,6 +158,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_RAC_PAENCTRL 0x0b4u
 #define EFR32_RAC_PAENCTRL_PARAMP (1u << 8)
 #define EFR32_MODEM_IF 0x208u
+/*
+ * PA ramp control and ramp levels: public revB2 MODEM_S_register.py offsets
+ * 0x0c4/0x0cc, writable masks 0xff800fff/0x00ffffff, reset values 0x555
+ * (RAMPRATE0..2 = 5) and 0x9f9f9f (RAMPLEV0..2 = 159).  Latches only: the
+ * medium carries no transmit power.
+ */
+#define EFR32_MODEM_RAMPCTRL 0x0c4u
+#define EFR32_MODEM_RAMPCTRL_RESET 0x00000555u
+#define EFR32_MODEM_RAMPLEV 0x0ccu
+#define EFR32_MODEM_RAMPLEV_RESET 0x009f9f9fu
 #define EFR32_MODEM_SEQIF 0x24cu
 #define EFR32_MODEM_IF_TXRAMPDONE (1u << 3)
 #define EFR32_RAC_SYEN_VCO_POWER ((1u << 7) | (1u << 8) | (1u << 9))
@@ -1017,8 +1027,8 @@ static const Efr32RegisterMask efr32_modem_masks[] = {
     {0x09c, 0xffffffff}, {0x0a0, 0xffffffff}, {0x0a4, 0xffffffff},
     {0x0a8, 0xffffffff}, {0x0ac, 0xffffffff}, {0x0b0, 0xffffffff},
     {0x0b4, 0xffffffff}, {0x0b8, 0xffffffff}, {0x0bc, 0xffffffff},
-    {0x0c0, 0xffffffff}, {0x0e0, 0x000001ff}, {0x0e4, 0x7fffffff},
-    {0x0ec, 0xeffff8ff}, {0x0f4, 0xffffffff}, {0x0f8, 0x7fffffff},
+    {0x0c0, 0xffffffff}, {0x0c4, 0xff800fff}, {0x0cc, 0x00ffffff},
+    {0x0e0, 0x000001ff}, {0x0e4, 0x7fffffff}, {0x0ec, 0xeffff8ff}, {0x0f4, 0xffffffff}, {0x0f8, 0x7fffffff},
     {0x0fc, 0xffefffff}, {0x100, 0xffffffff}, {0x104, 0xffffffff},
     {0x10c, 0x007fffff}, {0x110, 0x7fffffff}, {0x114, 0xffffffff},
     {0x124, 0x0000ffff}, {0x128, 0x0000ffff}, {0x130, 0x7ffffeff},
@@ -6686,6 +6696,10 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
      */
     efr32_register_put(s, EFR32_SYNTH_BASE + EFR32_SYNTH_STATUS,
                        EFR32_SYNTH_STATUS_SYNTHREADY);
+    efr32_register_put(s, EFR32_MODEM_BASE + EFR32_MODEM_RAMPCTRL,
+                       EFR32_MODEM_RAMPCTRL_RESET);
+    efr32_register_put(s, EFR32_MODEM_BASE + EFR32_MODEM_RAMPLEV,
+                       EFR32_MODEM_RAMPLEV_RESET);
     efr32_msc_reset(s);
     efr32_rtcc_reset(s);
     memset(s->iadc_fifo, 0, sizeof(s->iadc_fifo));
