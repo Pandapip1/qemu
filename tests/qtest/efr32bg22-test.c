@@ -4281,6 +4281,45 @@ static void test_iadc_triggers(void)
     qtest_quit(qts);
 }
 
+/*
+ * BURAM (RM ch. 17): 32 retention words with SET/CLR/TGL aliases, byte
+ * lanes, kept through resets other than power-on; gated by CLKEN0.BURAM.
+ */
+#define BURAM_BASE              0x40080000
+#define BURAM_NS_BASE           0x50080000
+#define CMU_CLKEN0_BURAM        (1u << 28)
+
+static void setup_buram_clock(QTestState *qts)
+{
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_BURAM);
+}
+
+static void test_buram_retention(void)
+{
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel qtest -S");
+
+    setup_buram_clock(qts);
+    for (unsigned n = 0; n < 32; n++) {
+        g_assert_cmphex(qtest_readl(qts, BURAM_BASE + 4 * n), ==, 0);
+        qtest_writel(qts, BURAM_BASE + 4 * n, 0x01010101u * n);
+    }
+    qtest_writeb(qts, BURAM_NS_BASE + 4 * 3 + 2, 0xa5);
+    g_assert_cmphex(qtest_readl(qts, BURAM_BASE + 4 * 3), ==, 0x03a50303);
+    qtest_writel(qts, BURAM_BASE + 4 * 5 + REGISTER_SET_WINDOW, 0xf0000000);
+    qtest_writel(qts, BURAM_BASE + 4 * 5 + REGISTER_CLEAR_WINDOW, 0x5);
+    g_assert_cmphex(qtest_readl(qts, BURAM_BASE + 4 * 5), ==, 0xf5050500);
+    g_assert_cmphex(qtest_readw(qts, BURAM_BASE + 4 * 31 + 2), ==, 0x1f1f);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    qtest_qmp_eventwait(qts, "RESET");
+    setup_buram_clock(qts);
+    g_assert_cmphex(qtest_readl(qts, BURAM_BASE + 4 * 3), ==, 0x03a50303);
+    g_assert_cmphex(qtest_readl(qts, BURAM_BASE + 4 * 31), ==, 0x1f1f1f1f);
+    qtest_quit(qts);
+    g_assert_true(m33_load_faults(BURAM_BASE, setup_no_clocks));
+    g_assert_false(m33_load_faults(BURAM_BASE, setup_buram_clock));
+}
+
 int main(int argc, char **argv)
 {
     int result;
@@ -4327,6 +4366,7 @@ int main(int argc, char **argv)
                    test_prs_timer_reloadstart_oneshot);
     qtest_add_func("/efr32bg22/prs-rtcc-capture", test_prs_rtcc_capture);
     qtest_add_func("/efr32bg22/iadc-triggers", test_iadc_triggers);
+    qtest_add_func("/efr32bg22/buram-retention", test_buram_retention);
     qtest_add_func("/efr32bg22/trng-fifo", test_trng_fifo);
     qtest_add_func("/efr32bg22/gpcrc-crc-vectors", test_gpcrc_crc_vectors);
     qtest_add_func("/efr32bg22/radioaes-ecb-and-key-sizes",

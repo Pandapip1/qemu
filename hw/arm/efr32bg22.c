@@ -22,6 +22,7 @@
 #include "hw/arm/efr32-gpcrc.h"
 #include "hw/arm/efr32-interconnect.h"
 #include "hw/arm/efr32-prs.h"
+#include "hw/arm/efr32-buram.h"
 #include "hw/arm/efr32-soc-link.h"
 #include "hw/misc/analog-source.h"
 #include "hw/misc/owo-suit.h"
@@ -8712,6 +8713,8 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
                          PERIPH_NONSECURE_OFFSET, EFR32_I2C0_IRQ);
         efr32_soc_create_reflex(s, gpio);
     }
+    efr32_buram_create(OBJECT(s), s->memory, &s->periph.link,
+                       EFR32_BURAM_BASE, PERIPH_NONSECURE_OFFSET);
     for (unsigned state = 0; state < EFR32_RAC_SEQ_STATE_EVENTS; state++) {
         s->periph.seq_irq_state[state] =
             qdev_get_gpio_in(DEVICE(&s->seq_armv7m), state);
