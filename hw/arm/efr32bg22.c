@@ -24,6 +24,7 @@
 #include "hw/arm/efr32-prs.h"
 #include "hw/arm/efr32-buram.h"
 #include "hw/arm/efr32-letimer.h"
+#include "hw/arm/efr32-eusart.h"
 #include "hw/arm/efr32-soc-link.h"
 #include "hw/misc/analog-source.h"
 #include "hw/misc/owo-suit.h"
@@ -8418,6 +8419,11 @@ static void efr32_soc_create_reflex(Efr32Bg22SoCState *s, DeviceState *gpio)
         OBJECT(s), s->memory, &s->periph.link, EFR32_LETIMER0_BASE,
         PERIPH_NONSECURE_OFFSET,
         qdev_get_gpio_in(DEVICE(&s->armv7m), EFR32_LETIMER0_IRQ));
+    DeviceState *euart = efr32_eusart_create(
+        OBJECT(s), s->memory, &s->periph.link, EFR32_EUART0_BASE,
+        PERIPH_NONSECURE_OFFSET,
+        qdev_get_gpio_in(DEVICE(&s->armv7m), EFR32_EUART0_RX_IRQ),
+        qdev_get_gpio_in(DEVICE(&s->armv7m), EFR32_EUART0_TX_IRQ));
     /* Consumer lines served outside the core model, and by whom. */
     struct {
         unsigned consumer;
@@ -8428,7 +8434,19 @@ static void efr32_soc_create_reflex(Efr32Bg22SoCState *s, DeviceState *gpio)
         { EFR32_PRS_CON_LETIMER0_START, letimer, EFR32_LETIMER_PRS_IN, 0 },
         { EFR32_PRS_CON_LETIMER0_STOP, letimer, EFR32_LETIMER_PRS_IN, 1 },
         { EFR32_PRS_CON_LETIMER0_CLEAR, letimer, EFR32_LETIMER_PRS_IN, 2 },
+        { EFR32_PRS_CON_EUART0_TRIGGER, euart, EFR32_EUSART_PRS_TRIGGER, 0 },
     };
+
+    qdev_connect_gpio_out_named(euart, EFR32_EUSART_PRS_TXC, 0,
+                                qdev_get_gpio_in_named(
+                                    prs, EFR32_PRS_ASYNC_IN,
+                                    EFR32_PRS_LINE(EFR32_PRS_SRC_EUART0,
+                                                   EFR32_PRS_SIG_EUART_TXC)));
+    qdev_connect_gpio_out_named(euart, EFR32_EUSART_PRS_RXFL, 0,
+                                qdev_get_gpio_in_named(
+                                    prs, EFR32_PRS_ASYNC_IN,
+                                    EFR32_PRS_LINE(EFR32_PRS_SRC_EUART0,
+                                                   EFR32_PRS_SIG_EUART_RXFL)));
 
     s->periph.prs = prs;
     for (unsigned n = 0; n < EFR32_PRS_ASYNC_INPUTS; n++) {

@@ -4497,6 +4497,141 @@ static void test_letimer_oneshot_pwm(void)
     g_assert_true(m33_load_faults(LETIMER0_BASE + LT_CNT, setup_no_clocks));
 }
 
+/*
+ * EUART0 (RM ch. 22) on EM01GRPACLK = HFXO, 38.4 MHz, 8N1 at CLKDIV 5072
+ * (115.3 kbaud with OVS x16): one frame is 10 x 16 x (256 + 5072) /
+ * (256 x 38.4 MHz) = 86.72 us.  CMD is LFSYNC (SYNCBUSY for 3 kernel
+ * clocks), CFG0 a CONFIG register (faults with EN set), loopback, the FIFO
+ * level flags, INTFLAG IF; the chardev line side both ways.
+ */
+#define EUART0_BASE             0x4a030000
+#define EU_EN                   0x004
+#define EU_CFG0                 0x008
+#define EU_CLKDIV               0x028
+#define EU_CMD                  0x030
+#define EU_RXDATA               0x034
+#define EU_TXDATA               0x03c
+#define EU_STATUS               0x040
+#define EU_IF                   0x044
+#define EU_SYNCBUSY             0x04c
+#define EU_CFG0_LOOPBK          (1u << 1)
+#define EU_CMD_RXEN             (1u << 0)
+#define EU_CMD_TXEN             (1u << 2)
+#define EU_STATUS_RXENS         (1u << 0)
+#define EU_STATUS_TXENS         (1u << 1)
+#define EU_STATUS_TXC           (1u << 5)
+#define EU_STATUS_TXFL          (1u << 6)
+#define EU_STATUS_RXFL          (1u << 7)
+#define EU_STATUS_TXIDLE        (1u << 13)
+#define EU_IF_TXC               (1u << 0)
+#define EU_IF_RXFL              (1u << 2)
+#define EU_IF_RXUF              (1u << 5)
+#define EU_CLKDIV_115200        5072
+#define EU_FRAME_NS             86718
+#define CMU_CLKEN0_EUART0       (1u << 24)
+
+static void setup_euart_enabled(QTestState *qts)
+{
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_EUART0);
+    qtest_writel(qts, EUART0_BASE + EU_EN, 1);
+}
+
+static void setup_euart_clock(QTestState *qts)
+{
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_EUART0);
+}
+
+static QTestState *euart_start(const char *extra, bool loopback)
+{
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel qtest %s",
+                                  extra);
+
+    setup_euart_clock(qts);
+    qtest_writel(qts, CMU_BASE_ADDR + CMU_EM01GRPACLKCTRL,
+                 CMU_EM01GRPACLK_HFXO);
+    qtest_writel(qts, EUART0_BASE + EU_CFG0, loopback ? EU_CFG0_LOOPBK : 0);
+    qtest_writel(qts, EUART0_BASE + EU_CLKDIV, EU_CLKDIV_115200);
+    qtest_writel(qts, EUART0_BASE + EU_EN, 1);
+    qtest_writel(qts, EUART0_BASE + EU_CMD, EU_CMD_RXEN | EU_CMD_TXEN);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_SYNCBUSY), ==,
+                    (EU_CMD_RXEN | EU_CMD_TXEN) << 3);
+    qtest_clock_step(qts, 3 * 27);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_SYNCBUSY), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_STATUS) &
+                    (EU_STATUS_RXENS | EU_STATUS_TXENS), ==,
+                    EU_STATUS_RXENS | EU_STATUS_TXENS);
+    return qts;
+}
+
+static void test_euart_loopback(void)
+{
+    QTestState *qts = euart_start("", true);
+
+    qtest_writel(qts, EUART0_BASE + EU_TXDATA, 0x55);
+    qtest_writel(qts, EUART0_BASE + EU_TXDATA, 0xaa);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_STATUS) &
+                    (EU_STATUS_TXC | EU_STATUS_TXIDLE | EU_STATUS_RXFL), ==,
+                    0);
+    qtest_clock_step(qts, 2 * EU_FRAME_NS - 100);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_STATUS) &
+                    (EU_STATUS_TXC | EU_STATUS_RXFL), ==, EU_STATUS_RXFL);
+    qtest_clock_step(qts, 100);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_STATUS) &
+                    (EU_STATUS_TXC | EU_STATUS_TXFL | EU_STATUS_TXIDLE), ==,
+                    EU_STATUS_TXC | EU_STATUS_TXFL | EU_STATUS_TXIDLE);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_IF) &
+                    (EU_IF_TXC | EU_IF_RXFL), ==, EU_IF_TXC | EU_IF_RXFL);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_RXDATA), ==, 0x55);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_RXDATA), ==, 0xaa);
+    /* RXFL is a level flag: cleared, it stays clear with the FIFO empty. */
+    qtest_writel(qts, EUART0_BASE + EU_IF + REGISTER_CLEAR_WINDOW, EU_IF_RXFL);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_IF) & EU_IF_RXFL, ==,
+                    0);
+    qtest_readl(qts, EUART0_BASE + EU_RXDATA);
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_IF) & EU_IF_RXUF, ==,
+                    EU_IF_RXUF);
+    qtest_quit(qts);
+    /* CONFIG: CFG0 written with EN set is a bus fault (RM SS4.2.4.4.2). */
+    g_assert_true(m33_store_faults(EUART0_BASE + EU_CFG0,
+                                   setup_euart_enabled));
+    g_assert_false(m33_store_faults(EUART0_BASE + EU_CFG0,
+                                    setup_euart_clock));
+}
+
+static void test_euart_chardev(void)
+{
+    g_autofree char *path = g_strdup_printf("%s/efr32-euart-%d.sock",
+                                            g_get_tmp_dir(), getpid());
+    g_autofree char *args = g_strdup_printf(
+        "-chardev socket,id=soc.euart0,path=%s", path);
+    int server = qtest_socket_server(path);
+    QTestState *qts;
+    int fd;
+    char byte = 0;
+
+    qts = euart_start(args, false);
+    fd = accept(server, NULL, NULL);
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_cmpint(write(fd, "Q", 1), ==, 1);
+    /* The byte is on the wire for one frame time. */
+    for (int i = 0; i < 100 &&
+                    !(qtest_readl(qts, EUART0_BASE + EU_STATUS) &
+                      EU_STATUS_RXFL); i++) {
+        qtest_clock_step(qts, EU_FRAME_NS);
+    }
+    g_assert_cmphex(qtest_readl(qts, EUART0_BASE + EU_RXDATA), ==, 'Q');
+    qtest_writel(qts, EUART0_BASE + EU_TXDATA, 'z');
+    qtest_clock_step(qts, EU_FRAME_NS);
+    g_assert_cmpint(read(fd, &byte, 1), ==, 1);
+    g_assert_cmpint(byte, ==, 'z');
+    close(fd);
+    close(server);
+    unlink(path);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     int result;
@@ -4547,6 +4682,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/letimer-free-running-toggle",
                    test_letimer_free_running_toggle);
     qtest_add_func("/efr32bg22/letimer-oneshot-pwm", test_letimer_oneshot_pwm);
+    qtest_add_func("/efr32bg22/euart-loopback", test_euart_loopback);
+    qtest_add_func("/efr32bg22/euart-chardev", test_euart_chardev);
     qtest_add_func("/efr32bg22/trng-fifo", test_trng_fifo);
     qtest_add_func("/efr32bg22/gpcrc-crc-vectors", test_gpcrc_crc_vectors);
     qtest_add_func("/efr32bg22/radioaes-ecb-and-key-sizes",
