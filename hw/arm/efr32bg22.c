@@ -200,6 +200,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_FRC_CMD_CONVINIT (1u << 9)
 #define EFR32_FRC_IF_TXDONE (1u << 0)
 #define EFR32_FRC_IF_RXDONE (1u << 4)
+#define EFR32_FRC_IF_RXOF (1u << 8)
 
 /*
  * DFLCTRL (0xa8004000+0x00c, public FRC_S_register.py) and WCNTCMP0
@@ -2085,8 +2086,8 @@ static void efr32_rac_rx_frame_end(void *opaque)
          * (channel 1 overflow) and the RAC sat in RXOVERFLOW with no state
          * event pending; RXDIS, SWRXEN withdrawn, BUFC CLEAR, FRC.CMD.RXABORT
          * and clearing BUFC.IF left it there, FORCEDISABLE took it to
-         * SHUTDOWN and OFF.  [I] The frame's octets that fit are written,
-         * no RXDONE is raised.
+         * SHUTDOWN and OFF.  FRC.IF.RXOF is raised with BUF1OF, RXDONE is
+         * not (SS7.89).  [I] The frame's octets that fit are written.
          */
         uint32_t room = efr32_bufc_capacity(s, EFR32_RF_RX_BUFC_CHANNEL) -
                         efr32_bufc_count(s, EFR32_RF_RX_BUFC_CHANNEL);
@@ -2100,6 +2101,7 @@ static void efr32_rac_rx_frame_end(void *opaque)
                                EFR32_BUFC_IF_BUF1OF);
         g_clear_pointer(&s->rx_frame, g_bytes_unref);
         efr32_rac_set_state(s, EFR32_RAC_STATE_RXOVERFLOW);
+        efr32_frc_raise(s, EFR32_FRC_IF_RXOF);
         return;
     }
     for (gsize index = 0; index < length; index++) {

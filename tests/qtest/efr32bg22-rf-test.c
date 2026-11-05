@@ -17,6 +17,7 @@ static char *rf_trace_path;
 #define FRC_RXRAWDATA            0x090
 #define FRC_IF_TXDONE            (1u << 0)
 #define FRC_IF_RXDONE            (1u << 4)
+#define FRC_IF_RXOF              (1u << 8)
 #define RAC_BASE                 0xa8020000
 #define RAC_CMD                  0x010
 #define RAC_CTRL                 0x014
@@ -1877,18 +1878,31 @@ static void test_released_rx_fifo_overflow(void)
     g_assert_cmphex(qtest_readl(global_qtest, peer(BUFC_BASE + BUFC_IF_OFFSET)) &
                     BUFC_IF_BUF1OF, ==, BUFC_IF_BUF1OF);
     g_assert_cmphex(qtest_readl(global_qtest, peer(FRC_BASE + FRC_IF)) &
-                    FRC_IF_RXDONE, ==, 0);
+                    (FRC_IF_RXDONE | FRC_IF_RXOF), ==, FRC_IF_RXOF);
     g_assert_cmphex(rf_status(peer_rac) & RAC_STATUS_SEQACTIVE, ==, 0);
 
-    /* RXDIS and withdrawing SWRXEN leave it there. */
+    /* RXDIS, withdrawing SWRXEN and dropping both flags leave it there. */
     qtest_writel(global_qtest, peer_rac + RAC_CMD, RAC_CMD_RXDIS);
     qtest_writel(global_qtest, peer_rac + RAC_RXENSRCEN + REGISTER_CLEAR_WINDOW,
                  RAC_RXENSRCEN_SWRXEN);
+    qtest_writel(global_qtest, peer(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW),
+                 FRC_IF_RXOF);
+    qtest_writel(global_qtest,
+                 peer(BUFC_BASE + BUFC_IF_OFFSET + REGISTER_CLEAR_WINDOW),
+                 BUFC_IF_BUF1OF);
     rf_step(ACK_TO_TRANSITION_NS * 4);
     g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RXOVERFLOW);
 
+    /*
+     * The HAL's recovery: FORCEDISABLE, then released with nothing enabled;
+     * the RAC stays quiescent (retained SHUTDOWN) until the next enable.
+     */
     qtest_writel(global_qtest, peer_rac + RAC_CTRL + REGISTER_SET_WINDOW,
                  RAC_CTRL_FORCEDISABLE);
+    g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_SHUTDOWN);
+    qtest_writel(global_qtest, peer_rac + RAC_CTRL + REGISTER_CLEAR_WINDOW,
+                 RAC_CTRL_FORCEDISABLE);
+    rf_step(ACK_TO_TRANSITION_NS * 4);
     g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_SHUTDOWN);
 }
 
