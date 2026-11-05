@@ -1001,6 +1001,29 @@ static void test_usart_tx_polling(void)
                     USART_STATUS_TXIDLE | USART_STATUS_TXBL);
 }
 
+/*
+ * An 8N1 frame at PCLK = HFXO 38.4 MHz, OVS x16, CLKDIV 0 (2.4 Mbaud) lasts
+ * 10 bit periods, 4.167 us (emlib's br = 256 fPCLK / (ovs (256 + DIV))).
+ */
+#define CMU_SYSCLKCTRL_HFXO   3
+#define USART_FRAME_2M4_NS    4166
+
+static void test_usart_frame_time(void)
+{
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel qtest");
+
+    qtest_writel(qts, CMU_BASE + CMU_SYSCLKCTRL, CMU_SYSCLKCTRL_HFXO);
+    qtest_writel(qts, USART0_BASE + USART_CMD, USART_CMD_TXEN);
+    qtest_writel(qts, USART0_BASE + USART_TXDATA, 0x5a);
+    qtest_clock_step(qts, USART_FRAME_2M4_NS - 1);
+    g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_STATUS) &
+                    USART_STATUS_TXC, ==, 0);
+    qtest_clock_step(qts, 1);
+    g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_STATUS) &
+                    USART_STATUS_TXC, ==, USART_STATUS_TXC);
+    qtest_quit(qts);
+}
+
 static void test_modem_masks(void)
 {
     writel(MODEM_BASE + MODEM_SHAPING1, 0xdeadbeef);
@@ -4546,6 +4569,7 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/cmu-nonsecure-alias", test_cmu_nonsecure_alias);
     qtest_add_func("/efr32bg22/dpll-lock", test_dpll_lock);
     qtest_add_func("/efr32bg22/usart-tx-polling", test_usart_tx_polling);
+    qtest_add_func("/efr32bg22/usart-frame-time", test_usart_frame_time);
     qtest_add_func("/efr32bg22/modem-masks", test_modem_masks);
     qtest_add_func("/efr32bg22/rfcrc-masks", test_rfcrc_masks);
     qtest_add_func("/efr32bg22/rfcrc-cmd-initialize",

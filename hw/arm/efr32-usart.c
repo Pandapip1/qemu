@@ -262,12 +262,15 @@ static int64_t usart_frame_ns(Efr32UsartState *s)
         /* data_bits * 2 * (256 + DIV) / (256 * fPCLK) seconds. */
         return muldiv64((uint64_t)data_bits * USART_SYNC_PCLK_PER_BIT *
                             divisor,
-                        NANOSECONDS_PER_SECOND,
-                        USART_CLKDIV_UNITY * pclk_hz);
+                        NANOSECONDS_PER_SECOND / USART_CLKDIV_UNITY, pclk_hz);
     }
-    /* half_bits / 2 * ovs * (256 + DIV) / (256 * fPCLK) seconds. */
-    return muldiv64((uint64_t)half_bits * ovs * divisor, NANOSECONDS_PER_SECOND,
-                    2 * USART_CLKDIV_UNITY * pclk_hz);
+    /*
+     * half_bits / 2 * ovs * (256 + DIV) / (256 * fPCLK) seconds.  The
+     * constant 512 is folded into the nanoseconds (10^9 / 512 is exact):
+     * muldiv64's divisor is 32 bits wide.
+     */
+    return muldiv64((uint64_t)half_bits * ovs * divisor,
+                    NANOSECONDS_PER_SECOND / (2 * USART_CLKDIV_UNITY), pclk_hz);
 }
 
 static bool usart_tx_buffer_level(Efr32UsartState *s)
