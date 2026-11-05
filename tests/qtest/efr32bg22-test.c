@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "qemu/osdep.h"
+#include <sys/un.h>
 #include "libqtest-single.h"
 #include "qemu/bswap.h"
 
@@ -1021,6 +1022,83 @@ static void test_usart_frame_time(void)
     qtest_clock_step(qts, 1);
     g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_STATUS) &
                     USART_STATUS_TXC, ==, USART_STATUS_TXC);
+    qtest_quit(qts);
+}
+
+/*
+ * The USART timer as Zephyr's async driver sets it (RM Table 21.10,
+ * receiver timeout): TIMECMP1 = TSTART RXEOF, TSTOP RXACT, RESTARTEN,
+ * TCMPVAL 8 raises IF.TCMP1 8 bit times after a received frame ends.
+ * A break from the host (telnet IAC BREAK on the chardev) is a frame of 0
+ * with a framing error (RM SS21.3.2.13).  2.4 Mbaud: bit 416 ns.
+ */
+#define USART_RXDATAX         0x020
+#define USART_IF              0x048
+#define USART_TIMECMP1        0x064
+#define USART_CMD_RXEN        (1u << 0)
+#define USART_STATUS_RXDATAV  (1u << 7)
+#define USART_IF_FERR         (1u << 9)
+#define USART_IF_TCMP1        (1u << 15)
+#define USART_RXDATAX_FERR    (1u << 15)
+#define USART_BIT_NS          416
+#define USART_TIMECMP1_RXTIMEOUT ((2u << 20) | (4u << 16) | (1u << 24) | 8)
+
+static int unix_connect(const char *path)
+{
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+
+    g_assert_cmpint(fd, >=, 0);
+    g_strlcpy(addr.sun_path, path, sizeof(addr.sun_path));
+    g_assert_cmpint(connect(fd, (struct sockaddr *)&addr, sizeof(addr)), ==,
+                    0);
+    return fd;
+}
+
+static void usart_wait_rx(QTestState *qts)
+{
+    for (int i = 0; i < 1000 &&
+                    !(qtest_readl(qts, USART0_BASE + USART_STATUS) &
+                      USART_STATUS_RXDATAV); i++) {
+        qtest_clock_step(qts, 100);
+    }
+    g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_STATUS) &
+                    USART_STATUS_RXDATAV, ==, USART_STATUS_RXDATAV);
+}
+
+static void test_usart_timer_and_break(void)
+{
+    g_autofree char *path = g_strdup_printf("%s/efr32-usart-%d.sock",
+                                            g_get_tmp_dir(), getpid());
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel qtest "
+                                  "-chardev socket,id=soc.usart0,path=%s,"
+                                  "server=on,wait=off,telnet=on", path);
+    const uint8_t brk[2] = { 0xff, 0xf3 };
+    int fd = unix_connect(path);
+
+    qtest_writel(qts, CMU_BASE + CMU_SYSCLKCTRL, CMU_SYSCLKCTRL_HFXO);
+    qtest_writel(qts, USART0_BASE + USART_TIMECMP1, USART_TIMECMP1_RXTIMEOUT);
+    qtest_writel(qts, USART0_BASE + USART_CMD, USART_CMD_RXEN);
+    g_assert_cmpint(write(fd, "A", 1), ==, 1);
+    usart_wait_rx(qts);
+    g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_IF) &
+                    USART_IF_TCMP1, ==, 0);
+    qtest_clock_step(qts, 8 * USART_BIT_NS - 200);
+    g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_IF) &
+                    USART_IF_TCMP1, ==, 0);
+    qtest_clock_step(qts, 200);
+    g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_IF) &
+                    USART_IF_TCMP1, ==, USART_IF_TCMP1);
+    g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_RXDATAX), ==, 'A');
+
+    g_assert_cmpint(write(fd, brk, sizeof(brk)), ==, sizeof(brk));
+    usart_wait_rx(qts);
+    g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_IF) & USART_IF_FERR,
+                    ==, USART_IF_FERR);
+    g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_RXDATAX), ==,
+                    USART_RXDATAX_FERR);
+    close(fd);
+    unlink(path);
     qtest_quit(qts);
 }
 
@@ -4918,6 +4996,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/dpll-lock", test_dpll_lock);
     qtest_add_func("/efr32bg22/usart-tx-polling", test_usart_tx_polling);
     qtest_add_func("/efr32bg22/usart-frame-time", test_usart_frame_time);
+    qtest_add_func("/efr32bg22/usart-timer-and-break",
+                   test_usart_timer_and_break);
     qtest_add_func("/efr32bg22/modem-masks", test_modem_masks);
     qtest_add_func("/efr32bg22/rfcrc-masks", test_rfcrc_masks);
     qtest_add_func("/efr32bg22/rfcrc-cmd-initialize",
