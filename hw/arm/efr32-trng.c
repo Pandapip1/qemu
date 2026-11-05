@@ -13,15 +13,24 @@
  * flags stay clear; test mode (TESTEN, TESTDATA) and the conditioning
  * bypass are not modelled (logged).
  *
- * Timing: never measured on silicon.  [I] From the RM's description: the
- * rings are sampled at Fs = PCLK / (CLKDIV + 1) (SS11.5.2.10); after
- * ENABLE the module waits INITWAITVAL clock cycles (SS11.5.2.8, taken as
- * PCLK cycles) and, unless BYPNIST, runs the NIST SP 800-90B start-up test,
- * which covers 1024 samples (SP 800-90B SS4.3); each 128-bit output block
- * is the AES-CBC-MAC of NB128BITBLOCKS x 128 samples (SS11.5.2.1), one
- * noise bit per sample.  A full FIFO stops the rings (FIFOFULLOFF) unless
- * FORCERUN; they restart when a word is read (FIFOTHRESH, 0x3F, is at
- * least the FIFO's depth however it is counted).
+ * Timing, measured on silicon (docs/radio-tables.md SS7.89:
+ * tests/periph-timing-port, DWT against the LFXO, HCLK 76.8 MHz, CLKDIV 0-3,
+ * NB128BITBLOCKS 1-8, INITWAITVAL 16-16384, with and without BYPNIST):
+ *  - The rings are sampled at Fs = HCLK / (CLKDIV + 1) (the RM's SS11.5.2.10
+ *    names PCLK; the block period follows HCLK, PCLK being HCLK / 2 there).
+ *  - After ENABLE the module waits INITWAITVAL HCLK cycles (SS11.5.2.8), then
+ *    the NIST start-up test takes 512 samples unless BYPNIST, then the first
+ *    block 512 samples whatever NB128BITBLOCKS, and its first word is in the
+ *    FIFO 1.41 us later [F fit: residual within 0.42 us; NB128BITBLOCKS 1
+ *    and 8 come 1.0 and 0.4 us early].
+ *  - Each further 128-bit block takes NB128BITBLOCKS x 128 samples
+ *    (SS11.5.2.1) plus 0.55 us [F fit at CLKDIV 0; 0.13 us at CLKDIV 1 and 3,
+ *    0.95 us at NB128BITBLOCKS 1].
+ *  - Silicon writes a block's four words over 1.0-2.1 us; the model writes
+ *    them together at the first word's time.
+ * A full FIFO stops the rings (FIFOFULLOFF) unless FORCERUN; they restart
+ * when a word is read (FIFOTHRESH, 0x3F, is at least the FIFO's depth however
+ * it is counted) [I: the restart's timing is unmeasured].
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -77,7 +86,10 @@ static const uint32_t ais31conf_reset[3] = {
     0x43401040u, 0x03c00680u, 0x04400340u,
 };
 
-#define NIST_STARTUP_SAMPLES 1024u
+#define NIST_STARTUP_SAMPLES 512u
+#define FIRST_BLOCK_SAMPLES 512u
+#define FIRST_WORD_LATENCY_NS 1410
+#define BLOCK_LATENCY_NS 550
 #define SAMPLES_PER_BLOCK 128u
 #define WORDS_PER_BLOCK 4u
 
@@ -91,22 +103,23 @@ static bool producing(Efr32Trng *t)
     return (t->ctrl & CTRL_ENABLE) && !(t->ctrl & CTRL_SOFTRESET);
 }
 
-static int64_t sample_ns(Efr32Trng *t, uint64_t pclk_hz, uint64_t samples)
+static int64_t sample_ns(Efr32Trng *t, uint64_t hclk_hz, uint64_t samples)
 {
     return muldiv64(samples * (t->clkdiv + 1), NANOSECONDS_PER_SECOND,
-                    pclk_hz ? pclk_hz : 1);
+                    hclk_hz ? hclk_hz : 1);
 }
 
-static int64_t block_ns(Efr32Trng *t, uint64_t pclk_hz)
+static int64_t block_ns(Efr32Trng *t, uint64_t hclk_hz)
 {
     uint32_t nb = (t->ctrl >> CTRL_NB128BITBLOCKS_SHIFT) &
                   CTRL_NB128BITBLOCKS_MASK;
 
-    return sample_ns(t, pclk_hz, (uint64_t)(nb ? nb : 1) * SAMPLES_PER_BLOCK);
+    return sample_ns(t, hclk_hz, (uint64_t)(nb ? nb : 1) * SAMPLES_PER_BLOCK) +
+           BLOCK_LATENCY_NS;
 }
 
 /* Write every block the noise source has finished by now. */
-static void trng_update(Efr32Trng *t, uint64_t pclk_hz)
+static void trng_update(Efr32Trng *t, uint64_t hclk_hz)
 {
     int64_t now = now_ns();
 
@@ -121,7 +134,8 @@ static void trng_update(Efr32Trng *t, uint64_t pclk_hz)
             qemu_guest_getrandom_nofail(&t->fifo[slot], sizeof(t->fifo[0]));
             t->level++;
         }
-        t->next_block_ns += block_ns(t, pclk_hz);
+        t->next_block_ns += block_ns(t, hclk_hz);
+        t->starting = false;
     }
     if (t->level + WORDS_PER_BLOCK > EFR32_TRNG_FIFO_WORDS) {
         /* Full: the rings stop (FIFOFULLOFF) and restart on a read. */
@@ -130,14 +144,16 @@ static void trng_update(Efr32Trng *t, uint64_t pclk_hz)
     }
 }
 
-static void trng_start(Efr32Trng *t, uint64_t pclk_hz)
+static void trng_start(Efr32Trng *t, uint64_t hclk_hz)
 {
-    uint64_t samples = (t->ctrl & CTRL_BYPNIST) ? 0 : NIST_STARTUP_SAMPLES;
+    uint64_t samples = FIRST_BLOCK_SAMPLES +
+                       ((t->ctrl & CTRL_BYPNIST) ? 0 : NIST_STARTUP_SAMPLES);
 
     t->next_block_ns = now_ns() +
         muldiv64(t->initwaitval, NANOSECONDS_PER_SECOND,
-                 pclk_hz ? pclk_hz : 1) +
-        sample_ns(t, pclk_hz, samples) + block_ns(t, pclk_hz);
+                 hclk_hz ? hclk_hz : 1) +
+        sample_ns(t, hclk_hz, samples) + FIRST_WORD_LATENCY_NS;
+    t->starting = true;
 }
 
 static void trng_clear_fifo(Efr32Trng *t)
@@ -146,7 +162,7 @@ static void trng_clear_fifo(Efr32Trng *t)
     t->status &= ~STATUS_FULLIF;
 }
 
-static uint32_t trng_state(Efr32Trng *t, uint64_t pclk_hz)
+static uint32_t trng_state(Efr32Trng *t, uint64_t hclk_hz)
 {
     int64_t now = now_ns();
 
@@ -157,7 +173,7 @@ static uint32_t trng_state(Efr32Trng *t, uint64_t pclk_hz)
         return (t->ctrl & CTRL_FORCERUN) ? STATE_FIFOFULLON
                                          : STATE_FIFOFULLOFF;
     }
-    if (t->level == 0 && t->next_block_ns - block_ns(t, pclk_hz) > now) {
+    if (t->starting && t->next_block_ns > now) {
         return STATE_STARTUP;
     }
     return STATE_RUNNING;
@@ -173,10 +189,10 @@ void efr32_trng_reset(Efr32Trng *t)
     t->next_block_ns = INT64_MAX;
 }
 
-bool efr32_trng_read(Efr32Trng *t, uint32_t offset, uint64_t pclk_hz,
+bool efr32_trng_read(Efr32Trng *t, uint32_t offset, uint64_t hclk_hz,
                      uint32_t *value)
 {
-    trng_update(t, pclk_hz);
+    trng_update(t, hclk_hz);
     switch (offset) {
     case RNGCTRL:
         *value = t->ctrl;
@@ -197,7 +213,7 @@ bool efr32_trng_read(Efr32Trng *t, uint32_t offset, uint64_t pclk_hz,
         *value = 0;
         return true;
     case RNGSTATUS:
-        *value = t->status | (trng_state(t, pclk_hz) << STATUS_STATE_SHIFT);
+        *value = t->status | (trng_state(t, hclk_hz) << STATUS_STATE_SHIFT);
         return true;
     case INITWAITVAL:
         *value = t->initwaitval;
@@ -219,12 +235,12 @@ bool efr32_trng_read(Efr32Trng *t, uint32_t offset, uint64_t pclk_hz,
     }
 }
 
-bool efr32_trng_write(Efr32Trng *t, uint32_t offset, uint64_t pclk_hz,
+bool efr32_trng_write(Efr32Trng *t, uint32_t offset, uint64_t hclk_hz,
                       uint32_t value)
 {
     uint32_t old = t->ctrl;
 
-    trng_update(t, pclk_hz);
+    trng_update(t, hclk_hz);
     switch (offset) {
     case RNGCTRL:
         t->ctrl = value & CTRL_MASK;
@@ -239,7 +255,7 @@ bool efr32_trng_write(Efr32Trng *t, uint32_t offset, uint64_t pclk_hz,
             t->next_block_ns = INT64_MAX;
         } else if (producing(t) &&
                    (!(old & CTRL_ENABLE) || (old & CTRL_SOFTRESET))) {
-            trng_start(t, pclk_hz);
+            trng_start(t, hclk_hz);
         } else if (!(t->ctrl & CTRL_ENABLE)) {
             t->next_block_ns = INT64_MAX;
         }
@@ -281,11 +297,11 @@ bool efr32_trng_write(Efr32Trng *t, uint32_t offset, uint64_t pclk_hz,
     }
 }
 
-uint32_t efr32_trng_pop(Efr32Trng *t, uint64_t pclk_hz)
+uint32_t efr32_trng_pop(Efr32Trng *t, uint64_t hclk_hz)
 {
     uint32_t word;
 
-    trng_update(t, pclk_hz);
+    trng_update(t, hclk_hz);
     if (!t->level) {
         /* [U] what silicon returns from an empty FIFO is unmeasured. */
         t->underruns++;
@@ -298,7 +314,7 @@ uint32_t efr32_trng_pop(Efr32Trng *t, uint64_t pclk_hz)
     if (t->next_block_ns == INT64_MAX && producing(t)) {
         /* The rings restart below the threshold. */
         t->status &= ~STATUS_FULLIF;
-        t->next_block_ns = now_ns() + block_ns(t, pclk_hz);
+        t->next_block_ns = now_ns() + block_ns(t, hclk_hz);
     }
     return word;
 }

@@ -34,17 +34,19 @@ typedef struct Efr32Trng {
     unsigned head, level;
     /* Virtual time the next 128-bit block is written (INT64_MAX: none). */
     int64_t next_block_ns;
+    /* Before the first block (RNGSTATUS.STATE STARTUP). */
+    bool starting;
     /* Words popped from an empty FIFO, for tests and traces. */
     uint64_t underruns;
 } Efr32Trng;
 
 void efr32_trng_reset(Efr32Trng *t);
-/* @offset within the RNGCTRL block; @pclk_hz the sample clock's source. */
-bool efr32_trng_read(Efr32Trng *t, uint32_t offset, uint64_t pclk_hz,
+/* @offset within the RNGCTRL block; @hclk_hz the sample clock's source. */
+bool efr32_trng_read(Efr32Trng *t, uint32_t offset, uint64_t hclk_hz,
                      uint32_t *value);
-bool efr32_trng_write(Efr32Trng *t, uint32_t offset, uint64_t pclk_hz,
+bool efr32_trng_write(Efr32Trng *t, uint32_t offset, uint64_t hclk_hz,
                       uint32_t value);
 /* One word from the output FIFO (any address in its window). */
-uint32_t efr32_trng_pop(Efr32Trng *t, uint64_t pclk_hz);
+uint32_t efr32_trng_pop(Efr32Trng *t, uint64_t hclk_hz);
 
 #endif

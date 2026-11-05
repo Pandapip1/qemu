@@ -865,8 +865,8 @@ struct Efr32Periph
     /* Warm (ADCWARM) for this PRESCALE/ADCMODE/REFSEL key; or in standby. */
     bool iadc_warm, iadc_standby;
     uint32_t iadc_warm_key;
-    uint32_t iadc_last_input;
-    bool iadc_have_input;
+    /* STATUS.ADCWARM reads 1 from the end of a warm-up until the power-down. */
+    int64_t iadc_warm_from_ns, iadc_cold_ns;
     /* TIMERn CCm compare/PWM outputs, to the GPIO routes. */
     qemu_irq timer_cc_out[5 * 3];
     /* SoC services for the blocks outside this model (efr32-soc-link.h). */
@@ -5324,8 +5324,8 @@ static bool efr32_cmu_wdoglock_write(Efr32Periph *s, uint32_t key,
  * or left-aligned (LEFT12), unipolar for a single-ended input.
  * Fault injection: "x-iadc-stall" (periph property) makes conversions never
  * complete: commands are accepted and nothing ever comes out.
- * Results arrive after the RM's warm-up and conversion times
- * (efr32_iadc_queue: OSR, ADC_CLK, WARMUPMODE, TIMEBASE; [I] unmeasured).
+ * Results arrive after the warm-up and conversion times measured on silicon
+ * (efr32_iadc_queue: OSR, ADC_CLK, WARMUPMODE, TIMEBASE; SS7.89).
  * Triggers (local timer, PRS, continuous): efr32_iadc_request and around.
  * Output resolution, 16/20-bit alignment and the window comparator:
  * efr32_iadc_convert, efr32_iadc_window_hit.
@@ -5441,6 +5441,13 @@ static void efr32_iadc_put(Efr32Periph *s, uint32_t offset, uint32_t value)
     efr32_register_put(s, EFR32_IADC_BASE + offset, value);
 }
 
+static bool efr32_iadc_adcwarm(Efr32Periph *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    return now >= s->iadc_warm_from_ns && now < s->iadc_cold_ns;
+}
+
 static void efr32_iadc_update(Efr32Periph *s)
 {
     uint32_t status = efr32_iadc_get(s, EFR32_IADC_STATUS) &
@@ -5466,7 +5473,7 @@ static void efr32_iadc_update(Efr32Periph *s)
                   (s->iadc_conv[i].queue ? EFR32_IADC_STATUS_SCANQEN
                                          : EFR32_IADC_STATUS_SINGLEQEN);
     }
-    if (s->iadc_warm) {
+    if (efr32_iadc_adcwarm(s)) {
         status |= EFR32_IADC_STATUS_ADCWARM;
     }
     if (s->iadc_fifo[0].count) {
@@ -5630,18 +5637,26 @@ static uint32_t efr32_iadc_push(Efr32Periph *s, unsigned q,
 }
 
 /*
- * Conversion timing, RM SS24.3.2-24.3.3 ([I]: the RM's formulas; never
- * measured on silicon):
+ * Conversion timing, RM SS24.3.2-24.3.3, measured on silicon
+ * (docs/radio-tables.md SS7.89: tests/periph-timing-port, DWT against the
+ * LFXO, CLK_CMU_ADC 76.8 MHz, ADC_CLK 2.4-9.6 MHz, OSR 2-64):
  *  - CLK_CMU_ADC: CMU_IADCCLKCTRL.CLKSEL, EM01GRPACLK (1, reset) or FSRCO
  *    (2); CLK_SRC_ADC = CLK_CMU_ADC / (CTRL.HSCLKRATE + 1); ADC_CLK =
  *    CLK_SRC_ADC / (SCHEDx.PRESCALE + 1), PRESCALE taken as 1 when it is 0
  *    and HSCLKRATE is not.
- *  - Warm-up: five TIMEBASE intervals ((CTRL.TIMEBASE + 1) CLK_SRC_ADC
- *    cycles) from power-down (WARMUPMODE NORMAL, after every request) or on
- *    a change of PRESCALE, ADCMODE or REFSEL; one from standby
- *    (KEEPINSTANDBY); none while kept warm (KEEPWARM).
- *  - Each conversion: ((4 * OSR) + 2) ADC_CLK cycles, OSR = 2 << OSRHS, plus
- *    2 ADC_CLK cycles when the input changes from the previous conversion.
+ *  - Warm-up [F, within 0.36 us]: five TIMEBASE intervals ((CTRL.TIMEBASE +
+ *    1) CLK_SRC_ADC cycles) from power-down (WARMUPMODE NORMAL, after every
+ *    request; after EN is set) or on a change of PRESCALE, ADCMODE or
+ *    REFSEL; one from standby (KEEPINSTANDBY); none while kept warm
+ *    (KEEPWARM).  STATUS.ADCWARM reads 1 from the warm-up's end until the
+ *    IADC powers down again.
+ *  - Each conversion: ((4 * OSR) + 2) ADC_CLK cycles, OSR = 2 << OSRHS, the
+ *    RM's figure [F: the OSR slope, and the spacing of a scan's entries].
+ *    The first result of a request comes later by a pipeline latency [F fit
+ *    over 15 configurations, residual within 0.18 us]: 9 ADC_CLK + 18
+ *    CLK_SRC_ADC cycles + 440 ns (the fit's 710 ns less the 270 ns poll of
+ *    the measuring loop), and a scan's first entry by 7 ADC_CLK more [F, at
+ *    9.6 MHz].  Changing the input costs nothing measurable [F].
  *  - Requests are served in the order they arrive (SINGLETAILGATE off); the
  *    input is sampled when its conversion completes.  Triggers: see
  *    efr32_iadc_command.
@@ -5666,7 +5681,13 @@ static uint32_t efr32_iadc_push(Efr32Periph *s, unsigned q,
 #define EFR32_CMU_IADCCLKCTRL_FSRCO 2u
 #define EFR32_IADC_WARMUP_INTERVALS_OFF 5
 #define EFR32_IADC_WARMUP_INTERVALS_STANDBY 1
-#define EFR32_IADC_CONV_SWITCH_CYCLES 2
+#define EFR32_IADC_CONV_FIXED_CYCLES 2
+#define EFR32_IADC_FIRST_ADC_CYCLES 9
+#define EFR32_IADC_FIRST_SRC_CYCLES 18
+#define EFR32_IADC_FIRST_NS 440
+#define EFR32_IADC_SCAN_FIRST_ADC_CYCLES 7
+#define EFR32_IADC_EN 0x004u
+#define EFR32_IADC_EN_EN (1u << 0)
 
 static uint64_t efr32_iadc_cmu_hz(Efr32Periph *s)
 {
@@ -5700,6 +5721,9 @@ static void efr32_iadc_queue(Efr32Periph *s, unsigned queue, unsigned id,
                     EFR32_IADC_CTRL_WARMUPMODE_MASK;
     uint32_t key, osr, cycles;
     uint64_t src_hz = efr32_iadc_cmu_hz(s) / (hsclkrate + 1), adc_hz;
+    int64_t start = MAX(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                        s->iadc_request_ns);
+    bool first = start >= s->iadc_busy_until_ns;
     int64_t t;
 
     if (hsclkrate && !prescale) {
@@ -5709,8 +5733,7 @@ static void efr32_iadc_queue(Efr32Periph *s, unsigned queue, unsigned id,
     if (!adc_hz || s->iadc_nconv == ARRAY_SIZE(s->iadc_conv)) {
         return;
     }
-    t = MAX(MAX(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), s->iadc_request_ns),
-            s->iadc_busy_until_ns);
+    t = MAX(start, s->iadc_busy_until_ns);
     key = prescale | (cfg & EFR32_IADC_CFG_ADCMODE_MASK) << 10 |
           ((cfg >> EFR32_IADC_CFG_REFSEL_SHIFT) &
            EFR32_IADC_CFG_REFSEL_MASK) << 12;
@@ -5725,26 +5748,31 @@ static void efr32_iadc_queue(Efr32Periph *s, unsigned queue, unsigned id,
                       NANOSECONDS_PER_SECOND, src_hz);
         s->iadc_warm = true;
         s->iadc_warm_key = key;
+        s->iadc_warm_from_ns = t;
     }
     osr = 2u << ((cfg >> EFR32_IADC_CFG_OSRHS_SHIFT) &
                  EFR32_IADC_CFG_OSRHS_MASK);
     /* DIGAVG: 1-16 conversions back to back per result (SS24.3.7.3). */
-    cycles = (4 * osr + 2) << MIN((cfg >> EFR32_IADC_CFG_DIGAVG_SHIFT) &
-                                  EFR32_IADC_CFG_DIGAVG_MASK, 4u);
-    if (s->iadc_have_input && input != s->iadc_last_input) {
-        cycles += EFR32_IADC_CONV_SWITCH_CYCLES;
+    cycles = (4 * osr + EFR32_IADC_CONV_FIXED_CYCLES)
+             << MIN((cfg >> EFR32_IADC_CFG_DIGAVG_SHIFT) &
+                    EFR32_IADC_CFG_DIGAVG_MASK, 4u);
+    if (first) {
+        cycles += EFR32_IADC_FIRST_ADC_CYCLES +
+                  (queue ? EFR32_IADC_SCAN_FIRST_ADC_CYCLES : 0);
+        t += muldiv64(EFR32_IADC_FIRST_SRC_CYCLES, NANOSECONDS_PER_SECOND,
+                      src_hz) + EFR32_IADC_FIRST_NS;
     }
-    s->iadc_last_input = input;
-    s->iadc_have_input = true;
     t += muldiv64(cycles, NANOSECONDS_PER_SECOND, adc_hz);
     s->iadc_busy_until_ns = t;
     s->iadc_conv[s->iadc_nconv++] = (typeof(s->iadc_conv[0])){
         t, queue, id, last, input,
     };
+    s->iadc_cold_ns = INT64_MAX;
     if (last && mode != EFR32_IADC_WARMUP_KEEPWARM) {
         /* Powered down or in standby once the request is served. */
         s->iadc_warm = false;
         s->iadc_standby = mode == EFR32_IADC_WARMUP_KEEPINSTANDBY;
+        s->iadc_cold_ns = t;
     }
     timer_mod(s->iadc_timer, s->iadc_conv[0].done_ns);
 }
@@ -6046,6 +6074,11 @@ static bool efr32_iadc_read(Efr32Periph *s, uint32_t address, uint32_t *value)
     case EFR32_IADC_CMD:
         *value = 0;
         return true;
+    case EFR32_IADC_STATUS:
+        *value = (efr32_iadc_get(s, EFR32_IADC_STATUS) &
+                  ~EFR32_IADC_STATUS_ADCWARM) |
+                 (efr32_iadc_adcwarm(s) ? EFR32_IADC_STATUS_ADCWARM : 0);
+        return true;
     default:
         return false;
     }
@@ -6082,6 +6115,14 @@ static bool efr32_iadc_write(Efr32Periph *s, uint32_t offset, uint32_t next)
         efr32_iadc_put(s, offset, next);
         efr32_iadc_update(s);
         return true;
+    case EFR32_IADC_EN:
+        if (!(next & EFR32_IADC_EN_EN)) {
+            /* Disabled, it powers down: the next request warms up [F]. */
+            s->iadc_warm = s->iadc_standby = false;
+            s->iadc_cold_ns = MIN(s->iadc_cold_ns,
+                                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        }
+        return false;
     default:
         return false;
     }
@@ -6421,14 +6462,14 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
     }
     if (address >= EFR32_TRNG_FIFO_BASE &&
         address < EFR32_TRNG_FIFO_BASE + EFR32_TRNG_FIFO_SIZE) {
-        return efr32_trng_pop(&s->trng, clock_get_hz(s->pclk));
+        return efr32_trng_pop(&s->trng, clock_get_hz(s->m33_cpuclk));
     }
     if (address >= EFR32_TRNG_CTRL_BASE &&
         address < EFR32_TRNG_CTRL_BASE + EFR32_TRNG_CTRL_SIZE) {
         uint32_t value;
 
         if (efr32_trng_read(&s->trng, address - EFR32_TRNG_CTRL_BASE,
-                            clock_get_hz(s->pclk), &value)) {
+                            clock_get_hz(s->m33_cpuclk), &value)) {
             return value;
         }
     }
@@ -6572,8 +6613,9 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
                           EFR32_TRNG_CTRL_BASE;
         uint32_t current = 0;
 
-        efr32_trng_read(&s->trng, offset, clock_get_hz(s->pclk), &current);
-        efr32_trng_write(&s->trng, offset, clock_get_hz(s->pclk),
+        efr32_trng_read(&s->trng, offset, clock_get_hz(s->m33_cpuclk),
+                        &current);
+        efr32_trng_write(&s->trng, offset, clock_get_hz(s->m33_cpuclk),
                          (current & ~mask) | (((uint32_t)value << shift) &
                                               mask));
         return;
@@ -7748,7 +7790,8 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     timer_del(s->iadc_timer);
     s->iadc_nconv = 0;
     s->iadc_busy_until_ns = 0;
-    s->iadc_warm = s->iadc_standby = s->iadc_have_input = false;
+    s->iadc_warm = s->iadc_standby = false;
+    s->iadc_warm_from_ns = s->iadc_cold_ns = 0;
     s->iadc_qen[0] = s->iadc_qen[1] = false;
     s->iadc_timer_on = false;
     timer_del(s->iadc_local_timer);
