@@ -36,6 +36,22 @@
 
 /* ---- traced MMIO -------------------------------------------------------- */
 
+/* Cross-core address view (finding K1). The IML/UMAC side converts LMAC
+ * addresses with (a & 0xff0fffff) | 0xc0e20000 (IML 0x804441a6, 0x80447082):
+ * LMAC 0x00axxxxx == UMAC 0xc0exxxxx [F, from that code]. UMAC 0xc0d0xxxx ==
+ * LMAC 0x00d0xxxx [I]: UMAC's semaphore set sits at the same block +0x20.
+ * Every shared-register model is keyed by the LMAC-view address. */
+static hwaddr lmac_view(hwaddr a)
+{
+    if (a >= 0xc0d00000 && a < 0xc0e00000) {
+        return a - 0xc0000000;
+    }
+    if (a >= 0xc0e00000 && a < 0xc0f00000) {
+        return a - 0xc0e00000 + 0x00a00000;
+    }
+    return a;
+}
+
 static uint32_t rs_get(hwaddr a);
 static void trace_log(const char *tag, hwaddr addr, uint64_t val, unsigned size);
 
@@ -71,7 +87,7 @@ static GHashTable *regstore;
 /* Free-running counter registers (timers): each read returns the previous value
  * plus one. Default: the 0xc0d02c68 timebase used by IML delay loops. */
 #define MAX_CTRS 16
-static struct { hwaddr addr; uint32_t val; } ctrs[MAX_CTRS] = { { 0xc0d02c68, 0 } };
+static struct { hwaddr addr; uint32_t val; } ctrs[MAX_CTRS] = { { 0x00d02c68, 0 } }; /* UMAC 0xc0d02c68 */
 static int n_ctrs = 1;
 
 /* Host-CSR mailbox at 0xc0d0001c/20/24/28 (inferred from IML code + driver
@@ -84,7 +100,7 @@ static int n_ctrs = 1;
  * (polled by IML 0x804458c8; written back to acknowledge). Host "physical"
  * addresses are served from system memory (host RAM window at 0x20000000). */
 #define DMA_BASE  0xc0a0a500u
-#define DMA_STAT  0xc0d02e24u
+#define DMA_STAT  0x00d02e24u   /* UMAC 0xc0d02e24 */
 static uint32_t dma_done;
 static unsigned dma_count;
 
@@ -158,7 +174,35 @@ static uint32_t fsm_read(void)
  * 0xa01e30 (not interpreted). Presumably arbitrates LMAC vs UMAC; with one
  * core modelled, any request for a free bit is granted at once. */
 #define SEM_BASE 0x00d03800u
-static uint32_t sem_owned;
+/* Per-core register sets: LMAC at +0x00, UMAC at +0x20 (UMAC 0xc0d03820/24/28
+ * observed at its boot, 0xc008d258/0xc008d278). Each bit is owned by at most
+ * one core. */
+static int8_t sem_owner[32] = { [0 ... 31] = -1 };
+
+static uint32_t sem_granted(int core)
+{
+    uint32_t m = 0;
+    for (int i = 0; i < 32; i++) {
+        if (sem_owner[i] == core) {
+            m |= 1u << i;
+        }
+    }
+    return m;
+}
+
+static void sem_update(int core, uint32_t mask, bool request)
+{
+    for (int i = 0; i < 32; i++) {
+        if (!(mask & (1u << i))) {
+            continue;
+        }
+        if (request && sem_owner[i] < 0) {
+            sem_owner[i] = core;
+        } else if (!request && sem_owner[i] == core) {
+            sem_owner[i] = -1;
+        }
+    }
+}
 
 /* LMAC indirect register window (finding W1, [I]): CTRL at 0xa2ac04 holds a
  * 16-bit target address in [15:0], bit 17 = write, bit 18 = GO/BUSY; DATA at
@@ -220,7 +264,7 @@ static void tmr_start(uint32_t mask)
     }
 }
 
-#define MBX_BASE 0xc0d00000u
+#define MBX_BASE 0x00d00000u    /* UMAC 0xc0d00000 */
 static uint32_t host_csr[0x400];
 static uint32_t mbx_idx, mbx_data;
 
@@ -250,102 +294,107 @@ static void trace_log(const char *tag, hwaddr addr, uint64_t val, unsigned size)
 static uint64_t trace_read(void *opaque, hwaddr addr, unsigned size)
 {
     hwaddr base = (hwaddr)(uintptr_t)opaque;
-    int hit; uint32_t v = override_lookup(base + addr, &hit);
-    if (base + addr == DMA_STAT && !hit) {
+    hwaddr ra = base + addr;            /* as issued by the core */
+    hwaddr a = lmac_view(ra);           /* model key */
+    int hit; uint32_t v = override_lookup(a, &hit);
+    if (a == DMA_STAT && !hit) {
         v = dma_done ? (1u << 29) : 0;
-        trace_log("R.dma", base + addr, v, size);
+        trace_log("R.dma", ra, v, size);
         return v;
     }
-    if (base + addr == TMR_TSTAMP && !hit) {
+    if (a == TMR_TSTAMP && !hit) {
         v = (uint32_t)qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
-        trace_log("R.ts", base + addr, v, size);
+        trace_log("R.ts", ra, v, size);
         return v;
     }
-    if (base + addr == MFIFO_BASE + 0x30 && !hit) {
-        trace_log("R.mfifo", base + addr, MFIFO_CAP, size);
+    if (a == MFIFO_BASE + 0x30 && !hit) {
+        trace_log("R.mfifo", ra, MFIFO_CAP, size);
         return MFIFO_CAP;
     }
-    if (base + addr == MFIFO_BASE + 0x38 && !hit) {
-        trace_log("R.mfifo", base + addr, 0, size);
+    if (a == MFIFO_BASE + 0x38 && !hit) {
+        trace_log("R.mfifo", ra, 0, size);
         return 0;
     }
-    if (base + addr == SEM_BASE + 4 && !hit) {
-        trace_log("R.sem", base + addr, sem_owned, size);
-        return sem_owned;
-    }
-    if (base + addr == FSM_BASE && !hit) {
-        v = fsm_read();
-        trace_log("R.fsm", base + addr, v, size);
+    if ((a == SEM_BASE + 0x04 || a == SEM_BASE + 0x24) && !hit) {
+        v = sem_granted(a == SEM_BASE + 0x24);
+        trace_log("R.sem", ra, v, size);
         return v;
     }
-    if (base + addr == MBX_BASE + 0x28 && !hit) {
+    if (a == FSM_BASE && !hit) {
+        v = fsm_read();
+        trace_log("R.fsm", ra, v, size);
+        return v;
+    }
+    if (a == MBX_BASE + 0x28 && !hit) {
         v = host_csr[(mbx_idx >> 2) & 0x3ff];
         trace_log("R.csr", mbx_idx, v, size);
         return v;
     }
     for (int i = 0; i < n_ctrs; i++) {
-        if (ctrs[i].addr == base + addr) {
+        if (ctrs[i].addr == a) {
             v = ++ctrs[i].val;
-            trace_log("R.ctr", base + addr, v, size);
+            trace_log("R.ctr", ra, v, size);
             return v;
         }
     }
     if (!hit && regstore) {
         gpointer p = g_hash_table_lookup(regstore,
-                                         GUINT_TO_POINTER((guint)(base + addr)));
+                                         GUINT_TO_POINTER((guint)(a)));
         v = (uint32_t)(uintptr_t)p;
     }
-    trace_log(hit ? "R.ovr" : "R", base + addr, v, size);
+    trace_log(hit ? "R.ovr" : "R", ra, v, size);
     return v;
 }
 
 static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     hwaddr base = (hwaddr)(uintptr_t)opaque;
-    trace_log("W", base + addr, val, size);
-    if (base + addr == MBX_BASE + 0x20) {
+    hwaddr ra = base + addr;            /* as issued by the core */
+    hwaddr a = lmac_view(ra);           /* model key */
+    trace_log("W", ra, val, size);
+    if (a == MBX_BASE + 0x20) {
         mbx_idx = val;
-    } else if (base + addr == MBX_BASE + 0x24) {
+    } else if (a == MBX_BASE + 0x24) {
         mbx_data = val;
-    } else if (base + addr == MBX_BASE + 0x1c && (val >> 24) == 0x69) {
+    } else if (a == MBX_BASE + 0x1c && (val >> 24) == 0x69) {
         host_csr[(mbx_idx >> 2) & 0x3ff] = mbx_data;
         trace_log("W.csr", mbx_idx, mbx_data, size);
     }
-    if (base + addr == DMA_STAT && (val & (1u << 29))) {
+    if (a == DMA_STAT && (val & (1u << 29))) {
         dma_done = 0;
     }
     if (!regstore) {
         regstore = g_hash_table_new(g_direct_hash, g_direct_equal);
     }
-    if (base + addr == AES_KEYF) {
+    if (a == AES_KEYF) {
         aes_key[aes_kidx++ & 3] = (uint32_t)val;
     }
-    if (base + addr == AES_CTRL && (val & 1)) {
-        g_hash_table_insert(regstore, GUINT_TO_POINTER((guint)(base + addr)),
+    if (a == AES_CTRL && (val & 1)) {
+        g_hash_table_insert(regstore, GUINT_TO_POINTER((guint)(a)),
                             (gpointer)(uintptr_t)(uint32_t)val);
         aes_run((uint32_t)val);
         val = (val & ~1ull) | 4;           /* done */
     }
-    if (base + addr == MFIFO_BASE + 0x40) {
-        trace_log("MSG", base + addr, val, size);
+    if (a == MFIFO_BASE + 0x40) {
+        trace_log("MSG", ra, val, size);
     }
-    if (base + addr == SEM_BASE) {
-        sem_owned |= (uint32_t)val;
-    } else if (base + addr == SEM_BASE + 8) {
-        sem_owned &= ~(uint32_t)val;
+    if (a == SEM_BASE || a == SEM_BASE + 0x20) {
+        sem_update(a == SEM_BASE + 0x20, (uint32_t)val, true);
+    } else if (a == SEM_BASE + 0x08 || a == SEM_BASE + 0x28) {
+        sem_update(a == SEM_BASE + 0x28, (uint32_t)val, false);
     }
-    if (base + addr == FSM_BASE) {
+    if (a == FSM_BASE) {
         fsm_ctl = (uint32_t)val & ~0xfu;
-    } else if (base + addr == FSM_BASE + 4) {
+    } else if (a == FSM_BASE + 4) {
         fsm_ctl &= ~(uint32_t)val;
-    } else if (base + addr == FSM_BASE + 8) {
+    } else if (a == FSM_BASE + 8) {
         fsm_ctl |= (uint32_t)val & ~0xfu;
     }
-    if (base + addr == TMR_START) {
+    if (a == TMR_START) {
         /* store first so tmr_start sees counts already written */
         tmr_start((uint32_t)val);
     }
-    if (base + addr == IND_CTRL && (val & IND_GO)) {
+    if (a == IND_CTRL && (val & IND_GO)) {
         guint ia = val & 0xffff;
         if (!indstore) {
             indstore = g_hash_table_new(g_direct_hash, g_direct_equal);
@@ -365,9 +414,9 @@ static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         }
         val &= ~(uint64_t)IND_GO;   /* access completes at once: not busy */
     }
-    g_hash_table_insert(regstore, GUINT_TO_POINTER((guint)(base + addr)),
+    g_hash_table_insert(regstore, GUINT_TO_POINTER((guint)(a)),
                         (gpointer)(uintptr_t)(uint32_t)val);
-    if (base + addr == DMA_BASE + 0x34) {
+    if (a == DMA_BASE + 0x34) {
         dma_kick();
     }
 }
@@ -535,8 +584,8 @@ static void ax210_init(MachineState *machine)
      * 0xa00000-0xffffff. */
     add_trace("ax210.lmac_periph",  0x00a00000, 0x00200000, 10); /* MPU 3 */
     add_trace("ax210.lmac_periph2", 0x00d00000, 0x00200000, 10); /* MPU 4 */
-    add_trace("ax210.ctl_d",    0xc0d00000, 0x00010000, 10); /* control regs polled by IML */
-    add_trace("ax210.crypto_c", 0xc0e20000, 0x00010000, 10); /* remapped crypto window */
+    add_trace("ax210.umac_d",   0xc0d00000, 0x00100000, 10); /* == LMAC 0xd0xxxx (K1) */
+    add_trace("ax210.umac_e",   0xc0e00000, 0x00100000, 10); /* == LMAC 0xaxxxxx (K1) */
     add_ram("ax210.host",  0x20000000, 0x10000000);   /* modelled host DRAM */
     add_trace("ax210.dma",      0xc0a0a000, 0x00001000, 10);
     add_trace("ax210.csr",      0xf0000000, 0x01000000, 10); /* chip CSRs */
@@ -548,7 +597,7 @@ static void ax210_init(MachineState *machine)
         char *c = g_strdup(ctr), *t2, *sv = NULL;
         for (t2 = strtok_r(c, ",", &sv); t2 && n_ctrs < MAX_CTRS;
              t2 = strtok_r(NULL, ",", &sv)) {
-            ctrs[n_ctrs].addr = strtoull(t2, 0, 16);
+            ctrs[n_ctrs].addr = lmac_view(strtoull(t2, 0, 16));
             ctrs[n_ctrs++].val = 0;
         }
         g_free(c);
@@ -577,7 +626,7 @@ static void ax210_init(MachineState *machine)
             char *eq = strchr(tok, '=');
             if (!eq) continue;
             *eq = 0;
-            overrides[n_overrides].addr = strtoull(tok, 0, 16);
+            overrides[n_overrides].addr = lmac_view(strtoull(tok, 0, 16));
             overrides[n_overrides].val  = strtoul(eq + 1, 0, 0);
             n_overrides++;
         }
