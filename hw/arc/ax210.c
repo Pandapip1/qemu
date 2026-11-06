@@ -30,8 +30,15 @@
 #include "sysemu/sysemu.h"
 #include "hw/arc/cpudevs.h"
 #include "boot.h"
+#include "qemu/timer.h"
+#include "crypto/aes.h"
+#include "hw/core/cpu.h"
 
 /* ---- traced MMIO -------------------------------------------------------- */
+
+static uint32_t rs_get(hwaddr a);
+static void trace_log(const char *tag, hwaddr addr, uint64_t val, unsigned size);
+
 
 typedef struct {
     const char *name;
@@ -83,6 +90,76 @@ static unsigned dma_count;
 
 static void dma_kick(void);
 
+/* LMAC AES-128 engine at 0xa01800 (finding A1). [F]: LMAC's boot self-test
+ * (0x4d9ba0) runs FIPS-197 Appendix C.1 through it (key 000102..0f, pt
+ * 00112233..ff, expected ct 69c4e0d8..c55a, table at 0x4e1828). Packing,
+ * pinned by that vector: key FIFO +0x08 takes the key's low word first, each
+ * word byte-swapped; data +0x98..+0xa4 holds word j = big-endian bytes
+ * [12-4j..15-4j], result written back in place. [I]: ctrl +0x94 bit0 =
+ * start, bit1 = encrypt (decrypt otherwise, unverified), status bit2 = done;
+ * the mode write 0x8 to 0xa01c10 is not interpreted. */
+#define AES_BASE 0x00a01800u
+#define AES_KEYF (AES_BASE + 0x08)
+#define AES_CTRL (AES_BASE + 0x94)
+#define AES_DATA (AES_BASE + 0x98)
+static uint32_t aes_key[4];
+static unsigned aes_kidx;
+
+static void aes_run(uint32_t ctrl)
+{
+    uint8_t key[16], in[16], out[16];
+    AES_KEY k;
+
+    for (int i = 0; i < 4; i++) {          /* key bytes: LE32(K[3]),..,LE32(K[0]) */
+        stl_le_p(key + 4 * i, aes_key[3 - i]);
+    }
+    for (int j = 0; j < 4; j++) {          /* block bytes: BE32(D[3]),..,BE32(D[0]) */
+        stl_be_p(in + 4 * (3 - j), rs_get(AES_DATA + 4 * j));
+    }
+    if (ctrl & 2) {
+        AES_set_encrypt_key(key, 128, &k);
+        AES_encrypt(in, out, &k);
+    } else {
+        AES_set_decrypt_key(key, 128, &k);
+        AES_decrypt(in, out, &k);
+    }
+    for (int j = 0; j < 4; j++) {
+        g_hash_table_insert(regstore, GUINT_TO_POINTER(AES_DATA + 4 * j),
+                            GUINT_TO_POINTER(ldl_be_p(out + 4 * (3 - j))));
+    }
+    trace_log((ctrl & 2) ? "AES.E" : "AES.D", AES_CTRL, ldl_be_p(out), 4);
+}
+
+/* LMAC power/clock request FSM at 0xd03380 (finding F1, [I]): +0x04 clears
+ * and +0x08 sets bits of the control word (SET/CLR alias convention). LMAC
+ * 0x4d525c sets bit 4 (with bit 26) and waits for state [3:0] == 5;
+ * 0x4d520c clears bit 4 and waits for state 0. Model: state follows bit 4
+ * immediately (the real transition latency is [?]). */
+#define FSM_BASE 0x00d03380u
+static uint32_t fsm_ctl;
+
+static uint32_t fsm_read(void)
+{
+    return (fsm_ctl & ~0xfu) | ((fsm_ctl & 0x10) ? 5 : 0);
+}
+
+/* LMAC outgoing message FIFO at 0xa00400 (finding Q1, [I]): LMAC send
+ * routine 0x13140(ptr, len, id) computes free = max([+0x30] - [+0x38] - 8, 0),
+ * asserts with the message id if len does not fit (the 0x3601 assert seen
+ * when both read 0), else pushes len/4 words to +0x40. Model: the consumer
+ * (UMAC or host, [?]) drains at once, so the fill level +0x38 reads 0;
+ * capacity +0x30 = 0x400 bytes is a guess. Pushed words are traced as MSG. */
+#define MFIFO_BASE 0x00a00400u
+#define MFIFO_CAP  0x400u
+
+/* Hardware semaphore bank at 0xd03800 (finding S1, [I]): LMAC 0x4ba960
+ * writes a bit mask to +0x0 (request) and returns whether [+0x4] (granted)
+ * has it; 0x4d1c88 writes 1<<n to +0x8 (release). Both mirror mask<<8 into
+ * 0xa01e30 (not interpreted). Presumably arbitrates LMAC vs UMAC; with one
+ * core modelled, any request for a free bit is granted at once. */
+#define SEM_BASE 0x00d03800u
+static uint32_t sem_owned;
+
 /* LMAC indirect register window (finding W1, [I]): CTRL at 0xa2ac04 holds a
  * 16-bit target address in [15:0], bit 17 = write, bit 18 = GO/BUSY; DATA at
  * 0xa2ac00. LMAC helpers 0x4be6f8 (read) / 0x4be714 (write) / 0x4be818 (wait
@@ -94,6 +171,54 @@ static void dma_kick(void);
 #define IND_GO   (1u << 18)
 #define IND_WR   (1u << 17)
 static GHashTable *indstore;
+
+/* LMAC timer/event unit at 0xa02000 (finding V1, [I]). From LMAC 0x166e4
+ * (enable bit n at +0x0c, count at +0xac+4n, start bit n at +0x08) and
+ * 0x16668 (wevt, then return +0x20). +0x20 is a free-running timestamp, not a
+ * status: LMAC 0x4d5222/0x4d5280 compute deadline = [+0x20] + N and loop
+ * until it passes. Model: a start-bit write arms channel n for `count` ticks
+ * (relative; absolute compare is [?]); expiry wakes the core from wevt/sleep
+ * as an event (no interrupt delivered: the IRQ line is [?]). 1 tick = 1 us
+ * for both, a guess (ch10 = 200000 -> 200 ms; delays of 50/2250 us). */
+#define TMR_BASE   0x00a02000u
+#define TMR_START  (TMR_BASE + 0x08)
+#define TMR_TSTAMP (TMR_BASE + 0x20)
+#define TMR_COUNT0 (TMR_BASE + 0xac)
+#define TMR_NCH    32
+static QEMUTimer *tmr[TMR_NCH];
+static CPUState *ax210_cs;
+
+
+static void tmr_expire(void *opaque)
+{
+    int ch = (int)(uintptr_t)opaque;
+    trace_log("TMR.X", TMR_COUNT0 + 4 * ch, ch, 4);
+    if (ax210_cs && ax210_cs->halted) {
+        ax210_cs->halted = 0;          /* event wake: resume after wevt */
+        qemu_cpu_kick(ax210_cs);
+    }
+}
+
+
+static void tmr_start(uint32_t mask)
+{
+    for (int ch = 0; ch < TMR_NCH; ch++) {
+        uint32_t cnt;
+        if (!(mask & (1u << ch))) {
+            continue;
+        }
+        cnt = rs_get(TMR_COUNT0 + 4 * ch);
+        if (!cnt) {
+            continue;
+        }
+        if (!tmr[ch]) {
+            tmr[ch] = timer_new_us(QEMU_CLOCK_VIRTUAL, tmr_expire,
+                                   (void *)(uintptr_t)ch);
+        }
+        timer_mod(tmr[ch], qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) + cnt);
+        trace_log("TMR.S", TMR_COUNT0 + 4 * ch, cnt, 4);
+    }
+}
 
 #define MBX_BASE 0xc0d00000u
 static uint32_t host_csr[0x400];
@@ -129,6 +254,28 @@ static uint64_t trace_read(void *opaque, hwaddr addr, unsigned size)
     if (base + addr == DMA_STAT && !hit) {
         v = dma_done ? (1u << 29) : 0;
         trace_log("R.dma", base + addr, v, size);
+        return v;
+    }
+    if (base + addr == TMR_TSTAMP && !hit) {
+        v = (uint32_t)qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
+        trace_log("R.ts", base + addr, v, size);
+        return v;
+    }
+    if (base + addr == MFIFO_BASE + 0x30 && !hit) {
+        trace_log("R.mfifo", base + addr, MFIFO_CAP, size);
+        return MFIFO_CAP;
+    }
+    if (base + addr == MFIFO_BASE + 0x38 && !hit) {
+        trace_log("R.mfifo", base + addr, 0, size);
+        return 0;
+    }
+    if (base + addr == SEM_BASE + 4 && !hit) {
+        trace_log("R.sem", base + addr, sem_owned, size);
+        return sem_owned;
+    }
+    if (base + addr == FSM_BASE && !hit) {
+        v = fsm_read();
+        trace_log("R.fsm", base + addr, v, size);
         return v;
     }
     if (base + addr == MBX_BASE + 0x28 && !hit) {
@@ -169,6 +316,34 @@ static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     }
     if (!regstore) {
         regstore = g_hash_table_new(g_direct_hash, g_direct_equal);
+    }
+    if (base + addr == AES_KEYF) {
+        aes_key[aes_kidx++ & 3] = (uint32_t)val;
+    }
+    if (base + addr == AES_CTRL && (val & 1)) {
+        g_hash_table_insert(regstore, GUINT_TO_POINTER((guint)(base + addr)),
+                            (gpointer)(uintptr_t)(uint32_t)val);
+        aes_run((uint32_t)val);
+        val = (val & ~1ull) | 4;           /* done */
+    }
+    if (base + addr == MFIFO_BASE + 0x40) {
+        trace_log("MSG", base + addr, val, size);
+    }
+    if (base + addr == SEM_BASE) {
+        sem_owned |= (uint32_t)val;
+    } else if (base + addr == SEM_BASE + 8) {
+        sem_owned &= ~(uint32_t)val;
+    }
+    if (base + addr == FSM_BASE) {
+        fsm_ctl = (uint32_t)val & ~0xfu;
+    } else if (base + addr == FSM_BASE + 4) {
+        fsm_ctl &= ~(uint32_t)val;
+    } else if (base + addr == FSM_BASE + 8) {
+        fsm_ctl |= (uint32_t)val & ~0xfu;
+    }
+    if (base + addr == TMR_START) {
+        /* store first so tmr_start sees counts already written */
+        tmr_start((uint32_t)val);
     }
     if (base + addr == IND_CTRL && (val & IND_GO)) {
         guint ia = val & 0xffff;
@@ -285,16 +460,45 @@ static bool ax210_aux_read(CPUARCState *env, target_ulong aux,
 
 static struct arc_boot_info ax210_boot_info;   /* zeroed: no kernel/cmdline */
 
+/* LMAC extension core register r32 (finding X2, [I]): a hardware status word
+ * the LMAC only reads (btst/bbit/tst/xbfu). Its code waits for bit 29 to be
+ * set after kicking an engine (0x4bc4b0, 0xc202) and for bits 12/18/25 to be
+ * clear (0x4bc48a, 0xc5be). Model: constant, bit 29 ("idle/done") set and
+ * busy bits clear; AX210_R32 overrides. Only applied to the ARCv2 (LMAC)
+ * core; the ARC700 (UMAC) core has no such use. */
+static uint32_t r32_init = 1u << 29;
+static bool is_lmac_core;
+
+static void ax210_reset(void *opaque)
+{
+    ARCCPU *cpu = opaque;
+
+    arc_cpu_reset(cpu);
+    if (is_lmac_core) {
+        cpu->env.r[32] = r32_init;
+    }
+}
+
 static void ax210_init(MachineState *machine)
 {
     ARCCPU *cpu = ARC_CPU(object_new(machine->cpu_type));
+    if (!strcmp(machine->cpu_type, TYPE_ARC_CPU_ARCEM)) {
+        /* LMAC programs 13 MPU region pairs (aux 0x422..0x43b, at
+         * 0x4be574); ARCv2 MPUs come in power-of-two sizes. Finding M2. */
+        object_property_set_uint(OBJECT(cpu), "mpu-numreg", 16, &error_fatal);
+    }
     object_property_set_uint(OBJECT(cpu), "freq_hz", 1000000, &error_fatal);
     object_property_set_bool(OBJECT(cpu), "rtc-opt", true, &error_fatal);
     object_property_set_bool(OBJECT(cpu), "realized", true, &error_fatal);
     cpu_arc_pic_init(cpu);
     cpu_arc_clock_init(cpu);
     cpu->env.boot_info = &ax210_boot_info;
-    qemu_register_reset(arc_cpu_reset, cpu);
+    is_lmac_core = !strcmp(machine->cpu_type, TYPE_ARC_CPU_ARCEM);
+    if (getenv("AX210_R32")) {
+        r32_init = strtoul(getenv("AX210_R32"), 0, 0);
+    }
+    qemu_register_reset(ax210_reset, cpu);
+    ax210_cs = CPU(cpu);
     arc_unknown_aux_write = ax210_aux_write;
     arc_unknown_aux_read = ax210_aux_read;
 
@@ -309,7 +513,12 @@ static void ax210_init(MachineState *machine)
     add_ram("ax210.unc",   0xc0000000, 0x01000000); /* uncached window: code @0xc0080000, bss @0xc0880000 */
 
     /* Traced peripheral windows (overlay RAM; higher priority). */
-    add_trace("ax210.crypto",   0x00a20000, 0x00010000, 10); /* RSA/SHA coproc 0xa248/49/4a */
+    /* LMAC peripheral space 0xa00000-0xafffff (finding P1, [I]): LMAC code
+     * uses it only as MMIO (e.g. assert mailbox 0xa0200c, sleep control
+     * 0xa01ec0, indirect window 0xa2ac00, crypto 0xa248xx, power FSM
+     * 0xd03380, markers 0xd0c110); no firmware section loads in
+     * 0xa00000-0xffffff. */
+    add_trace("ax210.lmac_periph", 0x00a00000, 0x00600000, 10);
     add_trace("ax210.ctl_d",    0xc0d00000, 0x00010000, 10); /* control regs polled by IML */
     add_trace("ax210.crypto_c", 0xc0e20000, 0x00010000, 10); /* remapped crypto window */
     add_ram("ax210.host",  0x20000000, 0x10000000);   /* modelled host DRAM */

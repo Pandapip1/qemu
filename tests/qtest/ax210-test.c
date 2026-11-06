@@ -14,6 +14,7 @@
  */
 #include "qemu/osdep.h"
 #include "libqos/libqtest.h"
+#include "qemu/bswap.h"
 
 /* RAM windows from hw/arc/ax210.c: ax210_init(). A write/read round-trip at
  * each window's base confirms it is backed by writable RAM, not an alias
@@ -150,6 +151,99 @@ static void test_dma_copies_host_to_device(void)
     qtest_quit(s);
 }
 
+#define LMAC_ARGS "-M ax210 -cpu arcem -m 32M -nographic -monitor none " \
+                  "-serial none -S"
+
+/* LMAC AES-128 engine (finding A1, [F]): reproduce the LMAC boot self-test
+ * (0x4d9ba0) exactly: FIPS-197 Appendix C.1, with the register packing that
+ * test uses. */
+static void test_lmac_aes_fips197(void)
+{
+    QTestState *s = qtest_init(LMAC_ARGS);
+    static const uint32_t key[4] = { 0x00010203, 0x04050607,
+                                     0x08090a0b, 0x0c0d0e0f };
+    static const uint32_t pt[4]  = { 0x00112233, 0x44556677,
+                                     0x8899aabb, 0xccddeeff };
+    static const uint32_t ct[4]  = { 0x69c4e0d8, 0x6a7b0430,
+                                     0xd8cdb780, 0x70b4c55a };
+
+    for (int i = 0; i < 4; i++) {       /* low word first, byte-swapped */
+        qtest_writel(s, 0xa01808, bswap32(key[3 - i]));
+    }
+    for (int j = 0; j < 4; j++) {       /* word j = pt[3 - j] */
+        qtest_writel(s, 0xa01898 + 4 * j, pt[3 - j]);
+    }
+    qtest_writel(s, 0xa01894, 3);       /* start, encrypt */
+    g_assert_cmpuint(qtest_readl(s, 0xa01894) & 4, ==, 4);   /* done */
+    for (int j = 0; j < 4; j++) {
+        g_assert_cmphex(qtest_readl(s, 0xa01898 + 4 * j), ==, ct[3 - j]);
+    }
+    qtest_quit(s);
+}
+
+/* Power/clock request FSM (finding F1, [I]): state [3:0] follows bit 4,
+ * which is set via +0x8 and cleared via +0x4 (LMAC 0x4d525c / 0x4d520c). */
+static void test_lmac_power_fsm(void)
+{
+    QTestState *s = qtest_init(LMAC_ARGS);
+
+    g_assert_cmpuint(qtest_readl(s, 0xd03380) & 0xf, ==, 0);
+    qtest_writel(s, 0xd03388, 0x04000010);
+    g_assert_cmpuint(qtest_readl(s, 0xd03380) & 0xf, ==, 5);
+    qtest_writel(s, 0xd03384, 0x10);
+    g_assert_cmpuint(qtest_readl(s, 0xd03380) & 0xf, ==, 0);
+    qtest_quit(s);
+}
+
+/* Hardware semaphore bank (finding S1, [I]). */
+static void test_lmac_semaphore(void)
+{
+    QTestState *s = qtest_init(LMAC_ARGS);
+
+    qtest_writel(s, 0xd03800, 1u << 3);
+    g_assert_cmpuint(qtest_readl(s, 0xd03804) & (1u << 3), ==, 1u << 3);
+    qtest_writel(s, 0xd03808, 1u << 3);
+    g_assert_cmpuint(qtest_readl(s, 0xd03804) & (1u << 3), ==, 0);
+    qtest_quit(s);
+}
+
+/* LMAC indirect register window (finding W1, [I]): a write then a read of
+ * the same target address round-trip, and BUSY (bit 18) reads clear. */
+static void test_lmac_indirect_window(void)
+{
+    QTestState *s = qtest_init(LMAC_ARGS);
+
+    qtest_writel(s, 0xa2ac00, 0x12345678);
+    qtest_writel(s, 0xa2ac04, 0x8ef4 | (1u << 17) | (1u << 18));
+    g_assert_cmpuint(qtest_readl(s, 0xa2ac04) & (1u << 18), ==, 0);
+    qtest_writel(s, 0xa2ac00, 0);
+    qtest_writel(s, 0xa2ac04, 0x8ef4 | (1u << 18));
+    g_assert_cmpuint(qtest_readl(s, 0xa2ac04) & (1u << 18), ==, 0);
+    g_assert_cmphex(qtest_readl(s, 0xa2ac00), ==, 0x12345678);
+    qtest_quit(s);
+}
+
+/* Timestamp (finding V1, [I]): 0xa02020 counts virtual microseconds. */
+static void test_lmac_timestamp(void)
+{
+    QTestState *s = qtest_init(LMAC_ARGS);
+    uint32_t t0 = qtest_readl(s, 0xa02020);
+
+    qtest_clock_step(s, 1000 * 1000);   /* 1 ms of virtual time, in ns */
+    g_assert_cmpuint(qtest_readl(s, 0xa02020) - t0, ==, 1000);
+    qtest_quit(s);
+}
+
+/* Message FIFO space (finding Q1, [I]): drained consumer, 1 KiB capacity. */
+static void test_lmac_msg_fifo_space(void)
+{
+    QTestState *s = qtest_init(LMAC_ARGS);
+
+    g_assert_cmphex(qtest_readl(s, 0xa00430), ==, 0x400);
+    g_assert_cmphex(qtest_readl(s, 0xa00438), ==, 0);
+    qtest_quit(s);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -164,6 +258,13 @@ int main(int argc, char **argv)
                    test_host_csr_proxy_seed_and_read);
     qtest_add_func("/ax210/dma-copies-host-to-device",
                    test_dma_copies_host_to_device);
+
+    qtest_add_func("/ax210/lmac/aes-fips197-c1", test_lmac_aes_fips197);
+    qtest_add_func("/ax210/lmac/power-fsm", test_lmac_power_fsm);
+    qtest_add_func("/ax210/lmac/semaphore", test_lmac_semaphore);
+    qtest_add_func("/ax210/lmac/indirect-window", test_lmac_indirect_window);
+    qtest_add_func("/ax210/lmac/timestamp", test_lmac_timestamp);
+    qtest_add_func("/ax210/lmac/msg-fifo-space", test_lmac_msg_fifo_space);
 
     return g_test_run();
 }
