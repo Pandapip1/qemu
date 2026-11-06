@@ -155,6 +155,12 @@ static void aes_run(uint32_t ctrl)
  * 0x4d520c clears bit 4 and waits for state 0. Model: state follows bit 4
  * immediately (the real transition latency is [?]). */
 #define FSM_BASE 0x00d03380u
+
+/* Configure-and-start unit at 0xd03f00 (finding G1, [I]): UMAC 0x8044acd0
+ * writes three config words to +0x0/+0x4/+0x8, then 0x804a6c94 writes 1 to
+ * +0x10 and waits ~20 timebase ticks for [+0x14] bit 0 (else fatal 0x101035).
+ * No firmware on either core writes +0x14. Model: done follows start at once. */
+#define CFGU_BASE 0x00d03f00u
 static uint32_t fsm_ctl;
 
 static uint32_t fsm_read(void)
@@ -346,6 +352,11 @@ static uint64_t trace_read(void *opaque, hwaddr addr, unsigned size)
     if ((a == SEM_BASE + 0x04 || a == SEM_BASE + 0x24) && !hit) {
         v = sem_granted(a == SEM_BASE + 0x24);
         trace_log("R.sem", ra, v, size);
+        return v;
+    }
+    if (a == CFGU_BASE + 0x14 && !hit) {
+        v = rs_get(CFGU_BASE + 0x10) & 1;
+        trace_log("R.cfgu", ra, v, size);
         return v;
     }
     if (a == FSM_BASE && !hit) {

@@ -300,6 +300,19 @@ static void test_host_csr_driver_defaults(void)
 
 /* Cross-core view + two-core semaphore (findings K1, S1): UMAC's set at
  * 0xc0d03820 and LMAC's at 0xd03800 arbitrate the same bits. */
+/* Configure-and-start unit (finding G1, [I]): UMAC's start at 0xc0d03f10
+ * reads back done at 0xc0d03f14 bit 0. */
+static void test_cfg_unit_start_done(void)
+{
+    QTestState *s = qtest_init("-M ax210 -m 32M -nographic -monitor none "
+                               "-serial none -S");
+
+    g_assert_cmpuint(qtest_readl(s, 0xc0d03f14) & 1, ==, 0);
+    qtest_writel(s, 0xc0d03f10, 1);
+    g_assert_cmpuint(qtest_readl(s, 0xc0d03f14) & 1, ==, 1);
+    qtest_quit(s);
+}
+
 static void test_semaphore_two_cores(void)
 {
     QTestState *s = qtest_init("-M ax210 -m 32M -nographic -monitor none "
@@ -423,6 +436,7 @@ int main(int argc, char **argv)
                    test_host_csr_driver_defaults);
     qtest_add_func("/ax210/semaphore-two-cores", test_semaphore_two_cores);
     qtest_add_func("/ax210/host-driver-ctxt-info", test_host_driver_ctxt_info);
+    qtest_add_func("/ax210/cfg-unit-start-done", test_cfg_unit_start_done);
 
     return g_test_run();
 }
