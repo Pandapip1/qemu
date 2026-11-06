@@ -23,6 +23,7 @@
 #include "cpu.h"
 #include "hw/hw.h"
 #include "hw/boards.h"
+#include "hw/irq.h"
 #include "hw/qdev-properties.h"
 #include "exec/memory.h"
 #include "exec/address-spaces.h"
@@ -298,6 +299,43 @@ static void tmr_start(uint32_t mask)
     }
 }
 
+/* UMAC timeout timer, IRQ6 (finding G2, [I]): UMAC's idle loop
+ * (0x804a66a0) writes 0x30d40 to 0xd02c78 before each sleep, and its IRQ6
+ * handler (0xc0080b30) writes the same value again and 0x10 to 0xd02e2c.
+ * Model: a write of N arms a one-shot that, N us later (the tick rate is
+ * [?]), sets 0xd02e2c bit 4 and raises IRQ6; writing bit 4 clears both. */
+#define TOUT_ARM  0x00d02c78u
+#define ISTAT     0x00d02e2cu
+#define TOUT_BIT  (1u << 4)
+#define TOUT_IRQ  6
+static QEMUTimer *tout;
+static bool tout_fired;
+
+static void tout_set(bool fired)
+{
+    CPUARCState *env = &ARC_CPU(ax210_cs)->env;
+
+    tout_fired = fired;
+    qemu_set_irq(env->irq[TOUT_IRQ], fired);
+}
+
+static void tout_expire(void *opaque)
+{
+    trace_log("TOUT.X", TOUT_ARM, TOUT_IRQ, 4);
+    tout_set(true);
+}
+
+static void tout_arm(uint32_t n)
+{
+    if (!ax210_cs || !(ARC_CPU(ax210_cs)->family & ARC_OPCODE_ARC700)) {
+        return;
+    }
+    if (!tout) {
+        tout = timer_new_us(QEMU_CLOCK_VIRTUAL, tout_expire, NULL);
+    }
+    timer_mod(tout, qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) + n);
+}
+
 #define MBX_BASE 0x00d00000u    /* UMAC 0xc0d00000 */
 static uint32_t host_csr[0x400];
 static uint32_t mbx_idx, mbx_data;
@@ -357,6 +395,11 @@ static uint64_t trace_read(void *opaque, hwaddr addr, unsigned size)
     if (a == CFGU_BASE + 0x14 && !hit) {
         v = rs_get(CFGU_BASE + 0x10) & 1;
         trace_log("R.cfgu", ra, v, size);
+        return v;
+    }
+    if (a == ISTAT && !hit) {
+        v = (rs_get(ISTAT) & ~TOUT_BIT) | (tout_fired ? TOUT_BIT : 0);
+        trace_log("R.istat", ra, v, size);
         return v;
     }
     if (a == FSM_BASE && !hit) {
@@ -428,6 +471,11 @@ static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         fsm_ctl &= ~(uint32_t)val;
     } else if (a == FSM_BASE + 8) {
         fsm_ctl |= (uint32_t)val & ~0xfu;
+    }
+    if (a == TOUT_ARM) {
+        tout_arm((uint32_t)val);
+    } else if (a == ISTAT && (val & TOUT_BIT) && tout_fired) {
+        tout_set(false);
     }
     if (a == TMR_START) {
         /* store first so tmr_start sees counts already written */

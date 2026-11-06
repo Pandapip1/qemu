@@ -407,6 +407,24 @@ static void test_host_driver_ctxt_info(void)
     qtest_quit(s);
 }
 
+/* UMAC timeout timer (finding G2, [I]): a write of N to 0xc0d02c78 sets
+ * 0xc0d02e2c bit 4 N us of virtual time later; writing bit 4 clears it. */
+static void test_umac_timeout_timer(void)
+{
+    /* No -S: virtual-clock timers only run while the VM runs. */
+    QTestState *s = qtest_init("-M ax210 -m 32M -nographic -monitor none "
+                               "-serial none");
+
+    qtest_writel(s, 0xc0d02c78, 1000);
+    qtest_clock_step(s, 999 * 1000);
+    g_assert_cmpuint(qtest_readl(s, 0xc0d02e2c) & 0x10, ==, 0);
+    qtest_clock_step(s, 2 * 1000);
+    g_assert_cmpuint(qtest_readl(s, 0xc0d02e2c) & 0x10, ==, 0x10);
+    qtest_writel(s, 0xc0d02e2c, 0x10);
+    g_assert_cmpuint(qtest_readl(s, 0xc0d02e2c) & 0x10, ==, 0);
+    qtest_quit(s);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -437,6 +455,7 @@ int main(int argc, char **argv)
     qtest_add_func("/ax210/semaphore-two-cores", test_semaphore_two_cores);
     qtest_add_func("/ax210/host-driver-ctxt-info", test_host_driver_ctxt_info);
     qtest_add_func("/ax210/cfg-unit-start-done", test_cfg_unit_start_done);
+    qtest_add_func("/ax210/umac-timeout-timer", test_umac_timeout_timer);
 
     return g_test_run();
 }
