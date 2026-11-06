@@ -4066,6 +4066,52 @@ static void test_trng_fifo(void)
 }
 
 /*
+ * TRNG test mode: TESTDATA through the conditioning function, AES-128
+ * CBC-MAC under KEY0-3. Key and blocks of NIST SP 800-38A F.2.1 (the first
+ * block XORed with that example's IV), so the MAC is its last ciphertext
+ * block 3ff1caa1 681fac09 120eca30 7586e1a7; words little-endian.
+ */
+#define TRNG_KEY0              0x010
+#define TRNG_TESTDATA          0x020
+#define TRNG_TESTEN_BYPASSES   0x00003004 /* TESTEN | BYPNIST | BYPAIS31 */
+
+static void test_trng_conditioning_kat(void)
+{
+    static const uint32_t key[4] = {
+        0x16157e2b, 0xa6d2ae28, 0x8815f7ab, 0x3c4fcf09,
+    };
+    static const uint32_t data[16] = {
+        0xe1bcc06b, 0x9199452a, 0x1a7434e1, 0x25199e7f,
+        0x578a2dae, 0x9cac031e, 0xac6fb79e, 0x518eaf45,
+        0x461cc830, 0x11e45ca3, 0x19c1fbe5, 0xef520a1a,
+        0x45249ff6, 0x179b4fdf, 0x7b412bad, 0x10376ce6,
+    };
+    static const uint32_t mac[4] = {
+        0xa1caf13f, 0x09ac1f68, 0x30ca0e12, 0xa7e18675,
+    };
+    QTestState *qts = qtest_init("-machine efr32bg22 -accel qtest");
+
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN1 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN1_CRYPTOACC);
+    qtest_writel(qts, TRNG_CTRL, TRNG_TESTEN_BYPASSES);
+    for (size_t i = 0; i < G_N_ELEMENTS(key); i++) {
+        qtest_writel(qts, TRNG_CTRL + TRNG_KEY0 + 4 * i, key[i]);
+    }
+    for (size_t i = 0; i < G_N_ELEMENTS(data); i++) {
+        g_assert_cmphex(qtest_readl(qts, TRNG_CTRL + TRNG_RNGSTATUS) & 1, ==,
+                        0);
+        qtest_writel(qts, TRNG_CTRL + TRNG_TESTDATA, data[i]);
+        g_assert_cmphex(qtest_readl(qts, TRNG_CTRL + TRNG_FIFOLEVEL), ==,
+                        i == G_N_ELEMENTS(data) - 1 ? 4 : 0);
+    }
+    qtest_writel(qts, TRNG_CTRL, 0);
+    for (size_t i = 0; i < G_N_ELEMENTS(mac); i++) {
+        g_assert_cmphex(qtest_readl(qts, TRNG_FIFO), ==, mac[i]);
+    }
+    qtest_quit(qts);
+}
+
+/*
  * GPCRC (RM chapter 14) through the register sequence of sl_hal_gpcrc.c and
  * Zephyr's crc_silabs_gpcrc.c, on the check string "123456789":
  * CRC-32/IEEE 0xCBF43926 (BITREVERSE 0, DATA, xorout ~0, written as words
@@ -5029,6 +5075,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/ldma-peripheral-request",
                    test_ldma_peripheral_request);
     qtest_add_func("/efr32bg22/trng-fifo", test_trng_fifo);
+    qtest_add_func("/efr32bg22/trng-conditioning-kat",
+                   test_trng_conditioning_kat);
     qtest_add_func("/efr32bg22/gpcrc-crc-vectors", test_gpcrc_crc_vectors);
     qtest_add_func("/efr32bg22/radioaes-ecb-and-key-sizes",
                    test_radioaes_ecb_and_key_sizes);
