@@ -171,6 +171,18 @@ static uint32_t fsm_read(void)
 #define MFIFO_BASE 0x00a00400u
 #define MFIFO_CAP  0x400u
 
+/* UMAC outgoing message FIFO at 0xc0a00500 (finding Q2, [I]): the layout of
+ * Q1 in UMAC's own 0xc0a0xxxx block. UMAC 0xc008d0a0 selects channel 0xe at
+ * +0x3c (LMAC does the same at 0xa0043c), takes free = max([+0x30] - [+0x38]
+ * - 8, 0) and pushes through 0x804a8d48 to +0x40; error 0x100efa if the
+ * message does not fit. Modelled as Q1. */
+#define MFIFO_UMAC 0xc0a00500u
+
+static bool is_mfifo(hwaddr a, unsigned off)
+{
+    return a == MFIFO_BASE + off || a == MFIFO_UMAC + off;
+}
+
 /* Hardware semaphore bank at 0xd03800 (finding S1, [I]): LMAC 0x4ba960
  * writes a bit mask to +0x0 (request) and returns whether [+0x4] (granted)
  * has it; 0x4d1c88 writes 1<<n to +0x8 (release). Both mirror mask<<8 into
@@ -217,7 +229,20 @@ static void sem_update(int core, uint32_t mask, bool request)
 #define IND_CTRL 0x00a2ac04u
 #define IND_GO   (1u << 18)
 #define IND_WR   (1u << 17)
+#define IND_ADDR 0x1ffffu
 static GHashTable *indstore;
+
+/* Register aliases (finding K2, [I]): UMAC 0x80448ca4 writes 0x400410 to
+ * 0xa3408c and requires 0xa200b0 to read it back (masked 0xff0fffff), and
+ * writes it to 0xa34090 and requires indirect 0xb800 to read it back exactly;
+ * either mismatch is fatal 0x1013f1. Modelled as one register per pair. */
+#define IND_ALIAS_ADDR 0xb800u
+#define IND_ALIAS_REG  0x00a34090u
+
+static hwaddr alias_key(hwaddr a)
+{
+    return a == 0x00a200b0 ? 0x00a3408c : a;
+}
 
 /* LMAC timer/event unit at 0xa02000 (finding V1, [I]). From LMAC 0x166e4
  * (enable bit n at +0x0c, count at +0xac+4n, start bit n at +0x08) and
@@ -298,7 +323,7 @@ static uint64_t trace_read(void *opaque, hwaddr addr, unsigned size)
 {
     hwaddr base = (hwaddr)(uintptr_t)opaque;
     hwaddr ra = base + addr;            /* as issued by the core */
-    hwaddr a = lmac_view(ra);           /* model key */
+    hwaddr a = alias_key(lmac_view(ra)); /* model key */
     int hit; uint32_t v = override_lookup(a, &hit);
     if (a == DMA_STAT && !hit) {
         v = dma_done ? (1u << 29) : 0;
@@ -310,11 +335,11 @@ static uint64_t trace_read(void *opaque, hwaddr addr, unsigned size)
         trace_log("R.ts", ra, v, size);
         return v;
     }
-    if (a == MFIFO_BASE + 0x30 && !hit) {
+    if (is_mfifo(a, 0x30) && !hit) {
         trace_log("R.mfifo", ra, MFIFO_CAP, size);
         return MFIFO_CAP;
     }
-    if (a == MFIFO_BASE + 0x38 && !hit) {
+    if (is_mfifo(a, 0x38) && !hit) {
         trace_log("R.mfifo", ra, 0, size);
         return 0;
     }
@@ -353,7 +378,7 @@ static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     hwaddr base = (hwaddr)(uintptr_t)opaque;
     hwaddr ra = base + addr;            /* as issued by the core */
-    hwaddr a = lmac_view(ra);           /* model key */
+    hwaddr a = alias_key(lmac_view(ra)); /* model key */
     trace_log("W", ra, val, size);
     if (a == MBX_BASE + 0x20) {
         mbx_idx = val;
@@ -378,7 +403,7 @@ static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         aes_run((uint32_t)val);
         val = (val & ~1ull) | 4;           /* done */
     }
-    if (a == MFIFO_BASE + 0x40) {
+    if (is_mfifo(a, 0x40)) {
         trace_log("MSG", ra, val, size);
     }
     if (a == SEM_BASE || a == SEM_BASE + 0x20) {
@@ -398,18 +423,21 @@ static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         tmr_start((uint32_t)val);
     }
     if (a == IND_CTRL && (val & IND_GO)) {
-        guint ia = val & 0xffff;
+        guint ia = val & IND_ADDR;
         if (!indstore) {
             indstore = g_hash_table_new(g_direct_hash, g_direct_equal);
         }
         if (val & IND_WR) {
             guint d = GPOINTER_TO_UINT(g_hash_table_lookup(regstore,
                                        GUINT_TO_POINTER(IND_DATA)));
-            g_hash_table_insert(indstore, GUINT_TO_POINTER(ia),
+            g_hash_table_insert(ia == IND_ALIAS_ADDR ? regstore : indstore,
+                                GUINT_TO_POINTER(ia == IND_ALIAS_ADDR ?
+                                                 IND_ALIAS_REG : ia),
                                 GUINT_TO_POINTER(d));
             trace_log("IND.W", ia, d, 4);
         } else {
-            guint d = GPOINTER_TO_UINT(g_hash_table_lookup(indstore,
+            guint d = ia == IND_ALIAS_ADDR ? rs_get(IND_ALIAS_REG) :
+                      GPOINTER_TO_UINT(g_hash_table_lookup(indstore,
                                        GUINT_TO_POINTER(ia)));
             g_hash_table_insert(regstore, GUINT_TO_POINTER(IND_DATA),
                                 GUINT_TO_POINTER(d));
@@ -717,7 +745,7 @@ static void ax210_init(MachineState *machine)
     add_trace("ax210.umac_d",   0xc0d00000, 0x00100000, 10); /* == LMAC 0xd0xxxx (K1) */
     add_trace("ax210.umac_e",   0xc0e00000, 0x00100000, 10); /* == LMAC 0xaxxxxx (K1) */
     add_ram("ax210.host",  0x20000000, 0x10000000);   /* modelled host DRAM */
-    add_trace("ax210.dma",      0xc0a0a000, 0x00001000, 10);
+    add_trace("ax210.umac_a",   0xc0a00000, 0x00010000, 10); /* UMAC MMIO: Q2, DMA */
     add_trace("ax210.csr",      0xf0000000, 0x01000000, 10); /* chip CSRs */
 
     if (getenv("AX210_TRACECAP")) trace_cap = strtoul(getenv("AX210_TRACECAP"), 0, 0);
@@ -753,6 +781,23 @@ static void ax210_init(MachineState *machine)
             if (!eq) continue;
             *eq = 0;
             host_csr[(strtoul(t3, 0, 16) >> 2) & 0x3ff] = strtoul(eq + 1, 0, 0);
+        }
+        g_free(c);
+    }
+
+    /* Indirect-window seeds (W1), e.g. hardware status bits the firmware
+     * polls that no firmware writes: AX210_IND="940c=1,...". */
+    const char *ind = getenv("AX210_IND");
+    if (ind) {
+        char *c = g_strdup(ind), *t4, *sv = NULL;
+        indstore = g_hash_table_new(g_direct_hash, g_direct_equal);
+        for (t4 = strtok_r(c, ",", &sv); t4; t4 = strtok_r(NULL, ",", &sv)) {
+            char *eq = strchr(t4, '=');
+            if (!eq) continue;
+            *eq = 0;
+            g_hash_table_insert(indstore,
+                                GUINT_TO_POINTER(strtoul(t4, 0, 16) & IND_ADDR),
+                                GUINT_TO_POINTER(strtoul(eq + 1, 0, 0)));
         }
         g_free(c);
     }
