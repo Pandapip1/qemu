@@ -122,6 +122,8 @@ qtests_alpha = ['boot-serial-test'] + \
 
 qtests_avr = [ 'boot-serial-test' ]
 
+qtests_arc = [ 'ax210-test' ]
+
 qtests_hppa = ['boot-serial-test'] + \
   ['test-filter-mirror', 'test-filter-redirector'] + \
   (slirp.found() ? ['test-netfilter'] : []) + \

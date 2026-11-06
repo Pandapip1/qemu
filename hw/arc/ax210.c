@@ -67,6 +67,26 @@ static GHashTable *regstore;
 static struct { hwaddr addr; uint32_t val; } ctrs[MAX_CTRS] = { { 0xc0d02c68, 0 } };
 static int n_ctrs = 1;
 
+/* Host-CSR mailbox at 0xc0d0001c/20/24/28 (inferred from IML code + driver
+ * csr offsets): write index to +0x20, command to +0x1c (top byte 0x6a = read,
+ * 0x69 = write, data at +0x24), result at +0x28. Backing array models the PCIe
+ * CSR block the host driver programs (e.g. 0x118 CTXT_INFO_ADDR). */
+/* Descriptor DMA engine at 0xc0a0a500 (from IML routine 0x804458a4): +0x34
+ * command (0x81000001 = host->device copy, kick), +0x38 device addr, +0x3c/0x40
+ * host addr lo/hi, +0x44 length. Completion = bit 29 of status reg 0xc0d02e24
+ * (polled by IML 0x804458c8; written back to acknowledge). Host "physical"
+ * addresses are served from system memory (host RAM window at 0x20000000). */
+#define DMA_BASE  0xc0a0a500u
+#define DMA_STAT  0xc0d02e24u
+static uint32_t dma_done;
+static unsigned dma_count;
+
+static void dma_kick(void);
+
+#define MBX_BASE 0xc0d00000u
+static uint32_t host_csr[0x400];
+static uint32_t mbx_idx, mbx_data;
+
 static target_ulong cur_pc(void)
 {
     if (current_cpu) {
@@ -94,6 +114,16 @@ static uint64_t trace_read(void *opaque, hwaddr addr, unsigned size)
 {
     hwaddr base = (hwaddr)(uintptr_t)opaque;
     int hit; uint32_t v = override_lookup(base + addr, &hit);
+    if (base + addr == DMA_STAT && !hit) {
+        v = dma_done ? (1u << 29) : 0;
+        trace_log("R.dma", base + addr, v, size);
+        return v;
+    }
+    if (base + addr == MBX_BASE + 0x28 && !hit) {
+        v = host_csr[(mbx_idx >> 2) & 0x3ff];
+        trace_log("R.csr", mbx_idx, v, size);
+        return v;
+    }
     for (int i = 0; i < n_ctrs; i++) {
         if (ctrs[i].addr == base + addr) {
             v = ++ctrs[i].val;
@@ -114,11 +144,59 @@ static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     hwaddr base = (hwaddr)(uintptr_t)opaque;
     trace_log("W", base + addr, val, size);
+    if (base + addr == MBX_BASE + 0x20) {
+        mbx_idx = val;
+    } else if (base + addr == MBX_BASE + 0x24) {
+        mbx_data = val;
+    } else if (base + addr == MBX_BASE + 0x1c && (val >> 24) == 0x69) {
+        host_csr[(mbx_idx >> 2) & 0x3ff] = mbx_data;
+        trace_log("W.csr", mbx_idx, mbx_data, size);
+    }
+    if (base + addr == DMA_STAT && (val & (1u << 29))) {
+        dma_done = 0;
+    }
     if (!regstore) {
         regstore = g_hash_table_new(g_direct_hash, g_direct_equal);
     }
     g_hash_table_insert(regstore, GUINT_TO_POINTER((guint)(base + addr)),
                         (gpointer)(uintptr_t)(uint32_t)val);
+    if (base + addr == DMA_BASE + 0x34) {
+        dma_kick();
+    }
+}
+
+static uint32_t rs_get(hwaddr a)
+{
+    return regstore ? (uint32_t)(uintptr_t)g_hash_table_lookup(regstore,
+                          GUINT_TO_POINTER((guint)a)) : 0;
+}
+
+static void dma_kick(void)
+{
+    uint32_t cmd = rs_get(DMA_BASE + 0x34);
+    uint32_t dev = rs_get(DMA_BASE + 0x38);
+    uint64_t host = ((uint64_t)rs_get(DMA_BASE + 0x40) << 32) |
+                    rs_get(DMA_BASE + 0x3c);
+    uint32_t len = rs_get(DMA_BASE + 0x44);
+    uint8_t *buf;
+    MemTxResult r1, r2;
+
+    dma_count++;
+    if (cmd != 0x81000001 || len == 0 || len > 0x100000) {
+        trace_log("DMA?", cmd, len, 4);
+        dma_done = 1;
+        return;
+    }
+    buf = g_malloc(len);
+    r1 = address_space_read(&address_space_memory, host,
+                            MEMTXATTRS_UNSPECIFIED, buf, len);
+    r2 = address_space_write(&address_space_memory, dev,
+                             MEMTXATTRS_UNSPECIFIED, buf, len);
+    fprintf(trace_fp ? trace_fp : stderr,
+            "DMA#%u host=%llx -> dev=%08x len=%x rd=%d wr=%d\n", dma_count,
+            (unsigned long long)host, dev, len, r1, r2);
+    g_free(buf);
+    dma_done = 1;
 }
 
 static const MemoryRegionOps trace_ops = {
@@ -173,6 +251,8 @@ static void ax210_init(MachineState *machine)
     add_trace("ax210.crypto",   0x00a20000, 0x00010000, 10); /* RSA/SHA coproc 0xa248/49/4a */
     add_trace("ax210.ctl_d",    0xc0d00000, 0x00010000, 10); /* control regs polled by IML */
     add_trace("ax210.crypto_c", 0xc0e20000, 0x00010000, 10); /* remapped crypto window */
+    add_ram("ax210.host",  0x20000000, 0x10000000);   /* modelled host DRAM */
+    add_trace("ax210.dma",      0xc0a0a000, 0x00001000, 10);
     add_trace("ax210.csr",      0xf0000000, 0x01000000, 10); /* chip CSRs */
 
     if (getenv("AX210_TRACECAP")) trace_cap = strtoul(getenv("AX210_TRACECAP"), 0, 0);
@@ -184,6 +264,19 @@ static void ax210_init(MachineState *machine)
              t2 = strtok_r(NULL, ",", &sv)) {
             ctrs[n_ctrs].addr = strtoull(t2, 0, 16);
             ctrs[n_ctrs++].val = 0;
+        }
+        g_free(c);
+    }
+
+    /* Host CSR initial contents: AX210_CSR="offs=val,..." (offs hex, val num) */
+    const char *csr = getenv("AX210_CSR");
+    if (csr) {
+        char *c = g_strdup(csr), *t3, *sv = NULL;
+        for (t3 = strtok_r(c, ",", &sv); t3; t3 = strtok_r(NULL, ",", &sv)) {
+            char *eq = strchr(t3, '=');
+            if (!eq) continue;
+            *eq = 0;
+            host_csr[(strtoul(t3, 0, 16) >> 2) & 0x3ff] = strtoul(eq + 1, 0, 0);
         }
         g_free(c);
     }
