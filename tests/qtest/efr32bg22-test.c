@@ -2497,6 +2497,38 @@ static void test_rtcc_counts_and_compares(void)
 }
 
 /*
+ * PRORTC: an RTCC_TypeDef at 0xA8000000 (device header) on its own clock
+ * (CMU.PRORTCCLKCTRL, reset LFRCO), separate from the RTCC.
+ */
+#define PRORTC_BASE           0xa8000000
+#define CMU_CLKEN1_PRORTC     (1u << 10)
+
+static void test_prortc_counts_and_compares(void)
+{
+    uint32_t cnt;
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    enable_radio_bus_clocks();
+    writel(CMU_BASE + CMU_CLKEN1 + REGISTER_SET_WINDOW, CMU_CLKEN1_PRORTC);
+    writel(PRORTC_BASE + RTCC_EN, 1);
+    writel(PRORTC_BASE + RTCC_CMD, RTCC_CMD_START);
+    g_assert_cmphex(readl(PRORTC_BASE + RTCC_STATUS), ==, 1);
+    clock_run(100 * LF_PERIOD_NS);
+    cnt = readl(PRORTC_BASE + RTCC_CNT);
+    g_assert_cmpuint(cnt, >=, 99);
+    g_assert_cmpuint(cnt, <=, 101);
+    writel(PRORTC_BASE + RTCC_CC1_CTRL, RTCC_CC_OUTPUTCOMPARE);
+    writel(PRORTC_BASE + RTCC_CC1_OCVALUE, cnt + 10);
+    clock_run(8 * LF_PERIOD_NS);
+    g_assert_cmphex(readl(PRORTC_BASE + RTCC_IF) & RTCC_IF_CC1, ==, 0);
+    clock_run(3 * LF_PERIOD_NS);
+    g_assert_cmphex(readl(PRORTC_BASE + RTCC_IF) & RTCC_IF_CC1, ==,
+                    RTCC_IF_CC1);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    enable_radio_bus_clocks();
+}
+
+/*
  * IADC single conversion of a board input (machine "analog" property):
  * PD02 at 968 mV against VDDX (3300 mV), gain 1, 12-bit right-aligned.
  */
@@ -5145,6 +5177,8 @@ int main(int argc, char **argv)
                    test_part_352k_flash_end_faults);
     qtest_add_func("/efr32bg22/rtcc-counts-and-compares",
                    test_rtcc_counts_and_compares);
+    qtest_add_func("/efr32bg22/prortc-counts-and-compares",
+                   test_prortc_counts_and_compares);
     qtest_add_func("/efr32bg22/iadc-single-conversion",
                    test_iadc_single_conversion);
     qtest_add_func("/efr32bg22/emu-rstcause", test_emu_rstcause);

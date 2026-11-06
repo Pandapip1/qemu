@@ -777,6 +777,23 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_RDMAILBOX_M33_IRQ 39
 #define EFR32_RDMAILBOX_SEQ_IRQ 23
 
+/* RTCC and PRORTC, two instances of one RTC (see efr32_rtcc_*). */
+#define EFR32_RTCC_INSTANCES 2
+#define EFR32_RTCC_CC_COUNT 3
+
+typedef struct Efr32Rtcc {
+    Efr32Periph *owner;
+    unsigned index;
+    /* Pre-counter and counter as one edge count. */
+    bool run;
+    uint64_t pos_base;
+    int64_t edge_base;
+    int64_t last_edge;
+    QEMUTimer *timer;
+    /* CCn PRS outputs (CMOA). */
+    bool ccv[EFR32_RTCC_CC_COUNT];
+} Efr32Rtcc;
+
 struct Efr32Periph
 {
     SysBusDevice parent_obj;
@@ -815,12 +832,7 @@ struct Efr32Periph
         int64_t edge;
     } burtc_pend[3];
     QEMUTimer *burtc_timer;
-    /* RTCC: pre-counter and counter as one edge count, see efr32_rtcc_*. */
-    bool rtcc_run;
-    uint64_t rtcc_pos_base;
-    int64_t rtcc_edge_base;
-    int64_t rtcc_last_edge;
-    QEMUTimer *rtcc_timer;
+    Efr32Rtcc rtcc[EFR32_RTCC_INSTANCES];
     /* TIMERn counts base_count + elapsed ticks since base_ns while counting. */
     struct {
         bool running;
@@ -914,8 +926,6 @@ struct Efr32Periph
     qemu_irq timer_dma[5][4];
     /* TIMERn CCm PRS output in PRSCONF = LEVEL. */
     bool timer_prs_level[5][3];
-    /* RTCC CCn PRS outputs (CMOA). */
-    bool rtcc_ccv[3];
     /* To the debug port: RAC clock retiming wedges it (SS7.80) */
     qemu_irq debug_wedge;
     bool timer_cc_level[5][3];
@@ -4852,7 +4862,6 @@ static void efr32_pa_ramp_complete(Efr32Periph *s)
 #define EFR32_RTCC_CC0_CTRL 0x030u
 #define EFR32_RTCC_CC_STRIDE 0x00cu
 #define EFR32_RTCC_CC_OCVALUE 0x004u
-#define EFR32_RTCC_CC_COUNT 3
 #define EFR32_RTCC_CC_CTRL_MODE_MASK 0x3u
 #define EFR32_RTCC_CC_CTRL_MODE_OUTPUTCOMPARE 0x2u
 #define EFR32_RTCC_CC_CTRL_COMPBASE_PRECNT (1u << 4)
@@ -4860,18 +4869,53 @@ static void efr32_pa_ramp_complete(Efr32Periph *s)
 #define EFR32_CMU_RTCCCLKCTRL 0x240u
 #define EFR32_CMU_RTCCCLKCTRL_RESET EFR32_CMU_LFCLKSEL_LFRCO
 
-static uint32_t efr32_rtcc_get(Efr32Periph *s, uint32_t offset)
+/*
+ * PRORTC, the protocol RTC (RM SS8.5: CMU.PRORTCCLKCTRL, CLKEN1.PRORTC;
+ * IRQ 41; PRS producer PRORTC, SOURCESEL 0x09, signals CCV0 and CCV1): the
+ * device header declares it an RTCC_TypeDef, so it is modelled as a second
+ * RTCC with its own clock selection, interrupt and PRS producer.  It has no
+ * PRS consumers.
+ */
+#define EFR32_PRORTC_IRQ 41
+#define EFR32_CMU_PRORTCCLKCTRL 0x248u
+#define EFR32_CMU_PRORTCCLKCTRL_RESET EFR32_CMU_LFCLKSEL_LFRCO
+#define EFR32_RTCC_CCV_OUTPUTS 3
+#define EFR32_PRORTC_CCV_OUTPUTS 2
+
+static const struct {
+    uint32_t base;
+    uint32_t clkctrl;
+    uint32_t clkctrl_reset;
+    unsigned irq;
+    unsigned prs_source;
+    unsigned prs_outputs;
+} efr32_rtcc_inst[EFR32_RTCC_INSTANCES] = {
+    { EFR32_RTCC_BASE, EFR32_CMU_RTCCCLKCTRL, EFR32_CMU_RTCCCLKCTRL_RESET,
+      EFR32_RTCC_IRQ, EFR32_PRS_SRC_RTCC, EFR32_RTCC_CCV_OUTPUTS },
+    { EFR32_PRORTC_BASE, EFR32_CMU_PRORTCCLKCTRL,
+      EFR32_CMU_PRORTCCLKCTRL_RESET, EFR32_PRORTC_IRQ, EFR32_PRS_SRC_PRORTC,
+      EFR32_PRORTC_CCV_OUTPUTS },
+};
+
+static uint32_t efr32_rtcc_get(Efr32Rtcc *r, uint32_t offset)
 {
-    return efr32_register_get(s, EFR32_RTCC_BASE + offset);
+    return efr32_register_get(r->owner,
+                              efr32_rtcc_inst[r->index].base + offset);
 }
 
-static uint64_t efr32_rtcc_hz(Efr32Periph *s)
+static void efr32_rtcc_put(Efr32Rtcc *r, uint32_t offset, uint32_t value)
 {
-    switch (efr32_cmu_get(s, EFR32_CMU_RTCCCLKCTRL) &
+    efr32_register_put(r->owner, efr32_rtcc_inst[r->index].base + offset,
+                       value);
+}
+
+static uint64_t efr32_rtcc_hz(Efr32Rtcc *r)
+{
+    switch (efr32_cmu_get(r->owner, efr32_rtcc_inst[r->index].clkctrl) &
             EFR32_CMU_LFCLKSEL_MASK) {
     case EFR32_CMU_LFCLKSEL_LFRCO:
     case EFR32_CMU_LFCLKSEL_LFXO:
-        return clock_get_hz(s->burtc_clk);
+        return clock_get_hz(r->owner->burtc_clk);
     case EFR32_CMU_LFCLKSEL_ULFRCO:
         return EFR32_ULFRCO_HZ;
     default:
@@ -4879,64 +4923,64 @@ static uint64_t efr32_rtcc_hz(Efr32Periph *s)
     }
 }
 
-static int64_t efr32_rtcc_edge_at(Efr32Periph *s, int64_t t)
+static int64_t efr32_rtcc_edge_at(Efr32Rtcc *r, int64_t t)
 {
-    uint64_t hz = efr32_rtcc_hz(s);
+    uint64_t hz = efr32_rtcc_hz(r);
 
     return hz ? muldiv64(t, hz, NANOSECONDS_PER_SECOND) : 0;
 }
 
-static unsigned efr32_rtcc_presc(Efr32Periph *s)
+static unsigned efr32_rtcc_presc(Efr32Rtcc *r)
 {
-    return (efr32_rtcc_get(s, EFR32_RTCC_CFG) &
+    return (efr32_rtcc_get(r, EFR32_RTCC_CFG) &
             EFR32_RTCC_CFG_CNTPRESC_MASK) >> EFR32_RTCC_CFG_CNTPRESC_SHIFT;
 }
 
-static bool efr32_rtcc_counting(Efr32Periph *s)
+static bool efr32_rtcc_counting(Efr32Rtcc *r)
 {
-    return s->rtcc_run && efr32_rtcc_hz(s) &&
-           (efr32_rtcc_get(s, EFR32_RTCC_EN) & EFR32_RTCC_EN_EN) &&
-           !efr32_debug_frozen(s, efr32_rtcc_get(s, EFR32_RTCC_CFG) &
-                                      EFR32_RTCC_CFG_DEBUGRUN);
+    return r->run && efr32_rtcc_hz(r) &&
+           (efr32_rtcc_get(r, EFR32_RTCC_EN) & EFR32_RTCC_EN_EN) &&
+           !efr32_debug_frozen(r->owner, efr32_rtcc_get(r, EFR32_RTCC_CFG) &
+                                             EFR32_RTCC_CFG_DEBUGRUN);
 }
 
 /* Edges counted (pre-counter and counter together) at LF edge @edge. */
-static uint64_t efr32_rtcc_pos_at(Efr32Periph *s, int64_t edge)
+static uint64_t efr32_rtcc_pos_at(Efr32Rtcc *r, int64_t edge)
 {
-    if (!efr32_rtcc_counting(s) || edge <= s->rtcc_edge_base) {
-        return s->rtcc_pos_base;
+    if (!efr32_rtcc_counting(r) || edge <= r->edge_base) {
+        return r->pos_base;
     }
-    return s->rtcc_pos_base + (uint64_t)(edge - s->rtcc_edge_base);
+    return r->pos_base + (uint64_t)(edge - r->edge_base);
 }
 
-static uint32_t efr32_rtcc_cnt_of(Efr32Periph *s, uint64_t pos)
+static uint32_t efr32_rtcc_cnt_of(Efr32Rtcc *r, uint64_t pos)
 {
-    return pos >> efr32_rtcc_presc(s);
+    return pos >> efr32_rtcc_presc(r);
 }
 
 /* First LF edge after @after at which CNT becomes @value. */
-static int64_t efr32_rtcc_next_cnt_edge(Efr32Periph *s, int64_t after,
+static int64_t efr32_rtcc_next_cnt_edge(Efr32Rtcc *r, int64_t after,
                                         uint32_t value)
 {
-    unsigned presc = efr32_rtcc_presc(s);
+    unsigned presc = efr32_rtcc_presc(r);
     uint64_t period = UINT64_C(1) << (EFR32_RTCC_CNT_BITS + presc);
-    uint64_t pos = efr32_rtcc_pos_at(s, after);
+    uint64_t pos = efr32_rtcc_pos_at(r, after);
     uint64_t target = (uint64_t)value << presc;
     uint64_t delta = (target - pos) & (period - 1);
 
     return after + (int64_t)(delta ? delta : period);
 }
 
-static void efr32_rtcc_update_irq(Efr32Periph *s)
+static void efr32_rtcc_update_irq(Efr32Rtcc *r)
 {
-    qemu_set_irq(s->irq[EFR32_RTCC_IRQ],
-                 !!(efr32_rtcc_get(s, EFR32_RTCC_IF) &
-                    efr32_rtcc_get(s, EFR32_RTCC_IEN)));
+    qemu_set_irq(r->owner->irq[efr32_rtcc_inst[r->index].irq],
+                 !!(efr32_rtcc_get(r, EFR32_RTCC_IF) &
+                    efr32_rtcc_get(r, EFR32_RTCC_IEN)));
 }
 
-static bool efr32_rtcc_cc_compares(Efr32Periph *s, unsigned channel)
+static bool efr32_rtcc_cc_compares(Efr32Rtcc *r, unsigned channel)
 {
-    uint32_t ctrl = efr32_rtcc_get(s, EFR32_RTCC_CC0_CTRL +
+    uint32_t ctrl = efr32_rtcc_get(r, EFR32_RTCC_CC0_CTRL +
                                           channel * EFR32_RTCC_CC_STRIDE);
 
     return (ctrl & EFR32_RTCC_CC_CTRL_MODE_MASK) ==
@@ -4947,7 +4991,8 @@ static bool efr32_rtcc_cc_compares(Efr32Periph *s, unsigned channel)
 /*
  * CCn PRS outputs (RM SS15.3.2-15.3.3, Figure 15.3): on a compare match
  * CCn_CTRL.CMOA pulses (one LFCLKRTCC cycle on silicon; see efr32-prs.c),
- * toggles, clears or sets the channel's output, PRS producer RTCC CCVn.
+ * toggles, clears or sets the channel's output, PRS producer RTCC CCVn
+ * (PRORTC CCV0-1).
  */
 #define EFR32_RTCC_CC_CTRL_CMOA_SHIFT 2
 #define EFR32_RTCC_CC_CTRL_CMOA_MASK 0x3u
@@ -4956,16 +5001,20 @@ static bool efr32_rtcc_cc_compares(Efr32Periph *s, unsigned channel)
 #define EFR32_RTCC_CMOA_CLEAR 2u
 #define EFR32_RTCC_CMOA_SET 3u
 
-static void efr32_rtcc_compare_output(Efr32Periph *s, unsigned channel)
+static void efr32_rtcc_compare_output(Efr32Rtcc *r, unsigned channel)
 {
-    uint32_t ctrl = efr32_rtcc_get(s, EFR32_RTCC_CC0_CTRL +
+    uint32_t ctrl = efr32_rtcc_get(r, EFR32_RTCC_CC0_CTRL +
                                           channel * EFR32_RTCC_CC_STRIDE);
-    bool *level = &s->rtcc_ccv[channel];
+    unsigned source = efr32_rtcc_inst[r->index].prs_source;
+    bool *level = &r->ccv[channel];
 
+    if (channel >= efr32_rtcc_inst[r->index].prs_outputs) {
+        return;
+    }
     switch ((ctrl >> EFR32_RTCC_CC_CTRL_CMOA_SHIFT) &
             EFR32_RTCC_CC_CTRL_CMOA_MASK) {
     case EFR32_RTCC_CMOA_PULSE:
-        efr32_prs_pulse(s, EFR32_PRS_SRC_RTCC, EFR32_PRS_SIG_RTCC_CCV(channel));
+        efr32_prs_pulse(r->owner, source, EFR32_PRS_SIG_RTCC_CCV(channel));
         return;
     case EFR32_RTCC_CMOA_TOGGLE:
         *level = !*level;
@@ -4977,20 +5026,20 @@ static void efr32_rtcc_compare_output(Efr32Periph *s, unsigned channel)
         *level = true;
         break;
     }
-    efr32_prs_level(s, EFR32_PRS_SRC_RTCC, EFR32_PRS_SIG_RTCC_CCV(channel),
+    efr32_prs_level(r->owner, source, EFR32_PRS_SIG_RTCC_CCV(channel),
                     *level);
 }
 
 /* Latch every event up to now, then arm the timer for the next one. */
-static void efr32_rtcc_process(Efr32Periph *s)
+static void efr32_rtcc_process(Efr32Rtcc *r)
 {
-    int64_t now = efr32_rtcc_edge_at(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    int64_t now = efr32_rtcc_edge_at(r, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     int64_t next = INT64_MAX;
     uint32_t flags = 0;
 
-    timer_del(s->rtcc_timer);
-    if (!efr32_rtcc_counting(s)) {
-        s->rtcc_last_edge = now;
+    timer_del(r->timer);
+    if (!efr32_rtcc_counting(r)) {
+        r->last_edge = now;
         return;
     }
     for (int channel = -1; channel < EFR32_RTCC_CC_COUNT; channel++) {
@@ -5000,75 +5049,87 @@ static void efr32_rtcc_process(Efr32Periph *s)
                                               EFR32_RTCC_IF_CC_STRIDE);
         uint32_t value = channel < 0
                              ? 0
-                             : efr32_rtcc_get(s, EFR32_RTCC_CC0_CTRL +
+                             : efr32_rtcc_get(r, EFR32_RTCC_CC0_CTRL +
                                                      channel *
                                                          EFR32_RTCC_CC_STRIDE +
                                                      EFR32_RTCC_CC_OCVALUE);
         int64_t edge;
 
-        if (channel >= 0 && !efr32_rtcc_cc_compares(s, channel)) {
+        if (channel >= 0 && !efr32_rtcc_cc_compares(r, channel)) {
             continue;
         }
-        edge = efr32_rtcc_next_cnt_edge(s, s->rtcc_last_edge, value);
+        edge = efr32_rtcc_next_cnt_edge(r, r->last_edge, value);
         if (edge <= now) {
             flags |= flag;
-            edge = efr32_rtcc_next_cnt_edge(s, now, value);
+            edge = efr32_rtcc_next_cnt_edge(r, now, value);
         }
         next = MIN(next, edge);
     }
-    s->rtcc_last_edge = now;
+    r->last_edge = now;
     if (flags) {
-        efr32_register_put(s, EFR32_RTCC_BASE + EFR32_RTCC_IF,
-                           efr32_rtcc_get(s, EFR32_RTCC_IF) | flags);
-        efr32_rtcc_update_irq(s);
+        efr32_rtcc_put(r, EFR32_RTCC_IF,
+                       efr32_rtcc_get(r, EFR32_RTCC_IF) | flags);
+        efr32_rtcc_update_irq(r);
     }
     for (unsigned channel = 0; channel < EFR32_RTCC_CC_COUNT; channel++) {
         if (flags & (EFR32_RTCC_IF_CC0 << (channel *
                                            EFR32_RTCC_IF_CC_STRIDE))) {
-            efr32_rtcc_compare_output(s, channel);
+            efr32_rtcc_compare_output(r, channel);
         }
     }
     if (next != INT64_MAX) {
-        timer_mod(s->rtcc_timer,
+        timer_mod(r->timer,
                   muldiv64_round_up(next, NANOSECONDS_PER_SECOND,
-                                    efr32_rtcc_hz(s)));
+                                    efr32_rtcc_hz(r)));
     }
 }
 
 static void efr32_rtcc_timer_expired(void *opaque)
 {
-    efr32_rtcc_process(EFR32_PERIPH(opaque));
+    efr32_rtcc_process(opaque);
 }
 
 /* Restart the count from @pos at the current edge. */
-static void efr32_rtcc_rebase(Efr32Periph *s, uint64_t pos)
+static void efr32_rtcc_rebase(Efr32Rtcc *r, uint64_t pos)
 {
-    s->rtcc_edge_base = s->rtcc_last_edge;
-    s->rtcc_pos_base = pos;
+    r->edge_base = r->last_edge;
+    r->pos_base = pos;
+}
+
+/* The instance whose register block holds @address, or NULL. */
+static Efr32Rtcc *efr32_rtcc_at(Efr32Periph *s, uint32_t address)
+{
+    for (unsigned i = 0; i < EFR32_RTCC_INSTANCES; i++) {
+        if ((address & ~0x3fffu) == efr32_rtcc_inst[i].base) {
+            return &s->rtcc[i];
+        }
+    }
+    return NULL;
 }
 
 static bool efr32_rtcc_read(Efr32Periph *s, uint32_t address, uint32_t *value)
 {
+    Efr32Rtcc *r = efr32_rtcc_at(s, address);
     uint64_t pos;
 
-    if ((address & ~0x3fffu) != EFR32_RTCC_BASE) {
+    if (!r) {
         return false;
     }
-    efr32_rtcc_process(s);
-    pos = efr32_rtcc_pos_at(s, s->rtcc_last_edge);
+    efr32_rtcc_process(r);
+    pos = efr32_rtcc_pos_at(r, r->last_edge);
     switch (address & 0xfffu) {
     case EFR32_RTCC_CNT:
-        *value = efr32_rtcc_cnt_of(s, pos);
+        *value = efr32_rtcc_cnt_of(r, pos);
         return true;
     case EFR32_RTCC_PRECNT:
         *value = extract64(pos, 0, EFR32_RTCC_PRECNT_BITS);
         return true;
     case EFR32_RTCC_COMBCNT:
-        *value = (efr32_rtcc_cnt_of(s, pos) << EFR32_RTCC_PRECNT_BITS) |
+        *value = (efr32_rtcc_cnt_of(r, pos) << EFR32_RTCC_PRECNT_BITS) |
                  extract64(pos, 0, EFR32_RTCC_PRECNT_BITS);
         return true;
     case EFR32_RTCC_STATUS:
-        *value = s->rtcc_run ? EFR32_RTCC_STATUS_RUNNING : 0;
+        *value = r->run ? EFR32_RTCC_STATUS_RUNNING : 0;
         return true;
     case EFR32_RTCC_SYNCBUSY:
     case EFR32_RTCC_CMD:
@@ -5080,30 +5141,30 @@ static bool efr32_rtcc_read(Efr32Periph *s, uint32_t address, uint32_t *value)
 }
 
 /* Returns true when the RTCC write is fully handled. */
-static bool efr32_rtcc_write(Efr32Periph *s, uint32_t offset, uint32_t next)
+static bool efr32_rtcc_write(Efr32Rtcc *r, uint32_t offset, uint32_t next)
 {
     uint64_t pos;
     unsigned presc;
 
-    efr32_rtcc_process(s);
-    pos = efr32_rtcc_pos_at(s, s->rtcc_last_edge);
-    presc = efr32_rtcc_presc(s);
+    efr32_rtcc_process(r);
+    pos = efr32_rtcc_pos_at(r, r->last_edge);
+    presc = efr32_rtcc_presc(r);
     switch (offset) {
     case EFR32_RTCC_CMD:
         if (next & EFR32_RTCC_CMD_STOP) {
-            efr32_rtcc_rebase(s, pos);
-            s->rtcc_run = false;
+            efr32_rtcc_rebase(r, pos);
+            r->run = false;
         } else if (next & EFR32_RTCC_CMD_START) {
-            efr32_rtcc_rebase(s, pos);
-            s->rtcc_run = true;
+            efr32_rtcc_rebase(r, pos);
+            r->run = true;
         }
         break;
     case EFR32_RTCC_CNT:
-        efr32_rtcc_rebase(s, ((uint64_t)next << presc) |
+        efr32_rtcc_rebase(r, ((uint64_t)next << presc) |
                                  (pos & ((UINT64_C(1) << presc) - 1)));
         break;
     case EFR32_RTCC_PRECNT:
-        efr32_rtcc_rebase(s, (pos & ~MAKE_64BIT_MASK(0,
+        efr32_rtcc_rebase(r, (pos & ~MAKE_64BIT_MASK(0,
                                          EFR32_RTCC_PRECNT_BITS)) |
                                  extract32(next, 0, EFR32_RTCC_PRECNT_BITS));
         break;
@@ -5114,15 +5175,15 @@ static bool efr32_rtcc_write(Efr32Periph *s, uint32_t offset, uint32_t next)
     case EFR32_RTCC_EN:
     case EFR32_RTCC_CFG:
         /* The count so far keeps its value across EN and CFG changes. */
-        efr32_rtcc_rebase(s, pos);
-        efr32_register_put(s, EFR32_RTCC_BASE + offset, next);
+        efr32_rtcc_rebase(r, pos);
+        efr32_rtcc_put(r, offset, next);
         break;
     default:
-        efr32_register_put(s, EFR32_RTCC_BASE + offset, next);
+        efr32_rtcc_put(r, offset, next);
         break;
     }
-    efr32_rtcc_update_irq(s);
-    efr32_rtcc_process(s);
+    efr32_rtcc_update_irq(r);
+    efr32_rtcc_process(r);
     return true;
 }
 
@@ -5140,44 +5201,46 @@ static bool efr32_rtcc_write(Efr32Periph *s, uint32_t offset, uint32_t next)
 static void efr32_rtcc_prs_input(Efr32Periph *s, unsigned channel,
                                  bool rising)
 {
+    Efr32Rtcc *r = &s->rtcc[0];
     uint32_t base = EFR32_RTCC_CC0_CTRL + channel * EFR32_RTCC_CC_STRIDE;
-    uint32_t ctrl = efr32_rtcc_get(s, base);
+    uint32_t ctrl = efr32_rtcc_get(r, base);
     unsigned edge = (ctrl >> EFR32_RTCC_CC_CTRL_ICEDGE_SHIFT) &
                     EFR32_RTCC_CC_CTRL_ICEDGE_MASK;
 
     if ((ctrl & EFR32_RTCC_CC_CTRL_MODE_MASK) !=
             EFR32_RTCC_CC_CTRL_MODE_INPUTCAPTURE ||
-        !(efr32_rtcc_get(s, EFR32_RTCC_EN) & EFR32_RTCC_EN_EN) ||
+        !(efr32_rtcc_get(r, EFR32_RTCC_EN) & EFR32_RTCC_EN_EN) ||
         !(edge == EFR32_TIMER_ICEDGE_BOTH ||
           (edge == EFR32_TIMER_ICEDGE_RISING && rising) ||
           (edge == EFR32_TIMER_ICEDGE_FALLING && !rising))) {
         return;
     }
-    efr32_rtcc_process(s);
-    efr32_register_put(s, EFR32_RTCC_BASE + base + EFR32_RTCC_CC_ICVALUE,
-                       efr32_rtcc_cnt_of(s, efr32_rtcc_pos_at(
-                                                s, s->rtcc_last_edge)));
-    efr32_register_put(s, EFR32_RTCC_BASE + EFR32_RTCC_IF,
-                       efr32_rtcc_get(s, EFR32_RTCC_IF) |
-                           (EFR32_RTCC_IF_CC0 << (channel *
-                                                  EFR32_RTCC_IF_CC_STRIDE)));
-    efr32_rtcc_update_irq(s);
+    efr32_rtcc_process(r);
+    efr32_rtcc_put(r, base + EFR32_RTCC_CC_ICVALUE,
+                   efr32_rtcc_cnt_of(r, efr32_rtcc_pos_at(r, r->last_edge)));
+    efr32_rtcc_put(r, EFR32_RTCC_IF,
+                   efr32_rtcc_get(r, EFR32_RTCC_IF) |
+                       (EFR32_RTCC_IF_CC0 << (channel *
+                                              EFR32_RTCC_IF_CC_STRIDE)));
+    efr32_rtcc_update_irq(r);
 }
 
-static void efr32_rtcc_reset(Efr32Periph *s)
+static void efr32_rtcc_reset(Efr32Rtcc *r)
 {
-    timer_del(s->rtcc_timer);
-    for (unsigned channel = 0; channel < EFR32_RTCC_CC_COUNT; channel++) {
-        s->rtcc_ccv[channel] = false;
-        efr32_prs_level(s, EFR32_PRS_SRC_RTCC, EFR32_PRS_SIG_RTCC_CCV(channel),
-                        false);
+    timer_del(r->timer);
+    for (unsigned channel = 0;
+         channel < efr32_rtcc_inst[r->index].prs_outputs; channel++) {
+        r->ccv[channel] = false;
+        efr32_prs_level(r->owner, efr32_rtcc_inst[r->index].prs_source,
+                        EFR32_PRS_SIG_RTCC_CCV(channel), false);
     }
-    s->rtcc_run = false;
-    s->rtcc_pos_base = 0;
-    s->rtcc_edge_base = 0;
-    s->rtcc_last_edge = 0;
-    efr32_register_put(s, EFR32_CMU_BASE + EFR32_CMU_RTCCCLKCTRL,
-                       EFR32_CMU_RTCCCLKCTRL_RESET);
+    r->run = false;
+    r->pos_base = 0;
+    r->edge_base = 0;
+    r->last_edge = 0;
+    efr32_register_put(r->owner,
+                       EFR32_CMU_BASE + efr32_rtcc_inst[r->index].clkctrl,
+                       efr32_rtcc_inst[r->index].clkctrl_reset);
 }
 
 /*
@@ -5454,8 +5517,11 @@ static void efr32_m33_debug_halted(void *opaque, int n, int level)
     if (efr32_burtc_hz(s)) {
         efr32_burtc_rebase(s, efr32_burtc_edge_at(s, now));
     }
-    efr32_rtcc_process(s);
-    efr32_rtcc_rebase(s, efr32_rtcc_pos_at(s, s->rtcc_last_edge));
+    for (int i = 0; i < EFR32_RTCC_INSTANCES; i++) {
+        efr32_rtcc_process(&s->rtcc[i]);
+        efr32_rtcc_rebase(&s->rtcc[i], efr32_rtcc_pos_at(&s->rtcc[i],
+                                                         s->rtcc[i].last_edge));
+    }
 
     s->m33_debug_halted = level;
 
@@ -5464,7 +5530,9 @@ static void efr32_m33_debug_halted(void *opaque, int n, int level)
         efr32_timer_pwm_update(s, i);
     }
     efr32_burtc_process(s);
-    efr32_rtcc_process(s);
+    for (int i = 0; i < EFR32_RTCC_INSTANCES; i++) {
+        efr32_rtcc_process(&s->rtcc[i]);
+    }
     efr32_wdog_debug_halt(s);
 }
 
@@ -7073,8 +7141,9 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         return;
     }
 
-    if ((register_address & ~0x3fffu) == EFR32_RTCC_BASE &&
-        efr32_rtcc_write(s, register_address & 0xfffu, next)) {
+    if (efr32_rtcc_at(s, register_address) &&
+        efr32_rtcc_write(efr32_rtcc_at(s, register_address),
+                         register_address & 0xfffu, next)) {
         return;
     }
 
@@ -8055,8 +8124,12 @@ static void efr32_periph_init(Object *o)
                                       ClockUpdate);
     s->burtc_timer =
         timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_burtc_timer_expired, s);
-    s->rtcc_timer =
-        timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_rtcc_timer_expired, s);
+    for (unsigned i = 0; i < EFR32_RTCC_INSTANCES; i++) {
+        s->rtcc[i].owner = s;
+        s->rtcc[i].index = i;
+        s->rtcc[i].timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                        efr32_rtcc_timer_expired, &s->rtcc[i]);
+    }
     for (int i = 0; i < EFR32_TIMER_COUNT; i++) {
         s->timers[i].event = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                           efr32_timer_callbacks[i], s);
@@ -8182,7 +8255,9 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     efr32_register_put(s, EFR32_MODEM_BASE + EFR32_MODEM_RAMPLEV,
                        EFR32_MODEM_RAMPLEV_RESET);
     efr32_msc_reset(s);
-    efr32_rtcc_reset(s);
+    for (int i = 0; i < EFR32_RTCC_INSTANCES; i++) {
+        efr32_rtcc_reset(&s->rtcc[i]);
+    }
     memset(s->iadc_fifo, 0, sizeof(s->iadc_fifo));
     timer_del(s->iadc_timer);
     s->iadc_nconv = 0;
@@ -8241,7 +8316,9 @@ static void efr32_periph_finalize(Object *obj)
     g_clear_pointer(&s->rx_frame, g_bytes_unref);
     timer_free(s->rac_tx_timer);
     timer_free(s->burtc_timer);
-    timer_free(s->rtcc_timer);
+    for (int i = 0; i < EFR32_RTCC_INSTANCES; i++) {
+        timer_free(s->rtcc[i].timer);
+    }
     for (int i = 0; i < EFR32_TIMER_COUNT; i++) {
         timer_free(s->timers[i].event);
         timer_free(s->timer_pwm[i]);
