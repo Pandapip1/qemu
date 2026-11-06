@@ -45,6 +45,19 @@ typedef enum Efr32RfTxTrigger {
 #define EFR32_RF_TX_BUFC_CHANNEL 0
 
 /*
+ * The link a frame was sent on, as the transmitter's registers held it at TXEN: MODEM.SYNC0
+ * (the access address), RFCRC.INIT and POLY, FRC.WHITEPOLY and WHITEINIT.  A receiver set up
+ * for another link does not detect the frame or fails its CRC.
+ */
+typedef struct Efr32RfLink {
+    uint32_t sync_word;
+    uint32_t crc_init;
+    uint32_t crc_poly;
+    uint32_t whiten_poly;
+    uint32_t whiten_init;
+} Efr32RfLink;
+
+/*
  * Information known at the hardware-to-medium boundary.  In particular,
  * buffer_channel identifies a BUFC staging channel; it is not an over-the-air
  * Bluetooth channel or a PHY configuration.
@@ -59,6 +72,7 @@ typedef struct Efr32RfTxMetadata {
      * transmitter.  A receiver derives sync and end-of-frame times from it.
      */
     int64_t air_start_ns;
+    Efr32RfLink link;
 } Efr32RfTxMetadata;
 
 typedef struct Efr32RfTxSnapshot Efr32RfTxSnapshot;
@@ -71,8 +85,9 @@ typedef struct Efr32RfTxSnapshot Efr32RfTxSnapshot;
  */
 typedef struct Efr32RfRxMetadata {
     uint8_t buffer_channel;
-    /* The transmitter's Efr32RfTxMetadata.air_start_ns. */
+    /* The transmitter's Efr32RfTxMetadata.air_start_ns and link. */
     int64_t air_start_ns;
+    Efr32RfLink link;
 } Efr32RfRxMetadata;
 
 typedef struct Efr32RfRxDeliveryRequest Efr32RfRxDeliveryRequest;

@@ -294,6 +294,7 @@ unsigned efr32_rf_medium_offer_latest_tx(Efr32RfMedium *medium,
         return 0;
     }
     metadata.air_start_ns = snapshot->metadata.air_start_ns;
+    metadata.link = snapshot->metadata.link;
 
     /*
      * This is deliberately a mailbox, not an RF channel model: it has no
@@ -377,6 +378,7 @@ unsigned efr32_rf_medium_offer_active_tx_to_receiver(Efr32RfMedium *medium,
     }
 
     metadata.air_start_ns = snapshot->metadata.air_start_ns;
+    metadata.link = snapshot->metadata.link;
     data = g_bytes_get_data(efr32_rf_tx_snapshot_get_data(snapshot), &length);
     request = efr32_rf_medium_prepare_rx_delivery(medium, receiver, &metadata,
                                                    data, length, errp);

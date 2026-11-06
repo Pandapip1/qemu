@@ -2146,6 +2146,70 @@ static void test_released_rx_srcchf_follows_channel(void)
     rf_reset_with_clocks();
 }
 
+/*
+ * The link a frame is sent on (owo-open-fw docs/radio-tables.md SS7.64, SS7.91): a receiver
+ * whose MODEM.VTCORRCFG0 is not ror(bitrev(the sender's SYNC0), 1) detects nothing; one with
+ * another RFCRC.INIT receives the frame with its CRC failed.
+ */
+#define MODEM_SYNC0              (MODEM_BASE + 0x068)
+#define MODEM_VTCORRCFG0         (MODEM_BASE + 0x104)
+#define RFCRC_INIT               (0xa8010000 + 0x018)
+#define LINK_AA                  0x204a9612u
+#define LINK_AA_VTCORR           0x2434a902u
+#define LINK_CRC_INIT            0x0019deb8u
+#define RF_NOT_DETECTED          0xffffffffu
+
+static uint32_t rf_receive_on_link(uint32_t rx_vtcorr, uint32_t rx_crc_init)
+{
+    const uint8_t frame[] = { 0x00, 0x0e, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+                              13, 14 };
+    const uint64_t peer_rac = peer(RAC_BASE);
+    const uint64_t peer_rx_channel = peer(BUFC_BASE + BUFC_CH1);
+
+    rf_reset_with_clocks();
+    qtest_writel(global_qtest, SYNTH_BASE + SYNTH_FREQ, SYNTH_FREQ_2426MHZ);
+    qtest_writel(global_qtest, peer(SYNTH_BASE + SYNTH_FREQ), SYNTH_FREQ_2426MHZ);
+    qtest_writel(global_qtest, peer(SYNTH_BASE + SYNTH_IFFREQ),
+                 SYNTH_IFFREQ_BLE_1M);
+    qtest_writel(global_qtest, peer(RAC_BASE + RAC_IFADCTRIM0),
+                 RAC_IFADCTRIM0_BLE_1M);
+    qtest_writel(global_qtest, peer(MODEM_SRCCHF), MODEM_SRCCHF_2426MHZ);
+    qtest_writel(global_qtest, MODEM_SYNC0, LINK_AA);
+    qtest_writel(global_qtest, RFCRC_INIT, LINK_CRC_INIT);
+    qtest_writel(global_qtest, peer(MODEM_VTCORRCFG0), rx_vtcorr);
+    qtest_writel(global_qtest, peer(RFCRC_INIT), rx_crc_init);
+    rf_release_sequencer(peer_rac, peer(SYNTH_BASE));
+    qtest_writel(global_qtest, peer(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW),
+                 FRC_IF_RXDONE | FRC_IF_TXDONE);
+    qtest_writel(global_qtest, peer(FRC_BASE + FRC_TRAILRXDATA),
+                 FRC_TRAILRXDATA_CRCOK);
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_CMD, 1);
+    qtest_writel(global_qtest, peer_rx_channel, 0);
+    rf_start_rx(peer_rac);
+    rf_ack(peer_rac, RAC_STATE_RXSEARCH);
+
+    rf_stage_tx(BUFC_BASE + BUFC_CH0, frame, sizeof(frame));
+    qtest_writel(global_qtest, RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+    rf_step(MODEL_RX_EOF_NS(sizeof(frame)) + MODEL_RX_DETECT_NS);
+    if (!(qtest_readl(global_qtest, peer(FRC_BASE + FRC_IF)) & FRC_IF_RXDONE)) {
+        g_assert_cmpuint(rf_state(peer_rac), ==, RAC_STATE_RXSEARCH);
+        return RF_NOT_DETECTED;
+    }
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_READOFFSET, sizeof(frame));
+    return qtest_readl(global_qtest, peer_rx_channel + BUFC_READDATA);
+}
+
+static void test_released_rx_follows_link(void)
+{
+    g_assert_cmphex(rf_receive_on_link(LINK_AA_VTCORR, LINK_CRC_INIT), ==,
+                    FRC_TRAILER_CRCOK);
+    g_assert_cmphex(rf_receive_on_link(~LINK_AA_VTCORR, LINK_CRC_INIT), ==,
+                    RF_NOT_DETECTED);
+    g_assert_cmphex(rf_receive_on_link(LINK_AA_VTCORR, 0x00aaaaaau) &
+                    FRC_TRAILER_CRCOK, ==, 0);
+    rf_reset_with_clocks();
+}
+
 /* Deliver one legacy-source frame to a released receiver in RXSEARCH. */
 static void rf_offer_frame_to_released_peer(void)
 {
@@ -2604,6 +2668,8 @@ int main(int argc, char **argv)
                    test_prs_radio_probe_routes);
     qtest_add_func("/efr32bg22/rf/released-rx-srcchf-follows-channel",
                    test_released_rx_srcchf_follows_channel);
+    qtest_add_func("/efr32bg22/rf/released-rx-follows-link",
+                   test_released_rx_follows_link);
     qtest_add_func("/efr32bg22/rf/released-rx-fifo-overflow",
                    test_released_rx_fifo_overflow);
     qtest_add_func("/efr32bg22/rf/released-rx-frame-disables",

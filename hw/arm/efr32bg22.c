@@ -994,6 +994,8 @@ struct Efr32Periph
     bool rx_disable_requested;
     /* EOF has passed; rac_frame_timer next fires for the RXFRAME exit. */
     bool rx_frame_ended;
+    /* The frame being received was sent with another CRC or whitening: its CRC fails. */
+    bool rx_link_crc_fails;
     /* A frame-driven exit waiting for the current state's own event. */
     bool rac_transition_held;
     uint32_t rac_held_state;
@@ -2150,7 +2152,8 @@ static void efr32_rac_rx_frame_end(void *opaque)
     if (efr32_register_get(s, EFR32_FRC_BASE + EFR32_FRC_TRAILRXDATA) &
         EFR32_FRC_TRAILRXDATA_CRCOK) {
         efr32_bufc_write_data_port(s, EFR32_RF_RX_BUFC_CHANNEL,
-                                   efr32_rx_demod_rate_drift_fails(s, length)
+                                   (efr32_rx_demod_rate_drift_fails(s, length) ||
+                                    s->rx_link_crc_fails)
                                        ? 0 : EFR32_FRC_TRAILER_CRCOK,
                                    false);
     }
@@ -2270,6 +2273,56 @@ static bool efr32_rx_chain_powered(Efr32Periph *s)
             EFR32_RAC_IFADCDBG_IFADCENCLK);
 }
 
+/*
+ * The link registers a frame carries (Efr32RfLink).  The receiver's Viterbi correlator matches
+ * MODEM.VTCORRCFG0 against the access address in on-air bit order rotated right by one,
+ * ror(bitrev(SYNC0), 1); with the PHY table's complement of that pattern silicon never
+ * detected a frame (owo-open-fw docs/radio-tables.md SS7.64), and a Central sending with the
+ * table's SYNC0, CRC init and whitening was never answered (SS7.91).  [I] A pattern within
+ * VTCORRCFG1.EXPECTHT bits of the frame's is detected; the CRC fails when CRC init, polynomial
+ * or whitening differ.
+ */
+#define EFR32_MODEM_SYNC0 0x068u
+#define EFR32_MODEM_VTCORRCFG0 0x104u
+#define EFR32_MODEM_VTCORRCFG1 0x110u
+#define EFR32_MODEM_VTCORRCFG1_EXPECTHT_SHIFT 27
+#define EFR32_MODEM_VTCORRCFG1_EXPECTHT_MASK 0xfu
+#define EFR32_RFCRC_POLY 0x020u
+#define EFR32_FRC_WHITEPOLY 0x034u
+#define EFR32_FRC_WHITEINIT 0x038u
+
+static Efr32RfLink efr32_rf_link(Efr32Periph *s)
+{
+    return (Efr32RfLink){
+        .sync_word = efr32_register_get(s, EFR32_MODEM_BASE + EFR32_MODEM_SYNC0),
+        .crc_init = efr32_register_get(s, EFR32_RFCRC_BASE + EFR32_RFCRC_INIT),
+        .crc_poly = efr32_register_get(s, EFR32_RFCRC_BASE + EFR32_RFCRC_POLY),
+        .whiten_poly = efr32_register_get(s, EFR32_FRC_BASE + EFR32_FRC_WHITEPOLY),
+        .whiten_init = efr32_register_get(s, EFR32_FRC_BASE + EFR32_FRC_WHITEINIT),
+    };
+}
+
+static bool efr32_rx_detects_sync(Efr32Periph *s, uint32_t sync_word)
+{
+    uint32_t pattern = revbit32(sync_word);
+    uint32_t expected = (pattern >> 1) | (pattern << 31);
+    uint32_t threshold = (efr32_register_get(s, EFR32_MODEM_BASE + EFR32_MODEM_VTCORRCFG1) >>
+                          EFR32_MODEM_VTCORRCFG1_EXPECTHT_SHIFT) &
+                         EFR32_MODEM_VTCORRCFG1_EXPECTHT_MASK;
+
+    return ctpop32(expected ^ efr32_register_get(s, EFR32_MODEM_BASE +
+                                                     EFR32_MODEM_VTCORRCFG0)) <=
+           threshold;
+}
+
+static bool efr32_rx_link_crc_fails(Efr32Periph *s, const Efr32RfLink *tx)
+{
+    Efr32RfLink rx = efr32_rf_link(s);
+
+    return rx.crc_init != tx->crc_init || rx.crc_poly != tx->crc_poly ||
+           rx.whiten_poly != tx->whiten_poly || rx.whiten_init != tx->whiten_init;
+}
+
 static void efr32_rac_rx_handoff(void *opaque)
 {
     Efr32Periph *s = EFR32_PERIPH(opaque);
@@ -2302,11 +2355,16 @@ static void efr32_rac_rx_handoff(void *opaque)
                                 &length);
         s->rx_offer_pending = efr32_rf_medium_has_rx_offer_for_radio(
             s->rf_medium, EFR32_RF_RADIO(s));
-        if (!efr32_rx_chain_powered(s)) {
-            /* Searching with the receive chain off detects nothing. */
+        if (!efr32_rx_chain_powered(s) ||
+            !efr32_rx_detects_sync(s, metadata->link.sync_word)) {
+            /*
+             * Searching with the receive chain off, or for another access
+             * address, detects nothing.
+             */
             efr32_rf_rx_delivery_request_free(request);
             return;
         }
+        s->rx_link_crc_fails = efr32_rx_link_crc_fails(s, &metadata->link);
         /*
          * TODO(per-channel receive): on silicon the open image's receive is
          * channel-dependent -- CRC-ok ch37 77 %, ch38 1 %, ch39 0 %, frames
@@ -2894,6 +2952,7 @@ static void efr32_rac_capture_tx_snapshot(Efr32Periph *s)
         .trigger = EFR32_RF_TX_TRIGGER_RAC_CMD_TXEN,
         .buffer_channel = EFR32_RF_TX_BUFC_CHANNEL,
         .channel = efr32_rf_channel(s),
+        .link = efr32_rf_link(s),
     };
     GByteArray *data = efr32_bufc_snapshot_data(
         s, EFR32_RF_TX_BUFC_CHANNEL);
