@@ -28,7 +28,7 @@ static void test_efr32_rf_radio_rx_offer_available(Efr32RfRadio *radio)
     ((TestEfr32RfRadio *)radio)->rx_offer_notifications++;
 }
 
-static uint8_t test_efr32_rf_radio_get_channel(Efr32RfRadio *radio)
+static uint16_t test_efr32_rf_radio_get_channel(Efr32RfRadio *radio)
 {
     return ((TestEfr32RfRadio *)radio)->channel;
 }
