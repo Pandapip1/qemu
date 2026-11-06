@@ -67,30 +67,38 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_SYNTH_BASE 0xa8018000u
 #define EFR32_SYNTH_CHCTRL 0x040u
 #define EFR32_SYNTH_CHSP 0x044u
-#define EFR32_SYNTH_CHSP_CHSP_MASK 0x3fu
+#define EFR32_SYNTH_CHSP_CHSP_MASK 0x3ffffu
+#define EFR32_SYNTH_CHCTRL_CHNO_MASK 0x3fu
+#define EFR32_SYNTH_CALOFFSET 0x048u
+#define EFR32_SYNTH_CALOFFSET_MASK 0x7fffu
+#define EFR32_SYNTH_CALOFFSET_SIGN 0x4000u
 /*
  * The carrier.  SYNTH.FREQ is in units of f_HFXO / 2^19: the three words
  * captured on silicon for the advertising channels are round(f * 2^19 /
  * 38.4 MHz) exactly (owo-open-fw docs/radio-tables.md SS7.80), and stock
- * leaves CHCTRL zero.  [I] CHCTRL x CHSP (the public "channel" and "channel
- * spacing" fields) adds to FREQ in the same units; it is zero in every
- * observed configuration.  The medium compares 2 MHz channel indices from
- * 2402 MHz.
+ * leaves CHCTRL zero.  CHCTRL.CHNO x CHSP (6 and 18 bits, public field
+ * widths) and CALOFFSET (15-bit two's complement) add to FREQ in the same
+ * units: measured on silicon from the LO count, CHNO 1..3 x CHSP 13653 moved
+ * the LO by 1.00 MHz per channel and CALOFFSET 0x1000 / 0x4000 / 0x7fff by
+ * +300 kHz / -1.2 MHz / 0 (SS7.90).
  */
 #define EFR32_SYNTH_FREQ 0x034u
 #define EFR32_SYNTH_FREQ_MASK 0x0fffffffu
 #define EFR32_SYNTH_FREQ_FRACTION_BITS 19
-#define EFR32_RF_RASTER0_HZ 2290000000ull
+#define EFR32_RF_RASTER0_HZ EFR32_SYNTH_LOCK_MIN_HZ
 #define EFR32_RF_RASTER_HZ 1000000ull
 /*
- * Carriers the synthesizer calibrates and locks to (owo-open-fw docs/radio-tables.md SS7.85,
- * measured on a BGM220P): the VCO calibration converged at every 5 MHz step from 2290 to
- * 2500 MHz (receive), and SYNTH.STATUS.INLOCK held throughout transmissions at 2304, 2395 and
- * 2445 MHz. Beyond the probed range nothing was measured, and the model reaches nothing
- * there (the datasheet specifies 2400-2483.5 MHz, Table 4.5 FRANGE).
+ * Carriers the synthesizer calibrates and locks to (owo-open-fw docs/radio-tables.md SS7.90,
+ * measured on a BGM220P, receive only): with the sequencer's calibration (VCOTUNING.VCAPSEL
+ * 16) the LO count read the programmed LO within one count (4.7 kHz) for every carrier from
+ * 2158 to 2644 MHz in 2 MHz steps; at 2156 and 2646 MHz the calibration code sat at its end
+ * (2047, 0) and the LO stopped short (pinned near 2156.5 and 2647.6 MHz LO). VCAPSEL 31 and
+ * 0 move the range to 2134-2596 and 2192-2702 MHz; the open sequencer always uses 16.
+ * Transmit lock was checked at 2304, 2395 and 2445 MHz only (SS7.85). Beyond the range the
+ * model reaches nothing (the datasheet specifies 2400-2483.5 MHz, Table 4.5 FRANGE).
  */
-#define EFR32_SYNTH_LOCK_MIN_HZ 2290000000ull
-#define EFR32_SYNTH_LOCK_MAX_HZ 2500000000ull
+#define EFR32_SYNTH_LOCK_MIN_HZ 2158000000ull
+#define EFR32_SYNTH_LOCK_MAX_HZ 2644000000ull
 /*
  * The frame path needs a running synthesizer (owo-open-fw
  * docs/radio-tables.md SS7.60/SS7.61, measured on silicon): with RAC.SYEN
@@ -951,6 +959,21 @@ struct Efr32Periph
     int64_t synth_lock_ns;
     /* SYNTH.LOCNTSTATUS.BUSY until this time (LOCNTCTRL.RUN). */
     int64_t locnt_busy_until_ns;
+    /* A LO count running or ended but not yet read (efr32_synth_locnt_run). */
+    bool locnt_pending;
+    /* The count counts: the synthesizer stopped, or LOCNTCTRL.FCALRUNCLKEN. */
+    bool locnt_counts;
+    /* LO cycles of the running count up to locnt_acc_ns. */
+    double locnt_acc_cycles;
+    int64_t locnt_acc_ns;
+    /* The count's start and its exact length, 2^(NUMCYCLE + 1) HFXO periods. */
+    int64_t locnt_run_ns;
+    double locnt_window_s;
+    /* The closed-loop LO trajectory (efr32_synth_lo_closed_hz). */
+    double lo_from_hz;
+    double lo_to_hz;
+    int64_t lo_change_ns;
+    bool lo_tx_loop;
     /* A latched TX request: RAC.STATUS.TXENS. */
     bool tx_requested;
     /* RXDIS seen in RXSEARCH, applied once STATERXSEARCH is clear. */
@@ -2416,37 +2439,365 @@ static uint32_t efr32_frc_dynamic_length_wcntcmp0(const uint8_t *bytes,
     return field + minlength;
 }
 
-/* The programmed carrier in Hz (see EFR32_SYNTH_FREQ). */
+/* The programmed carrier in SYNTH.FREQ units (see EFR32_SYNTH_FREQ). */
+static uint64_t efr32_rf_carrier_word(Efr32Periph *s)
+{
+    uint32_t caloffset = efr32_register_get(s, EFR32_SYNTH_BASE + EFR32_SYNTH_CALOFFSET) &
+                         EFR32_SYNTH_CALOFFSET_MASK;
+    int64_t offset = (caloffset & EFR32_SYNTH_CALOFFSET_SIGN)
+                         ? (int64_t)caloffset - (int64_t)(EFR32_SYNTH_CALOFFSET_SIGN << 1)
+                         : (int64_t)caloffset;
+
+    return (uint64_t)((int64_t)(efr32_register_get(s, EFR32_SYNTH_BASE + EFR32_SYNTH_FREQ) &
+                                EFR32_SYNTH_FREQ_MASK) +
+                      (int64_t)(efr32_register_get(s, EFR32_SYNTH_BASE + EFR32_SYNTH_CHCTRL) &
+                                EFR32_SYNTH_CHCTRL_CHNO_MASK) *
+                          (efr32_register_get(s, EFR32_SYNTH_BASE + EFR32_SYNTH_CHSP) &
+                           EFR32_SYNTH_CHSP_CHSP_MASK) +
+                      offset);
+}
+
+/* The programmed carrier in Hz. */
 static uint64_t efr32_rf_carrier_hz(Efr32Periph *s)
 {
-    uint64_t word = (efr32_register_get(s, EFR32_SYNTH_BASE + EFR32_SYNTH_FREQ) &
-                     EFR32_SYNTH_FREQ_MASK) +
-                    (uint64_t)efr32_register_get(s, EFR32_SYNTH_BASE +
-                                                 EFR32_SYNTH_CHCTRL) *
-                        (efr32_register_get(s, EFR32_SYNTH_BASE +
-                                            EFR32_SYNTH_CHSP) &
-                         EFR32_SYNTH_CHSP_CHSP_MASK);
+    uint64_t word = efr32_rf_carrier_word(s);
 
     return (word * EFR32_HFXO_HZ + (1ull << (EFR32_SYNTH_FREQ_FRACTION_BITS - 1)))
            >> EFR32_SYNTH_FREQ_FRACTION_BITS;
 }
 
-/* Whether the synthesizer reaches @p hz (EFR32_SYNTH_LOCK_MIN_HZ..MAX_HZ). */
+/*
+ * Whether the synthesizer reaches @p hz (EFR32_SYNTH_LOCK_MIN_HZ..MAX_HZ), compared to the kHz: a
+ * programmed carrier is off by up to half a SYNTH.FREQ unit (37 Hz).
+ */
+#define EFR32_HZ_PER_KHZ 1000u
+
 static bool efr32_synth_in_range(uint64_t hz)
 {
-    return hz >= EFR32_SYNTH_LOCK_MIN_HZ && hz <= EFR32_SYNTH_LOCK_MAX_HZ;
+    uint64_t khz = (hz + EFR32_HZ_PER_KHZ / 2) / EFR32_HZ_PER_KHZ;
+
+    return khz >= EFR32_SYNTH_LOCK_MIN_HZ / EFR32_HZ_PER_KHZ &&
+           khz <= EFR32_SYNTH_LOCK_MAX_HZ / EFR32_HZ_PER_KHZ;
+}
+
+/*
+ * The LO in time and the LO counter (owo-open-fw docs/radio-tables.md SS7.90, measured on a
+ * BGM220P with the counter itself, receive only).
+ *
+ * LO counter: after LOCNTCTRL.RUN, LOCNTSTATUS.LOCOUNT (19 bits) holds the LO cycles in
+ * 2^(NUMCYCLE + 1) HFXO periods; NUMCYCLE saturates at 12 (13-15 read and last as 12). With the
+ * synthesizer running it counts only with LOCNTCTRL.FCALRUNCLKEN (0 without); stopped, in the
+ * calibration state, it counts the open-loop VCO. LOCNTTARGET there is the programmed LO's
+ * count for the NUMCYCLE of the last RUN; CAPCALSTART and CLEAR set the NUMCYCLE-0 value.
+ * [I] Outside calibration TARGET holds (silicon read the NUMCYCLE-5 value after a calibrated
+ * start, not modelled). [I] The count is rounded to the nearest cycle.
+ *
+ * Open-loop VCO, VCAPSEL 16: the codes the silicon calibration chose for 83 LOs from 2166.7 to
+ * 2630.7 MHz, and LO counts at codes 0 and 2047; other VCAPSELs: open-loop counts at codes 0,
+ * 1024 and 2047. [I] Linear in between (the top code bit's own step, 14 MHz between codes 960
+ * and 1024, falls between two calibrated LOs).
+ *
+ * Closed loop, a changed carrier (FREQ, CHCTRL, CHSP, CALOFFSET, IFFREQ, IF mode): a second-
+ * order step fitted to staggered NUMCYCLE-3 counts of 1 and 4 MHz steps up and down (n = 240
+ * windows each loop, rms 0.09 / 0.08 of the step): receive loop zeta 0.45, f_n 196 kHz
+ * (overshoot 20 %, settled to 2 % in about 7 us); with the loop configured for TX
+ * (RAC.SYNTHENCTRL.LPFBWSEL) zeta 0.46, f_n 683 kHz. Steps beyond the fast range (+9.9 /
+ * -11.6 MHz from where the LO was, at 2399.7 MHz) reach it at once and cover the rest at
+ * 10.6 MHz/ms ([I] mean of +24 MHz, -24 MHz and back; silicon moves in uneven stages). After
+ * SYNTHSTART the LO starts from the open-loop VCO at the calibrated code.
+ */
+#define EFR32_SYNTH_VCOTUNING 0x04cu
+#define EFR32_SYNTH_VCOTUNING_CODE_MASK 0x7ffu
+#define EFR32_SYNTH_VCOTUNING_VCAPSEL_SHIFT 11
+#define EFR32_SYNTH_VCOTUNING_VCAPSEL_MASK 0x1fu
+#define EFR32_SYNTH_CMD_CAPCALSTART (1u << 4)
+#define EFR32_SYNTH_LOCNTCTRL_CLEAR (1u << 1)
+#define EFR32_SYNTH_LOCNTCTRL_FCALRUNCLKEN (1u << 11)
+#define EFR32_SYNTH_LOCNT_NUMCYCLE_MAX 12u
+#define EFR32_SYNTH_LOCOUNT_MASK 0x7ffffu
+#define EFR32_RAC_SYNTHENCTRL 0x094u
+#define EFR32_RAC_SYNTHENCTRL_LPFBWSEL (1u << 20)
+
+/*
+ * VCAPSEL 16, open loop: VCOTUNING code against frequency in kHz. Codes 1-2044: the code the
+ * silicon calibration chose for an LO 2 or 10 MHz apart (the open-loop VCO at that code is at or
+ * just above that LO); codes 0 and 2047: LO counts of the open-loop VCO.
+ */
+#define EFR32_VCO_COUNT8_PERIODS 512u
+static const struct {
+    uint16_t code;
+    uint32_t khz;
+} efr32_vco_vcapsel16[] = {
+    { 0, 2631300 }, { 1, 2630700 }, { 4, 2628700 }, { 10, 2626700 }, { 13, 2624700 },
+    { 19, 2622700 }, { 25, 2620700 }, { 28, 2618700 }, { 36, 2616700 }, { 42, 2614700 },
+    { 45, 2612700 }, { 52, 2610700 }, { 57, 2608700 }, { 68, 2606700 }, { 74, 2604700 },
+    { 80, 2602700 }, { 83, 2600700 }, { 86, 2598700 }, { 92, 2596700 }, { 100, 2594700 },
+    { 105, 2592700 }, { 113, 2590700 }, { 116, 2588700 }, { 131, 2586700 }, { 137, 2584700 },
+    { 141, 2582700 }, { 146, 2580700 }, { 173, 2570700 }, { 209, 2560700 }, { 235, 2550700 },
+    { 285, 2540700 }, { 322, 2530700 }, { 353, 2520700 }, { 379, 2510700 }, { 420, 2500700 },
+    { 453, 2490700 }, { 485, 2480700 }, { 555, 2470700 }, { 589, 2460700 }, { 621, 2450700 },
+    { 665, 2440700 }, { 697, 2430700 }, { 733, 2420700 }, { 790, 2410700 }, { 824, 2400700 },
+    { 861, 2390700 }, { 908, 2380700 }, { 1061, 2370700 }, { 1102, 2360700 }, { 1138, 2350700 },
+    { 1185, 2340700 }, { 1226, 2330700 }, { 1286, 2320700 }, { 1322, 2310700 }, { 1366, 2300700 },
+    { 1416, 2290700 }, { 1453, 2280700 }, { 1498, 2270700 }, { 1580, 2260700 }, { 1624, 2250700 },
+    { 1674, 2240700 }, { 1716, 2230700 }, { 1768, 2220700 }, { 1830, 2210700 }, { 1881, 2200700 },
+    { 1885, 2198700 }, { 1896, 2196700 }, { 1907, 2194700 }, { 1924, 2192700 }, { 1932, 2190700 },
+    { 1941, 2188700 }, { 1948, 2186700 }, { 1958, 2184700 }, { 1970, 2182700 }, { 1977, 2180700 },
+    { 1990, 2178700 }, { 2002, 2176700 }, { 2007, 2174700 }, { 2020, 2172700 }, { 2032, 2170700 },
+    { 2037, 2168700 }, { 2044, 2166700 }, { 2047, 2165700 },
+};
+/* Counts of NUMCYCLE 8 at VCOTUNING 0, 1024 and 2047 for each VCAPSEL measured. */
+static const uint8_t efr32_vco_vcapsels[] = { 0, 8, 16, 24, 31 };
+static const uint16_t efr32_vco_codes[] = { 0, 1024, 2047 };
+static const uint16_t efr32_vco_count8_by_vcapsel[][3] = {
+    { 35905, 32360, 29329 },
+    { 35470, 32047, 29089 },
+    { 35084, 31765, 28876 },
+    { 34753, 31514, 28687 },
+    { 34489, 31313, 28538 },
+};
+#define EFR32_VCO_VCAPSEL_REFERENCE_ROW 2u
+/*
+ * Where the closed-loop LO stops when the carrier is beyond the VCO (the calibration code at
+ * 2047 or 0): LO counts with VCAPSEL 0, 16 and 31 pinned at 2189.34 / 2703.76, 2156.47 /
+ * 2647.57 and 2134.12 / 2600.92 MHz for every carrier past them (2 MHz steps, 400 us after the
+ * calibration). [I] Linear in VCAPSEL in between.
+ */
+static const uint8_t efr32_vco_limit_vcapsels[] = { 0, 16, 31 };
+static const double efr32_vco_limit_low_hz[] = { 2189.34e6, 2156.47e6, 2134.12e6 };
+static const double efr32_vco_limit_high_hz[] = { 2703.76e6, 2647.57e6, 2600.92e6 };
+
+#define EFR32_LO_RX_ZETA 0.45
+#define EFR32_LO_RX_FN_HZ 196000.0
+#define EFR32_LO_TX_ZETA 0.46
+#define EFR32_LO_TX_FN_HZ 683000.0
+#define EFR32_LO_FAST_UP_HZ 9.9e6
+#define EFR32_LO_FAST_DOWN_HZ 11.6e6
+#define EFR32_LO_SLEW_HZ_PER_S 10.6e9
+/* Past this the second-order part is below 1e-9 of the step. */
+#define EFR32_LO_SETTLE_NS 60000
+#define EFR32_LO_INTEGRATION_STEP_NS 25
+
+static double efr32_lerp(double x0, double y0, double x1, double y1, double x)
+{
+    return x1 == x0 ? y0 : y0 + (y1 - y0) * (x - x0) / (x1 - x0);
+}
+
+/* Open-loop VCO frequency at @p vcotuning (code and VCAPSEL). */
+static double efr32_vco_open_hz(uint32_t vcotuning)
+{
+    uint32_t code = vcotuning & EFR32_SYNTH_VCOTUNING_CODE_MASK;
+    uint32_t vcapsel = (vcotuning >> EFR32_SYNTH_VCOTUNING_VCAPSEL_SHIFT) &
+                       EFR32_SYNTH_VCOTUNING_VCAPSEL_MASK;
+    size_t i = 0;
+    double count;
+    double delta[G_N_ELEMENTS(efr32_vco_codes)];
+    size_t v = 0;
+
+    while (i + 2 < G_N_ELEMENTS(efr32_vco_vcapsel16) && code > efr32_vco_vcapsel16[i + 1].code) {
+        i++;
+    }
+    count = efr32_lerp(efr32_vco_vcapsel16[i].code, efr32_vco_vcapsel16[i].khz,
+                       efr32_vco_vcapsel16[i + 1].code, efr32_vco_vcapsel16[i + 1].khz, code) *
+            EFR32_HZ_PER_KHZ * EFR32_VCO_COUNT8_PERIODS / (double)EFR32_HFXO_HZ;
+    while (v + 2 < G_N_ELEMENTS(efr32_vco_vcapsels) && vcapsel > efr32_vco_vcapsels[v + 1]) {
+        v++;
+    }
+    for (size_t j = 0; j < G_N_ELEMENTS(efr32_vco_codes); j++) {
+        delta[j] = efr32_lerp(efr32_vco_vcapsels[v], efr32_vco_count8_by_vcapsel[v][j],
+                              efr32_vco_vcapsels[v + 1], efr32_vco_count8_by_vcapsel[v + 1][j],
+                              vcapsel) -
+                   efr32_vco_count8_by_vcapsel[EFR32_VCO_VCAPSEL_REFERENCE_ROW][j];
+    }
+    count += code < efr32_vco_codes[1]
+                 ? efr32_lerp(efr32_vco_codes[0], delta[0], efr32_vco_codes[1], delta[1], code)
+                 : efr32_lerp(efr32_vco_codes[1], delta[1], efr32_vco_codes[2], delta[2], code);
+    return count * (double)EFR32_HFXO_HZ / EFR32_VCO_COUNT8_PERIODS;
+}
+
+/* The closed-loop LO range at the current VCAPSEL. */
+static void efr32_vco_limits_hz(Efr32Periph *s, double *low, double *high)
+{
+    uint32_t vcapsel = (efr32_register_get(s, EFR32_SYNTH_BASE + EFR32_SYNTH_VCOTUNING) >>
+                        EFR32_SYNTH_VCOTUNING_VCAPSEL_SHIFT) &
+                       EFR32_SYNTH_VCOTUNING_VCAPSEL_MASK;
+    size_t i = vcapsel > efr32_vco_limit_vcapsels[1] ? 1 : 0;
+
+    *low = efr32_lerp(efr32_vco_limit_vcapsels[i], efr32_vco_limit_low_hz[i],
+                      efr32_vco_limit_vcapsels[i + 1], efr32_vco_limit_low_hz[i + 1], vcapsel);
+    *high = efr32_lerp(efr32_vco_limit_vcapsels[i], efr32_vco_limit_high_hz[i],
+                       efr32_vco_limit_vcapsels[i + 1], efr32_vco_limit_high_hz[i + 1], vcapsel);
+}
+
+/* The LO the loop is steered to: the carrier, plus the IF on the high side while receiving. */
+static double efr32_synth_target_lo_hz(Efr32Periph *s)
+{
+    uint32_t iffreq_reg = efr32_register_get(s, EFR32_SYNTH_BASE + EFR32_SYNTH_IFFREQ);
+    double lo = (double)efr32_rf_carrier_word(s);
+
+    if (s->synth_if_enabled) {
+        double iffreq = iffreq_reg & EFR32_SYNTH_IFFREQ_IFFREQ_MASK;
+
+        lo += (iffreq_reg & EFR32_SYNTH_IFFREQ_LOSIDE) ? iffreq : -iffreq;
+    }
+    return lo * (double)EFR32_HFXO_HZ / (double)(1u << EFR32_SYNTH_FREQ_FRACTION_BITS);
+}
+
+/* The closed-loop LO at virtual time @p ns on the current trajectory. */
+static double efr32_synth_lo_closed_hz(Efr32Periph *s, int64_t ns)
+{
+    double tau = (double)MAX(ns - s->lo_change_ns, 0) / NANOSECONDS_PER_SECOND;
+    double zeta = s->lo_tx_loop ? EFR32_LO_TX_ZETA : EFR32_LO_RX_ZETA;
+    double wn = 2.0 * M_PI * (s->lo_tx_loop ? EFR32_LO_TX_FN_HZ : EFR32_LO_RX_FN_HZ);
+    double wd = wn * sqrt(1.0 - zeta * zeta);
+    double fast = MIN(MAX(s->lo_to_hz - s->lo_from_hz, -EFR32_LO_FAST_DOWN_HZ),
+                      EFR32_LO_FAST_UP_HZ);
+    double goal = s->lo_from_hz + fast;
+    double rest = s->lo_to_hz - goal;
+    double h = exp(-zeta * wn * tau) *
+               (cos(wd * tau) + zeta / sqrt(1.0 - zeta * zeta) * sin(wd * tau));
+    double lo = goal + (s->lo_from_hz - goal) * h;
+
+    if (rest != 0.0) {
+        lo += copysign(MIN(fabs(rest), EFR32_LO_SLEW_HZ_PER_S * tau), rest);
+    }
+    return lo;
+}
+
+/* The LO at virtual time @p ns: the open-loop VCO while the synthesizer is stopped. */
+static double efr32_synth_lo_hz(Efr32Periph *s, int64_t ns)
+{
+    if (!s->synth_running) {
+        return efr32_vco_open_hz(efr32_register_get(s, EFR32_SYNTH_BASE +
+                                                       EFR32_SYNTH_VCOTUNING));
+    }
+    return efr32_synth_lo_closed_hz(s, ns);
+}
+
+/* LO cycles from @p from_ns to @p to_ns on the current trajectory. */
+static double efr32_synth_lo_cycles(Efr32Periph *s, int64_t from_ns, int64_t to_ns)
+{
+    double rest = fabs(s->lo_to_hz - s->lo_from_hz) -
+                  (s->lo_to_hz > s->lo_from_hz ? EFR32_LO_FAST_UP_HZ : EFR32_LO_FAST_DOWN_HZ);
+    int64_t settled_ns = s->lo_change_ns + EFR32_LO_SETTLE_NS +
+                         (rest > 0 ? (int64_t)(rest / EFR32_LO_SLEW_HZ_PER_S *
+                                               NANOSECONDS_PER_SECOND) : 0);
+    double cycles = 0.0;
+    int64_t t = from_ns;
+
+    if (!s->synth_running) {
+        return efr32_synth_lo_hz(s, from_ns) * (double)(to_ns - from_ns) /
+               NANOSECONDS_PER_SECOND;
+    }
+    while (t < MIN(to_ns, settled_ns)) {
+        int64_t dt = MIN((int64_t)EFR32_LO_INTEGRATION_STEP_NS, MIN(to_ns, settled_ns) - t);
+
+        cycles += efr32_synth_lo_hz(s, t + dt / 2) * (double)dt / NANOSECONDS_PER_SECOND;
+        t += dt;
+    }
+    if (t < to_ns) {
+        cycles += s->lo_to_hz * (double)(to_ns - t) / NANOSECONDS_PER_SECOND;
+    }
+    return cycles;
+}
+
+/* A LO count in progress takes the trajectory so far before the trajectory changes. */
+static void efr32_synth_locnt_accumulate(Efr32Periph *s, int64_t now)
+{
+    if (s->locnt_pending && now > s->locnt_acc_ns) {
+        int64_t until = MIN(now, s->locnt_busy_until_ns);
+
+        if (until > s->locnt_acc_ns) {
+            s->locnt_acc_cycles += efr32_synth_lo_cycles(s, s->locnt_acc_ns, until);
+            s->locnt_acc_ns = until;
+        }
+    }
+}
+
+/* The carrier, IF mode, loop configuration or run state changed: steer the LO from where it is. */
+static void efr32_synth_retarget(Efr32Periph *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    double low, high;
+
+    efr32_synth_locnt_accumulate(s, now);
+    s->lo_from_hz = efr32_synth_lo_hz(s, now);
+    efr32_vco_limits_hz(s, &low, &high);
+    s->lo_to_hz = MIN(MAX(efr32_synth_target_lo_hz(s), low), high);
+    s->lo_change_ns = now;
+    s->lo_tx_loop = (efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_SYNTHENCTRL) &
+                     EFR32_RAC_SYNTHENCTRL_LPFBWSEL) != 0;
+}
+
+/* The programmed LO's count for NUMCYCLE @p numcycle (LOCNTTARGET). */
+static uint32_t efr32_synth_locnt_target(Efr32Periph *s, unsigned numcycle)
+{
+    return (uint32_t)lround(efr32_synth_target_lo_hz(s) *
+                            (double)(2u << MIN(numcycle, EFR32_SYNTH_LOCNT_NUMCYCLE_MAX)) /
+                            (double)EFR32_HFXO_HZ) &
+           EFR32_SYNTH_LOCOUNT_MASK;
+}
+
+/* LOCNTCTRL.RUN: a count of 2^(NUMCYCLE + 1) HFXO periods from now. */
+static void efr32_synth_locnt_run(Efr32Periph *s, uint32_t locntctrl)
+{
+    unsigned numcycle = MIN((locntctrl & EFR32_SYNTH_LOCNTCTRL_NUMCYCLE_MASK) >>
+                                EFR32_SYNTH_LOCNTCTRL_NUMCYCLE_SHIFT,
+                            EFR32_SYNTH_LOCNT_NUMCYCLE_MAX);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    s->locnt_busy_until_ns = now + (int64_t)((2ull << numcycle) * NANOSECONDS_PER_SECOND /
+                                             EFR32_HFXO_HZ);
+    s->locnt_pending = true;
+    s->locnt_counts = !s->synth_running || (locntctrl & EFR32_SYNTH_LOCNTCTRL_FCALRUNCLKEN);
+    s->locnt_acc_cycles = 0.0;
+    s->locnt_acc_ns = now;
+    s->locnt_run_ns = now;
+    s->locnt_window_s = (double)(2ull << numcycle) / (double)EFR32_HFXO_HZ;
+    if (!s->synth_running) {
+        efr32_register_put(s, EFR32_SYNTH_BASE + EFR32_SYNTH_LOCNTTARGET,
+                           efr32_synth_locnt_target(s, numcycle));
+    }
+}
+
+/* LOCNTSTATUS.LOCOUNT once the count has ended. */
+static void efr32_synth_locnt_complete(Efr32Periph *s, int64_t now)
+{
+    double cycles;
+
+    if (!s->locnt_pending || now < s->locnt_busy_until_ns) {
+        return;
+    }
+    efr32_synth_locnt_accumulate(s, now);
+    s->locnt_pending = false;
+    /* The busy time is whole nanoseconds: scale to the exact window. */
+    cycles = s->locnt_acc_cycles * s->locnt_window_s * NANOSECONDS_PER_SECOND /
+             (double)(s->locnt_busy_until_ns - s->locnt_run_ns);
+    efr32_register_put(s, EFR32_SYNTH_BASE + EFR32_SYNTH_LOCNTSTATUS,
+                       s->locnt_counts ? (uint32_t)llround(cycles) & EFR32_SYNTH_LOCOUNT_MASK : 0);
+}
+
+/* Whether the LO has arrived at the carrier the medium is asked about. */
+static bool efr32_synth_lo_arrived(Efr32Periph *s)
+{
+    return !s->synth_running ||
+           fabs(efr32_synth_lo_hz(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) -
+                efr32_synth_target_lo_hz(s)) <=
+               EFR32_RF_RASTER_HZ / 2;
 }
 
 /*
  * The medium's channel: the carrier on a 1 MHz raster from EFR32_RF_RASTER0_HZ, so Bluetooth
  * carriers (2 MHz apart) and amateur-plan carriers on any whole MHz each match only themselves.
- * A carrier the synthesizer cannot reach matches no receiver.
+ * A carrier the synthesizer cannot reach matches no receiver, nor does one the running LO has
+ * not yet reached (a large step without recalibration slews, SS7.90).
  */
-static uint8_t efr32_rf_channel(Efr32Periph *s)
+static uint16_t efr32_rf_channel(Efr32Periph *s)
 {
     uint64_t hz = efr32_rf_carrier_hz(s);
 
     if (!efr32_synth_in_range(hz) ||
+        !efr32_synth_lo_arrived(s) ||
         hz + EFR32_RF_RASTER_HZ / 2 < EFR32_RF_RASTER0_HZ) {
         return EFR32_RF_NO_CHANNEL;
     }
@@ -6374,8 +6725,10 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
         efr32_pa_ramp_complete(s);
     }
     if (address == EFR32_SYNTH_BASE + EFR32_SYNTH_LOCNTSTATUS) {
-        uint32_t status = efr32_register_get(s, address) &
-                          ~EFR32_SYNTH_LOCNTSTATUS_BUSY;
+        uint32_t status;
+
+        efr32_synth_locnt_complete(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        status = efr32_register_get(s, address) & ~EFR32_SYNTH_LOCNTSTATUS_BUSY;
 
         if (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) < s->locnt_busy_until_ns) {
             status |= EFR32_SYNTH_LOCNTSTATUS_BUSY;
@@ -6656,13 +7009,16 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
 
 
     if (register_address == EFR32_SYNTH_BASE + EFR32_SYNTH_LOCNTCTRL &&
-        ((address >> 12) & 3) != 2 &&
-        (((uint32_t)value << shift) & mask & EFR32_SYNTH_LOCNTCTRL_RUN)) {
-        unsigned numcycle = (next & EFR32_SYNTH_LOCNTCTRL_NUMCYCLE_MASK) >>
-                            EFR32_SYNTH_LOCNTCTRL_NUMCYCLE_SHIFT;
+        ((address >> 12) & 3) != 2) {
+        uint32_t written = ((uint32_t)value << shift) & mask;
 
-        s->locnt_busy_until_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-            efr32_cycles_ns(2ull << numcycle, EFR32_HFXO_HZ);
+        if ((written & EFR32_SYNTH_LOCNTCTRL_CLEAR) && !s->synth_running) {
+            efr32_register_put(s, EFR32_SYNTH_BASE + EFR32_SYNTH_LOCNTTARGET,
+                               efr32_synth_locnt_target(s, 0));
+        }
+        if (written & EFR32_SYNTH_LOCNTCTRL_RUN) {
+            efr32_synth_locnt_run(s, next);
+        }
     }
 
     if (usart_index >= 0 && (register_address & 0xfff) == EFR32_USART_CMD)
@@ -6752,6 +7108,9 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
     if (register_address == EFR32_SYNTH_BASE + EFR32_SYNTH_CMD)
     {
         /* Write-only command register: act on it, store nothing. */
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+        efr32_synth_locnt_accumulate(s, now);
         if (next & EFR32_SYNTH_CMD_SYNTHSTOP) {
             s->synth_running = false;
         }
@@ -6761,12 +7120,32 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         if (next & EFR32_SYNTH_CMD_DISABLEIF) {
             s->synth_if_enabled = false;
         }
+        if (next & EFR32_SYNTH_CMD_CAPCALSTART) {
+            efr32_register_put(s, EFR32_SYNTH_BASE + EFR32_SYNTH_LOCNTTARGET,
+                               efr32_synth_locnt_target(s, 0));
+        }
+        if (s->synth_running && (next & (EFR32_SYNTH_CMD_ENABLEIF | EFR32_SYNTH_CMD_DISABLEIF))) {
+            efr32_synth_retarget(s);
+        }
         if ((next & EFR32_SYNTH_CMD_SYNTHSTART) &&
             (efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_SYEN) &
              EFR32_RAC_SYEN_VCO_POWER) == EFR32_RAC_SYEN_VCO_POWER) {
+            /*
+             * The loop closes from the open-loop VCO at the calibrated code. [I] A start
+             * with a code far from the carrier (no calibration) is taken as locked: not
+             * measured.
+             */
+            double open_hz = efr32_synth_lo_hz(s, now);
+
             s->synth_running = true;
-            s->synth_lock_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                               EFR32_SYNTH_LOCK_NS;
+            efr32_synth_retarget(s);
+            if (open_hz >= s->lo_to_hz - EFR32_LO_FAST_DOWN_HZ &&
+                open_hz <= s->lo_to_hz + EFR32_LO_FAST_UP_HZ) {
+                s->lo_from_hz = open_hz;
+            } else {
+                s->lo_from_hz = s->lo_to_hz;
+            }
+            s->synth_lock_ns = now + EFR32_SYNTH_LOCK_NS;
         }
         /* INLOCK and IFFREQEN are computed when STATUS is read. */
         efr32_register_put(s, EFR32_SYNTH_BASE + EFR32_SYNTH_STATUS,
@@ -6901,8 +7280,20 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         return;
     }
 
+    if (register_address == EFR32_SYNTH_BASE + EFR32_SYNTH_VCOTUNING) {
+        /* A LO count of the open-loop VCO takes the old code up to now. */
+        efr32_synth_locnt_accumulate(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    }
     efr32_register_put(s, register_address,
                        efr32_radio_mask_write(register_address, next));
+    if (s->synth_running &&
+        (register_address == EFR32_SYNTH_BASE + EFR32_SYNTH_FREQ ||
+         register_address == EFR32_SYNTH_BASE + EFR32_SYNTH_CHCTRL ||
+         register_address == EFR32_SYNTH_BASE + EFR32_SYNTH_CHSP ||
+         register_address == EFR32_SYNTH_BASE + EFR32_SYNTH_CALOFFSET ||
+         register_address == EFR32_SYNTH_BASE + EFR32_SYNTH_IFFREQ)) {
+        efr32_synth_retarget(s);
+    }
 
     /*
      * Matched hardware captures found that working RAIL enables BUFC and
@@ -7763,6 +8154,10 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     s->synth_running = false;
     s->synth_if_enabled = false;
     s->locnt_busy_until_ns = 0;
+    s->locnt_pending = false;
+    s->lo_from_hz = 0.0;
+    s->lo_to_hz = 0.0;
+    s->lo_change_ns = 0;
     efr32_register_put(s, EFR32_SYNTH_BASE + EFR32_SYNTH_STATUS, 0);
     s->pa_ramp_pending = false;
     efr32_rf_medium_reset_radio(s->rf_medium, EFR32_RF_RADIO(s));
@@ -7867,7 +8262,7 @@ static bool efr32_periph_is_rx_ready(Efr32RfRadio *radio)
     return s->rac_state == EFR32_RAC_STATE_RXSEARCH;
 }
 
-static uint8_t efr32_periph_get_channel(Efr32RfRadio *radio)
+static uint16_t efr32_periph_get_channel(Efr32RfRadio *radio)
 {
     return efr32_rf_channel(EFR32_PERIPH(radio));
 }

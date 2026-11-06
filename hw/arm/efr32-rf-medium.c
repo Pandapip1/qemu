@@ -58,7 +58,7 @@ bool efr32_rf_radio_is_rx_ready(Efr32RfRadio *radio)
     return klass->is_rx_ready && klass->is_rx_ready(radio);
 }
 
-uint8_t efr32_rf_radio_get_channel(Efr32RfRadio *radio)
+uint16_t efr32_rf_radio_get_channel(Efr32RfRadio *radio)
 {
     Efr32RfRadioClass *klass = EFR32_RF_RADIO_GET_CLASS(radio);
 
