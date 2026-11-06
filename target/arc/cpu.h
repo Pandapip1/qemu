@@ -473,4 +473,10 @@ void arc_mmu_disable(CPUARCState *env);
 
 #include "exec/cpu-all.h"
 
+/* Board hooks for undefined aux registers; see target/arc/op_helper.c. */
+extern void (*arc_unknown_aux_write)(CPUARCState *env, target_ulong aux,
+                                     target_ulong val);
+extern bool (*arc_unknown_aux_read)(CPUARCState *env, target_ulong aux,
+                                    target_ulong *val);
+
 #endif /* !defined (CPU_ARC_H) */

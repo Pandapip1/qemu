@@ -83,6 +83,18 @@ static unsigned dma_count;
 
 static void dma_kick(void);
 
+/* LMAC indirect register window (finding W1, [I]): CTRL at 0xa2ac04 holds a
+ * 16-bit target address in [15:0], bit 17 = write, bit 18 = GO/BUSY; DATA at
+ * 0xa2ac00. LMAC helpers 0x4be6f8 (read) / 0x4be714 (write) / 0x4be818 (wait
+ * while BUSY) define the protocol. BUSY self-clears: accesses complete
+ * immediately against a backing store whose contents are unknown ([?]),
+ * so it starts zeroed and is traced (IND.R / IND.W). */
+#define IND_DATA 0x00a2ac00u
+#define IND_CTRL 0x00a2ac04u
+#define IND_GO   (1u << 18)
+#define IND_WR   (1u << 17)
+static GHashTable *indstore;
+
 #define MBX_BASE 0xc0d00000u
 static uint32_t host_csr[0x400];
 static uint32_t mbx_idx, mbx_data;
@@ -158,6 +170,26 @@ static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     if (!regstore) {
         regstore = g_hash_table_new(g_direct_hash, g_direct_equal);
     }
+    if (base + addr == IND_CTRL && (val & IND_GO)) {
+        guint ia = val & 0xffff;
+        if (!indstore) {
+            indstore = g_hash_table_new(g_direct_hash, g_direct_equal);
+        }
+        if (val & IND_WR) {
+            guint d = GPOINTER_TO_UINT(g_hash_table_lookup(regstore,
+                                       GUINT_TO_POINTER(IND_DATA)));
+            g_hash_table_insert(indstore, GUINT_TO_POINTER(ia),
+                                GUINT_TO_POINTER(d));
+            trace_log("IND.W", ia, d, 4);
+        } else {
+            guint d = GPOINTER_TO_UINT(g_hash_table_lookup(indstore,
+                                       GUINT_TO_POINTER(ia)));
+            g_hash_table_insert(regstore, GUINT_TO_POINTER(IND_DATA),
+                                GUINT_TO_POINTER(d));
+            trace_log("IND.R", ia, d, 4);
+        }
+        val &= ~(uint64_t)IND_GO;   /* access completes at once: not busy */
+    }
     g_hash_table_insert(regstore, GUINT_TO_POINTER((guint)(base + addr)),
                         (gpointer)(uintptr_t)(uint32_t)val);
     if (base + addr == DMA_BASE + 0x34) {
@@ -222,6 +254,33 @@ static void add_trace(const char *name, hwaddr base, uint64_t size, int prio)
     memory_region_add_subregion_overlap(get_system_memory(), base, r, prio);
 }
 
+/* ---- vendor aux registers ---------------------------------------------- */
+
+/* Aux registers the CPU model does not define (e.g. LMAC reset writes
+ * 0xa0000000 to aux 0x20a). Policy matches unmodelled MMIO (finding R1):
+ * read back the last value written, and trace every access. */
+static GHashTable *auxstore;
+
+static void ax210_aux_write(CPUARCState *env, target_ulong aux,
+                            target_ulong val)
+{
+    if (!auxstore) {
+        auxstore = g_hash_table_new(g_direct_hash, g_direct_equal);
+    }
+    g_hash_table_insert(auxstore, GUINT_TO_POINTER((guint)aux),
+                        GUINT_TO_POINTER((guint)val));
+    trace_log("AUX.W", aux, val, 4);
+}
+
+static bool ax210_aux_read(CPUARCState *env, target_ulong aux,
+                           target_ulong *val)
+{
+    *val = auxstore ? GPOINTER_TO_UINT(g_hash_table_lookup(auxstore,
+                                       GUINT_TO_POINTER((guint)aux))) : 0;
+    trace_log("AUX.R", aux, *val, 4);
+    return true;
+}
+
 /* ---- machine ------------------------------------------------------------ */
 
 static struct arc_boot_info ax210_boot_info;   /* zeroed: no kernel/cmdline */
@@ -236,6 +295,8 @@ static void ax210_init(MachineState *machine)
     cpu_arc_clock_init(cpu);
     cpu->env.boot_info = &ax210_boot_info;
     qemu_register_reset(arc_cpu_reset, cpu);
+    arc_unknown_aux_write = ax210_aux_write;
+    arc_unknown_aux_read = ax210_aux_read;
 
     /* Catch-all tracer over the whole 32-bit space (lowest priority). */
     add_trace("ax210.catchall", 0x00000000, 0x100000000ULL, -1000);

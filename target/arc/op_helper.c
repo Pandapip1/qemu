@@ -235,6 +235,17 @@ static void report_aux_reg_error(target_ulong aux)
                   "\n", aux);
 }
 
+/*
+ * Optional board hook for aux registers the CPU model does not define.
+ * NULL (default): architectural behaviour, an instruction error.  A board
+ * that models a core with vendor aux registers (e.g. hw/arc/ax210.c) can
+ * install handlers; read returns true if it handled the access.
+ */
+void (*arc_unknown_aux_write)(CPUARCState *env, target_ulong aux,
+                              target_ulong val);
+bool (*arc_unknown_aux_read)(CPUARCState *env, target_ulong aux,
+                             target_ulong *val);
+
 void helper_sr(CPUARCState *env, target_ulong val, target_ulong aux)
 {
     /* saving return address in case an exception must be raised later */
@@ -242,7 +253,10 @@ void helper_sr(CPUARCState *env, target_ulong val, target_ulong aux)
     struct arc_aux_reg_detail *aux_reg_detail =
         arc_aux_reg_struct_for_address(aux, cpu->family);
 
-    g_assert(aux_reg_detail != NULL);
+    if (aux_reg_detail == NULL && arc_unknown_aux_write) {
+        arc_unknown_aux_write(env, aux, val);
+        return;
+    }
     if (aux_reg_detail == NULL) {
         report_aux_reg_error(aux);
         arc_raise_exception(env, GETPC(), EXCP_INST_ERROR);
@@ -268,6 +282,10 @@ target_ulong helper_lr(CPUARCState *env, target_ulong aux)
     struct arc_aux_reg_detail *aux_reg_detail =
         arc_aux_reg_struct_for_address(aux, cpu->family);
 
+    if (aux_reg_detail == NULL && arc_unknown_aux_read &&
+        arc_unknown_aux_read(env, aux, &result)) {
+        return result;
+    }
     if (aux_reg_detail == NULL) {
         report_aux_reg_error(aux);
         arc_raise_exception(env, GETPC(), EXCP_INST_ERROR);
