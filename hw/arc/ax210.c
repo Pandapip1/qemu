@@ -508,7 +508,22 @@ static void ax210_init(MachineState *machine)
     /* RAM windows (firmware load addresses). ARC cache aliases 0x8.. and 0xc..
      * are modelled as independent RAM here; coherence between aliases is a
      * known simplification to revisit if firmware relies on it. */
-    add_ram("ax210.lmac",  0x00000000, 0x01100000); /* LMAC code/data, paged, DCCM-low, CSS */
+    if (is_lmac_core) {
+        /* LMAC map from the firmware's own MPU programming (finding M2, [F]
+         * for the firmware's view; read live at the main loop, decoded with
+         * the ARCv2 RDB/RDP encoding of Zephyr arc_mpu_v2_internal.h).
+         * Peripheral regions 0xa00000-0xbfffff and 0xd00000-0xefffff are
+         * the lmac_periph traces below; everything else is unmapped and
+         * reaches the catch-all tracer. */
+        add_ram("ax210.lmac.iccm",  0x00000000, 0x00018000); /* MPU 0-1, X   */
+        add_ram("ax210.lmac.romwin",0x00440000, 0x00074000); /* MPU 12, R    */
+        add_ram("ax210.lmac.code",  0x004b4000, 0x0004c000); /* MPU 7-11, RWX*/
+        add_ram("ax210.lmac.sram",  0x00600000, 0x00040000); /* MPU 5, RW    */
+        add_ram("ax210.lmac.shbuf", 0x00660800, 0x00000800); /* MPU 6, RW    */
+        add_ram("ax210.lmac.dccm",  0x00800000, 0x00008000); /* MPU 2, RW    */
+    } else {
+        add_ram("ax210.lmac",  0x00000000, 0x01100000); /* UMAC/IML runs: flat low window incl. paged image */
+    }
     add_ram("ax210.umac",  0x80000000, 0x00800000); /* UMAC code/data (0x80400000+) */
     add_ram("ax210.unc",   0xc0000000, 0x01000000); /* uncached window: code @0xc0080000, bss @0xc0880000 */
 
@@ -518,7 +533,8 @@ static void ax210_init(MachineState *machine)
      * 0xa01ec0, indirect window 0xa2ac00, crypto 0xa248xx, power FSM
      * 0xd03380, markers 0xd0c110); no firmware section loads in
      * 0xa00000-0xffffff. */
-    add_trace("ax210.lmac_periph", 0x00a00000, 0x00600000, 10);
+    add_trace("ax210.lmac_periph",  0x00a00000, 0x00200000, 10); /* MPU 3 */
+    add_trace("ax210.lmac_periph2", 0x00d00000, 0x00200000, 10); /* MPU 4 */
     add_trace("ax210.ctl_d",    0xc0d00000, 0x00010000, 10); /* control regs polled by IML */
     add_trace("ax210.crypto_c", 0xc0e20000, 0x00010000, 10); /* remapped crypto window */
     add_ram("ax210.host",  0x20000000, 0x10000000);   /* modelled host DRAM */

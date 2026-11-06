@@ -244,6 +244,22 @@ static void test_lmac_msg_fifo_space(void)
     qtest_quit(s);
 }
 
+/* LMAC memory map (finding M2): every RAM region LMAC's own MPU declares is
+ * backed by RAM in the arcem configuration. */
+static void test_lmac_mpu_map_ram(void)
+{
+    QTestState *s = qtest_init(LMAC_ARGS);
+    static const uint32_t ram[] = { 0x0, 0x17ffc, 0x440000, 0x4b4000,
+                                    0x4ffffc, 0x600000, 0x63fffc, 0x660800,
+                                    0x660ffc, 0x800000, 0x807ffc };
+
+    for (unsigned i = 0; i < ARRAY_SIZE(ram); i++) {
+        qtest_writel(s, ram[i], 0xa5a50000 | i);
+        g_assert_cmphex(qtest_readl(s, ram[i]), ==, 0xa5a50000 | i);
+    }
+    qtest_quit(s);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -265,6 +281,8 @@ int main(int argc, char **argv)
     qtest_add_func("/ax210/lmac/indirect-window", test_lmac_indirect_window);
     qtest_add_func("/ax210/lmac/timestamp", test_lmac_timestamp);
     qtest_add_func("/ax210/lmac/msg-fifo-space", test_lmac_msg_fifo_space);
+
+    qtest_add_func("/ax210/lmac/mpu-map-ram", test_lmac_mpu_map_ram);
 
     return g_test_run();
 }
