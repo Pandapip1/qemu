@@ -494,6 +494,55 @@ void aux_irq_set(const struct arc_aux_reg_detail *aux_reg_detail,
 
 /* Check if we can interrupt the cpu. */
 
+/*
+ * ARCompact: line n (3-31) is level 2 if AUX_IRQ_LEV bit n is set, else
+ * level 1. Level 2 needs E2 and not A2; level 1 needs E1 and neither A1
+ * nor A2. The lowest-numbered line wins. Entry saves PC, STATUS32 and BTA
+ * to ILINKn/STATUS32_Ln/BTA_Ln, sets An and jumps to vector slot n.
+ */
+static bool arc_v1_exec_interrupt(CPUState *cs)
+{
+    ARCCPU *cpu = ARC_CPU(cs);
+    CPUARCState *env = &cpu->env;
+    uint32_t st = pack_status32(&env->stat);
+    uint32_t pend = env->irq_v1_pending & env->aux_ienable;
+    uint32_t l2 = pend & env->aux_irq_lev;
+    uint32_t l1 = pend & ~env->aux_irq_lev;
+    uint32_t n;
+
+    if ((st & ((1u << 0) | (1u << 5))) || GET_STATUS_BIT(env->stat, DEf)) {
+        return false;
+    }
+    if (l2 && (st & (1u << 2)) && !(st & (1u << 4))) {
+        n = ctz32(l2);
+        env->r[30] = env->pc;
+        env->status32_l2 = st;
+        env->bta_l2 = env->bta;
+        env->icause2 = n;
+        env->aux_irq_lv12 |= 2;
+        st |= 1u << 4;
+    } else if (l1 && (st & (1u << 1)) && !(st & ((1u << 3) | (1u << 4)))) {
+        n = ctz32(l1);
+        env->r[29] = env->pc;
+        env->status32_l1 = st;
+        env->bta_l1 = env->bta;
+        env->icause1 = n;
+        env->aux_irq_lv12 |= 1;
+        st |= 1u << 3;
+    } else {
+        return false;
+    }
+    if (GET_STATUS_BIT(env->stat, Uf)) {
+        switchSP(env);
+    }
+    unpack_status32(&env->stat, st & ~(1u << 7));
+    env->pc = env->intvec + (n << 3);
+    CPU_PCL(env) = env->pc;
+    qemu_log_mask(CPU_LOG_INT, "[IRQ] ARCompact irq %u at pc=0x" TARGET_FMT_lx
+                  "\n", n, (target_ulong) env->r[(st & (1u << 4)) ? 30 : 29]);
+    return true;
+}
+
 bool arc_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
 {
     ARCCPU *cpu = ARC_CPU(cs);
@@ -501,6 +550,11 @@ bool arc_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
     bool found = false;
     uint32_t vectno = 0;
     uint32_t offset, priority;
+
+    if (cpu->family & (ARC_OPCODE_ARC700 | ARC_OPCODE_ARC600)) {
+        return (interrupt_request & CPU_INTERRUPT_HARD) &&
+               arc_v1_exec_interrupt(cs);
+    }
 
     /* Check if we should execute this interrupt. */
     if (GET_STATUS_BIT(env->stat, Hf)
@@ -621,6 +675,9 @@ void arc_resetIRQ(ARCCPU *cpu)
     if (!cpu->cfg.has_interrupts) {
         return;
     }
+
+    /* ARCompact: AUX_IENABLE resets with every line enabled. */
+    env->aux_ienable = 0xfffffff8;
 
     for (i = 0; i < (cpu->cfg.number_of_interrupts & 0xff); i++) {
         env->irq_bank[NR_OF_EXCEPTIONS + i].enable = 1;

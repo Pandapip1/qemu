@@ -210,6 +210,26 @@ arc_general_regs_get(const struct arc_aux_reg_detail *aux_reg_detail,
         reg = env->status32_l2;
         break;
 
+    case AUX_ID_aux_irq_lv12:
+        reg = env->aux_irq_lv12;
+        break;
+
+    case AUX_ID_icause1:
+        reg = env->icause1;
+        break;
+
+    case AUX_ID_icause2:
+        reg = env->icause2;
+        break;
+
+    case AUX_ID_aux_ienable:
+        reg = env->aux_ienable;
+        break;
+
+    case AUX_ID_aux_itrigger:
+        reg = env->aux_itrigger;
+        break;
+
     case AUX_ID_hw_pf_ctrl:
         reg = (0)       /* EN */
             | (1 << 1)  /* RD_ST */
@@ -293,6 +313,18 @@ arc_general_regs_set(const struct arc_aux_reg_detail *aux_reg_detail,
 
     case AUX_ID_status32_l2:
         env->status32_l2 = val;
+        break;
+
+    case AUX_ID_aux_irq_lv12:
+        env->aux_irq_lv12 &= ~val;
+        break;
+
+    case AUX_ID_aux_ienable:
+        env->aux_ienable = val & ~7u;
+        break;
+
+    case AUX_ID_aux_itrigger:
+        env->aux_itrigger = val;
         break;
 
     case AUX_ID_aux_xmac0:

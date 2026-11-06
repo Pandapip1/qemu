@@ -270,6 +270,12 @@ struct CPUArchState {
     uint32_t icause[16];     /* Banked cause register */
     uint32_t aux_irq_hint;   /* AUX register, used to trigger soft irq */
     uint32_t aux_irq_lev;    /* ARCv1 AUX register */
+    uint32_t aux_irq_lv12;   /* ARCv1: sticky L1/L2 taken, write 1 to clear */
+    uint32_t aux_ienable;    /* ARCv1 */
+    uint32_t aux_itrigger;   /* ARCv1 */
+    uint32_t icause1;        /* ARCv1 */
+    uint32_t icause2;        /* ARCv1 */
+    uint32_t irq_v1_pending; /* ARCv1: input line n is bit n */
     uint32_t aux_ap[24];     /* actionpoint AMV/AMM/AC 0-7, 0x220-0x237 */
     uint32_t aux_macmode;    /* ARCv1 XMAC AUX registers */
     uint32_t aux_xmac[3];

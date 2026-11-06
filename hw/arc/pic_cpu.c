@@ -42,6 +42,21 @@ static void arc_pic_cpu_handler(void *opaque, int irq, int level)
     /* Assert if this handler is called in a system without interrupts. */
     assert(cpu->cfg.has_interrupts);
 
+    if (cpu->family & (ARC_OPCODE_ARC700 | ARC_OPCODE_ARC600)) {
+        assert(irq >= 3 && irq < 32);
+        if (level) {
+            qatomic_or(&env->irq_v1_pending, 1u << irq);
+        } else {
+            qatomic_and(&env->irq_v1_pending, ~(1u << irq));
+        }
+        if (env->irq_v1_pending) {
+            cpu_interrupt(cs, CPU_INTERRUPT_HARD);
+        } else {
+            cpu_reset_interrupt(cs, CPU_INTERRUPT_HARD);
+        }
+        return;
+    }
+
     /* Assert if the IRQ is not within the cpu configuration bounds. */
     assert(irq >= NR_OF_EXCEPTIONS && irq < (cpu->cfg.number_of_interrupts + NR_OF_EXCEPTIONS - 1));
 
@@ -106,6 +121,11 @@ void cpu_arc_pic_init(ARCCPU *cpu)
 
     for (i = 0; i < cpu->cfg.number_of_interrupts; i++) {
         env->irq[NR_OF_EXCEPTIONS + i] = qi[NR_OF_EXCEPTIONS + i];
+    }
+    if (cpu->family & (ARC_OPCODE_ARC700 | ARC_OPCODE_ARC600)) {
+        for (i = 3; i < NR_OF_EXCEPTIONS; i++) {
+            env->irq[i] = qi[i];
+        }
     }
 }
 
