@@ -115,10 +115,14 @@ static void icount_update_locked(CPUState *cpu)
     cpu->icount_budget -= executed;
     if (cpu_clocks) {
         if (cpu->icount_counts_cycles) {
-            cpu_clocks_advance_locked(cpu, (executed +
-                                            cpu->icount_extra_cycles) *
-                                           cpu->icount_cycle_fs);
-            cpu->icount_extra_cycles = 0;
+            int64_t mc = executed * 1000 + cpu->icount_extra_mc;
+
+            /* A credit (e.g. dual issue) not yet covered carries over. */
+            cpu->icount_extra_mc = MIN(mc, 0);
+            if (mc > 0) {
+                cpu_clocks_advance_locked(cpu, mc * cpu->icount_cycle_fs /
+                                               1000);
+            }
         } else {
             cpu_clocks_advance_locked(cpu, executed * cpu_clocks_insn_fs(cpu));
         }
@@ -630,17 +634,33 @@ void icount_set_cpu_cycle_counting(CPUState *cpu, bool on)
     cpu->icount_counts_cycles = cpu_clocks && on;
 }
 
+void icount_set_cpu_mem_costs(CPUState *cpu, const IcountMemCosts *costs,
+                              unsigned n)
+{
+    cpu->icount_mem_costs = costs;
+    cpu->icount_mem_costs_n = n;
+}
+
 void icount_set_cpu_exception_cycles(CPUState *cpu, uint64_t millicycles)
 {
     cpu->icount_exception_millicycles = millicycles;
 }
 
+static GSList *cpu_clocks_bus_models;
+
 void icount_charge_exception(CPUState *cpu)
 {
-    icount_charge_cycles(cpu, cpu->icount_exception_millicycles);
-}
+    uint64_t millicycles = cpu->icount_exception_millicycles;
 
-static GSList *cpu_clocks_bus_models;
+    for (GSList *l = cpu_clocks_bus_models; cpu_clocks && l; l = l->next) {
+        IcountBusModel *model = l->data;
+
+        if (model->exception) {
+            millicycles = model->exception(model->opaque, cpu, millicycles);
+        }
+    }
+    icount_charge_cycles(cpu, millicycles);
+}
 
 void icount_register_bus_model(IcountBusModel *model)
 {

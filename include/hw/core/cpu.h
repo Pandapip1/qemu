@@ -398,6 +398,22 @@ struct qemu_work_item;
 /* Bus-model target classes counted per vCPU and round (IcountBusModel). */
 #define ICOUNT_BUS_TARGETS 8
 
+/*
+ * Data access costs of a cycle-counting vCPU (icount_set_cpu_mem_costs()):
+ * while it executes code from [fetch_base, fetch_base + fetch_size), a load
+ * or store to [base, base + size) of a range costs that range's extra
+ * millicycles per 32-bit transfer.  For memory QEMU maps as RAM, whose
+ * accesses never reach a bus model.
+ */
+#define ICOUNT_MEM_COST_RANGES 2
+struct IcountMemCosts {
+    uint32_t fetch_base, fetch_size;
+    struct {
+        uint32_t base, size;
+        int32_t load_mc, store_mc;
+    } range[ICOUNT_MEM_COST_RANGES];
+};
+
 /**
  * struct CPUState - common state of one CPU core or thread.
  *
@@ -509,10 +525,13 @@ struct CPUState {
     uint64_t icount_cycle_fs;
     /*
      * The translator counts this vCPU's cycles: one per instruction plus
-     * the extra cycles it adds to icount_extra_cycles (Armv6-M timings).
+     * the extra millicycles it adds to icount_extra_mc (per instruction
+     * class, and per data access to memory in icount_mem_costs).
      */
     bool icount_counts_cycles;
-    int64_t icount_extra_cycles;
+    int64_t icount_extra_mc;
+    const IcountMemCosts *icount_mem_costs;
+    unsigned icount_mem_costs_n;
     /* Extra cycles (x1000) charged on each exception entry. */
     uint64_t icount_exception_millicycles;
     /* The clock is stopped: the vCPU keeps its state and does not run. */

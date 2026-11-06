@@ -64,3 +64,7 @@ void icount_bus_access(IcountBusModel *model, CPUState *master,
 void icount_set_cpu_cycle_counting(CPUState *cpu, bool on)
 {
 }
+void icount_set_cpu_mem_costs(CPUState *cpu, const IcountMemCosts *costs,
+                              unsigned n)
+{
+}

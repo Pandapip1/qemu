@@ -58,9 +58,6 @@ typedef struct Efr32Interconnect {
     Efr32IcTimeline tl[EFR32_IC_MANAGERS][EFR32_IC_PORTS];
     /* End of each manager's last access to the matrix / radio bus. */
     int64_t last_end_ps[EFR32_IC_MANAGERS];
-    /* M33 SEQRAM accesses in the current and the previous round. */
-    uint32_t seqram_m33_round, seqram_m33_prev;
-    int64_t round_ns;
     /* Start of the M0+'s current run of SEQRAM-local execution. */
     int64_t seq_local_from_ps;
 } Efr32Interconnect;
@@ -72,7 +69,7 @@ uint64_t efr32_ic_access(Efr32Interconnect *ic, unsigned manager,
                          unsigned *port);
 void efr32_ic_round_end(Efr32Interconnect *ic, int64_t start_ns,
                         int64_t end_ns);
-/* Exception entry of the M0+, millicycles, under the current contention. */
+/* Exception entry of the M0+ now, millicycles, under the M33's SEQRAM use. */
 uint64_t efr32_ic_seq_exception_millicycles(Efr32Interconnect *ic);
 
 #endif

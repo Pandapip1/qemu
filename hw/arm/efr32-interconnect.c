@@ -64,8 +64,9 @@
  * SEQRAM access costs it 0.5 cycle more (1.88 -> 2.38) and costs the M0+
  * 0.9 of its cycles (SS7.74 [F]); M0+ exception entry, which stacks to and
  * fetches from SEQRAM, grows from 16 to a median 45-51 cycles while the M33
- * streams SEQRAM ([F]), scaled here by the M33's SEQRAM utilization in the
- * last round.
+ * streams SEQRAM ([F]), scaled here by the M33's SEQRAM tenures inside the
+ * entry itself.  An entry also ends the M0+'s sleep: SEQRAM tenures of the
+ * M33 before it cost the M0+ nothing.
  *
  * Not modelled: M33 SRAM and flash accesses are RAM to QEMU (no bus
  * access), so the M33's SRAM traffic does not slow the M0+'s SRAM and
@@ -94,8 +95,8 @@ typedef struct Efr32IcTiming {
 } Efr32IcTiming;
 
 /*
- * M0+: the Armv6-M translator charges 2 cycles per load or store; M33: its
- * average instruction already includes a 1-cycle SRAM access.
+ * Beyond the instruction's own count: the Armv6-M translator charges the
+ * M0+ 2 cycles per load or store, the Armv8-M one the M33 1.
  */
 static const Efr32IcTiming timing[EFR32_IC_MANAGERS][EFR32_IC_TARGETS] = {
     [EFR32_IC_SEQ] = {
@@ -388,7 +389,6 @@ uint64_t efr32_ic_access(Efr32Interconnect *ic, unsigned m,
         ic->seq_local_from_ps = g + tenure;
     }
     if (port == EFR32_IC_PORT_SEQRAM && m == EFR32_IC_M33) {
-        ic->seqram_m33_round++;
         /* From flash only: with its code in SRAM the M33 waits on its own
          * fetch and SS7.74 saw no change (3.87 either way). */
         if (ic->seq_executing && !m33_code_in_sram) {
@@ -426,20 +426,27 @@ void efr32_ic_round_end(Efr32Interconnect *ic, int64_t start_ns,
             }
         }
     }
-    ic->seqram_m33_prev = ic->seqram_m33_round;
-    ic->seqram_m33_round = 0;
-    ic->round_ns = end_ns - start_ns;
 }
 
 uint64_t efr32_ic_seq_exception_millicycles(Efr32Interconnect *ic)
 {
-    uint64_t busy_ps, round_ps = (uint64_t)ic->round_ns * PS_PER_NS;
+    Efr32IcTimeline *tl = &ic->tl[EFR32_IC_M33][EFR32_IC_PORT_SEQRAM];
+    int64_t t = now_ps(ic->cpu[EFR32_IC_SEQ]);
+    int64_t window = mc_ps(ic->rhclk_hz, SEQ_EXCEPTION_ENTRY_MC);
+    int64_t period = mc_ps(ic->hclk_hz, M33_SEQRAM_STREAM_PERIOD_MC);
+    uint64_t n = 0, busy_ps, mc = SEQ_EXCEPTION_ENTRY_MC;
 
-    if (!round_ps || !ic->seqram_m33_prev) {
-        return SEQ_EXCEPTION_ENTRY_MC;
+    for (unsigned i = 0; window && i < tl->count; i++) {
+        Efr32IcTenure *e = tl_at(tl, i);
+
+        if (e->start_ps >= t && e->start_ps < t + window) {
+            n++;
+        }
     }
-    busy_ps = ic->seqram_m33_prev *
-              (uint64_t)mc_ps(ic->hclk_hz, M33_SEQRAM_STREAM_PERIOD_MC);
-    return SEQ_EXCEPTION_ENTRY_MC +
-           SEQ_EXCEPTION_SEQRAM_MC * MIN(busy_ps, round_ps) / round_ps;
+    if (window) {
+        busy_ps = n * period;
+        mc += SEQ_EXCEPTION_SEQRAM_MC * MIN(busy_ps, window) / window;
+    }
+    ic->seq_local_from_ps = t + mc_ps(ic->rhclk_hz, mc);
+    return mc;
 }

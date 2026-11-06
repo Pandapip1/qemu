@@ -3374,8 +3374,8 @@ static void test_seq_systick_counts(void)
 /*
  * Per-CPU clocks under -icount (owo-open-fw docs/radio-tables.md SS7.73).
  * On silicon the M33 runs at HCLK and the M0+ at SYSCLK / (RHCLKPRESC + 1),
- * each at its own rate while the other runs; firmware code averaged 1.84
- * M33 cycles per instruction and M0+ code follows the Armv6-M timings, and
+ * each at its own rate while the other runs; both count cycles per
+ * instruction class (SUBS 1 and a taken BNE 2 on either core, SS7.75), and
  * a radio-register access costs extra cycles.  Each core here times a loop
  * with its own SysTick (core cycles) and with RAC.STIMER (4.8 ticks/us of
  * virtual time), both cores at once.
@@ -3392,8 +3392,7 @@ static void test_seq_systick_counts(void)
 #define CORE_CLOCK_CMU_SYSCLK_HFXO   3u
 #define CORE_CLOCK_CMU_RHCLK_DIV2    (1u << 16)
 #define CORE_CLOCK_HFXO_HZ           38400000.0
-#define CORE_CLOCK_M33_CPI           1.84
-#define CORE_CLOCK_SEQ_LOOP_CYCLES   3.0
+#define CORE_CLOCK_LOOP_CYCLES       3.0
 #define THUMB16_SUBS_R3_1            0x3b01u
 #define THUMB16_BNE_BACK_ONE         0xd1fdu  /* bne to the insn before */
 
@@ -3502,15 +3501,140 @@ static void test_core_clocks_per_cpu_rates(void)
 {
     QTestState *qts = core_clock_start("");
 
-    /* M33: the measured firmware average, 1.84 cycles per instruction. */
+    /* SUBS 1 + taken BNE 2 per iteration on both cores. */
     core_clock_check(qts, CORE_CLOCK_M33_RESULT,
-                     CORE_CLOCK_M33_CPI * (2.0 * CORE_CLOCK_LOOPS + 2),
+                     CORE_CLOCK_LOOP_CYCLES * CORE_CLOCK_LOOPS,
                      CORE_CLOCK_HFXO_HZ);
-    /* M0+: Armv6-M timings, SUBS 1 + taken BNE 2 per iteration. */
     core_clock_check(qts, CORE_CLOCK_SEQ_RESULT,
-                     CORE_CLOCK_SEQ_LOOP_CYCLES * CORE_CLOCK_LOOPS,
+                     CORE_CLOCK_LOOP_CYCLES * CORE_CLOCK_LOOPS,
                      CORE_CLOCK_HFXO_HZ / 2);
     qtest_quit(qts);
+}
+
+/*
+ * Cycles per instruction class and data access (owo-open-fw
+ * docs/radio-tables.md SS7.75, SS7.93): the silicon kernels, eight copies
+ * of one instruction and SUBS/BNE, timed by the core's own SysTick.  M33,
+ * code in flash: NOP 0.5, a flash data load 4.5 at MSC.READCTRL MODE = WS1
+ * (one cycle more per further wait state); code in SRAM: SRAM loads 1.5.
+ */
+#define CORE_BODY_LOOPS     2000u
+#define CORE_BODY_COPIES    8u
+#define CORE_BODY_INSNS     26u
+#define THUMB16_NOP         0xbf00u
+#define MSC_READCTRL        0x008
+#define MSC_READCTRL_MODE(ws) ((uint32_t)(ws) << 20)
+
+/*
+ * An M33 probe at @code that stores {SysTick before, SysTick after, 1} at
+ * @result around CORE_BODY_LOOPS iterations of CORE_BODY_COPIES x @op, with
+ * r1 = @target.
+ */
+static void core_body_write_probe(QTestState *qts, uint32_t code,
+                                  uint32_t result, uint16_t op,
+                                  uint32_t target)
+{
+    uint16_t insn[CORE_BODY_INSNS];
+    uint32_t lit = code + 2 * CORE_BODY_INSNS;
+    uint32_t literals[] = { CORE_CLOCK_SYSTICK_BASE, target, CORE_BODY_LOOPS,
+                            CORE_CLOCK_SYSTICK_FULL, result };
+    int n = 4, loop;
+    size_t i;
+
+    insn[0] = thumb_ldr_pc(0, code + 0, lit + 0);
+    insn[1] = thumb_ldr_pc(1, code + 2, lit + 4);
+    insn[2] = thumb_ldr_pc(3, code + 4, lit + 8);
+    insn[3] = thumb_ldr_pc(7, code + 6, lit + 12);
+    insn[n++] = thumb_str_imm(7, 0, 1);         /* RELOAD */
+    insn[n++] = thumb_movs_imm8(7, CORE_CLOCK_SYSTICK_ON_CORE);
+    insn[n++] = thumb_str_imm(7, 0, 0);         /* CSR */
+    insn[n++] = thumb_ldr_imm(2, 0, 2);         /* SysTick before */
+    loop = n;
+    for (i = 0; i < CORE_BODY_COPIES; i++) {
+        insn[n++] = op;
+    }
+    insn[n++] = THUMB16_SUBS_R3_1;
+    /* bne to the loop start */
+    insn[n] = 0xd100u | ((uint32_t)(loop - n - 2) & 0xffu);
+    n++;
+    insn[n++] = thumb_ldr_imm(4, 0, 2);         /* SysTick after */
+    insn[n] = thumb_ldr_pc(5, code + 2 * n, lit + 16);
+    n++;
+    insn[n++] = thumb_str_imm(2, 5, 0);
+    insn[n++] = thumb_str_imm(4, 5, 1);
+    insn[n++] = thumb_movs_imm8(6, 1);
+    insn[n++] = thumb_str_imm(6, 5, 2);
+    insn[n++] = THUMB16_BRANCH_SELF;
+    insn[n++] = THUMB16_BRANCH_SELF;
+    g_assert_cmpint(n, ==, CORE_BODY_INSNS);
+    for (i = 0; i < CORE_BODY_INSNS; i += 2) {
+        qtest_writel(qts, code + 2 * i, THUMB16_PAIR(insn[i], insn[i + 1]));
+    }
+    for (i = 0; i < G_N_ELEMENTS(literals); i++) {
+        qtest_writel(qts, code + 2 * CORE_BODY_INSNS + 4 * i, literals[i]);
+    }
+}
+
+/* Cycles per instruction of the body, from the probe's result. */
+static double core_body_cycles(QTestState *qts, uint32_t result)
+{
+    uint32_t c0, c1;
+
+    for (unsigned attempt = 0; attempt < 5000; attempt++) {
+        if (qtest_readl(qts, result + 8)) {
+            break;
+        }
+        g_usleep(1000);
+    }
+    g_assert_cmpuint(qtest_readl(qts, result + 8), ==, 1);
+    c0 = qtest_readl(qts, result);
+    c1 = qtest_readl(qts, result + 4);
+    return ((double)((c0 - c1) & CORE_CLOCK_SYSTICK_FULL) / CORE_BODY_LOOPS -
+            CORE_CLOCK_LOOP_CYCLES) / CORE_BODY_COPIES;
+}
+
+/* The M33 runs the probe from @code (flash or SRAM), MSC MODE = @ws. */
+static double m33_body_cycles(uint32_t code, uint16_t op, uint32_t target,
+                              unsigned ws)
+{
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel tcg "
+                                  "-icount shift=5,sleep=off -S");
+    const uint32_t result = 0x20007000u;
+    double cycles;
+
+    qtest_writel(qts, 0x00000000, 0x20008000);
+    qtest_writel(qts, 0x00000004, 0x00000201);
+    /* Reset vector: branch to the probe. */
+    qtest_writel(qts, 0x00000200, THUMB16_PAIR(0x4800u, 0x4700u));
+    qtest_writel(qts, 0x00000204, code | 1);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    core_body_write_probe(qts, code, result, op, target);
+    qtest_writel(qts, result + 8, 0);
+    qtest_writel(qts, MSC_BASE + MSC_READCTRL, MSC_READCTRL_MODE(ws));
+    qtest_qmp_assert_success(qts, "{'execute':'cont'}");
+    cycles = core_body_cycles(qts, result);
+    qtest_quit(qts);
+    return cycles;
+}
+
+static void test_core_clocks_m33_access_costs(void)
+{
+    const uint16_t ldr = thumb_ldr_imm(6, 1, 0);
+
+    g_assert_cmpfloat_with_epsilon(
+        m33_body_cycles(0x100, THUMB16_NOP, 0, 1), 0.5, 0.01);
+    g_assert_cmpfloat_with_epsilon(
+        m33_body_cycles(0x100, ldr, 0x20006000, 1), 1.0, 0.01);
+    g_assert_cmpfloat_with_epsilon(
+        m33_body_cycles(0x100, ldr, 0x1000, 1), 4.5, 0.01);
+    g_assert_cmpfloat_with_epsilon(
+        m33_body_cycles(0x100, ldr, 0x1000, 0), 3.5, 0.01);
+    g_assert_cmpfloat_with_epsilon(
+        m33_body_cycles(0x100, ldr, 0x1000, 3), 6.5, 0.01);
+    g_assert_cmpfloat_with_epsilon(
+        m33_body_cycles(0x20001000, ldr, 0x20006000, 1), 1.5, 0.01);
+    g_assert_cmpfloat_with_epsilon(
+        m33_body_cycles(0x20001000, ldr, 0x1000, 1), 4.0, 0.01);
 }
 
 /*
@@ -5184,6 +5308,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/seq-systick-counts", test_seq_systick_counts);
     qtest_add_func("/efr32bg22/core-clocks-per-cpu-rates",
                    test_core_clocks_per_cpu_rates);
+    qtest_add_func("/efr32bg22/core-clocks-m33-access-costs",
+                   test_core_clocks_m33_access_costs);
     qtest_add_func("/efr32bg22/core-clocks-radio-clock-stops-seq",
                    test_core_clocks_radio_clock_stops_seq);
     qtest_add_func("/efr32bg22/radio-sequencer-executes-open-code",

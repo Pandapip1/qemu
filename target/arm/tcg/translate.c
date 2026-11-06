@@ -933,26 +933,38 @@ static TCGv gen_aa32_addr(DisasContext *s, TCGv_i32 a32, MemOp op)
  * Internal routines are used for NEON cases where the endianness
  * and/or alignment has already been taken into account and manipulated.
  */
+static TCGv_i64 gen_icount_mem_cost(DisasContext *s, TCGv_i32 a32,
+                                    MemOp opc, bool is_store);
+static void gen_icount_mem_cost_add(TCGv_i64 cost);
+
 void gen_aa32_ld_internal_i32(DisasContext *s, TCGv_i32 val,
                               TCGv_i32 a32, int index, MemOp opc)
 {
     TCGv addr = gen_aa32_addr(s, a32, opc);
+    TCGv_i64 cost = gen_icount_mem_cost(s, a32, opc, false);
+
     tcg_gen_qemu_ld_i32(val, addr, index, opc);
+    gen_icount_mem_cost_add(cost);
 }
 
 void gen_aa32_st_internal_i32(DisasContext *s, TCGv_i32 val,
                               TCGv_i32 a32, int index, MemOp opc)
 {
     TCGv addr = gen_aa32_addr(s, a32, opc);
+    TCGv_i64 cost = gen_icount_mem_cost(s, a32, opc, true);
+
     tcg_gen_qemu_st_i32(val, addr, index, opc);
+    gen_icount_mem_cost_add(cost);
 }
 
 void gen_aa32_ld_internal_i64(DisasContext *s, TCGv_i64 val,
                               TCGv_i32 a32, int index, MemOp opc)
 {
     TCGv addr = gen_aa32_addr(s, a32, opc);
+    TCGv_i64 cost = gen_icount_mem_cost(s, a32, opc, false);
 
     tcg_gen_qemu_ld_i64(val, addr, index, opc);
+    gen_icount_mem_cost_add(cost);
 
     /* Not needed for user-mode BE32, where we use MO_BE instead.  */
     if (!IS_USER_ONLY && s->sctlr_b && (opc & MO_SIZE) == MO_64) {
@@ -964,6 +976,7 @@ void gen_aa32_st_internal_i64(DisasContext *s, TCGv_i64 val,
                               TCGv_i32 a32, int index, MemOp opc)
 {
     TCGv addr = gen_aa32_addr(s, a32, opc);
+    TCGv_i64 cost = gen_icount_mem_cost(s, a32, opc, true);
 
     /* Not needed for user-mode BE32, where we use MO_BE instead.  */
     if (!IS_USER_ONLY && s->sctlr_b && (opc & MO_SIZE) == MO_64) {
@@ -973,6 +986,7 @@ void gen_aa32_st_internal_i64(DisasContext *s, TCGv_i64 val,
     } else {
         tcg_gen_qemu_st_i64(val, addr, index, opc);
     }
+    gen_icount_mem_cost_add(cost);
 }
 
 void gen_aa32_ld_i32(DisasContext *s, TCGv_i32 val, TCGv_i32 a32,
@@ -6540,7 +6554,7 @@ static bool trans_B(DisasContext *s, arg_i *a)
     return true;
 }
 
-static void gen_icount_extra_cycles(unsigned cycles);
+static void gen_icount_extra_mc(int32_t mc);
 static bool trans_B_cond_thumb(DisasContext *s, arg_ci *a)
 {
     /* This has cond from encoding, required to be outside IT block.  */
@@ -6553,7 +6567,7 @@ static bool trans_B_cond_thumb(DisasContext *s, arg_ci *a)
     }
     arm_skip_unless(s, a->cond);
     if (s->icount_cycles) {
-        gen_icount_extra_cycles(1);   /* taken */
+        gen_icount_extra_mc(1000);   /* taken */
     }
     gen_jmp(s, jmp_diff(s, a->imm));
     return true;
@@ -6959,6 +6973,9 @@ static bool trans_CBZ(DisasContext *s, arg_CBZ *a)
     arm_gen_condlabel(s);
     tcg_gen_brcondi_i32(a->nz ? TCG_COND_EQ : TCG_COND_NE,
                         tmp, 0, s->condlabel.label);
+    if (s->icount_cycles) {
+        gen_icount_extra_mc(1000);   /* taken */
+    }
     gen_jmp(s, jmp_diff(s, a->imm));
     return true;
 }
@@ -7525,6 +7542,18 @@ static void arm_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     dc->isar = &cpu->isar;
     dc->condjmp = 0;
     dc->icount_cycles = cs->icount_counts_cycles;
+    dc->icount_v8m_main = arm_feature(env, ARM_FEATURE_V8) &&
+                          arm_feature(env, ARM_FEATURE_M_MAIN);
+    dc->icount_mem_costs = NULL;
+    for (unsigned i = 0; dc->icount_cycles && i < cs->icount_mem_costs_n;
+         i++) {
+        const IcountMemCosts *c = &cs->icount_mem_costs[i];
+
+        if (dc->base.pc_first - c->fetch_base < c->fetch_size) {
+            dc->icount_mem_costs = c;
+            break;
+        }
+    }
     dc->pc_save = dc->base.pc_first;
     dc->aarch64 = false;
     dc->thumb = EX_TBFLAG_AM32(tb_flags, THUMB);
@@ -7836,45 +7865,101 @@ static bool thumb_insn_is_unconditional(DisasContext *s, uint32_t insn)
 /*
  * Per-CPU icount clocks (CPUState.icount_counts_cycles): a core that counts
  * cycles rather than instructions takes one cycle per instruction plus the
- * extra cycles below, from the Cortex-M0+ instruction timings (loads and
- * stores 2, LDM/STM/PUSH/POP 1 + N and POP {PC} 3 + N, B and taken B<c> 2,
- * BL 3, BX/BLX and writes to PC 2, MSR/MRS/barriers 3-4).  Device accesses
- * that cost more are charged by the device's bus model.
+ * extra millicycles below, per instruction class, and per data access by
+ * address (CPUState.icount_mem_costs).  Device accesses that cost more are
+ * charged by the device's bus model.
  */
-static void gen_icount_extra_cycles(unsigned cycles)
+static void gen_icount_add_mc(TCGv_i64 mc)
 {
     TCGv_i64 t = tcg_temp_new_i64();
     const intptr_t ofs =
-        (intptr_t)offsetof(ArchCPU, parent_obj.icount_extra_cycles) -
+        (intptr_t)offsetof(ArchCPU, parent_obj.icount_extra_mc) -
         (intptr_t)offsetof(ArchCPU, env);
 
     tcg_gen_ld_i64(t, tcg_env, ofs);
-    tcg_gen_addi_i64(t, t, cycles);
+    tcg_gen_add_i64(t, t, mc);
     tcg_gen_st_i64(t, tcg_env, ofs);
 }
 
+static void gen_icount_extra_mc(int32_t mc)
+{
+    gen_icount_add_mc(tcg_constant_i64(mc));
+}
+
 /*
- * Extra cycles of an Armv6-M instruction known at translation time; *branch
- * is set for instructions that may leave the TB, whose cycles must be
- * counted before they execute.
+ * The data access cost of a load or store at @a32, computed before the
+ * access; gen_icount_mem_cost_add() charges it after, so an I/O
+ * re-execution counts it once.  The costs are read when the access runs,
+ * so a machine may change them (e.g. flash wait states) without a flush.
  */
-static unsigned armv6m_extra_cycles(uint32_t insn, bool is_16bit,
-                                    bool *branch)
+static TCGv_i64 gen_icount_mem_cost(DisasContext *s, TCGv_i32 a32,
+                                    MemOp opc, bool is_store)
+{
+    const IcountMemCosts *c = s->icount_mem_costs;
+    TCGv_i64 sum = NULL;
+
+    if (!c) {
+        return NULL;
+    }
+    for (unsigned i = 0; i < ICOUNT_MEM_COST_RANGES; i++) {
+        const int32_t *mc = is_store ? &c->range[i].store_mc :
+                                       &c->range[i].load_mc;
+        TCGv_i32 in, per;
+        TCGv_i64 cost;
+
+        if (!c->range[i].size) {
+            continue;
+        }
+        in = tcg_temp_new_i32();
+        per = tcg_temp_new_i32();
+        cost = tcg_temp_new_i64();
+        tcg_gen_subi_i32(in, a32, c->range[i].base);
+        tcg_gen_setcondi_i32(TCG_COND_LTU, in, in, c->range[i].size);
+        tcg_gen_ld_i32(per, tcg_constant_ptr(mc), 0);
+        tcg_gen_mul_i32(in, in, per);
+        if ((opc & MO_SIZE) == MO_64) {
+            tcg_gen_shli_i32(in, in, 1);        /* two 32-bit transfers */
+        }
+        tcg_gen_ext_i32_i64(cost, in);
+        if (sum) {
+            tcg_gen_add_i64(sum, sum, cost);
+        } else {
+            sum = cost;
+        }
+    }
+    return sum;
+}
+
+static void gen_icount_mem_cost_add(TCGv_i64 cost)
+{
+    if (cost) {
+        gen_icount_add_mc(cost);
+    }
+}
+
+/*
+ * Extra millicycles of an Armv6-M instruction known at translation time,
+ * from the Cortex-M0+ instruction timings (loads and stores 2, LDM/STM/
+ * PUSH/POP 1 + N and POP {PC} 3 + N, B and taken B<c> 2, BL 3, BX/BLX and
+ * writes to PC 2, MSR/MRS/barriers 3-4); *branch is set for instructions
+ * that may leave the TB, whose cycles must be counted before they execute.
+ */
+static int32_t armv6m_extra_mc(uint32_t insn, bool is_16bit, bool *branch)
 {
     *branch = false;
     if (!is_16bit) {
         if ((insn & 0xf800d000) == 0xf000d000) {        /* BL */
             *branch = true;
-            return 2;
+            return 2000;
         }
         if ((insn & 0xffe0d000) == 0xf3808000) {        /* MSR */
-            return 3;
+            return 3000;
         }
         if ((insn & 0xffffd000) == 0xf3ef8000) {        /* MRS */
-            return 2;
+            return 2000;
         }
         if ((insn & 0xffffff00) == 0xf3bf8f00) {        /* DSB/DMB/ISB */
-            return 3;
+            return 3000;
         }
         return 0;
     }
@@ -7884,31 +7969,120 @@ static unsigned armv6m_extra_cycles(uint32_t insn, bool is_16bit,
     case 0x0c: case 0x0d: case 0x0e: case 0x0f:         /* ld/st word, byte */
     case 0x10: case 0x11:                               /* ld/st halfword */
     case 0x12: case 0x13:                               /* ld/st SP-relative */
-        return 1;
+        return 1000;
     case 0x18: case 0x19:                               /* STM, LDM */
-        return ctpop8(insn & 0xff);
+        return ctpop8(insn & 0xff) * 1000;
     case 0x1c:                                          /* B */
         *branch = true;
-        return 1;
+        return 1000;
     }
     if ((insn & 0xff00) == 0x4700) {                    /* BX, BLX */
         *branch = true;
-        return 1;
+        return 1000;
     }
     if ((insn & 0xfc87) == 0x4487 && (insn & 0x0300) != 0x0100) {
         /* ADD/MOV to PC */
         *branch = true;
-        return 1;
+        return 1000;
     }
     if ((insn & 0xfe00) == 0xb400) {                    /* PUSH */
-        return ctpop8(insn & 0xff) + ((insn >> 8) & 1);
+        return (ctpop8(insn & 0xff) + ((insn >> 8) & 1)) * 1000;
     }
     if ((insn & 0xfe00) == 0xbc00) {                    /* POP */
         if (insn & 0x100) {
             *branch = true;
-            return ctpop8(insn & 0xff) + 1 + 2;
+            return (ctpop8(insn & 0xff) + 1 + 2) * 1000;
         }
-        return ctpop8(insn & 0xff);
+        return ctpop8(insn & 0xff) * 1000;
+    }
+    return 0;
+}
+
+/*
+ * Armv8-M Mainline (Cortex-M33) cycle counts.  Measured on an EFR32BG22
+ * with code in flash and the instruction cache warm (owo-open-fw
+ * docs/radio-tables.md SS7.75, SS7.93): ALU, loads and stores 1 cycle
+ * (their target's cost on top: icount_mem_costs and the bus model), NOP
+ * 0.5 (dual issue), a taken B<c> 2.  Inferred from those: every other write
+ * to PC (B, BL, BX, BLX, CBZ/CBNZ taken, POP/LDM/LDR to PC, TBB/TBH) refills
+ * the pipeline like a taken B<c>, one more cycle; a multiple transfer moves
+ * one word per cycle (LDM/STM/PUSH/POP N, LDRD/STRD 2).  Placeholders,
+ * unmeasured: divides (the Armv7-M Cortex-M4's worst case, 12), multiplies
+ * and the rest 1, no IT-block folding and no dual issue but NOP.
+ */
+#define V8M_REFILL_MC 1000
+#define V8M_TRANSFER_MC 1000
+#define V8M_NOP_MC (-500)
+#define V8M_DIVIDE_MC 11000
+
+static int32_t armv8m_main_extra_mc(uint32_t insn, bool is_16bit,
+                                    bool *branch)
+{
+    int n;
+
+    *branch = false;
+    if (!is_16bit) {
+        if ((insn & 0xf800d000) == 0xf000d000 ||        /* BL */
+            (insn & 0xf800d000) == 0xf0009000) {        /* B.W */
+            *branch = true;
+            return V8M_REFILL_MC;
+        }
+        if ((insn & 0xfe400000) == 0xe8000000 &&        /* LDM, STM */
+            ((insn >> 23) & 3) != 0 && ((insn >> 23) & 3) != 3) {
+            n = ctpop16(insn & 0xffff);
+            if ((insn & (1 << 20)) && (insn & (1 << 15))) {
+                *branch = true;
+                return (n - 1) * V8M_TRANSFER_MC + V8M_REFILL_MC;
+            }
+            return (n - 1) * V8M_TRANSFER_MC;
+        }
+        if ((insn & 0xfff0ffe0) == 0xe8d0f000) {        /* TBB, TBH */
+            *branch = true;
+            return V8M_REFILL_MC;
+        }
+        if ((insn & 0xfe400000) == 0xe8400000 &&        /* LDRD, STRD */
+            (insn & 0x01200000)) {
+            return V8M_TRANSFER_MC;
+        }
+        if ((insn & 0xff70f000) == 0xf850f000) {        /* LDR PC */
+            *branch = true;
+            return V8M_REFILL_MC;
+        }
+        if ((insn & 0xffd0f0f0) == 0xfb90f0f0) {        /* SDIV, UDIV */
+            return V8M_DIVIDE_MC;
+        }
+        return 0;
+    }
+    if (insn == 0xbf00) {                               /* NOP */
+        return V8M_NOP_MC;
+    }
+    if ((insn >> 11) == 0x1c) {                         /* B */
+        *branch = true;
+        return V8M_REFILL_MC;
+    }
+    if ((insn & 0xff00) == 0x4700) {                    /* BX, BLX */
+        *branch = true;
+        return V8M_REFILL_MC;
+    }
+    if ((insn & 0xfc87) == 0x4487 && (insn & 0x0300) != 0x0100) {
+        /* ADD/MOV to PC */
+        *branch = true;
+        return V8M_REFILL_MC;
+    }
+    if ((insn >> 11) == 0x18 || (insn >> 11) == 0x19) { /* STM, LDM */
+        return (ctpop8(insn & 0xff) - 1) * V8M_TRANSFER_MC;
+    }
+    if ((insn & 0xfe00) == 0xb400) {                    /* PUSH */
+        return (ctpop8(insn & 0xff) + ((insn >> 8) & 1) - 1) *
+               V8M_TRANSFER_MC;
+    }
+    if ((insn & 0xfe00) == 0xbc00) {                    /* POP */
+        n = ctpop8(insn & 0xff) + ((insn >> 8) & 1);
+        if (insn & 0x100) {
+            *branch = true;
+            return (n - 1) * V8M_TRANSFER_MC + V8M_REFILL_MC;
+        }
+        return (n - 1) * V8M_TRANSFER_MC;
     }
     return 0;
 }
@@ -7923,7 +8097,7 @@ static void thumb_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     /* TCG op to rewind to if this turns out to be an invalid ECI state */
     TCGOp *insn_eci_rewind = NULL;
     target_ulong insn_eci_pc_save = -1;
-    unsigned icount_extra = 0;
+    int32_t icount_extra = 0;
     bool icount_branch = false;
 
     /* Misaligned thumb PC is architecturally impossible. */
@@ -8003,9 +8177,11 @@ static void thumb_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     }
 
     if (dc->icount_cycles) {
-        icount_extra = armv6m_extra_cycles(insn, is_16bit, &icount_branch);
+        icount_extra = dc->icount_v8m_main ?
+            armv8m_main_extra_mc(insn, is_16bit, &icount_branch) :
+            armv6m_extra_mc(insn, is_16bit, &icount_branch);
         if (icount_extra && icount_branch) {
-            gen_icount_extra_cycles(icount_extra);
+            gen_icount_extra_mc(icount_extra);
         }
     }
     if (is_16bit) {
@@ -8016,7 +8192,7 @@ static void thumb_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     if (icount_extra && !icount_branch &&
         dc->base.is_jmp != DISAS_NORETURN) {
         /* After the access, so an I/O re-execution counts it once. */
-        gen_icount_extra_cycles(icount_extra);
+        gen_icount_extra_mc(icount_extra);
     }
 
     /* Advance the Thumb condexec condition.  */

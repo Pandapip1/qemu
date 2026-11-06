@@ -57,8 +57,14 @@ typedef struct DisasContext {
      * after decode (ie after any UNDEF checks)
      */
     bool eci_handled;
-    /* Per-CPU icount clocks: charge Armv6-M cycles per instruction. */
+    /*
+     * Per-CPU icount clocks: charge cycles per instruction class, Armv6-M
+     * timings or (icount_v8m_main) Armv8-M Mainline ones, and data access
+     * costs by address (icount_mem_costs, for code at this TB's PC).
+     */
     bool icount_cycles;
+    bool icount_v8m_main;
+    const IcountMemCosts *icount_mem_costs;
     int sctlr_b;
     MemOp be_data;
 #if !defined(CONFIG_USER_ONLY)

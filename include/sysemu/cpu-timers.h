@@ -108,9 +108,17 @@ void icount_set_cpu_clock(CPUState *cpu, uint64_t hz,
  * class by its translator (one cycle per instruction plus the class's extra
  * cycles) instead of by an average per instruction; the average set by
  * icount_set_cpu_clock() then only sizes the slices.  Call before the vCPU
- * runs.  Only the Armv6-M Thumb translator counts cycles.
+ * runs.  Only the M-profile Thumb translator counts cycles (Armv6-M and
+ * Armv8-M Mainline timings).
  */
 void icount_set_cpu_cycle_counting(CPUState *cpu, bool on);
+/*
+ * icount_set_cpu_mem_costs: data access costs of a cycle-counting vCPU, by
+ * code and data address (IcountMemCosts; @costs must outlive the vCPU).
+ * Call before the vCPU runs.
+ */
+void icount_set_cpu_mem_costs(CPUState *cpu, const IcountMemCosts *costs,
+                              unsigned n);
 /* icount_set_cpu_exception_cycles: cycles each exception entry costs. */
 void icount_set_cpu_exception_cycles(CPUState *cpu, uint64_t millicycles);
 void icount_charge_exception(CPUState *cpu);
@@ -131,12 +139,15 @@ void icount_charge_cycles(CPUState *cpu, uint64_t millicycles);
  * (CPUState.icount_bus_accesses).  @access may also charge other vCPUs
  * through icount_charge_cycles() for contention.  @round_end, if set, runs
  * when a round completes, before the occupancy is cleared, so a model can
- * resolve contention from what every master did in the round.
+ * resolve contention from what every master did in the round.  @exception,
+ * if set, prices an exception entry of @cpu at its current time, given the
+ * vCPU's own entry cost (icount_set_cpu_exception_cycles()).
  */
 typedef struct IcountBusModel {
     uint64_t (*access)(void *opaque, CPUState *master, uint64_t addr,
                        unsigned size, bool is_write, unsigned *target);
     void (*round_end)(void *opaque, int64_t start_ns, int64_t end_ns);
+    uint64_t (*exception)(void *opaque, CPUState *cpu, uint64_t millicycles);
     void *opaque;
 } IcountBusModel;
 void icount_register_bus_model(IcountBusModel *model);

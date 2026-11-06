@@ -57,6 +57,7 @@ typedef struct I2SCodec I2SCodec;
 typedef struct IOMMUMemoryRegion IOMMUMemoryRegion;
 typedef struct ISABus ISABus;
 typedef struct ISADevice ISADevice;
+typedef struct IcountMemCosts IcountMemCosts;
 typedef struct IsaDma IsaDma;
 typedef struct JSONWriter JSONWriter;
 typedef struct MACAddr MACAddr;

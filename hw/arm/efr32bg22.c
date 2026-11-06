@@ -649,6 +649,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_MSC_IRQ 49
 /* READCTRL resets to MODE = 2 (RM SS6.8.2) */
 #define EFR32_MSC_READCTRL_RESET 0x00200000u
+#define EFR32_MSC_READCTRL_MODE_SHIFT 20
+#define EFR32_MSC_READCTRL_MODE_MASK 0x3u
 /* WREN, IRQERASEABORT and LPWRITE are the writable fields (RM SS6.8.3) */
 #define EFR32_MSC_WRITECTRL_MASK 0x0000000bu
 #define EFR32_MSC_MISCLOCKWORD_MASK (EFR32_MSC_MISCLOCKWORD_MELOCKBIT | \
@@ -947,6 +949,8 @@ struct Efr32Periph
     /* PCLK = HCLK / (PCLKPRESC + 1): the USARTs' clock. */
     Clock *pclk;
     IcountBusModel bus_model;
+    /* M33 data access costs of memory QEMU maps as RAM, by code region. */
+    IcountMemCosts m33_mem_costs[2];
     bool seq_released;
     bool synth_running;
     /* A sequencer-driven TX reached completion with the synthesizer off. */
@@ -6635,6 +6639,8 @@ static void efr32_msc_check_address(Efr32Periph *s)
                      EFR32_MSC_STATUS_LOCKED : 0);
 }
 
+static void efr32_mem_costs_update(Efr32Periph *s);
+
 /* Returns true when the write to this MSC register is fully handled. */
 static bool efr32_msc_write(Efr32Periph *s, uint32_t offset, uint32_t old,
                             uint32_t next)
@@ -6644,7 +6650,11 @@ static bool efr32_msc_write(Efr32Periph *s, uint32_t offset, uint32_t old,
 
     switch (offset) {
     case EFR32_MSC_READCTRL:
-        return reglocked;
+        if (!reglocked) {
+            efr32_msc_put(s, offset, next);
+            efr32_mem_costs_update(s);
+        }
+        return true;
     case EFR32_MSC_WRITECTRL:
         if (!reglocked) {
             efr32_msc_put(s, offset, next & EFR32_MSC_WRITECTRL_MASK);
@@ -6702,6 +6712,7 @@ static void efr32_msc_reset(Efr32Periph *s)
     efr32_msc_put(s, EFR32_MSC_MISCLOCKWORD, EFR32_MSC_MISCLOCKWORD_RESET);
     efr32_msc_put(s, EFR32_MSC_READCTRL, EFR32_MSC_READCTRL_RESET);
     efr32_msc_put(s, EFR32_MSC_PWRCTRL, EFR32_MSC_PWRCTRL_RESET);
+    efr32_mem_costs_update(s);
     efr32_msc_update_irq(s);
 }
 
@@ -7587,23 +7598,45 @@ static bool efr32_bus_error(Efr32Periph *s, uint32_t address)
 #define EFR32_CMU_SYSCLKCTRL_PCLKPRESC_SHIFT 10
 #define EFR32_CMU_SYSCLKCTRL_PCLKPRESC_MASK 0x1u
 /*
- * Core cycles per instruction, from real code: a firmware function called
- * from the debugger at full speed (cycles) and single-stepped
- * (instructions), n = 6 calls each, no spread.
- *  - M33, stage 3 from flash, warm cache: snprintk 7973 cycles / 4342
- *    insns = 1.84 (compiled C); memcpy 1.60, memset 1.50, strlen 1.45
- *    (library loops).  The compiled-C average is used.
+ * Both cores count cycles per instruction class (the Thumb translator,
+ * icount_set_cpu_cycle_counting); a flat average fits neither (SS7.75,
+ * SS7.93):
  *  - M0+, the open sequencer image: the Armv6-M timings (one cycle, loads
- *    and stores 2, taken branches 2, BL 3, ...; the translator counts them,
- *    icount_set_cpu_cycle_counting) plus 3 extra cycles per radio access
- *    reproduce each function exactly: rx_frontend_stop 61 cycles / 22
- *    insns, synth_config_tx 112 / 39, efr32_seq_delay 7 cycles per pass.
- *    A flat average does not: pga_dc_interp (ALU) runs at 1.19 cycles per
- *    instruction, synth_power_down at 2.5.  The average below only sizes
- *    the M0+'s slices.
+ *    and stores 2, taken branches 2, BL 3, ...) plus the bus model's
+ *    radio, BUFC and peripheral costs reproduce each function exactly:
+ *    rx_frontend_stop 61 cycles / 22 insns, synth_config_tx 112 / 39,
+ *    efr32_seq_delay 7 cycles per pass; pga_dc_interp (ALU) runs at 1.19
+ *    cycles per instruction, synth_power_down at 2.5.
+ *  - M33: the Armv8-M Mainline counts in target/arm/tcg/translate.c, from
+ *    the silicon kernels (ALU, loads and stores 1, NOP 0.5, taken branch 2,
+ *    code in flash with the cache warm), plus the costs of flash and SRAM
+ *    data below and of the bus model's targets.  Compiled C averaged 1.84
+ *    cycles per instruction (snprintk 7973 cycles / 4342 instructions),
+ *    library loops 1.45-1.60.
+ * The averages below only size the slices.
  */
 #define EFR32_M33_CYCLES_PER_INSN_MILLI 1840u
 #define EFR32_SEQ_CYCLES_PER_INSN_MILLI 2000u
+/*
+ * Data accesses QEMU maps as RAM, so the bus model never sees them
+ * (millicycles beyond the instruction's own cycle; SS7.75 kernels, eight
+ * accesses back to back between loop passes, n = 5 + 5, no spread):
+ *  - M33, code in flash: a flash data load 4.5 cycles at MSC.READCTRL MODE
+ *    = WS1, SRAM loads and stores 1.  With code in SRAM, where the fetch
+ *    shares the System interface: flash 4.0, SRAM 1.5.  The RM (SS6.5)
+ *    passes data reads of the code region through the instruction cache
+ *    uncached, so literal pools cost the same [I]; each further wait state
+ *    adds one cycle to every flash read [I] (SS6.3.9, "one wait-state
+ *    inserted for each fetch or read transfer").
+ * The M0+'s SEQRAM stores average 2.5 cycles in the kernels but take 2 in
+ * the sequencer's delay loop and 3 in a copy at another address (SS7.75):
+ * a fetch-alignment effect not pinned yet, so the Armv6-M 2 stands [P].
+ */
+#define EFR32_CODE_REGION_END 0x20000000u
+#define EFR32_M33_FLASH_LOAD_WS1_MC 3500
+#define EFR32_M33_SRAM_CODE_FLASH_LOAD_WS1_MC 3000
+#define EFR32_M33_SRAM_CODE_SRAM_MC 500
+#define EFR32_FLASH_WAIT_STATE_MC 1000
 /*
  * Exception entry, SysTick reload to the first handler load (SS7.73,
  * cross-core probes): M0+ 16 cycles; M33 17 (18 from WFI) with its vector
@@ -7691,6 +7724,32 @@ static void efr32_cpu_clocks_update(Efr32Periph *s)
                           EFR32_CMU_SYSCLKCTRL_PCLKPRESC_MASK) + 1), 0);
 }
 
+/* The M33's data access costs; flash follows MSC.READCTRL.MODE. */
+static void efr32_mem_costs_update(Efr32Periph *s)
+{
+    int32_t ws = (efr32_register_get(s, EFR32_MSC_BASE + EFR32_MSC_READCTRL) >>
+                  EFR32_MSC_READCTRL_MODE_SHIFT) & EFR32_MSC_READCTRL_MODE_MASK;
+    int32_t extra_ws = (ws - 1) * EFR32_FLASH_WAIT_STATE_MC;
+    IcountMemCosts *flash_code = &s->m33_mem_costs[0];
+    IcountMemCosts *sram_code = &s->m33_mem_costs[1];
+
+    *flash_code = (IcountMemCosts) {
+        .fetch_base = 0, .fetch_size = EFR32_CODE_REGION_END,
+        .range[0] = { 0, EFR32_CODE_REGION_END,
+                      EFR32_M33_FLASH_LOAD_WS1_MC + extra_ws, 0 },
+    };
+    *sram_code = (IcountMemCosts) {
+        .fetch_base = EFR32_IC_SRAM_BASE,
+        .fetch_size = EFR32_IC_SRAM_END - EFR32_IC_SRAM_BASE,
+        .range[0] = { 0, EFR32_CODE_REGION_END,
+                      EFR32_M33_SRAM_CODE_FLASH_LOAD_WS1_MC + extra_ws, 0 },
+        .range[1] = { EFR32_IC_SRAM_BASE,
+                      EFR32_IC_SRAM_END - EFR32_IC_SRAM_BASE,
+                      EFR32_M33_SRAM_CODE_SRAM_MC,
+                      EFR32_M33_SRAM_CODE_SRAM_MC },
+    };
+}
+
 /* The M0+ is executing: released, clocked and not sleeping. */
 static bool efr32_seq_executing(Efr32Periph *s)
 {
@@ -7762,10 +7821,19 @@ static void efr32_bus_round_end(void *opaque, int64_t start_ns,
     s->ic.seq_executing = efr32_seq_executing(s);
     s->ic.rhclk_hz = s->seq_cpuclk ? clock_get_hz(s->seq_cpuclk) : 0;
     efr32_ic_round_end(&s->ic, start_ns, end_ns);
-    if (s->seq_cpu) {
-        icount_set_cpu_exception_cycles(
-            s->seq_cpu, efr32_ic_seq_exception_millicycles(&s->ic));
+}
+
+static uint64_t efr32_bus_exception(void *opaque, CPUState *cpu,
+                                    uint64_t millicycles)
+{
+    Efr32Periph *s = opaque;
+
+    if (cpu != s->seq_cpu) {
+        return millicycles;
     }
+    s->ic.hclk_hz = s->m33_cpuclk ? clock_get_hz(s->m33_cpuclk) : 0;
+    s->ic.rhclk_hz = s->seq_cpuclk ? clock_get_hz(s->seq_cpuclk) : 0;
+    return efr32_ic_seq_exception_millicycles(&s->ic);
 }
 
 /* Every CPU access to this device goes through the bus model. */
@@ -9325,11 +9393,16 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
     }
     s->periph.bus_model.access = efr32_bus_cost;
     s->periph.bus_model.round_end = efr32_bus_round_end;
+    s->periph.bus_model.exception = efr32_bus_exception;
     s->periph.bus_model.opaque = &s->periph;
     s->periph.ic.cpu[EFR32_IC_M33] = s->periph.m33_cpu;
     s->periph.ic.cpu[EFR32_IC_SEQ] = s->periph.seq_cpu;
     icount_register_bus_model(&s->periph.bus_model);
     icount_set_cpu_cycle_counting(s->periph.seq_cpu, true);
+    icount_set_cpu_cycle_counting(s->periph.m33_cpu, true);
+    efr32_mem_costs_update(&s->periph);
+    icount_set_cpu_mem_costs(s->periph.m33_cpu, s->periph.m33_mem_costs,
+                             ARRAY_SIZE(s->periph.m33_mem_costs));
     icount_set_cpu_exception_cycles(s->periph.seq_cpu,
                                     EFR32_SEQ_EXCEPTION_ENTRY_MILLICYCLES);
     icount_set_cpu_exception_cycles(s->periph.m33_cpu,
