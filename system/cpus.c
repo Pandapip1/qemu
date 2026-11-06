@@ -690,9 +690,21 @@ void qemu_init_vcpu(CPUState *cpu)
 
 void cpu_stop_current(void)
 {
+    CPUState *cpu;
+
     if (current_cpu) {
         current_cpu->stop = true;
         cpu_exit(current_cpu);
+        /*
+         * A thread that runs several vCPUs (round-robin TCG) must not run
+         * the others on until the main loop stops the VM: how far they
+         * would get depends on host timing, which breaks icount runs.
+         */
+        CPU_FOREACH(cpu) {
+            if (cpu != current_cpu && qemu_cpu_is_self(cpu) && !cpu->stopped) {
+                cpu->stop = true;
+            }
+        }
     }
 }
 

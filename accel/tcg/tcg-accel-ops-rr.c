@@ -28,6 +28,7 @@
 #include "sysemu/tcg.h"
 #include "sysemu/replay.h"
 #include "sysemu/cpu-timers.h"
+#include "sysemu/cpus.h"
 #include "qemu/main-loop.h"
 #include "qemu/notify.h"
 #include "qemu/guest-random.h"
@@ -277,6 +278,7 @@ static void *rr_cpu_thread_fn(void *arg)
 
                 if (r == EXCP_DEBUG) {
                     cpu_handle_guest_debug(cpu);
+                    cpu_stop_current();
                     break;
                 } else if (r == EXCP_ATOMIC) {
                     bql_unlock();

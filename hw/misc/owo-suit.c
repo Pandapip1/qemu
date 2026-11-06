@@ -784,8 +784,7 @@ static void suit_script_fire(void *opaque)
             s->next_step++;
             suit_rec_int(s, SIG_SCRIPT, s->next_step);
             if (!strcmp(st->path, "pause")) {
-                qemu_system_vmstop_request_prepare();
-                qemu_system_vmstop_request(RUN_STATE_PAUSED);
+                vm_stop(RUN_STATE_PAUSED);
             } else {
                 qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_QMP_QUIT);
             }
