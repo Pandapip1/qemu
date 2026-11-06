@@ -333,7 +333,19 @@ void helper_rtie(CPUARCState *env)
         return;
     }
 
-    if (GET_STATUS_BIT(env->stat, AEf) || (env->aux_irq_act & 0xFFFF) == 0) {
+    if ((env_archcpu(env)->family & (ARC_OPCODE_ARC700 | ARC_OPCODE_ARC600))
+        && !GET_STATUS_BIT(env->stat, AEf)) {
+        /* ARCompact: A2 (bit 4) returns from level 2, otherwise level 1. */
+        bool l2 = pack_status32(&env->stat) & (1u << 4);
+
+        env->pc = l2 ? env->r[30] : env->r[29];
+        CPU_PCL(env) = env->pc;
+        unpack_status32(&env->stat, l2 ? env->status32_l2 : env->status32_l1);
+        env->bta = l2 ? env->bta_l2 : env->bta_l1;
+        qemu_log_mask(CPU_LOG_INT, "[IRQ] RTIE L%d @0x" TARGET_FMT_lx "\n",
+                      l2 ? 2 : 1, env->pc);
+    } else if (GET_STATUS_BIT(env->stat, AEf) ||
+               (env->aux_irq_act & 0xFFFF) == 0) {
         assert(GET_STATUS_BIT(env->stat, Uf) == 0);
 
         CPU_PCL(env) = env->eret;

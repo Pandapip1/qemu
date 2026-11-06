@@ -103,6 +103,10 @@ arc_general_regs_get(const struct arc_aux_reg_detail *aux_reg_detail,
     ARCCPU *cpu = env_archcpu(env);
     target_ulong reg = 0;
 
+    if (aux_reg_detail->address >= 0x220 && aux_reg_detail->address <= 0x237) {
+        return env->aux_ap[aux_reg_detail->address - 0x220];
+    }
+
     switch (aux_reg_detail->id) {
     case AUX_ID_aux_volatile:
         reg = 0xc0000000;
@@ -176,6 +180,16 @@ arc_general_regs_get(const struct arc_aux_reg_detail *aux_reg_detail,
         reg = env->aux_irq_lev;
         break;
 
+    case AUX_ID_aux_macmode:
+        reg = env->aux_macmode;
+        break;
+
+    case AUX_ID_aux_xmac0:
+    case AUX_ID_aux_xmac1:
+    case AUX_ID_aux_xmac2:
+        reg = env->aux_xmac[aux_reg_detail->address - 0x44];
+        break;
+
     case AUX_ID_bta:
         reg = env->bta;
         break;
@@ -186,6 +200,14 @@ arc_general_regs_get(const struct arc_aux_reg_detail *aux_reg_detail,
 
     case AUX_ID_bta_l2:
         reg = env->bta_l2;
+        break;
+
+    case AUX_ID_status32_l1:
+        reg = env->status32_l1;
+        break;
+
+    case AUX_ID_status32_l2:
+        reg = env->status32_l2;
         break;
 
     case AUX_ID_hw_pf_ctrl:
@@ -214,6 +236,11 @@ arc_general_regs_set(const struct arc_aux_reg_detail *aux_reg_detail,
                      target_ulong val, void *data)
 {
     CPUARCState *env = (CPUARCState *) data;
+
+    if (aux_reg_detail->address >= 0x220 && aux_reg_detail->address <= 0x237) {
+        env->aux_ap[aux_reg_detail->address - 0x220] = val;
+        return;
+    }
 
     switch (aux_reg_detail->id) {
     case AUX_ID_lp_start:
@@ -246,6 +273,32 @@ arc_general_regs_set(const struct arc_aux_reg_detail *aux_reg_detail,
 
     case AUX_ID_aux_irq_lev:
         env->aux_irq_lev = val;
+        break;
+
+    case AUX_ID_aux_macmode:
+        env->aux_macmode = val;
+        break;
+
+    case AUX_ID_bta_l1:
+        env->bta_l1 = val;
+        break;
+
+    case AUX_ID_bta_l2:
+        env->bta_l2 = val;
+        break;
+
+    case AUX_ID_status32_l1:
+        env->status32_l1 = val;
+        break;
+
+    case AUX_ID_status32_l2:
+        env->status32_l2 = val;
+        break;
+
+    case AUX_ID_aux_xmac0:
+    case AUX_ID_aux_xmac1:
+    case AUX_ID_aux_xmac2:
+        env->aux_xmac[aux_reg_detail->address - 0x44] = val;
         break;
 
     default:

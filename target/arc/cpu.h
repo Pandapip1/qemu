@@ -244,6 +244,8 @@ struct CPUArchState {
     target_ulong bta;
     target_ulong bta_l1;
     target_ulong bta_l2;
+    uint32_t status32_l1;  /* ARCv1 */
+    uint32_t status32_l2;
 
     target_ulong pc;     /*  program counter         */
     target_ulong lps;    /*  loops start             */
@@ -268,6 +270,9 @@ struct CPUArchState {
     uint32_t icause[16];     /* Banked cause register */
     uint32_t aux_irq_hint;   /* AUX register, used to trigger soft irq */
     uint32_t aux_irq_lev;    /* ARCv1 AUX register */
+    uint32_t aux_ap[24];     /* actionpoint AMV/AMM/AC 0-7, 0x220-0x237 */
+    uint32_t aux_macmode;    /* ARCv1 XMAC AUX registers */
+    uint32_t aux_xmac[3];
     target_ulong aux_user_sp;
     uint32_t aux_irq_ctrl;
     uint32_t aux_rtc_ctrl;
