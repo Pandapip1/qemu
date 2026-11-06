@@ -603,6 +603,17 @@ static void ax210_init(MachineState *machine)
         g_free(c);
     }
 
+    /* Host CSRs as the driver leaves them before firmware load (finding C2):
+     * CSR_HW_REV (0x028) type CSR_HW_REV_TYPE_TY = 0x420 [F, iwl-csr.h:358];
+     * iwl_mvm_nic_config copies HW_REV[3:0] (step/dash) into
+     * CSR_HW_IF_CONFIG_REG[3:0] [F, mvm/ops.c:100, called from
+     * pcie/trans-gen2.c:273]. IML 0x80445a2c and UMAC 0x8044a702 require
+     * dash == 2 when on-die [0xd03400] & 7 != 2 (else dash == 1), error
+     * 0x2fc otherwise; the real step/dash is [?], so step A (0), dash 2,
+     * with on-die 0xd03400 left at 0, is a consistent guess. */
+    host_csr[0x028 >> 2] = 0x420 | 0x2;
+    host_csr[0x000 >> 2] = 0x2;
+
     /* Host CSR initial contents: AX210_CSR="offs=val,..." (offs hex, val num) */
     const char *csr = getenv("AX210_CSR");
     if (csr) {

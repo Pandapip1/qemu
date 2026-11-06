@@ -260,6 +260,39 @@ static void test_lmac_mpu_map_ram(void)
     qtest_quit(s);
 }
 
+/* Host CSR defaults (finding C2): as iwl_mvm_nic_config leaves them, read
+ * back through the UMAC-side CSR proxy. */
+static void test_host_csr_driver_defaults(void)
+{
+    QTestState *s = qtest_init("-M ax210 -m 32M -nographic -monitor none "
+                               "-serial none -S");
+
+    qtest_writel(s, 0xc0d00020, 0x028);       /* CSR_HW_REV */
+    qtest_writel(s, 0xc0d0001c, 0x6a000000);
+    g_assert_cmphex(qtest_readl(s, 0xc0d00028) & 0xfff0, ==, 0x420); /* TY */
+    qtest_writel(s, 0xc0d00020, 0x000);       /* CSR_HW_IF_CONFIG_REG */
+    qtest_writel(s, 0xc0d0001c, 0x6a000000);
+    g_assert_cmphex(qtest_readl(s, 0xc0d00028) & 0xf, ==, 0x2);
+    qtest_quit(s);
+}
+
+/* Cross-core view + two-core semaphore (findings K1, S1): UMAC's set at
+ * 0xc0d03820 and LMAC's at 0xd03800 arbitrate the same bits. */
+static void test_semaphore_two_cores(void)
+{
+    QTestState *s = qtest_init("-M ax210 -m 32M -nographic -monitor none "
+                               "-serial none -S");
+
+    qtest_writel(s, 0xc0d03820, 1);           /* UMAC requests bit 0 */
+    g_assert_cmpuint(qtest_readl(s, 0xc0d03824) & 1, ==, 1);
+    qtest_writel(s, 0xc0d03800, 1);           /* LMAC view: busy */
+    g_assert_cmpuint(qtest_readl(s, 0xc0d03804) & 1, ==, 0);
+    qtest_writel(s, 0xc0d03828, 1);           /* UMAC releases */
+    qtest_writel(s, 0xc0d03800, 1);           /* LMAC now gets it */
+    g_assert_cmpuint(qtest_readl(s, 0xc0d03804) & 1, ==, 1);
+    qtest_quit(s);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -283,6 +316,10 @@ int main(int argc, char **argv)
     qtest_add_func("/ax210/lmac/msg-fifo-space", test_lmac_msg_fifo_space);
 
     qtest_add_func("/ax210/lmac/mpu-map-ram", test_lmac_mpu_map_ram);
+
+    qtest_add_func("/ax210/host-csr-driver-defaults",
+                   test_host_csr_driver_defaults);
+    qtest_add_func("/ax210/semaphore-two-cores", test_semaphore_two_cores);
 
     return g_test_run();
 }
