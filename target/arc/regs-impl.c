@@ -172,6 +172,10 @@ arc_general_regs_get(const struct arc_aux_reg_detail *aux_reg_detail,
         reg = env->efa;
         break;
 
+    case AUX_ID_aux_irq_lev:
+        reg = env->aux_irq_lev;
+        break;
+
     case AUX_ID_bta:
         reg = env->bta;
         break;
@@ -238,6 +242,10 @@ arc_general_regs_set(const struct arc_aux_reg_detail *aux_reg_detail,
 
     case AUX_ID_efa:
         env->efa = val;
+        break;
+
+    case AUX_ID_aux_irq_lev:
+        env->aux_irq_lev = val;
         break;
 
     default:
