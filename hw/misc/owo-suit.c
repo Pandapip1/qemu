@@ -661,7 +661,7 @@ static void suit_refresh(OwoSuitState *s)
     suit_rec_int(s, SIG_PA6, suit_net(s, SUIT_PIN_SEL2));
     suit_rec_int(s, SIG_PC3, suit_net(s, SUIT_PIN_SWITCH_LATCH));
     suit_rec_int(s, SIG_PC7, suit_net(s, SUIT_PIN_BOOST));
-    suit_rec_int(s, SIG_PC4, (pcf8575_pins(s->exp) == s->exp->last_read));
+    suit_rec_int(s, SIG_PC4, pcf8575_int_released(s->exp));
     suit_rec_int(s, SIG_BRIDGE, bridge);
     suit_rec_int(s, SIG_SWITCH, s->sw->latched);
     suit_rec_int(s, SIG_PAD, suit_pad_code(s));

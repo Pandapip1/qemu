@@ -266,6 +266,57 @@ static void test_i2c_expander(void)
     g_assert_cmphex(i2c_step() & I2C_IF_MSTOP, ==, I2C_IF_MSTOP);
 }
 
+static void expander_write(uint8_t p0, uint8_t p1)
+{
+    writel(I2C0_BASE + I2C_TXDATA, EXPANDER_WRITE);
+    writel(I2C0_BASE + I2C_CMD, I2C_CMD_START);
+    g_assert_cmphex(i2c_step() & I2C_IF_ACK, ==, I2C_IF_ACK);
+    writel(I2C0_BASE + I2C_TXDATA, p0);
+    writel(I2C0_BASE + I2C_TXDATA, p1);
+    g_assert_cmphex(i2c_step() & I2C_IF_ACK, ==, I2C_IF_ACK);
+    writel(I2C0_BASE + I2C_CMD, I2C_CMD_STOP);
+    g_assert_cmphex(i2c_step() & I2C_IF_MSTOP, ==, I2C_IF_MSTOP);
+}
+
+static void expander_ext_low(unsigned mask)
+{
+    qtest_qmp_assert_success(global_qtest, "{'execute':'qom-set','arguments':"
+                             "{'path':'/machine/suit','property':"
+                             "'expander-ext-low','value':%u}}", mask);
+}
+
+static bool expander_int_released(void)
+{
+    return readl(GPIO_PORT(PORT_C) + GPIO_DIN) & (1u << 4);
+}
+
+/*
+ * /INT (PC4) follows input changes only (NXP PCF8575 data sheet): a write
+ * that drives pins low does not assert it, an input pulled low does, a read
+ * releases it, and a pin written 0 (an output) pulled low does not.
+ */
+static void test_expander_int_inputs_only(void)
+{
+    reset();
+    pin_mode(PORT_C, 4, GPIO_MODE_INPUT);
+    writel(I2C0_BASE + I2C_EN, 1);
+    writel(I2C0_BASE + I2C_CMD, I2C_CMD_ABORT);
+    expander_write(0xd3, 0xff);
+    g_assert_true(expander_int_released());
+    expander_ext_low(1u << 0);
+    g_assert_false(expander_int_released());
+    writel(I2C0_BASE + I2C_TXDATA, EXPANDER_READ);
+    writel(I2C0_BASE + I2C_CMD, I2C_CMD_START);
+    g_assert_cmphex(i2c_step() & I2C_IF_RXDATAV, ==, I2C_IF_RXDATAV);
+    g_assert_cmphex(readl(I2C0_BASE + I2C_RXDATA), ==, 0xd2);
+    g_assert_true(expander_int_released());
+    writel(I2C0_BASE + I2C_CMD, I2C_CMD_NACK | I2C_CMD_STOP);
+    g_assert_cmphex(i2c_step() & I2C_IF_MSTOP, ==, I2C_IF_MSTOP);
+    expander_ext_low((1u << 0) | (1u << 2));
+    g_assert_true(expander_int_released());
+    expander_ext_low(0);
+}
+
 /* Up-count PWM on PC7: high while CNT < OC (RM SS19.3.3.9). */
 static void test_timer_pwm_pin(void)
 {
@@ -409,6 +460,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22-board/usart-spi-switch-readback",
                    test_usart_spi_switch_readback);
     qtest_add_func("/efr32bg22-board/i2c-expander", test_i2c_expander);
+    qtest_add_func("/efr32bg22-board/expander-int-inputs-only",
+                   test_expander_int_inputs_only);
     qtest_add_func("/efr32bg22-board/timer-pwm-pin", test_timer_pwm_pin);
     qtest_add_func("/efr32bg22-board/iadc-scan-board-battery",
                    test_iadc_scan_board_battery);

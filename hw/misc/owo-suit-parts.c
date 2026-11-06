@@ -292,8 +292,12 @@ static void switch_class_init(ObjectClass *klass, void *data)
  * 16-bit quasi-bidirectional I2C expander.  A write sends P0-P7 then
  * P10-P17 (pairs repeat); a read returns the pin levels in the same order.
  * A pin is high unless its latch is 0 or something outside pulls it low;
- * power-on latches are all 1.  /INT goes low when an input changes from
- * what was last read and returns high on a read.
+ * power-on latches are all 1.  /INT (NXP PCF8575 data sheet, "Interrupt
+ * output"): any edge on a pin in input mode (latch 1) asserts it; it is
+ * released when the pins return to their levels at the last reset, or by a
+ * read or a write of the port, which resets the interrupt circuit to the
+ * port's levels then.  A pin written 0 is an output and raises no
+ * interrupt.
  * Fault injection: "fault-nack": the part does not acknowledge its address
  * (absent or wedged).
  */
@@ -312,10 +316,23 @@ uint16_t pcf8575_pins(PCF8575State *s)
     return s->latch & ~s->ext_low;
 }
 
+bool pcf8575_int_released(PCF8575State *s)
+{
+    return !((pcf8575_pins(s) ^ s->int_ref) & s->latch);
+}
+
 static void pcf8575_update_int(PCF8575State *s)
 {
     /* /INT is open drain, active low. */
-    qemu_set_irq(s->int_out, pcf8575_pins(s) == s->last_read);
+    qemu_set_irq(s->int_out, pcf8575_int_released(s));
+}
+
+/* A read or write of one port resets the interrupt circuit for that port. */
+static void pcf8575_int_reset(PCF8575State *s, bool second_port)
+{
+    uint16_t port = second_port ? 0xff00u : 0x00ffu;
+
+    s->int_ref = (s->int_ref & ~port) | (pcf8575_pins(s) & port);
 }
 
 void pcf8575_set_ext_low(PCF8575State *s, uint16_t mask)
@@ -348,6 +365,7 @@ static int pcf8575_send(I2CSlave *i2c, uint8_t data)
     } else {
         s->latch = (s->latch & 0xff00u) | data;
     }
+    pcf8575_int_reset(s, s->second_byte);
     s->second_byte = !s->second_byte;
     pcf8575_update_int(s);
     pcf8575_notify(s);
@@ -360,8 +378,8 @@ static uint8_t pcf8575_recv(I2CSlave *i2c)
     uint16_t pins = pcf8575_pins(s);
     uint8_t value = s->second_byte ? pins >> PCF8575_PORT_BITS : pins;
 
+    pcf8575_int_reset(s, s->second_byte);
     s->second_byte = !s->second_byte;
-    s->last_read = pins;
     pcf8575_update_int(s);
     return value;
 }
@@ -372,7 +390,7 @@ static void pcf8575_realize(DeviceState *dev, Error **errp)
 
     qdev_init_gpio_out_named(dev, &s->int_out, "int", 1);
     s->latch = PCF8575_POR_LATCH;
-    s->last_read = pcf8575_pins(s);
+    s->int_ref = pcf8575_pins(s);
 }
 
 static Property pcf8575_properties[] = {
