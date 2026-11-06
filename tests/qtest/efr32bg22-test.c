@@ -87,6 +87,9 @@ static char *tx_snapshot_trace_path;
 #define RAC_CMD               0x010
 #define RAC_CTRL              0x014
 #define RAC_SR0               0x040
+#define RAC_EM1PCSR           0x05c
+#define RAC_EM1PCSR_RADIOEM1PMODE (1u << 0)
+#define RAC_EM1PCSR_RADIOEM1PACK  (1u << 17)
 #define RAC_SR3               0x04c
 #define RAC_STCTRL            0x050
 /* STCAL[23:0] | STSKEW[24] -- the only two documented fields (RAC_S_field.py),
@@ -2497,6 +2500,38 @@ static void test_rtcc_counts_and_compares(void)
 }
 
 /*
+ * PRORTC: an RTCC_TypeDef at 0xA8000000 (device header) on its own clock
+ * (CMU.PRORTCCLKCTRL, reset LFRCO), separate from the RTCC.
+ */
+#define PRORTC_BASE           0xa8000000
+#define CMU_CLKEN1_PRORTC     (1u << 10)
+
+static void test_prortc_counts_and_compares(void)
+{
+    uint32_t cnt;
+
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    enable_radio_bus_clocks();
+    writel(CMU_BASE + CMU_CLKEN1 + REGISTER_SET_WINDOW, CMU_CLKEN1_PRORTC);
+    writel(PRORTC_BASE + RTCC_EN, 1);
+    writel(PRORTC_BASE + RTCC_CMD, RTCC_CMD_START);
+    g_assert_cmphex(readl(PRORTC_BASE + RTCC_STATUS), ==, 1);
+    clock_run(100 * LF_PERIOD_NS);
+    cnt = readl(PRORTC_BASE + RTCC_CNT);
+    g_assert_cmpuint(cnt, >=, 99);
+    g_assert_cmpuint(cnt, <=, 101);
+    writel(PRORTC_BASE + RTCC_CC1_CTRL, RTCC_CC_OUTPUTCOMPARE);
+    writel(PRORTC_BASE + RTCC_CC1_OCVALUE, cnt + 10);
+    clock_run(8 * LF_PERIOD_NS);
+    g_assert_cmphex(readl(PRORTC_BASE + RTCC_IF) & RTCC_IF_CC1, ==, 0);
+    clock_run(3 * LF_PERIOD_NS);
+    g_assert_cmphex(readl(PRORTC_BASE + RTCC_IF) & RTCC_IF_CC1, ==,
+                    RTCC_IF_CC1);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'system_reset'}");
+    enable_radio_bus_clocks();
+}
+
+/*
  * IADC single conversion of a board input (machine "analog" property):
  * PD02 at 968 mV against VDDX (3300 mV), gain 1, 12-bit right-aligned.
  */
@@ -3118,6 +3153,20 @@ static void test_rac_sr0_clear_alias(void)
     writel(RAC_BASE + RAC_SR0 + REGISTER_CLEAR_WINDOW, 1u << 5);
 
     g_assert_cmphex(readl(RAC_BASE + RAC_SR0), ==, UINT32_MAX & ~(1u << 5));
+}
+
+static void test_rac_em1p_ack(void)
+{
+    g_assert_cmphex(readl(RAC_BASE + RAC_EM1PCSR), ==, 0);
+
+    writel(RAC_BASE + RAC_EM1PCSR + REGISTER_SET_WINDOW,
+           RAC_EM1PCSR_RADIOEM1PMODE);
+    g_assert_cmphex(readl(RAC_BASE + RAC_EM1PCSR), ==,
+                    RAC_EM1PCSR_RADIOEM1PMODE | RAC_EM1PCSR_RADIOEM1PACK);
+
+    writel(RAC_BASE + RAC_EM1PCSR + REGISTER_CLEAR_WINDOW,
+           RAC_EM1PCSR_RADIOEM1PMODE);
+    g_assert_cmphex(readl(RAC_BASE + RAC_EM1PCSR), ==, 0);
 }
 
 static void test_rac_force_disable(void)
@@ -4190,6 +4239,52 @@ static void test_trng_fifo(void)
 }
 
 /*
+ * TRNG test mode: TESTDATA through the conditioning function, AES-128
+ * CBC-MAC under KEY0-3. Key and blocks of NIST SP 800-38A F.2.1 (the first
+ * block XORed with that example's IV), so the MAC is its last ciphertext
+ * block 3ff1caa1 681fac09 120eca30 7586e1a7; words little-endian.
+ */
+#define TRNG_KEY0              0x010
+#define TRNG_TESTDATA          0x020
+#define TRNG_TESTEN_BYPASSES   0x00003004 /* TESTEN | BYPNIST | BYPAIS31 */
+
+static void test_trng_conditioning_kat(void)
+{
+    static const uint32_t key[4] = {
+        0x16157e2b, 0xa6d2ae28, 0x8815f7ab, 0x3c4fcf09,
+    };
+    static const uint32_t data[16] = {
+        0xe1bcc06b, 0x9199452a, 0x1a7434e1, 0x25199e7f,
+        0x578a2dae, 0x9cac031e, 0xac6fb79e, 0x518eaf45,
+        0x461cc830, 0x11e45ca3, 0x19c1fbe5, 0xef520a1a,
+        0x45249ff6, 0x179b4fdf, 0x7b412bad, 0x10376ce6,
+    };
+    static const uint32_t mac[4] = {
+        0xa1caf13f, 0x09ac1f68, 0x30ca0e12, 0xa7e18675,
+    };
+    QTestState *qts = qtest_init("-machine efr32bg22 -accel qtest");
+
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN1 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN1_CRYPTOACC);
+    qtest_writel(qts, TRNG_CTRL, TRNG_TESTEN_BYPASSES);
+    for (size_t i = 0; i < G_N_ELEMENTS(key); i++) {
+        qtest_writel(qts, TRNG_CTRL + TRNG_KEY0 + 4 * i, key[i]);
+    }
+    for (size_t i = 0; i < G_N_ELEMENTS(data); i++) {
+        g_assert_cmphex(qtest_readl(qts, TRNG_CTRL + TRNG_RNGSTATUS) & 1, ==,
+                        0);
+        qtest_writel(qts, TRNG_CTRL + TRNG_TESTDATA, data[i]);
+        g_assert_cmphex(qtest_readl(qts, TRNG_CTRL + TRNG_FIFOLEVEL), ==,
+                        i == G_N_ELEMENTS(data) - 1 ? 4 : 0);
+    }
+    qtest_writel(qts, TRNG_CTRL, 0);
+    for (size_t i = 0; i < G_N_ELEMENTS(mac); i++) {
+        g_assert_cmphex(qtest_readl(qts, TRNG_FIFO), ==, mac[i]);
+    }
+    qtest_quit(qts);
+}
+
+/*
  * GPCRC (RM chapter 14) through the register sequence of sl_hal_gpcrc.c and
  * Zephyr's crc_silabs_gpcrc.c, on the check string "123456789":
  * CRC-32/IEEE 0xCBF43926 (BITREVERSE 0, DATA, xorout ~0, written as words
@@ -5153,6 +5248,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/ldma-peripheral-request",
                    test_ldma_peripheral_request);
     qtest_add_func("/efr32bg22/trng-fifo", test_trng_fifo);
+    qtest_add_func("/efr32bg22/trng-conditioning-kat",
+                   test_trng_conditioning_kat);
     qtest_add_func("/efr32bg22/gpcrc-crc-vectors", test_gpcrc_crc_vectors);
     qtest_add_func("/efr32bg22/radioaes-ecb-and-key-sizes",
                    test_radioaes_ecb_and_key_sizes);
@@ -5221,6 +5318,8 @@ int main(int argc, char **argv)
                    test_part_352k_flash_end_faults);
     qtest_add_func("/efr32bg22/rtcc-counts-and-compares",
                    test_rtcc_counts_and_compares);
+    qtest_add_func("/efr32bg22/prortc-counts-and-compares",
+                   test_prortc_counts_and_compares);
     qtest_add_func("/efr32bg22/iadc-single-conversion",
                    test_iadc_single_conversion);
     qtest_add_func("/efr32bg22/emu-rstcause", test_emu_rstcause);
@@ -5301,6 +5400,7 @@ int main(int argc, char **argv)
                    test_seq_lockup_until_seqreset);
     qtest_add_func("/efr32bg22/rac-sr0-clear-alias",
                    test_rac_sr0_clear_alias);
+    qtest_add_func("/efr32bg22/rac-em1p-ack", test_rac_em1p_ack);
     qtest_add_func("/efr32bg22/rac-force-disable", test_rac_force_disable);
     qtest_add_func("/efr32bg22/rac-stctrl-mask", test_rac_stctrl_mask);
     qtest_add_func("/efr32bg22/seq-nvic-ipr-byte-isolation",

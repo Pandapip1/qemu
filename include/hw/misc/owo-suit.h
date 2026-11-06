@@ -65,7 +65,8 @@ typedef struct PCF8575State {
     uint16_t latch;
     /* Pins something outside pulls low. */
     uint16_t ext_low;
-    uint16_t last_read;
+    /* Pin levels at the last interrupt reset (a read or write of the port). */
+    uint16_t int_ref;
     bool second_byte;
     qemu_irq int_out;
     /* Properties. */
@@ -82,6 +83,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(PCF8575State, PCF8575)
 int64_t ltc2634_output_uv(LTC2634State *s, unsigned ch);
 /* The expander's pin levels (quasi-bidirectional: latch AND not pulled). */
 uint16_t pcf8575_pins(PCF8575State *s);
+/* The open-drain /INT: true while released (high). */
+bool pcf8575_int_released(PCF8575State *s);
 void pcf8575_set_ext_low(PCF8575State *s, uint16_t mask);
 
 #endif

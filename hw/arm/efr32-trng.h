@@ -36,6 +36,10 @@ typedef struct Efr32Trng {
     int64_t next_block_ns;
     /* Before the first block (RNGSTATUS.STATE STARTUP). */
     bool starting;
+    /* Test mode: TESTDATA words of the open block, the CBC-MAC so far. */
+    uint32_t test_block[4];
+    unsigned test_words, test_blocks;
+    uint8_t test_mac[16];
     /* Words popped from an empty FIFO, for tests and traces. */
     uint64_t underruns;
 } Efr32Trng;

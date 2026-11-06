@@ -10,8 +10,19 @@
  * The noise source is QEMU's guest random source (qemu_guest_getrandom:
  * the host's RNG, or a reproducible stream under -seed).  The model has no
  * failing noise source, so the health and AIS31 tests always pass and their
- * flags stay clear; test mode (TESTEN, TESTDATA) and the conditioning
- * bypass are not modelled (logged).
+ * flags stay clear.
+ *
+ * Test mode (TESTEN): TESTDATA words replace the noise source, ENABLE or not.
+ * Every four words are a 128-bit block (word 0 first, bytes little-endian)
+ * and the conditioning function is AES-128 CBC-MAC under KEY0-3 (same byte
+ * order) over NB128BITBLOCKS blocks, whose MAC is written to the FIFO as one
+ * block [I: the stock firmware's start-up known-answer test writes the key
+ * and the input blocks of NIST SP 800-38A F.2.1 (the first block XORed with
+ * its IV) and expects that example's last CBC block, and passes on silicon].
+ * That test writes the field as 0 and four blocks and reads one block back,
+ * so 0 conditions four blocks here [I]. CONDBYPASS writes the blocks to the
+ * FIFO unconditioned [I]. TESTDATABUSY stays clear and a MAC is in the FIFO
+ * when its last word is written [U: unmeasured].
  *
  * Timing, measured on silicon (docs/radio-tables.md SS7.89:
  * tests/periph-timing-port, DWT against the LFXO, HCLK 76.8 MHz, CLKDIV 0-3,
@@ -38,6 +49,7 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "qemu/guest-random.h"
+#include "crypto/aes.h"
 #include "hw/arm/efr32-trng.h"
 
 #define RNGCTRL 0x000u
@@ -100,7 +112,66 @@ static int64_t now_ns(void)
 
 static bool producing(Efr32Trng *t)
 {
-    return (t->ctrl & CTRL_ENABLE) && !(t->ctrl & CTRL_SOFTRESET);
+    return (t->ctrl & CTRL_ENABLE) &&
+           !(t->ctrl & (CTRL_SOFTRESET | CTRL_TESTEN));
+}
+
+/* The stock known-answer test's field value 0 conditions four blocks. */
+#define TEST_NB_ZERO_BLOCKS 4u
+
+static void test_reset(Efr32Trng *t)
+{
+    t->test_words = t->test_blocks = 0;
+    memset(t->test_mac, 0, sizeof(t->test_mac));
+}
+
+static void fifo_push_block(Efr32Trng *t, const uint32_t *words)
+{
+    for (unsigned i = 0; i < WORDS_PER_BLOCK; i++) {
+        if (t->level == EFR32_TRNG_FIFO_WORDS) {
+            t->status |= STATUS_FULLIF;
+            return;
+        }
+        t->fifo[(t->head + t->level) % EFR32_TRNG_FIFO_WORDS] = words[i];
+        t->level++;
+    }
+}
+
+/* One TESTDATA word into the conditioning function (or around it). */
+static void test_data(Efr32Trng *t, uint32_t value)
+{
+    uint32_t nb = (t->ctrl >> CTRL_NB128BITBLOCKS_SHIFT) &
+                  CTRL_NB128BITBLOCKS_MASK;
+    uint8_t block[16], key[16];
+    uint32_t out[WORDS_PER_BLOCK];
+    AES_KEY ek;
+
+    t->test_block[t->test_words++] = value;
+    if (t->test_words < WORDS_PER_BLOCK) {
+        return;
+    }
+    t->test_words = 0;
+    if (t->ctrl & CTRL_CONDBYPASS) {
+        fifo_push_block(t, t->test_block);
+        return;
+    }
+    for (unsigned i = 0; i < WORDS_PER_BLOCK; i++) {
+        stl_le_p(&block[4 * i], t->test_block[i]);
+        stl_le_p(&key[4 * i], t->key[i]);
+    }
+    for (unsigned i = 0; i < sizeof(block); i++) {
+        t->test_mac[i] ^= block[i];
+    }
+    AES_set_encrypt_key(key, 128, &ek);
+    AES_encrypt(t->test_mac, t->test_mac, &ek);
+    if (++t->test_blocks < (nb ? nb : TEST_NB_ZERO_BLOCKS)) {
+        return;
+    }
+    for (unsigned i = 0; i < WORDS_PER_BLOCK; i++) {
+        out[i] = ldl_le_p(&t->test_mac[4 * i]);
+    }
+    fifo_push_block(t, out);
+    test_reset(t);
 }
 
 static int64_t sample_ns(Efr32Trng *t, uint64_t hclk_hz, uint64_t samples)
@@ -244,17 +315,18 @@ bool efr32_trng_write(Efr32Trng *t, uint32_t offset, uint64_t hclk_hz,
     switch (offset) {
     case RNGCTRL:
         t->ctrl = value & CTRL_MASK;
-        if (t->ctrl & (CTRL_TESTEN | CTRL_CONDBYPASS)) {
-            qemu_log_mask(LOG_UNIMP, "efr32 TRNG: test mode / conditioning "
-                          "bypass not modelled (RNGCTRL 0x%x)\n", t->ctrl);
+        if ((t->ctrl & CTRL_TESTEN) && !(old & CTRL_TESTEN)) {
+            test_reset(t);
         }
         if (t->ctrl & CTRL_SOFTRESET) {
             /* "The continuous test, the conditioning function and the FIFO
              * are reset" while the bit is set. */
             trng_clear_fifo(t);
+            test_reset(t);
             t->next_block_ns = INT64_MAX;
         } else if (producing(t) &&
-                   (!(old & CTRL_ENABLE) || (old & CTRL_SOFTRESET))) {
+                   (!(old & CTRL_ENABLE) ||
+                    (old & (CTRL_SOFTRESET | CTRL_TESTEN)))) {
             trng_start(t, hclk_hz);
         } else if (!(t->ctrl & CTRL_ENABLE)) {
             t->next_block_ns = INT64_MAX;
@@ -265,8 +337,8 @@ bool efr32_trng_write(Efr32Trng *t, uint32_t offset, uint64_t hclk_hz,
         return true;
     case TESTDATA:
         /* "Writes ... are ignored if the TESTEN bit ... is 0." */
-        if (t->ctrl & CTRL_TESTEN) {
-            qemu_log_mask(LOG_UNIMP, "efr32 TRNG: TESTDATA not modelled\n");
+        if ((t->ctrl & CTRL_TESTEN) && !(t->ctrl & CTRL_SOFTRESET)) {
+            test_data(t, value);
         }
         return true;
     case RNGSTATUS:

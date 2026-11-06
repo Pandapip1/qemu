@@ -359,6 +359,24 @@ static void icount_timer_cb(void *opaque)
     icount_warp_rt();
 }
 
+/*
+ * A vCPU stopped (or stopping) for a VM stop or the debugger counts as idle,
+ * but it is not waiting for a timer: warping then would move
+ * QEMU_CLOCK_VIRTUAL before the main loop marks the VM stopped, by an amount
+ * that depends on host timing.
+ */
+static bool icount_cpu_stopping(void)
+{
+    CPUState *cpu;
+
+    CPU_FOREACH(cpu) {
+        if (cpu->stop || cpu->stopped) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void icount_start_warp_timer(void)
 {
     int64_t clock;
@@ -375,7 +393,7 @@ void icount_start_warp_timer(void)
     }
 
     if (replay_mode != REPLAY_MODE_PLAY) {
-        if (!all_cpu_threads_idle()) {
+        if (!all_cpu_threads_idle() || icount_cpu_stopping()) {
             return;
         }
 
