@@ -40,6 +40,8 @@ void arc_cpu_do_interrupt(CPUState *cs)
     CPUARCState *env    = &cpu->env;
     uint32_t     offset = 0;
     uint32_t     vectno;
+    bool         arcompact =
+        cpu->family & (ARC_OPCODE_ARC700 | ARC_OPCODE_ARC600);
     const char  *name;
 
     struct lpa_lf_entry *entry = env->arconnect.lpa_lf;
@@ -85,6 +87,25 @@ void arc_cpu_do_interrupt(CPUState *cs)
     }
     vectno = cs->exception_index & 0x0F;
     offset = OFFSET_FOR_VECTOR(vectno);
+    if (arcompact) {
+        /*
+         * ARCompact numbers the exceptions above Instruction Error from
+         * 0x20 and the table holds an 8-byte instruction per vector, which
+         * the core jumps to (Linux arch/arc: arcregs.h ECR_V_*,
+         * entry-compact.S).
+         */
+        switch (cs->exception_index) {
+        case EXCP_MACHINE_CHECK: vectno = 0x20; break;
+        case EXCP_TLB_MISS_I:    vectno = 0x21; break;
+        case EXCP_TLB_MISS_D:    vectno = 0x22; break;
+        case EXCP_PROTV:         vectno = 0x23; break;
+        case EXCP_PRIVILEGEV:    vectno = 0x24; break;
+        case EXCP_TRAP:          vectno = 0x25; break;
+        case EXCP_EXTENSION:     vectno = 0x26; break;
+        default:                 break;
+        }
+        offset = vectno << 3;
+    }
 
     /* Generic computation for exceptions. */
     switch (cs->exception_index) {
@@ -222,7 +243,9 @@ void arc_cpu_do_interrupt(CPUState *cs)
     env->stat.pstate &= ~BRANCH_DELAY;
 
     /* 15. The PC is set with the appropriate exception vector. */
-    switch(get_mmu_version(env)) {
+    if (arcompact) {
+        env->pc = env->intvec + offset;
+    } else switch(get_mmu_version(env)) {
 #if defined(TARGET_ARC32)
       case MMU_VERSION_6:
         /* Interrupt vector table is translated by MMU in v6. */
