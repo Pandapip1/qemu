@@ -87,6 +87,9 @@ static char *tx_snapshot_trace_path;
 #define RAC_CMD               0x010
 #define RAC_CTRL              0x014
 #define RAC_SR0               0x040
+#define RAC_EM1PCSR           0x05c
+#define RAC_EM1PCSR_RADIOEM1PMODE (1u << 0)
+#define RAC_EM1PCSR_RADIOEM1PACK  (1u << 17)
 #define RAC_SR3               0x04c
 #define RAC_STCTRL            0x050
 /* STCAL[23:0] | STSKEW[24] -- the only two documented fields (RAC_S_field.py),
@@ -3152,6 +3155,20 @@ static void test_rac_sr0_clear_alias(void)
     g_assert_cmphex(readl(RAC_BASE + RAC_SR0), ==, UINT32_MAX & ~(1u << 5));
 }
 
+static void test_rac_em1p_ack(void)
+{
+    g_assert_cmphex(readl(RAC_BASE + RAC_EM1PCSR), ==, 0);
+
+    writel(RAC_BASE + RAC_EM1PCSR + REGISTER_SET_WINDOW,
+           RAC_EM1PCSR_RADIOEM1PMODE);
+    g_assert_cmphex(readl(RAC_BASE + RAC_EM1PCSR), ==,
+                    RAC_EM1PCSR_RADIOEM1PMODE | RAC_EM1PCSR_RADIOEM1PACK);
+
+    writel(RAC_BASE + RAC_EM1PCSR + REGISTER_CLEAR_WINDOW,
+           RAC_EM1PCSR_RADIOEM1PMODE);
+    g_assert_cmphex(readl(RAC_BASE + RAC_EM1PCSR), ==, 0);
+}
+
 static void test_rac_force_disable(void)
 {
     writel(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW, FRC_IF_TXDONE);
@@ -5259,6 +5276,7 @@ int main(int argc, char **argv)
                    test_seq_lockup_until_seqreset);
     qtest_add_func("/efr32bg22/rac-sr0-clear-alias",
                    test_rac_sr0_clear_alias);
+    qtest_add_func("/efr32bg22/rac-em1p-ack", test_rac_em1p_ack);
     qtest_add_func("/efr32bg22/rac-force-disable", test_rac_force_disable);
     qtest_add_func("/efr32bg22/rac-stctrl-mask", test_rac_stctrl_mask);
     qtest_add_func("/efr32bg22/seq-nvic-ipr-byte-isolation",

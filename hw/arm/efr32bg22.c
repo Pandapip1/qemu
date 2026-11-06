@@ -3027,6 +3027,29 @@ static uint32_t efr32_bufc_mask_write(uint32_t offset, uint32_t value)
     }
 }
 
+/*
+ * RAC.EM1PCSR (0x05c, public RAC_S field model): RADIOEM1PMODE bit 0,
+ * RADIOEM1PDISSWREQ 1, MCUEM1PMODE 4, MCUEM1PDISSWREQ 5 read-write;
+ * RADIOEM1PREQ 16, RADIOEM1PACK 17, RADIOEM1PHWREQ 18 read-only.  The stock
+ * firmware sets RADIOEM1PMODE and waits for RADIOEM1PACK.  [I] The radio
+ * acknowledges at once (latency unmeasured); no EM1P request is raised.
+ */
+#define EFR32_RAC_EM1PCSR 0x05cu
+#define EFR32_RAC_EM1PCSR_RW 0x00000033u
+#define EFR32_RAC_EM1PCSR_RADIOEM1PMODE (1u << 0)
+#define EFR32_RAC_EM1PCSR_RADIOEM1PACK (1u << 17)
+
+static uint32_t efr32_rac_em1pcsr(Efr32Periph *s)
+{
+    uint32_t value =
+        efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_EM1PCSR) &
+        EFR32_RAC_EM1PCSR_RW;
+
+    return value | (value & EFR32_RAC_EM1PCSR_RADIOEM1PMODE
+                        ? EFR32_RAC_EM1PCSR_RADIOEM1PACK
+                        : 0);
+}
+
 static uint32_t efr32_rac_status(Efr32Periph *s)
 {
     uint32_t state = s->rac_state;
@@ -6937,6 +6960,9 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
         return efr32_rac_status(s);
     if (address == EFR32_RAC_BASE + EFR32_RAC_STIMER)
         return efr32_rac_stimer(s);
+    if (address == EFR32_RAC_BASE + EFR32_RAC_EM1PCSR) {
+        return efr32_rac_em1pcsr(s);
+    }
     if (((address & ~0x3fffu) == EFR32_PROTIMER_BASE ||
          (address & ~0x3fffu) == EFR32_PROTIMER_NS_BASE) &&
         offset == EFR32_PROTIMER_COUNTER)
