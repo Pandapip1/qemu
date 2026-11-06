@@ -98,7 +98,10 @@ static int n_ctrs = 1;
  * command (0x81000001 = host->device copy, kick), +0x38 device addr, +0x3c/0x40
  * host addr lo/hi, +0x44 length. Completion = bit 29 of status reg 0xc0d02e24
  * (polled by IML 0x804458c8; written back to acknowledge). Host "physical"
- * addresses are served from system memory (host RAM window at 0x20000000). */
+ * addresses are served from system memory (host RAM window at 0x20000000).
+ * The driver's IMR copy uses channel 0 of the same block with the same field
+ * order, CTRL last with bit 31 DMA_EN (iwl-fh.h IMR_TFH_SRV_DMA_CHNL0_* at
+ * 0xa0a51c, pcie/trans.c iwl_trans_pcie_copy_imr_fh): +0x34 is channel 1. */
 #define DMA_BASE  0xc0a0a500u
 #define DMA_STAT  0x00d02e24u   /* UMAC 0xc0d02e24 */
 static uint32_t dma_done;
@@ -455,6 +458,133 @@ static void dma_kick(void)
     dma_done = 1;
 }
 
+/* Host driver model (finding H1): what iwlwifi leaves in host DRAM and the
+ * CSRs before the device boots, built from a .ucode file (AX210_HOSTFW) the
+ * way iwl_pcie_ctxt_info_v2_alloc() / _kick() do it (pcie/ctxt-info-v2.c,
+ * pcie/ctxt-info.c iwl_pcie_init_fw_sec(), iwl-drv.c iwl_store_ucode_sec()).
+ * Allocation is a page-granular bump allocator over the host RAM window, in
+ * the driver's order. Rings are allocated at their driver sizes but left
+ * empty; the debug destination (hwm_cfg) is not configured. */
+#define HOST_PAGE        0x1000u
+#define CPU1_CPU2_SEP    0xffffccccu
+#define PAGING_SEP       0xaaaabbbbu
+#define TLV_SEC_RT       19
+#define TLV_IML          52
+static hwaddr host_brk = 0x20000000;
+
+static hwaddr host_alloc(uint32_t len)
+{
+    hwaddr a = host_brk;
+    host_brk += ROUND_UP(len, HOST_PAGE);
+    return a;
+}
+
+static hwaddr host_alloc_copy(const void *data, uint32_t len)
+{
+    hwaddr a = host_alloc(len);
+    address_space_write(&address_space_memory, a, MEMTXATTRS_UNSPECIFIED,
+                        data, len);
+    return a;
+}
+
+static void host_csr_write64(unsigned off, uint64_t v)
+{
+    host_csr[off >> 2] = (uint32_t)v;
+    host_csr[(off + 4) >> 2] = v >> 32;
+}
+
+static void ax210_host_driver_init(const char *path)
+{
+    gchar *buf;
+    gsize blen;
+    size_t off = 88;                       /* sizeof(iwl_tlv_ucode_header) */
+    struct { uint32_t offset; const uint8_t *data; uint32_t len; } sec[256];
+    int nsec = 0, i, n[3] = { 0 }, part = 0;
+    const uint8_t *iml = NULL;
+    uint32_t iml_len = 0;
+    uint8_t ps[0x6bc] = { 0 };             /* sizeof(iwl_prph_scratch) */
+    uint8_t ci[0x68] = { 0 };              /* sizeof(iwl_context_info_v2) */
+    hwaddr rx_bd, rx_used, rx_stts, cmdq, ps_a, pi_a, ci_a, iml_a;
+
+    if (!g_file_get_contents(path, &buf, &blen, NULL)) {
+        error_report("ax210: cannot read %s", path);
+        exit(1);
+    }
+    while (off + 8 <= blen) {
+        uint32_t t = ldl_le_p(buf + off), l = ldl_le_p(buf + off + 4);
+        const uint8_t *d = (const uint8_t *)buf + off + 8;
+        off += 8 + ROUND_UP(l, 4);
+        if (off > ROUND_UP(blen, 4)) {
+            break;
+        }
+        if (t == TLV_SEC_RT && l >= 4 && nsec < ARRAY_SIZE(sec)) {
+            sec[nsec].offset = ldl_le_p(d);
+            sec[nsec].data = d + 4;
+            sec[nsec++].len = l - 4;
+        } else if (t == TLV_IML) {
+            iml = d;
+            iml_len = l;
+        }
+    }
+
+    /* iwl_pcie_gen2_nic_init(): RX queue and command queue rings. */
+    rx_bd = host_alloc(4096 * 16);         /* 2 * IWL_NUM_RBDS_HE transfer descs */
+    rx_used = host_alloc(4096 * 32);       /* completion descs */
+    rx_stts = host_alloc(HOST_PAGE);
+    cmdq = host_alloc(128 * 256);          /* min_txq_size TFDs, 256B format */
+
+    ps_a = host_alloc(sizeof(ps));
+    stw_le_p(ps + 0x00, host_csr[0x028 >> 2]);          /* version.mac_id */
+    stw_le_p(ps + 0x04, sizeof(ps) / 4);                /* version.size */
+    stl_le_p(ps + 0x08, (1u << 16) | (1u << 17) | 0xc0000); /* control_flags */
+    stq_le_p(ps + 0x30, rx_bd);                         /* rbd_cfg.free_rbd_addr */
+    for (i = 0; i < nsec; i++) {
+        hwaddr a;
+        if (sec[i].offset == CPU1_CPU2_SEP || sec[i].offset == PAGING_SEP) {
+            if (++part > 2) {
+                break;
+            }
+            continue;
+        }
+        if (n[part] >= 64) {
+            continue;
+        }
+        a = host_alloc_copy(sec[i].data, sec[i].len);
+        /* dram.common: umac_img[64] at 0x7c, lmac_img[64], virtual_img[64] */
+        stq_le_p(ps + 0x7c + (part == 0 ? 0x200 : part == 1 ? 0 : 0x400) +
+                 8 * n[part]++, a);
+    }
+    pi_a = host_alloc(HOST_PAGE);
+    ci_a = host_alloc(sizeof(ci));
+    stq_le_p(ci + 0x08, pi_a);                          /* prph_info_base_addr */
+    stq_le_p(ci + 0x10, rx_stts);                       /* cr_head_idx_arr */
+    stq_le_p(ci + 0x18, pi_a + HOST_PAGE / 2);          /* tr_tail_idx_arr */
+    stq_le_p(ci + 0x20, pi_a + 3 * HOST_PAGE / 4);      /* cr_tail_idx_arr */
+    stq_le_p(ci + 0x34, cmdq);                          /* mtr_base_addr */
+    stq_le_p(ci + 0x3c, rx_used);                       /* mcr_base_addr */
+    stw_le_p(ci + 0x44, 4);                             /* TFD_QUEUE_CB_SIZE(128) */
+    stw_le_p(ci + 0x46, 12);                            /* RX_QUEUE_CB_SIZE(4096) */
+    stq_le_p(ci + 0x58, ps_a);                          /* prph_scratch_base_addr */
+    stl_le_p(ci + 0x60, 0x67c);         /* offsetofend(prph_scratch, dram.common) */
+    address_space_write(&address_space_memory, ps_a, MEMTXATTRS_UNSPECIFIED,
+                        ps, sizeof(ps));
+    address_space_write(&address_space_memory, ci_a, MEMTXATTRS_UNSPECIFIED,
+                        ci, sizeof(ci));
+    iml_a = iml ? host_alloc_copy(iml, iml_len) : 0;
+
+    /* iwl_pcie_ctxt_info_v2_kick() */
+    host_csr_write64(0x118, ci_a);                      /* CSR_CTXT_INFO_ADDR */
+    host_csr_write64(0x120, iml_a);                     /* CSR_IML_DATA_ADDR */
+    host_csr[0x128 >> 2] = iml_len;                     /* CSR_IML_SIZE_ADDR */
+    host_csr[0x000 >> 2] |= 1u << 1;                    /* CSR_AUTO_FUNC_BOOT_ENA */
+    fprintf(trace_fp ? trace_fp : stderr,
+            "HOST ctxt=%llx scratch=%llx info=%llx iml=%llx/%x lmac=%d umac=%d "
+            "paging=%d\n", (unsigned long long)ci_a, (unsigned long long)ps_a,
+            (unsigned long long)pi_a, (unsigned long long)iml_a, iml_len,
+            n[0], n[1], n[2]);
+    g_free(buf);
+}
+
 static const MemoryRegionOps trace_ops = {
     .read = trace_read,
     .write = trace_write,
@@ -625,6 +755,10 @@ static void ax210_init(MachineState *machine)
             host_csr[(strtoul(t3, 0, 16) >> 2) & 0x3ff] = strtoul(eq + 1, 0, 0);
         }
         g_free(c);
+    }
+
+    if (getenv("AX210_HOSTFW")) {
+        ax210_host_driver_init(getenv("AX210_HOSTFW"));
     }
 
     /* MMIO read overrides, discovered iteratively, as

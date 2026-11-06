@@ -293,6 +293,85 @@ static void test_semaphore_two_cores(void)
     qtest_quit(s);
 }
 
+static uint32_t csr_read(QTestState *s, uint32_t off)
+{
+    qtest_writel(s, 0xc0d00020, off);
+    qtest_writel(s, 0xc0d0001c, 0x6a000000);
+    return qtest_readl(s, 0xc0d00028);
+}
+
+static void put_tlv(GByteArray *b, uint32_t type, uint32_t off,
+                    const void *data, uint32_t len)
+{
+    uint8_t hdr[12];
+    static const uint8_t pad[4];
+
+    stl_le_p(hdr, type);
+    stl_le_p(hdr + 4, len + (type == 19 ? 4 : 0));
+    stl_le_p(hdr + 8, off);
+    g_byte_array_append(b, hdr, type == 19 ? 12 : 8);
+    g_byte_array_append(b, data, len);
+    g_byte_array_append(b, pad, ROUND_UP(len, 4) - len);
+}
+
+/* Host driver model (finding H1): from a .ucode, the context info, prph
+ * scratch and DRAM map laid out as iwl_pcie_ctxt_info_v2_alloc() does, and
+ * the CSRs as iwl_pcie_ctxt_info_v2_kick() leaves them. */
+static void test_host_driver_ctxt_info(void)
+{
+    static const uint8_t lmac[8] = "LMACsec0", umac[8] = "UMACsec0";
+    static const uint8_t page[4] = "PAGE", iml[12] = "IMLimage0123";
+    GByteArray *b = g_byte_array_new();
+    uint8_t hdr[88] = { 0 }, sep[4] = { 0 };
+    QTestState *s;
+    uint64_t ci, ps;
+    uint32_t ctl;
+    char *path;
+    int fd;
+
+    stl_le_p(hdr + 4, 0x0a4c5749);            /* IWL_TLV_UCODE_MAGIC */
+    g_byte_array_append(b, hdr, sizeof(hdr));
+    put_tlv(b, 19, 0x00440000, lmac, sizeof(lmac));
+    put_tlv(b, 19, 0xffffcccc, sep, sizeof(sep));
+    put_tlv(b, 19, 0x80440000, umac, sizeof(umac));
+    put_tlv(b, 19, 0xaaaabbbb, sep, sizeof(sep));
+    put_tlv(b, 19, 0x00000000, page, sizeof(page));
+    put_tlv(b, 52, 0, iml, sizeof(iml));
+    fd = g_file_open_tmp("ax210-XXXXXX.ucode", &path, NULL);
+    g_assert(fd >= 0);
+    g_assert(write(fd, b->data, b->len) == b->len);
+    close(fd);
+    g_byte_array_free(b, true);
+
+    g_setenv("AX210_HOSTFW", path, true);
+    s = qtest_init("-M ax210 -m 32M -nographic -monitor none "
+                   "-serial none -S");
+    g_unsetenv("AX210_HOSTFW");
+    unlink(path);
+    g_free(path);
+
+    ci = csr_read(s, 0x118) | (uint64_t)csr_read(s, 0x11c) << 32;
+    g_assert_cmphex(ci, !=, 0);
+    ps = qtest_readq(s, ci + 0x58);           /* prph_scratch_base_addr */
+    g_assert_cmphex(qtest_readl(s, ci + 0x60), ==, 0x67c);
+    g_assert_cmphex(qtest_readw(s, ps + 0x00), ==, csr_read(s, 0x028) & 0xffff);
+    ctl = qtest_readl(s, ps + 0x08);          /* RB_SIZE_4K|MTR_MODE|256B */
+    g_assert_cmphex(ctl, ==, 0x000f0000);
+    g_assert_cmphex(qtest_readq(s, ps + 0x27c) & 0xfff, ==, 0); /* lmac_img[0] */
+    g_assert_cmphex(qtest_readq(s, qtest_readq(s, ps + 0x27c)), ==,
+                    ldq_le_p(lmac));
+    g_assert_cmphex(qtest_readq(s, ps + 0x27c + 8), ==, 0);
+    g_assert_cmphex(qtest_readq(s, qtest_readq(s, ps + 0x7c)), ==,
+                    ldq_le_p(umac));                        /* umac_img[0] */
+    g_assert_cmphex(qtest_readl(s, qtest_readq(s, ps + 0x47c)), ==,
+                    ldl_le_p(page));                        /* virtual_img[0] */
+    g_assert_cmphex(qtest_readl(s, csr_read(s, 0x120) + 8), ==,
+                    ldl_le_p(iml + 8));                     /* CSR_IML_DATA_ADDR */
+    g_assert_cmphex(csr_read(s, 0x128), ==, sizeof(iml));
+    g_assert_cmphex(csr_read(s, 0x000) & 0x2, ==, 0x2);     /* AUTO_FUNC_BOOT_ENA */
+    qtest_quit(s);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -320,6 +399,7 @@ int main(int argc, char **argv)
     qtest_add_func("/ax210/host-csr-driver-defaults",
                    test_host_csr_driver_defaults);
     qtest_add_func("/ax210/semaphore-two-cores", test_semaphore_two_cores);
+    qtest_add_func("/ax210/host-driver-ctxt-info", test_host_driver_ctxt_info);
 
     return g_test_run();
 }

@@ -70,6 +70,8 @@ firmware images do when run against this model."
 | U3 | UMAC fatal path signals the host with `CSR_INT_BIT_SW_ERR` | **yes** (meaning) | [F]: `0x80483c8e-0x80483cc2` writes bit 25 to host CSR `0x008` (`CSR_INT`, `iwl-csr.h:31`; `CSR_INT_BIT_SW_ERR` = "uCode error", line 201) or, when on-die `0xc0d05c00` bit 25 is set, to `0x2808` (`CSR_MSIX_HW_INT_CAUSES_AD`, line 602), then halts at `0x804a5be4` (`[0xc0d03864] = 1; b .`). Also corroborates M1's offset space. |
 | C2 | Host CSR defaults: `CSR_HW_REV` (`0x028`) type `0x420`, `CSR_HW_IF_CONFIG_REG[3:0]` = step/dash | modelled; [F] driver behaviour, [?] value | Type `CSR_HW_REV_TYPE_TY = 0x420` (`iwl-csr.h:358`); `iwl_mvm_nic_config` copies HW_REV[3:0] into HW_IF_CONFIG (`mvm/ops.c:100`, from `pcie/trans-gen2.c:273`). IML `0x80445a2c` / UMAC `0x8044a702` require dash 2 when on-die `[0xd03400] & 7 != 2`, else dash 1 (error `0x2fc`). Model: step A, dash 2, on-die 0 — consistent, but which pairing real silicon has is [?]. Replaces the earlier `c0d00028=2` override. Tested `/ax210/host-csr-driver-defaults`. |
 | K1 | Cross-core address view: LMAC `0x00axxxxx` == UMAC `0xc0exxxxx`; LMAC `0x00d0xxxx` == UMAC `0xc0d0xxxx` | modelled | First half [F]: the IML converts addresses with `(a & 0xff0fffff) \| 0xc0e20000` (`0x804441a6`, `0x80447082`). Second half [I]: UMAC's semaphore set (`0xc0d03820/24/28`) is the LMAC bank at `0xd03800` + `0x20`. Shared models are keyed by the LMAC-view address. Tested `/ax210/semaphore-two-cores`. |
+| H1 | Host driver model: context info, prph scratch, DRAM map, IML and CSRs as iwlwifi leaves them (`AX210_HOSTFW=<ucode>`) | **yes** (layout), modelled | [F] driver: `pcie/ctxt-info-v2.c` `iwl_pcie_ctxt_info_v2_alloc/_kick`, `pcie/ctxt-info.c` `iwl_pcie_init_fw_sec`, `fw/api/ctxt-info-v2.h` (torvalds/linux `eedaa7d6`). [F] firmware agrees: UMAC `0x804485e4` DMAs `0x68` bytes (`sizeof(iwl_context_info_v2)`), follows `prph_scratch_base_addr` (`+0x58`, error `0x1000aa` if 0), DMAs `1660` = `offsetofend(iwl_prph_scratch, dram.common)`, checks `version.mac_id` against `CSR_HW_REV` (error `0x1000ac`), stores `prph_info_base_addr`; `0x80448710` decodes `control_flags` bits 4/8-11 and `hwm_cfg` at their driver offsets. Values: `rx_buf_size` 4K default (`iwl-modparams.h`) so `control_flags = 0x000f0000`; `mtr_size = 4`, `mcr_size = 12`. Simplifications: page-granular bump allocator at `0x20000000`; rings allocated but empty; no debug destination. Tested `/ax210/host-driver-ctxt-info`. |
+| A2 | ARC700 `AUX_IRQ_LEV` (`0x200`) | **yes** (storage) | Architectural ARCv1 register, declared but without get/set in `target/arc`, so UMAC's `sr 0x100,[aux_irq_lev]` (`0x80447836`) raised an instruction error. Now read/write storage; level semantics are unused because this fork has no ARCv1 interrupt delivery. |
 
 ## Harness vs. tests
 
@@ -97,8 +99,7 @@ Two tiers exist, and they should not be confused:
   for LMAC). The real die has both; S1 and Q1 are where they would meet.
 - LMAC interrupt sources (V1 expiry, Q1 inbound, anything giving the main
   loop at `0x4d08fa` work): [?].
-- U2's context-info gate: a host-driver model that supplies context info
-  (structures in `fw/api/ctxt-info-v2.h`) is not built.
+- U2: the LMAC handshake at `0x80448ca4` (needs both cores, or a model of what LMAC leaves in `0xa34000`).
 - The crypto coprocessor path (`0xa248xx`/`0xc0e2xxxx`): traced as a
   no-op MMIO window; never exercised by the IML in any run captured so
   far, because no run has supplied a DMA'd firmware image for it to
