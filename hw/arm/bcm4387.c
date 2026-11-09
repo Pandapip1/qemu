@@ -100,6 +100,7 @@ struct BCM4387MachineState {
 
     char *hostblob;
     char *rom;
+    char *patch;
     uint32_t atcm_size;
     bool identity;
 
@@ -405,10 +406,25 @@ static void bcm4387_init(MachineState *machine)
                            RAM_SIZE - s->atcm_size, &error_fatal);
     memory_region_add_subregion(sysmem, RAM_BASE + s->atcm_size, &s->btcm);
 
-    /* RAM above the TCM for the firmware's ROM-patch code (see SOCRAM_BASE). */
+    /* RAM above the TCM for the firmware's ROM-patch code (see SOCRAM_BASE).
+     * socram=<file> pre-loads it from a hardware dump of 0x939000 upward (the
+     * firmware would otherwise populate it from the init path we can't yet
+     * reach). */
     memory_region_init_ram(&s->socram, NULL, "bcm4387.socram", SOCRAM_SIZE,
                            &error_fatal);
     memory_region_add_subregion(sysmem, SOCRAM_BASE, &s->socram);
+    if (s->patch) {
+        int64_t psz = get_image_size(s->patch, &error_fatal);
+
+        if (psz <= 0 || psz > SOCRAM_SIZE ||
+            load_image_size(s->patch,
+                            memory_region_get_ram_ptr(&s->socram), psz) != psz) {
+            error_report("bcm4387: cannot load socram %s", s->patch);
+            exit(1);
+        }
+        info_report("bcm4387: loaded socram %s at 0x%x (0x%" PRIx64 " bytes)",
+                    s->patch, SOCRAM_BASE, psz);
+    }
 
     s->nab = banks_fill(s->bank_info, 0, s->atcm_size);
     s->nbb = banks_fill(s->bank_info, s->nab, RAM_SIZE - s->atcm_size) -
@@ -568,6 +584,7 @@ static char *get_str(char **field)
 
 STR_PROP("hostblob", hostblob)
 STR_PROP("rom", rom)
+STR_PROP("socram", patch)
 
 static void get_atcm(Object *o, Visitor *v, const char *name, void *opaque,
                      Error **errp)
@@ -613,6 +630,7 @@ static void bcm4387_class_init(ObjectClass *oc, const void *data)
 
     object_class_property_add_str(oc, "hostblob", get_hostblob, set_hostblob);
     object_class_property_add_str(oc, "rom", get_rom, set_rom);
+    object_class_property_add_str(oc, "socram", get_patch, set_patch);
     object_class_property_add(oc, "atcm-size", "uint32", get_atcm, set_atcm,
                               NULL, NULL);
     object_class_property_add_bool(oc, "identity", get_identity, set_identity);
