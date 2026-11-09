@@ -232,29 +232,44 @@ static void sem_update(int core, uint32_t mask, bool request)
     }
 }
 
-/* LMAC indirect register window (finding W1, [I]): CTRL at 0xa2ac04 holds a
- * 16-bit target address in [15:0], bit 17 = write, bit 18 = GO/BUSY; DATA at
+/* LMAC indirect register window (finding W1): CTRL at 0xa2ac04 holds a
+ * target address in [16:0], bit 17 = write, bit 18 = GO/BUSY; DATA at
  * 0xa2ac00. LMAC helpers 0x4be6f8 (read) / 0x4be714 (write) / 0x4be818 (wait
- * while BUSY) define the protocol. BUSY self-clears: accesses complete
- * immediately against a backing store whose contents are unknown ([?]),
- * so it starts zeroed and is traced (IND.R / IND.W). */
+ * while BUSY) define the protocol. The target is device address 0xa20000 +
+ * addr [I]: UMAC reads 0xb800 as the CNVR ID, which iwl-prph.h names
+ * CNVR_AUX_MISC_CHIP at 0xa2b800. BUSY self-clears: accesses complete at
+ * once. Traced IND.R / IND.W with the window address. */
 #define IND_DATA 0x00a2ac00u
 #define IND_CTRL 0x00a2ac04u
 #define IND_GO   (1u << 18)
 #define IND_WR   (1u << 17)
 #define IND_ADDR 0x1ffffu
-static GHashTable *indstore;
+#define IND_BASE 0x00a20000u
 
-/* Register aliases (finding K2, [I]): UMAC 0x80448ca4 writes 0x400410 to
- * 0xa3408c and requires 0xa200b0 to read it back (masked 0xff0fffff), and
- * writes it to 0xa34090 and requires indirect 0xb800 to read it back exactly;
- * either mismatch is fatal 0x1013f1. Modelled as one register per pair. */
-#define IND_ALIAS_ADDR 0xb800u
-#define IND_ALIAS_REG  0x00a34090u
+/* Chip identification (finding K2): read-only, silicon values. AX210 dmesg
+ * reads "Detected crf-id 0x400410, cnv-id 0x400410 wfpm id 0x80000000"; the
+ * driver (pcie/trans.c) takes them from SD_REG_VER_GEN2, CNVI_AUX_MISC_CHIP
+ * and WFPM_OTP_CFG1_ADDR (iwl-prph.h; the last at UMAC periphery offset
+ * 0x300000). UMAC 0x80448ca4 compares the first two with FSEQ_CNVR_ID /
+ * FSEQ_CNVI_ID (0xa34090 / 0xa3408c), fatal 0x1013f1 on a mismatch. */
+static const struct {
+    hwaddr a;
+    uint32_t v;
+} chip_id[] = {
+    { 0x00a200b0, 0x00400410 },     /* CNVI_AUX_MISC_CHIP */
+    { 0x00a2b800, 0x00400410 },     /* SD_REG_VER_GEN2 = CNVR_AUX_MISC_CHIP */
+    { 0x00d03098, 0x80000000 },     /* WFPM_OTP_CFG1_ADDR */
+};
 
-static hwaddr alias_key(hwaddr a)
+static bool chip_id_read(hwaddr a, uint32_t *v)
 {
-    return a == 0x00a200b0 ? 0x00a3408c : a;
+    for (int i = 0; i < ARRAY_SIZE(chip_id); i++) {
+        if (chip_id[i].a == a) {
+            *v = chip_id[i].v;
+            return true;
+        }
+    }
+    return false;
 }
 
 /* LMAC timer/event unit at 0xa02000 (finding V1, [I]). From LMAC 0x166e4
@@ -374,7 +389,7 @@ static uint64_t trace_read(void *opaque, hwaddr addr, unsigned size)
 {
     hwaddr base = (hwaddr)(uintptr_t)opaque;
     hwaddr ra = base + addr;            /* as issued by the core */
-    hwaddr a = alias_key(lmac_view(ra)); /* model key */
+    hwaddr a = lmac_view(ra);           /* model key */
     int hit; uint32_t v = override_lookup(a, &hit);
     if (a == DMA_STAT && !hit) {
         v = dma_done ? (1u << 29) : 0;
@@ -426,6 +441,10 @@ static uint64_t trace_read(void *opaque, hwaddr addr, unsigned size)
             return v;
         }
     }
+    if (!hit && chip_id_read(a, &v)) {
+        trace_log("R.id", ra, v, size);
+        return v;
+    }
     if (!hit && regstore) {
         gpointer p = g_hash_table_lookup(regstore,
                                          GUINT_TO_POINTER((guint)(a)));
@@ -439,7 +458,7 @@ static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     hwaddr base = (hwaddr)(uintptr_t)opaque;
     hwaddr ra = base + addr;            /* as issued by the core */
-    hwaddr a = alias_key(lmac_view(ra)); /* model key */
+    hwaddr a = lmac_view(ra);           /* model key */
     trace_log("W", ra, val, size);
     if (a == MBX_BASE + 0x20) {
         mbx_idx = val;
@@ -490,21 +509,17 @@ static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     }
     if (a == IND_CTRL && (val & IND_GO)) {
         guint ia = val & IND_ADDR;
-        if (!indstore) {
-            indstore = g_hash_table_new(g_direct_hash, g_direct_equal);
-        }
+        hwaddr ta = IND_BASE + ia;
         if (val & IND_WR) {
-            guint d = GPOINTER_TO_UINT(g_hash_table_lookup(regstore,
-                                       GUINT_TO_POINTER(IND_DATA)));
-            g_hash_table_insert(ia == IND_ALIAS_ADDR ? regstore : indstore,
-                                GUINT_TO_POINTER(ia == IND_ALIAS_ADDR ?
-                                                 IND_ALIAS_REG : ia),
+            uint32_t d = rs_get(IND_DATA);
+            g_hash_table_insert(regstore, GUINT_TO_POINTER((guint)ta),
                                 GUINT_TO_POINTER(d));
             trace_log("IND.W", ia, d, 4);
         } else {
-            guint d = ia == IND_ALIAS_ADDR ? rs_get(IND_ALIAS_REG) :
-                      GPOINTER_TO_UINT(g_hash_table_lookup(indstore,
-                                       GUINT_TO_POINTER(ia)));
+            uint32_t d;
+            if (!chip_id_read(ta, &d)) {
+                d = rs_get(ta);
+            }
             g_hash_table_insert(regstore, GUINT_TO_POINTER(IND_DATA),
                                 GUINT_TO_POINTER(d));
             trace_log("IND.R", ia, d, 4);
@@ -891,13 +906,16 @@ static void ax210_init(MachineState *machine)
     const char *ind = getenv("AX210_IND");
     if (ind) {
         char *c = g_strdup(ind), *t4, *sv = NULL;
-        indstore = g_hash_table_new(g_direct_hash, g_direct_equal);
+        if (!regstore) {
+            regstore = g_hash_table_new(g_direct_hash, g_direct_equal);
+        }
         for (t4 = strtok_r(c, ",", &sv); t4; t4 = strtok_r(NULL, ",", &sv)) {
             char *eq = strchr(t4, '=');
             if (!eq) continue;
             *eq = 0;
-            g_hash_table_insert(indstore,
-                                GUINT_TO_POINTER(strtoul(t4, 0, 16) & IND_ADDR),
+            g_hash_table_insert(regstore,
+                                GUINT_TO_POINTER(IND_BASE +
+                                                 (strtoul(t4, 0, 16) & IND_ADDR)),
                                 GUINT_TO_POINTER(strtoul(eq + 1, 0, 0)));
         }
         g_free(c);

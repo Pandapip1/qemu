@@ -223,10 +223,10 @@ static void test_lmac_indirect_window(void)
     qtest_quit(s);
 }
 
-/* Indirect address is [16:0] (W1): UMAC reads target 0x18028, which must
- * not alias 0x8028. Register aliases (K2, [I]): the two write/readback
- * pairs UMAC 0x80448ca4 self-tests. */
-static void test_lmac_register_aliases(void)
+/* Indirect window (W1): the address is [16:0] (UMAC reads 0x18028, which
+ * must not alias 0x8028) and targets device 0xa20000 + addr. Chip IDs (K2):
+ * read-only silicon values, also through the window (0xb800 = 0xa2b800). */
+static void test_lmac_indirect_target_and_chip_ids(void)
 {
     QTestState *s = qtest_init(LMAC_ARGS);
 
@@ -234,12 +234,13 @@ static void test_lmac_register_aliases(void)
     qtest_writel(s, 0xa2ac04, 0x18028 | (1u << 17) | (1u << 18));
     qtest_writel(s, 0xa2ac04, 0x08028 | (1u << 18));
     g_assert_cmphex(qtest_readl(s, 0xa2ac00), ==, 0);
+    g_assert_cmphex(qtest_readl(s, 0xa38028), ==, 0x11111111);
 
-    qtest_writel(s, 0xa3408c, 0x400410);
+    qtest_writel(s, 0xa200b0, 0);           /* read-only */
     g_assert_cmphex(qtest_readl(s, 0xa200b0), ==, 0x400410);
-    qtest_writel(s, 0xa34090, 0x400410);
     qtest_writel(s, 0xa2ac04, 0xb800 | (1u << 18));
     g_assert_cmphex(qtest_readl(s, 0xa2ac00), ==, 0x400410);
+    g_assert_cmphex(qtest_readl(s, 0xd03098), ==, 0x80000000);
     qtest_quit(s);
 }
 
@@ -460,7 +461,8 @@ int main(int argc, char **argv)
     qtest_add_func("/ax210/lmac/power-fsm", test_lmac_power_fsm);
     qtest_add_func("/ax210/lmac/semaphore", test_lmac_semaphore);
     qtest_add_func("/ax210/lmac/indirect-window", test_lmac_indirect_window);
-    qtest_add_func("/ax210/lmac/register-aliases", test_lmac_register_aliases);
+    qtest_add_func("/ax210/lmac/indirect-target-chip-ids",
+                   test_lmac_indirect_target_and_chip_ids);
     qtest_add_func("/ax210/lmac/timestamp", test_lmac_timestamp);
     qtest_add_func("/ax210/lmac/msg-fifo-space", test_lmac_msg_fifo_space);
 
