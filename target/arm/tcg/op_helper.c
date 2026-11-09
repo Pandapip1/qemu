@@ -25,6 +25,7 @@
 #include "exec/exec-all.h"
 #include "exec/cpu_ldst.h"
 #include "cpregs.h"
+#include "hw/intc/armv7m_nvic.h"
 
 #define SIGNBIT (uint32_t)0x80000000
 #define SIGNBIT64 ((uint64_t)1 << 63)
@@ -403,6 +404,11 @@ void HELPER(wfi)(CPUARMState *env, uint32_t insn_len)
                         target_el);
     }
 
+    if (arm_feature(env, ARM_FEATURE_M)) {
+        armv7m_nvic_set_sleeping(env->nvic, true,
+                                 env->v7m.scr[env->v7m.secure] &
+                                 R_V7M_SCR_SLEEPDEEP_MASK);
+    }
     cs->exception_index = EXCP_HLT;
     cs->halted = 1;
     cpu_loop_exit(cs);

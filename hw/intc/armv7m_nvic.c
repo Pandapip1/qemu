@@ -526,6 +526,13 @@ static void nvic_irq_update(NVICState *s)
     lvl = (pend_prio < s->exception_prio);
     trace_nvic_irq_update(s->vectpending, pend_prio, s->exception_prio, lvl);
     qemu_set_irq(s->excpout, lvl);
+    qemu_set_irq(s->wakeup, lvl);
+}
+
+void armv7m_nvic_set_sleeping(NVICState *s, bool sleeping, bool deep)
+{
+    qemu_set_irq(s->sleepdeep, sleeping && deep);
+    qemu_set_irq(s->sleeping, sleeping);
 }
 
 void armv7m_nvic_set_debug_maskints(NVICState *s, bool mask)
@@ -1148,7 +1155,12 @@ static uint32_t nvic_readl(NVICState *s, uint32_t offset, MemTxAttrs attrs)
         if (!arm_feature(&cpu->env, ARM_FEATURE_V7)) {
             goto bad_offset;
         }
-        return cpu->env.v7m.scr[attrs.secure];
+        val = cpu->env.v7m.scr[attrs.secure];
+        if (!attrs.secure &&
+            (cpu->env.v7m.scr[M_REG_S] & R_V7M_SCR_SLEEPDEEPS_MASK)) {
+            val &= ~R_V7M_SCR_SLEEPDEEP_MASK;
+        }
+        return val;
     case 0xd14: /* Configuration Control.  */
         /*
          * Non-banked bits: BFHFNMIGN (stored in the NS copy of the register)
@@ -1699,14 +1711,33 @@ static void nvic_writel(NVICState *s, uint32_t offset, uint32_t value,
         if (!arm_feature(&cpu->env, ARM_FEATURE_V7)) {
             goto bad_offset;
         }
-        /* We don't implement deep-sleep so these bits are RAZ/WI.
+    {
+        /*
+         * SLEEPDEEP is shared by both Security states (kept in both
+         * copies); SLEEPDEEPS, Secure only, makes it RAZ/WI from Non-secure.
+         * SLEEPDEEP reaches the power controller as the SLEEPDEEP signal.
          * The other bits in the register are banked.
          * QEMU's implementation ignores SEVONPEND and SLEEPONEXIT, which
          * is architecturally permitted.
          */
-        value &= ~(R_V7M_SCR_SLEEPDEEP_MASK | R_V7M_SCR_SLEEPDEEPS_MASK);
+        uint32_t deep = cpu->env.v7m.scr[M_REG_S] & R_V7M_SCR_SLEEPDEEP_MASK;
+
+        if (attrs.secure ||
+            !(cpu->env.v7m.scr[M_REG_S] & R_V7M_SCR_SLEEPDEEPS_MASK)) {
+            deep = value & R_V7M_SCR_SLEEPDEEP_MASK;
+        }
+        if (!attrs.secure) {
+            value = (value & ~R_V7M_SCR_SLEEPDEEPS_MASK) |
+                    (cpu->env.v7m.scr[M_REG_S] & R_V7M_SCR_SLEEPDEEPS_MASK);
+        }
         cpu->env.v7m.scr[attrs.secure] = value;
+        cpu->env.v7m.scr[M_REG_NS] =
+            (cpu->env.v7m.scr[M_REG_NS] &
+             ~(R_V7M_SCR_SLEEPDEEP_MASK | R_V7M_SCR_SLEEPDEEPS_MASK)) | deep;
+        cpu->env.v7m.scr[M_REG_S] =
+            (cpu->env.v7m.scr[M_REG_S] & ~R_V7M_SCR_SLEEPDEEP_MASK) | deep;
         break;
+    }
     case 0xd14: /* Configuration Control.  */
     {
         uint32_t mask;
@@ -2632,6 +2663,7 @@ static void armv7m_nvic_reset(DeviceState *dev)
 
     /* Reset ends Lockup (the CPU clears its own m_locked_up). */
     qemu_set_irq(s->lockup, 0);
+    armv7m_nvic_set_sleeping(s, false, false);
     memset(s->vectors, 0, sizeof(s->vectors));
     memset(s->sec_vectors, 0, sizeof(s->sec_vectors));
     s->prigroup[M_REG_NS] = 0;
@@ -2774,6 +2806,9 @@ static void armv7m_nvic_instance_init(Object *obj)
     sysbus_init_irq(sbd, &nvic->excpout);
     qdev_init_gpio_out_named(dev, &nvic->sysresetreq, "SYSRESETREQ", 1);
     qdev_init_gpio_out_named(dev, &nvic->lockup, "LOCKUP", 1);
+    qdev_init_gpio_out_named(dev, &nvic->sleeping, "SLEEPING", 1);
+    qdev_init_gpio_out_named(dev, &nvic->sleepdeep, "SLEEPDEEP", 1);
+    qdev_init_gpio_out_named(dev, &nvic->wakeup, "WAKEUP", 1);
     qdev_init_gpio_in_named(dev, nvic_systick_trigger, "systick-trigger",
                             M_REG_NUM_BANKS);
     qdev_init_gpio_in_named(dev, nvic_nmi_trigger, "NMI", 1);

@@ -1174,6 +1174,9 @@ bool arm_cpu_exec_halt(CPUState *cs)
         if (cpu->wfxt_timer) {
             timer_del(cpu->wfxt_timer);
         }
+        if (arm_feature(&cpu->env, ARM_FEATURE_M) && cpu->env.nvic) {
+            armv7m_nvic_set_sleeping(cpu->env.nvic, false, false);
+        }
     }
     return leave_halt;
 }

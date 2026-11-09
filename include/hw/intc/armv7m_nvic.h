@@ -87,6 +87,15 @@ struct NVICState {
     qemu_irq excpout;
     qemu_irq sysresetreq;
     qemu_irq lockup;    /* "LOCKUP": the core has entered Lockup */
+    /*
+     * The Cortex-M sleep signals: "SLEEPING" while the core sleeps in WFI,
+     * "SLEEPDEEP" while that sleep is a deep one (SCR.SLEEPDEEP), and
+     * "WAKEUP", the interrupt controller's request to end the sleep, for a
+     * power controller that stops the clocks in deep sleep.
+     */
+    qemu_irq sleeping;
+    qemu_irq sleepdeep;
+    qemu_irq wakeup;
 };
 
 /* Interface between CPU and Interrupt controller.  */
@@ -209,6 +218,13 @@ static inline bool armv7m_nvic_neg_prio_requested(NVICState *s, bool secure)
  * @mask: PendSV, SysTick and external interrupts are masked
  */
 void armv7m_nvic_set_debug_maskints(NVICState *s, bool mask);
+/**
+ * armv7m_nvic_set_sleeping: the core entered or left a WFI sleep
+ * @s: the NVIC
+ * @sleeping: true from a WFI that halts the core until it wakes
+ * @deep: the sleep is a deep sleep (SCR.SLEEPDEEP)
+ */
+void armv7m_nvic_set_sleeping(NVICState *s, bool sleeping, bool deep);
 #ifndef CONFIG_USER_ONLY
 bool armv7m_nvic_can_take_pending_exception(NVICState *s);
 #else
