@@ -104,6 +104,7 @@ struct BCM4387MachineState {
     uint32_t atcm_size;
     bool identity;
     bool relocate;
+    bool relocraw;
 
     ARMCPU *cpu;
     MemoryRegion atcm, atcm_alias, btcm, socram, rom_mr, erom, scratch, trace;
@@ -515,7 +516,16 @@ static void bcm4387_init(MachineState *machine)
             error_report("bcm4387: cannot read firmware %s", machine->firmware);
             exit(1);
         }
-        if (s->identity && !s->relocate) {
+        if (s->relocraw) {
+            /*
+             * relocraw=on: run the real ASLR relocator with its genuine,
+             * unmodified placement helpers (0x8a3e48 / 0x8a3eb8). The RNG seed
+             * is fixed by the hostblob, so the section placement is
+             * deterministic. No forced offset, no stub: whatever the firmware
+             * copies/re-links is by definition correct. Used to observe the
+             * true copy destination(s) and then map RAM to cover them.
+             */
+        } else if (s->identity && !s->relocate) {
             static const uint8_t ret0[] = { 0x00, 0x20, 0x70, 0x47 };
             static const uint8_t bxlr[] = { 0x70, 0x47, 0x00, 0xbf };
             gsize o1 = 0x8a3e48 - RAM_BASE, o2 = 0x8a3eb8 - RAM_BASE;
@@ -648,6 +658,16 @@ static void set_relocate(Object *o, bool v, Error **errp)
     BCM4387_MACHINE(o)->relocate = v;
 }
 
+static bool get_relocraw(Object *o, Error **errp)
+{
+    return BCM4387_MACHINE(o)->relocraw;
+}
+
+static void set_relocraw(Object *o, bool v, Error **errp)
+{
+    BCM4387_MACHINE(o)->relocraw = v;
+}
+
 static void bcm4387_instance_init(Object *obj)
 {
     BCM4387_MACHINE(obj)->atcm_size = 0x140000;
@@ -675,6 +695,7 @@ static void bcm4387_class_init(ObjectClass *oc, const void *data)
                               NULL, NULL);
     object_class_property_add_bool(oc, "identity", get_identity, set_identity);
     object_class_property_add_bool(oc, "relocate", get_relocate, set_relocate);
+    object_class_property_add_bool(oc, "relocraw", get_relocraw, set_relocraw);
 }
 
 static const TypeInfo bcm4387_machine_types[] = {
