@@ -236,8 +236,10 @@ static void sem_update(int core, uint32_t mask, bool request)
  * target address in [16:0], bit 17 = write, bit 18 = GO/BUSY; DATA at
  * 0xa2ac00. LMAC helpers 0x4be6f8 (read) / 0x4be714 (write) / 0x4be818 (wait
  * while BUSY) define the protocol. The target is device address 0xa20000 +
- * addr [I]: UMAC reads 0xb800 as the CNVR ID, which iwl-prph.h names
- * CNVR_AUX_MISC_CHIP at 0xa2b800. BUSY self-clears: accesses complete at
+ * addr: UMAC reads 0xb800 as the CNVR ID, which iwl-prph.h names
+ * CNVR_AUX_MISC_CHIP at 0xa2b800, and the values firmware writes through
+ * 0x9890 / 0x9938 are what silicon reads at 0xa29890 / 0xa29938 (dump in
+ * ~/Projects/ax210/ref-silicon/). BUSY self-clears: accesses complete at
  * once. Traced IND.R / IND.W with the window address. */
 #define IND_DATA 0x00a2ac00u
 #define IND_CTRL 0x00a2ac04u
