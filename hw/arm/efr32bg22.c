@@ -542,8 +542,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
  * AIRCR.SYSRESETREQ sets SYSREQ.  The Gecko bootloader and AppLoader honour
  * the reset-reason word in RAM only when SYSREQ is set.
  * [I] Causes accumulate until cleared (the RM's instruction to clear after
- * reading); unmeasured.  Pin, WDOG0 and lockup causes are modelled; BOD,
- * EM4 and DCI causes are not.
+ * reading); unmeasured.  Pin, WDOG0, lockup and brown-out causes are
+ * modelled (efr32_soc_brown_out); EM4 and DCI causes are not.
  *
  * EMU_RSTCTRL (RM 12.5.14, Table 12.8): whether a soft reset source resets
  * the device.  SYSRMODE (reset 1) for SYSRESETREQ, WDOG0RMODE (1) for the
@@ -6224,8 +6224,9 @@ static bool efr32_cmu_wdoglock_write(Efr32Periph *s, uint32_t key,
  * Triggers (local timer, PRS, continuous): efr32_iadc_request and around.
  * Output resolution, 16/20-bit alignment and the window comparator:
  * efr32_iadc_convert, efr32_iadc_window_hit.
+ * SUPPLY inputs: efr32_iadc_supply_mv.
  * [U] Not modelled: bipolar output (TWOSCOMPL, differential inputs below
- * 0 read 0), gain/offset calibration (SCALEx), SUPPLY inputs.
+ * 0 read 0), gain/offset calibration (SCALEx).
  */
 #define EFR32_IADC_BASE 0x4a004000u
 #define EFR32_IADC_IRQ 48
@@ -6285,7 +6286,27 @@ static bool efr32_cmu_wdoglock_write(Efr32Periph *s, uint32_t key,
 #define EFR32_IADC_INPUT_PORTPOS_SHIFT 12
 #define EFR32_IADC_INPUT_FIELD_MASK 0xfu
 #define EFR32_IADC_INPUT_CFG (1u << 16)
+#define EFR32_IADC_PORT_GND 0u
+#define EFR32_IADC_PORT_SUPPLY 1u
 #define EFR32_IADC_PORT_GPIO_FIRST 8u /* PORTA; PORTB 9, PORTC 10, PORTD 11 */
+/*
+ * PORTPOS = SUPPLY selects a supply by PINPOS (RM SS24.3.5.2, Table 24.3);
+ * AVDD, IOVDD and DVDD reach the converter divided by 4, DECOUPLE whole.
+ */
+#define EFR32_IADC_SUPPLY_AVDD 0u
+#define EFR32_IADC_SUPPLY_IOVDD 1u
+#define EFR32_IADC_SUPPLY_DVDD 4u
+#define EFR32_IADC_SUPPLY_DECOUPLE 7u
+#define EFR32_IADC_SUPPLY_ATTENUATION 4u
+/*
+ * DVDD: the DC-DC's nominal 1.8 V output while it regulates (RM SS12.3.7,
+ * DCDC_CTRL.MODE = DCDCREGULATION), else the board supply through bypass.
+ * DECOUPLE: the LDO's level for the EM0/EM1 voltage scale in EMU_STATUS
+ * (RM SS12.3.5, Table 12.4: VSCALE0 0.9 V, VSCALE1 1.0 V, VSCALE2 1.1 V).
+ */
+#define EFR32_DCDC_CTRL_MODE_DCDCREGULATION 1u
+#define EFR32_DCDC_DVDD_MV 1800u
+static const uint32_t efr32_decouple_mv[] = { 900, 1000, 1100 };
 #define EFR32_IADC_FIFO_DEPTH 4
 #define EFR32_IADC_RESULT_BITS 12
 #define EFR32_IADC_WORD_BITS 20
@@ -6385,12 +6406,40 @@ static void efr32_iadc_update(Efr32Periph *s)
                     efr32_iadc_get(s, EFR32_IADC_IEN)));
 }
 
-/* Millivolts on an IADC input; GND, SUPPLY and undriven pins read 0. */
+/* Millivolts at the converter for a SUPPLY selection; VSS and reserved 0. */
+static uint32_t efr32_iadc_supply_mv(Efr32Periph *s, uint32_t pin)
+{
+    uint32_t vscale = (efr32_register_get(s, EFR32_EMU_BASE +
+                                                 EFR32_EMU_STATUS) >>
+                       EFR32_EMU_STATUS_VSCALE_SHIFT) &
+                      EFR32_EMU_STATUS_VSCALE_MASK;
+    bool dcdc = efr32_register_get(s, EFR32_DCDC_BASE + EFR32_DCDC_CTRL) &
+                EFR32_DCDC_CTRL_MODE_DCDCREGULATION;
+
+    switch (pin) {
+    case EFR32_IADC_SUPPLY_AVDD:
+    case EFR32_IADC_SUPPLY_IOVDD:
+        return EFR32_BOARD_VDDX_MV / EFR32_IADC_SUPPLY_ATTENUATION;
+    case EFR32_IADC_SUPPLY_DVDD:
+        return (dcdc ? EFR32_DCDC_DVDD_MV : EFR32_BOARD_VDDX_MV) /
+               EFR32_IADC_SUPPLY_ATTENUATION;
+    case EFR32_IADC_SUPPLY_DECOUPLE:
+        return vscale < ARRAY_SIZE(efr32_decouple_mv)
+                   ? efr32_decouple_mv[vscale] : 0;
+    default:
+        return 0;
+    }
+}
+
+/* Millivolts on an IADC input; GND and undriven pins read 0. */
 static uint32_t efr32_iadc_input_mv(Efr32Periph *s, uint32_t port,
                                     uint32_t pin)
 {
     int32_t mv;
 
+    if (port == EFR32_IADC_PORT_SUPPLY) {
+        return efr32_iadc_supply_mv(s, pin);
+    }
     if (port < EFR32_IADC_PORT_GPIO_FIRST ||
         port - EFR32_IADC_PORT_GPIO_FIRST >= EFR32_GPIO_PORTS ||
         pin >= EFR32_GPIO_PINS) {
@@ -6425,16 +6474,28 @@ static uint32_t efr32_iadc_convert(Efr32Periph *s, uint32_t input,
                         ? EFR32_IADC_VBGR_MV
                         : 0;
     uint32_t full;
-    uint64_t pos = efr32_iadc_input_mv(
-        s, (input >> EFR32_IADC_INPUT_PORTPOS_SHIFT) &
-               EFR32_IADC_INPUT_FIELD_MASK,
-        (input >> EFR32_IADC_INPUT_PINPOS_SHIFT) &
-            EFR32_IADC_INPUT_FIELD_MASK);
-    uint64_t neg = efr32_iadc_input_mv(
-        s, (input >> EFR32_IADC_INPUT_PORTNEG_SHIFT) &
-               EFR32_IADC_INPUT_FIELD_MASK,
-        (input >> EFR32_IADC_INPUT_PINNEG_SHIFT) &
-            EFR32_IADC_INPUT_FIELD_MASK);
+    uint32_t portpos = (input >> EFR32_IADC_INPUT_PORTPOS_SHIFT) &
+                       EFR32_IADC_INPUT_FIELD_MASK;
+    uint32_t pinpos = (input >> EFR32_IADC_INPUT_PINPOS_SHIFT) &
+                      EFR32_IADC_INPUT_FIELD_MASK;
+    uint32_t portneg = (input >> EFR32_IADC_INPUT_PORTNEG_SHIFT) &
+                       EFR32_IADC_INPUT_FIELD_MASK;
+    uint32_t pinneg = (input >> EFR32_IADC_INPUT_PINNEG_SHIFT) &
+                      EFR32_IADC_INPUT_FIELD_MASK;
+    uint64_t pos, neg;
+
+    /*
+     * PORTPOS = GND with a direct input on PORTNEG: the IADC swaps that
+     * input onto the positive side, a single-ended conversion (SS24.3.5.2).
+     */
+    if (portpos == EFR32_IADC_PORT_GND &&
+        portneg == EFR32_IADC_PORT_SUPPLY) {
+        portpos = portneg;
+        pinpos = pinneg;
+        portneg = EFR32_IADC_PORT_GND;
+    }
+    pos = efr32_iadc_input_mv(s, portpos, pinpos);
+    neg = efr32_iadc_input_mv(s, portneg, pinneg);
     /*
      * Output resolution (RM SS24.3.7.4): 11 + log2(OSR x DIGAVG) bits, at
      * most 20, MSB-aligned in the 20-bit word and truncated to the 12, 16
@@ -9516,6 +9577,79 @@ static void efr32_soc_nreset(void *opaque, int n, int level)
     efr32_soc_reset_request(s);
 }
 
+/*
+ * Brown-out detectors (RM SS12.3.x "Brown-Out Detection", Table 12.8): the
+ * board raises line n of "brown-out" while that supply is below its
+ * detector's threshold.  DVDD's detector is DVDDBOD in EM0/EM1 and
+ * DVDDLEBOD in EM2 (RM BOD table); DVDDBOD, DVDDLEBOD and DECBOD are hard
+ * resets that hold the part while the supply stays low, AVDDBOD and
+ * IOVDD0BOD soft resets.  DECBOD, AVDDBOD and IOVDD0BOD reset only with
+ * their EMU_RSTCTRL mode bit (RM 12.5.14); a blocked one leaves no cause.
+ * EMU_RSTCAUSE.VREGIN, the VREGVDD comparator captured at every reset,
+ * stays 0: the board supply is above its 2.0-2.3 V threshold (RM SS12.3.7).
+ */
+enum {
+    EFR32_BOD_DVDD,
+    EFR32_BOD_DECOUPLE,
+    EFR32_BOD_AVDD,
+    EFR32_BOD_IOVDD0,
+    EFR32_BOD_LINES,
+};
+#define EFR32_EMU_RSTCAUSE_DVDDBOD (1u << 7)
+#define EFR32_EMU_RSTCAUSE_DVDDLEBOD (1u << 8)
+#define EFR32_EMU_RSTCAUSE_DECBOD (1u << 9)
+#define EFR32_EMU_RSTCAUSE_AVDDBOD (1u << 10)
+#define EFR32_EMU_RSTCAUSE_IOVDD0BOD (1u << 11)
+#define EFR32_EMU_RSTCTRL_AVDDBODRMODE (1u << 6)
+#define EFR32_EMU_RSTCTRL_IOVDD0BODRMODE (1u << 7)
+#define EFR32_EMU_RSTCTRL_DECBODRMODE (1u << 10)
+
+static void efr32_soc_brown_out(void *opaque, int n, int level)
+{
+    Efr32Bg22SoCState *s = opaque;
+    uint32_t cause, rmode = 0;
+    bool hard = true;
+
+    switch (n) {
+    case EFR32_BOD_DVDD:
+        cause = s->periph.em2 ? EFR32_EMU_RSTCAUSE_DVDDLEBOD
+                              : EFR32_EMU_RSTCAUSE_DVDDBOD;
+        break;
+    case EFR32_BOD_DECOUPLE:
+        cause = EFR32_EMU_RSTCAUSE_DECBOD;
+        rmode = EFR32_EMU_RSTCTRL_DECBODRMODE;
+        break;
+    case EFR32_BOD_AVDD:
+        cause = EFR32_EMU_RSTCAUSE_AVDDBOD;
+        rmode = EFR32_EMU_RSTCTRL_AVDDBODRMODE;
+        hard = false;
+        break;
+    case EFR32_BOD_IOVDD0:
+        cause = EFR32_EMU_RSTCAUSE_IOVDD0BOD;
+        rmode = EFR32_EMU_RSTCTRL_IOVDD0BODRMODE;
+        hard = false;
+        break;
+    default:
+        g_assert_not_reached();
+    }
+    if (rmode && !(s->periph.rstctrl & rmode)) {
+        return;
+    }
+    if (!hard) {
+        if (level) {
+            s->periph.rstcause |= cause;
+            efr32_soc_reset_request(s);
+        }
+        return;
+    }
+    if (level) {
+        s->periph.rstcause |= cause;
+        s->periph.rstctrl = EFR32_EMU_RSTCTRL_RESET;
+    }
+    CPU(s->armv7m.cpu)->start_powered_off = level;
+    efr32_soc_reset_request(s);
+}
+
 /* The reset that follows a DCI device erase (efr32-dap.c). */
 static void efr32_soc_erase_reset(void *opaque, int n, int level)
 {
@@ -9575,6 +9709,8 @@ static void efr32_soc_init(Object *obj)
                             TYPE_ARMV7M);
     object_initialize_child(obj, "periph", &s->periph, TYPE_EFR32_PERIPH);
     notifier_list_init(&s->reset_notifiers);
+    qdev_init_gpio_in_named(DEVICE(obj), efr32_soc_brown_out, "brown-out",
+                            EFR32_BOD_LINES);
 }
 
 /* efr32bg22c224f512im40.h IRQn_Type. */

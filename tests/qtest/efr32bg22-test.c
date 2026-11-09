@@ -2637,6 +2637,58 @@ static void test_iadc_single_conversion(void)
 }
 
 /*
+ * PORTPOS = SUPPLY (RM SS24.3.5.2, Table 24.3) against the 3.3 V VDDX
+ * reference: AVDD/4 = 825 mV reads 1024; DVDD/4 is 825 mV in bypass and
+ * 450 mV (558) with the DC-DC regulating its 1.8 V; DECOUPLE at the reset
+ * VSCALE2 is 1.1 V (1365); VSS reads 0.  PORTPOS = GND with SUPPLY on
+ * PORTNEG is swapped into a single-ended conversion.
+ */
+#define IADC_INPUT(portpos, pinpos, portneg, pinneg) \
+    (((portpos) << 12) | ((pinpos) << 8) | ((portneg) << 4) | (pinneg))
+#define IADC_PORT_GND         0u
+#define IADC_PORT_SUPPLY      1u
+#define DCDC_CTRL_MODE_DCDCREGULATION 1u
+
+static uint32_t iadc_supply_read(QTestState *qts, uint32_t input)
+{
+    qtest_writel(qts, IADC_BASE + IADC_SINGLE, input);
+    iadc_convert_after(qts, IADC_WARMUP_NS + IADC_CONV_NS);
+    return qtest_readl(qts, IADC_BASE + IADC_SINGLEFIFODATA);
+}
+
+static void test_iadc_supply_inputs(void)
+{
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel qtest");
+
+    qtest_writel(qts, IADC_BASE + IADC_CTRL, IADC_CTRL_TIMEBASE_1US);
+    qtest_writel(qts, IADC_BASE + IADC_SCHED0, 1);
+    qtest_writel(qts, IADC_BASE + IADC_CFG0, IADC_CFG0_VDDX_GAIN1);
+    g_assert_cmpuint(iadc_supply_read(qts, IADC_INPUT(IADC_PORT_SUPPLY, 0,
+                                                      IADC_PORT_GND, 0)),
+                     ==, 1024);
+    g_assert_cmpuint(iadc_supply_read(qts, IADC_INPUT(IADC_PORT_SUPPLY, 1,
+                                                      IADC_PORT_GND, 0)),
+                     ==, 1024);
+    g_assert_cmpuint(iadc_supply_read(qts, IADC_INPUT(IADC_PORT_SUPPLY, 2,
+                                                      IADC_PORT_GND, 0)),
+                     ==, 0);
+    g_assert_cmpuint(iadc_supply_read(qts, IADC_INPUT(IADC_PORT_SUPPLY, 4,
+                                                      IADC_PORT_GND, 0)),
+                     ==, 1024);
+    g_assert_cmpuint(iadc_supply_read(qts, IADC_INPUT(IADC_PORT_SUPPLY, 7,
+                                                      IADC_PORT_GND, 0)),
+                     ==, 1365);
+    g_assert_cmpuint(iadc_supply_read(qts, IADC_INPUT(IADC_PORT_GND, 0,
+                                                      IADC_PORT_SUPPLY, 0)),
+                     ==, 1024);
+    qtest_writel(qts, DCDC_BASE + DCDC_CTRL, DCDC_CTRL_MODE_DCDCREGULATION);
+    g_assert_cmpuint(iadc_supply_read(qts, IADC_INPUT(IADC_PORT_SUPPLY, 4,
+                                                      IADC_PORT_GND, 0)),
+                     ==, 558);
+    qtest_quit(qts);
+}
+
+/*
  * Output resolution 11 + log2(OSR x DIGAVG) bits (RM SS24.3.7.4): OSR 4 and
  * 4-sample averaging give 15 bits, 968 mV of 3.3 V = 9612, read RIGHT16 as
  * 9612 << 1 = 19224 (its 12 MSBs are still 1201); the window comparator
@@ -3077,6 +3129,46 @@ static void test_m33_lockup(void)
     /* RSTCTRL survives the soft resets it allowed */
     g_assert_cmphex(qtest_readl(qts, LOCKUP_EMU_RSTCTRL), ==,
                     LOCKUP_RSTCTRL_RESET | LOCKUP_RSTCTRL_LOCKUPRMODE);
+    qtest_quit(qts);
+}
+
+/*
+ * Brown-out detectors (RM Table 12.8): DVDDBOD and DECBOD are hard resets
+ * that restore EMU_RSTCTRL; AVDDBOD is a soft reset that resets only with
+ * RSTCTRL.AVDDBODRMODE (reset 0), and blocked leaves no cause.
+ */
+#define BOD_DVDD               0
+#define BOD_DECOUPLE           1
+#define BOD_AVDD               2
+#define RSTCAUSE_DVDDBOD       (1u << 7)
+#define RSTCAUSE_DECBOD        (1u << 9)
+#define RSTCAUSE_AVDDBOD       (1u << 10)
+#define RSTCTRL_AVDDBODRMODE   (1u << 6)
+
+static uint32_t brown_out(QTestState *qts, int line)
+{
+    qtest_writel(qts, EMU_BASE + EMU_CMD, EMU_CMD_RSTCAUSECLR);
+    qtest_set_irq_in(qts, "/machine/soc", "brown-out", line, 1);
+    qtest_set_irq_in(qts, "/machine/soc", "brown-out", line, 0);
+    return qtest_readl(qts, LOCKUP_RSTCAUSE);
+}
+
+static void test_brown_out_resets(void)
+{
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel qtest");
+
+    g_assert_cmphex(brown_out(qts, BOD_DVDD), ==, RSTCAUSE_DVDDBOD);
+    g_assert_cmphex(brown_out(qts, BOD_DECOUPLE), ==, RSTCAUSE_DECBOD);
+    g_assert_cmphex(brown_out(qts, BOD_AVDD), ==, 0);
+    qtest_writel(qts, LOCKUP_EMU_RSTCTRL,
+                 LOCKUP_RSTCTRL_RESET | RSTCTRL_AVDDBODRMODE);
+    g_assert_cmphex(brown_out(qts, BOD_AVDD), ==, RSTCAUSE_AVDDBOD);
+    /* A soft reset keeps RSTCTRL; a hard one restores it. */
+    g_assert_cmphex(qtest_readl(qts, LOCKUP_EMU_RSTCTRL), ==,
+                    LOCKUP_RSTCTRL_RESET | RSTCTRL_AVDDBODRMODE);
+    g_assert_cmphex(brown_out(qts, BOD_DVDD), ==, RSTCAUSE_DVDDBOD);
+    g_assert_cmphex(qtest_readl(qts, LOCKUP_EMU_RSTCTRL), ==,
+                    LOCKUP_RSTCTRL_RESET);
     qtest_quit(qts);
 }
 
@@ -5692,6 +5784,7 @@ int main(int argc, char **argv)
                    test_rtcc_counts_and_compares);
     qtest_add_func("/efr32bg22/prortc-counts-and-compares",
                    test_prortc_counts_and_compares);
+    qtest_add_func("/efr32bg22/iadc-supply-inputs", test_iadc_supply_inputs);
     qtest_add_func("/efr32bg22/iadc-single-conversion",
                    test_iadc_single_conversion);
     qtest_add_func("/efr32bg22/emu-rstcause", test_emu_rstcause);
@@ -5766,6 +5859,7 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/seq-sleeping-follows-wfi",
                    test_seq_sleeping_follows_wfi);
     qtest_add_func("/efr32bg22/m33-lockup", test_m33_lockup);
+    qtest_add_func("/efr32bg22/brown-out-resets", test_brown_out_resets);
     qtest_add_func("/efr32bg22/rstctrl-blocks-sysresetreq",
                    test_rstctrl_blocks_sysresetreq);
     qtest_add_func("/efr32bg22/seq-lockup-until-seqreset",
