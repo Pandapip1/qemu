@@ -253,9 +253,10 @@ static void sem_update(int core, uint32_t mask, bool request)
  * 0x300000). UMAC 0x80448ca4 compares the first two with FSEQ_CNVR_ID /
  * FSEQ_CNVI_ID (0xa34090 / 0xa3408c), fatal 0x1013f1 on a mismatch.
  * FSEQ_OTP_VERSION is OTP content the firmware only reads (UMAC 0x80448cae
- * branches on >= 0xa440); 0xa652 is the value on two AX210 cards. Sources:
+ * branches on >= 0xa440); 0xa652 on all three saved AX210 dumps. Sources:
  * the error dumps indexed in ~/Projects/ax210/ref-silicon/README.md, one of
- * them from a card running this firmware (89.6b44fa0b.0). */
+ * them from a card running firmware API 89 (build 89.6b44fa0b; the model
+ * runs 89.b20dcd1f). */
 static const struct {
     hwaddr a;
     uint32_t v;
