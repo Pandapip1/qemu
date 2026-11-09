@@ -10,6 +10,9 @@ contrib_plugins = [
 'hwprofile.c',
 'ips.c',
 'stoptrigger.c',
+'romtrap.c',
+'memwatch.c',
+'mpudump.c',
 'traps.c',
 'uftrace.c',
 ]

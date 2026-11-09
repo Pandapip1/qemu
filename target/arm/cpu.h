@@ -422,6 +422,7 @@ typedef struct CPUArchState {
 
         uint32_t c9_insn; /* Cache lockdown registers.  */
         uint32_t c9_data;
+        uint32_t tcm_region[2]; /* Cortex-R ATCM/BTCM region registers */
         uint64_t c9_pmcr; /* performance monitor control register */
         uint64_t c9_pmcnten; /* perf monitor counter enables */
         uint64_t c9_pmovsr; /* perf monitor overflow status */
@@ -1145,6 +1146,12 @@ struct ArchCPU {
      * architecture version.
      */
     bool cfgend;
+
+    /* Whether the CFGTE input is high: reset into Thumb with SCTLR.TE set. */
+    bool cfgte;
+
+    /* Cortex-R TCM region register reset values (ATCM, BTCM). */
+    uint32_t tcm_region_reset[2];
 
     QLIST_HEAD(, ARMELChangeHook) pre_el_change_hooks;
     QLIST_HEAD(, ARMELChangeHook) el_change_hooks;

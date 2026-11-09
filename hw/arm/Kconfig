@@ -727,3 +727,8 @@ config ARMSSE
     select UNIMP
     select SSE_COUNTER
     select SSE_TIMER
+
+config BCM4387
+    bool
+    default y
+    depends on TCG && ARM

@@ -481,6 +481,10 @@ static void arm_cpu_reset_hold(Object *obj, ResetType type)
     if (A32_BANKED_CURRENT_REG_GET(env, sctlr) & SCTLR_V) {
         env->regs[15] = 0xFFFF0000;
     }
+    if (!arm_feature(env, ARM_FEATURE_M) &&
+        (A32_BANKED_CURRENT_REG_GET(env, sctlr) & SCTLR_TE)) {
+        env->thumb = true;
+    }
 
     env->vfp.xregs[ARM_VFP_FPEXC] = 0;
 #endif
@@ -1324,6 +1328,9 @@ static const Property arm_cpu_has_gcie_property =
 static const Property arm_cpu_cfgend_property =
             DEFINE_PROP_BOOL("cfgend", ARMCPU, cfgend, false);
 
+static const Property arm_cpu_cfgte_property =
+            DEFINE_PROP_BOOL("cfgte", ARMCPU, cfgte, false);
+
 static const Property arm_cpu_has_vfp_property =
             DEFINE_PROP_BOOL("vfp", ARMCPU, has_vfp, true);
 
@@ -1349,6 +1356,12 @@ static const Property arm_cpu_pmsav7_dregion_property =
             DEFINE_PROP_UNSIGNED_NODEFAULT("pmsav7-dregion", ARMCPU,
                                            pmsav7_dregion,
                                            qdev_prop_uint32, uint32_t);
+
+static const Property arm_cpu_atcm_region_property =
+            DEFINE_PROP_UINT32("atcm-region", ARMCPU, tcm_region_reset[0], 0);
+
+static const Property arm_cpu_btcm_region_property =
+            DEFINE_PROP_UINT32("btcm-region", ARMCPU, tcm_region_reset[1], 0);
 #endif
 
 static bool arm_get_pmu(Object *obj, Error **errp)
@@ -1660,6 +1673,12 @@ static void arm_cpu_post_init(Object *obj)
             qdev_property_add_static(DEVICE(obj),
                                      &arm_cpu_pmsav7_dregion_property);
         }
+        if (!arm_feature(&cpu->env, ARM_FEATURE_M)) {
+            qdev_property_add_static(DEVICE(obj),
+                                     &arm_cpu_atcm_region_property);
+            qdev_property_add_static(DEVICE(obj),
+                                     &arm_cpu_btcm_region_property);
+        }
     }
 
     if (arm_feature(&cpu->env, ARM_FEATURE_M_SECURITY)) {
@@ -1716,6 +1735,9 @@ static void arm_cpu_post_init(Object *obj)
     }
 #endif
     qdev_property_add_static(DEVICE(obj), &arm_cpu_cfgend_property);
+    if (!arm_feature(&cpu->env, ARM_FEATURE_M)) {
+        qdev_property_add_static(DEVICE(obj), &arm_cpu_cfgte_property);
+    }
 }
 
 static void arm_cpu_finalizefn(Object *obj)
@@ -2162,6 +2184,10 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
 
     if (cpu->reset_hivecs) {
             cpu->reset_sctlr |= (1 << 13);
+    }
+
+    if (cpu->cfgte) {
+        cpu->reset_sctlr |= SCTLR_TE;
     }
 
     if (cpu->cfgend) {
