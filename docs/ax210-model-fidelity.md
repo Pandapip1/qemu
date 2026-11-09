@@ -104,6 +104,76 @@ when run against this model", not a claim about real silicon.
 | G1 | Configure-and-start unit at `0xd03f00`: config `+0x0/+0x4/+0x8`, start `+0x10` bit 0, done `+0x14` bit 0 | modelled, [I] | UMAC `0x8044acd0` loads three words from `0xc088400c` (the last two are addresses it then writes through), `0x804a6c94` starts and waits ~20 timebase ticks for done, else fatal `0x101035`. No firmware on either core writes `+0x14`. Model: done follows start at once. Tested `/ax210/cfg-unit-start-done`. |
 | G2 | UMAC timeout timer: write N to `0xd02c78` arms; expiry sets `0xd02e2c` bit 4 and raises IRQ6; writing bit 4 clears | modelled, [I]; tick rate [?] | UMAC's idle loop re-arms `0x30d40` at `0x804a66a0` before each `sleep`; its IRQ6 handler `0xc0080b30` writes `0x10` to `0xd02e2c` and re-arms. Model: one-shot, 1 tick = 1 us of virtual time. Under it UMAC takes IRQ6 every 200 ms from its idle `sleep` and returns. Tested `/ax210/umac-timeout-timer`. |
 
+## Audit (EFR32 method), 2026-11-09
+
+Method of `~/Projects/owo-open-fw/docs/model-fidelity.md`: every finding
+graded **yes** (modelled as evidenced), **partial** (the gap says what is
+missing), **no** (not modelled), **contradicts** (model disagrees with
+evidence), **n/a**. Evidence: **S** silicon (saved AX210 dumps,
+`~/Projects/ax210/ref-silicon/`), **V** vendor (the `.ucode`'s debug TLVs,
+iwlwifi and Linux arch/arc sources), **F** firmware behaviour, **I**
+inferred, **?** unknown. N-rows list hardware not modelled at all.
+
+| | yes | partial | no | contradicts | n/a | total |
+|---|---|---|---|---|---|---|
+| 2026-11-09 | 15 | 23 | 8 | 0 | 1 | 47 |
+
+Contradictions resolved in this pass (now **yes**): K2 (write/readback
+aliases vs. read-only chip IDs, by iwl-prph.h names and silicon values),
+CSR_HW_REV `0x422` vs silicon `0x420` (C2), Q1/Q2 "message FIFOs" vs TX
+FIFOs (iwl-prph.h), UMAC windows as separate RAM vs one device address
+space (M3), FSEQ_OTP_VERSION 0 vs `0xa652`.
+
+| ID | Status | Evidence | Gap |
+|---|---|---|---|
+| R0 | yes | F | - |
+| R1 | partial | I | Write-readback is the model's default for unmodelled MMIO, not a hardware claim; real registers have their own semantics. |
+| T1 | partial | I | Counts per read; no real rate (timing). |
+| M1 | partial | I; V for indices 0x118/0x120/0x128/0x028 | Index-to-CSR mapping conflicts for index 0 (C2); command encoding unconfirmed. |
+| D1 | partial | I; registers in vendor list (V) | Host-to-device copy only; completes at once (no timing). |
+| C1 | yes | V (driver) | - |
+| E1 | n/a | - | Withdrawn (L1). |
+| L1 | yes | F | - |
+| L2 | partial | F; S (halt helper, fw89 dump) | LMAC interrupt sources [?]. |
+| X1 | partial | I | Meanings [?]. |
+| X2 | partial | I | Bit meanings beyond bit 29 [?]. |
+| M2 | yes | F | - |
+| M3 | yes | V (ucode region TLVs) + F | - |
+| P1 | yes | F; V (every listed register lies in these ranges) | - |
+| W1 | partial | F (protocol); V (CNVR register name) | Target mapping 0xa20000+addr [I]; BUSY completes at once. |
+| V1 | partial | F | Tick = 1 us assumed; interrupt wiring [?]. |
+| F1 | partial | F/I | State follows the request at once (no latency). |
+| S1 | partial | I; 0xd03800 in vendor list | Arbitration and fairness [?]. |
+| A1 | partial | F (FIPS-197 C.1) | Control bits [I]; no timing. |
+| Q1 | partial | V (iwl-prph.h TXF_*) | FIFO contents, the TX engine that drains them and its timing not modelled. |
+| B1 | partial | F | Relies on R1/T1/M1 overrides. |
+| U1 | yes | F | - |
+| U2 | partial | F; S cross-checks | Needs I1 from the harness; IRQ5/IRQ8 sources [?]. |
+| U3 | yes | V + F | - |
+| C2 | partial | S (CSR_HW_REV); I (index 0) | Index 0 value conflicts with driver code. |
+| K1 | partial | F (0xa2/0xa3); I (0xd0) | - |
+| H1 | partial | V (driver) | Rings empty; no debug destination; page bump allocator. |
+| A2 | yes | V (Linux arch/arc) | - |
+| A3 | yes | Architectural | - |
+| A4 | yes | V (Linux entry-compact.S) + F (UMAC table) | - |
+| A5 | partial | Architectural | Storage only; actionpoint triggers not modelled. |
+| A6 | partial | Architectural | Storage only; MAC instructions not modelled. |
+| A7 | yes | F + architectural | - |
+| A8 | yes | V (Linux arch/arc) + F | Priority within a level assumed lowest line first. |
+| K2 | yes | S (three cards) + V | - |
+| K3 | yes | F | - |
+| Q2 | partial | V (iwl-prph.h TXF_CPU2_*) | As Q1. |
+| I1 | no | ? | Hardware status bit supplied by the harness, not modelled. |
+| G1 | partial | I | Done follows start at once; register meaning [?]. |
+| G2 | partial | I | Tick rate [?] (1 us assumed); one-shot assumed. |
+| N1 | no | V (iwl-prph.h, rxf_config) | MAC TX/RX engines: TXF drain, RX FIFOs (0xa00c00, 0xd00e00, 0xd05a00) and the RX DMA to the host (ALIVE and notifications). |
+| N2 | no | - | PCI device model: the real iwlwifi driver cannot bind to the simulation; the host side is the scripted H1/M1 model. |
+| N3 | no | F (structure) | UMAC IRQ5 cause aggregator (0xd02e00 groups, summary 0xd02e64); IRQ8 and LMAC IRQ19/22 sources. |
+| N4 | no | - | Inter-core message path ([?]; not the TX FIFOs). |
+| N5 | no | V (TLV PHY register list) | PHY/radio registers (0xa44400-0xad3dd8): 3911 listed, none modelled. |
+| N6 | no | - | Timing: core clocks, bus and peripheral latencies (no silicon timing evidence available). |
+| N7 | no | - | IML/ROM boot path from reset (ROM image not available); the harness starts UMAC at the IML handoff. |
+
 ## Harness vs. tests
 
 Two tiers exist, and they should not be confused:
@@ -137,7 +207,7 @@ Two tiers exist, and they should not be confused:
 - UMAC IRQ5 is a cause aggregator [F structure, not modelled]: `0xc0083f60` reads the summary word `0xd02e64` (fatal `0x100116` if 0), takes the highest set bit k and calls `table[k]` at `0xc0880a64` (filled at runtime; at idle ~18 bits have handlers, `0xc0082100` is the empty entry). The `0xd02e00` block holds groups n: mask `+4n`, status `+0x20+4n`, acknowledged by writing the bit (handlers `0xc008214c` n=1, `0xc00822e8` n=2, `0xc0082334` n=4, `0xc008208c` n=6); D1's DMA-done bit (`+0x24` bit 29) and G2's bit (`+0x2c` bit 4) sit in groups 1 and 3. Which group bit an LMAC message raises, and where UMAC reads it, are [?]; `0xd00e00` (UMAC `0xc00824b8` compares `0xd00e4c`/`0xd00e50`; LMAC `0x1544` polls `0xd00e40`) is the next lead.
 - UMAC IRQ5 and IRQ8 (level 2) sources: [?].
 - TX FIFOs (Q1, Q2) are the MAC TX path ([iwl-prph.h] `TXF_*`, `TXF_CPU2_*`): in a dual run neither core reads them back, as expected of a TX FIFO. UMAC `0x804a8b18` programs 15 FIFOs (`TXF_LARC_NUM` 0-14) from static data (`+0x34` buffer offset `0x9000-0x23800`, `+0x30` size) and clears `TXF_LOCK_FENCE`; LMAC `0x1e64` manages `TXF_LOCK_FENCE`/`TXF_RD_PTR`. FIFO contents, the TX engine that drains them and its timing are not modelled (drain at once). How the cores exchange messages is still [?] (not through these FIFOs).
-- `0xa00c00` (`iwl-prph.h`: RX FIFO `RXF_*`, e.g. `RXF_SIZE_ADDR` `+0x88`, `RXF_RD_WR_PTR` `+0x50`, `RXF_RD_RD_PTR` `+0x54`, `RXF_RD_FENCE_PTR` `+0x4c`) and `0xd00e00` (UMAC) are a pair of identical ports (LMAC data table `0x804194` lists both): free `+0x34`, push header (bits 27-29 \| length) then data to `+0xc0`, buffer `+0x84`/`+0x88` (UMAC: `0x2a000`/`0xb400`). UMAC's sender is `0x8049305c`. Not used during boot to idle. IRQ8's handler (`0xc0080658`) reads `0xd02fa0`, `0xd00ee0`, `0xd05498`, `0xd03944`, `0xc0a01c64`.
+- RX FIFOs (vendor `rxf_config` region lists three: `0xa00c00`, `0xd00e00`, `0xd05a00`, each with `+0x84` base, `+0x88` size, `+0x50/+0x54` pointers, `+0x4c` fence). `0xa00c00` (`iwl-prph.h`: RX FIFO `RXF_*`, e.g. `RXF_SIZE_ADDR` `+0x88`, `RXF_RD_WR_PTR` `+0x50`, `RXF_RD_RD_PTR` `+0x54`, `RXF_RD_FENCE_PTR` `+0x4c`) and `0xd00e00` (UMAC) are a pair of identical ports (LMAC data table `0x804194` lists both): free `+0x34`, push header (bits 27-29 \| length) then data to `+0xc0`, buffer `+0x84`/`+0x88` (UMAC: `0x2a000`/`0xb400`). UMAC's sender is `0x8049305c`. Not used during boot to idle. IRQ8's handler (`0xc0080658`) reads `0xd02fa0`, `0xd00ee0`, `0xd05498`, `0xd03944`, `0xc0a01c64`.
 - Signatures UMAC `0x80448ca4` checks: `0xa340f0` == `0x4552414e` is written by UMAC itself later (`0x804490fc`), so it is a warm-boot marker; the writer of `0xa34048` (`|0xe == 0x5442440f`) is unknown. Both read 0 on this cold boot.
 - The crypto coprocessor path (`0xa248xx`/`0xc0e2xxxx`): traced as a
   no-op MMIO window; never exercised by the IML in any run captured so
