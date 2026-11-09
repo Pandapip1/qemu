@@ -3558,6 +3558,99 @@ static void test_seq_systick_calib_follows_stctrl(void)
 }
 
 /*
+ * The sequencer's two M33-facing paths: it reads TIMER0.CNT through the
+ * non-secure peripheral window at 0x50048024 (the timed command's clock,
+ * radio_seq.S), and RDMAILBOX1's IF & IEN raise its IRQ 23 (vector word
+ * 16 + 23), whose handler acknowledges through the CLR alias.  The M0+
+ * stores the TIMER0 sample in SPARE1 and counts handler runs in SPARE0.
+ */
+#define SEQ_NVIC_ISER          0xe000e100u
+#define SEQ_MAILBOX_IRQ        23
+#define SEQ_MAILBOX_VECTOR     ((16 + SEQ_MAILBOX_IRQ) * 4)
+#define RDMAILBOX1_IF_CLR      (RFMAILBOX_C_BASE + RFMAILBOX_FLAGS + \
+                                REGISTER_CLEAR_WINDOW)
+#define RDMAILBOX1_IEN         (RFMAILBOX_C_BASE + 0x044)
+#define THUMB16_MOVS_R1_15     0x210fu
+#define THUMB16_BX_LR          0x4770u
+
+static uint32_t seq_spare_wait(QTestState *qts, unsigned word)
+{
+    uint32_t value = 0;
+
+    for (unsigned attempt = 0; attempt < 1000 && !value; attempt++) {
+        value = qtest_readl(qts, SEQRAM_NS_BASE + SEQ_SPARE0 + 4 * word);
+        if (!value) {
+            g_usleep(1000);
+        }
+    }
+    return value;
+}
+
+static void test_seq_mailbox_irq_and_timer0(void)
+{
+    const uint32_t code = 0x100, handler = code + 16, lit = code + 32;
+    uint16_t insn[16];
+    uint32_t literals[5] = {
+        SEQ_NVIC_ISER, 1u << SEQ_MAILBOX_IRQ, TIMER0_NS_BASE + TIMER_CNT,
+        SEQ_SPARE0, RDMAILBOX1_IF_CLR,
+    };
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel tcg -S");
+    uint32_t sample;
+
+    insn[0] = thumb_ldr_pc(0, code + 0, lit + 0);
+    insn[1] = thumb_ldr_pc(1, code + 2, lit + 4);
+    insn[2] = thumb_str_imm(1, 0, 0);          /* ISER = 1 << 23 */
+    insn[3] = thumb_ldr_pc(2, code + 6, lit + 8);
+    insn[4] = thumb_ldr_imm(3, 2, 0);          /* r3 = TIMER0.CNT */
+    insn[5] = thumb_ldr_pc(4, code + 10, lit + 12);
+    insn[6] = thumb_str_imm(3, 4, 1);          /* SPARE1 = r3 */
+    insn[7] = THUMB16_BRANCH_SELF;
+    insn[8] = thumb_ldr_pc(0, handler + 0, lit + 16);
+    insn[9] = THUMB16_MOVS_R1_15;
+    insn[10] = thumb_str_imm(1, 0, 0);         /* IF_CLR = 0xf */
+    insn[11] = thumb_ldr_pc(0, handler + 6, lit + 12);
+    insn[12] = THUMB16_LDR_R1_R0;
+    insn[13] = THUMB16_ADDS_R1_1;
+    insn[14] = THUMB16_STR_R1_R0;              /* SPARE0++ */
+    insn[15] = THUMB16_BX_LR;
+
+    qtest_writel(qts, 0x00000000, 0x20008000);
+    qtest_writel(qts, 0x00000004, 0x00000101);
+    qtest_writel(qts, 0x00000100, 0x0000e7fe);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    setup_timer_clocks(qts);
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN1 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN1_RDMAILBOX1);
+    qtest_writel(qts, TIMER0_BASE + TIMER_EN, TIMER_EN_EN);
+    qtest_writel(qts, TIMER0_BASE + TIMER_TOP, 0xffffffff);
+    qtest_writel(qts, TIMER0_BASE + TIMER_CNT, 1);
+    qtest_writel(qts, TIMER0_BASE + TIMER_CMD, TIMER_CMD_START);
+    /* SEQRAM takes writes once its bus clock runs. */
+    qtest_seq_enable_radio_bus_clocks(qts);
+    qtest_writel(qts, SEQRAM_NS_BASE + SEQ_MAILBOX_VECTOR, handler | 1);
+    seq_load_and_release(qts, insn, G_N_ELEMENTS(insn), literals,
+                         G_N_ELEMENTS(literals));
+
+    sample = seq_spare_wait(qts, 1);
+    g_assert_cmphex(sample, !=, 0);
+    g_assert_cmphex(sample, <=, qtest_readl(qts, TIMER0_BASE + TIMER_CNT));
+
+    /* IF without IEN: no interrupt. */
+    qtest_writel(qts, RFMAILBOX_C_BASE + RFMAILBOX_FLAGS + REGISTER_SET_WINDOW,
+                 1);
+    g_usleep(20000);
+    g_assert_cmpuint(qtest_readl(qts, SEQRAM_NS_BASE + SEQ_SPARE0), ==, 0);
+    /* IEN: the handler runs once and clears IF. */
+    qtest_writel(qts, RDMAILBOX1_IEN, 1);
+    g_assert_cmpuint(seq_spare_wait(qts, 0), ==, 1);
+    g_usleep(20000);
+    g_assert_cmpuint(qtest_readl(qts, SEQRAM_NS_BASE + SEQ_SPARE0), ==, 1);
+    g_assert_cmphex(qtest_readl(qts, RFMAILBOX_C_BASE + RFMAILBOX_FLAGS), ==,
+                    0);
+    qtest_quit(qts);
+}
+
+/*
  * Per-CPU clocks under -icount (owo-open-fw docs/radio-tables.md SS7.73).
  * On silicon the M33 runs at HCLK and the M0+ at SYSCLK / (RHCLKPRESC + 1),
  * each at its own rate while the other runs; both count cycles per
@@ -5874,6 +5967,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/seq-systick-counts", test_seq_systick_counts);
     qtest_add_func("/efr32bg22/seq-systick-calib-follows-stctrl",
                    test_seq_systick_calib_follows_stctrl);
+    qtest_add_func("/efr32bg22/seq-mailbox-irq-and-timer0",
+                   test_seq_mailbox_irq_and_timer0);
     qtest_add_func("/efr32bg22/core-clocks-per-cpu-rates",
                    test_core_clocks_per_cpu_rates);
     qtest_add_func("/efr32bg22/core-clocks-m33-access-costs",
