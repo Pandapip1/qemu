@@ -16,9 +16,9 @@ confirmed. **[?]** unknown — not modelled, and not safe to guess.
 A project reverse-engineering a debuggable microcontroller (SWD/JTAG, a
 reference manual, silicon measurement via a probe) can tag most findings
 [F]. The AX210's on-die ARC core has no such access path available here:
-it is not a standalone debuggable chip, there is no public register
-reference for its internal MMIO, and this session has no hardware probe
-into a physical unit. The only oracles available are:
+it is not a standalone debuggable chip, there is no public reference
+manual for its internal MMIO, and there is no AX210 on this machine to
+probe. The oracles available are:
 
 1. **The host driver source** (`linux-iwlwifi`, upstream `drivers/net/
    wireless/intel/iwlwifi`): authoritative [F] for the *host-side* PCI CSR
@@ -37,9 +37,25 @@ into a physical unit. The only oracles available are:
    invent — so every register this model didn't get from (1) is [I] at
    best, and must be labelled as such rather than presented as measured.
 
-Nothing below should be read as a claim about real silicon strength,
-timing, or any property beyond "this is consistent with what the signed
-firmware images do when run against this model."
+4. **Intel's own debug metadata in the `.ucode`**: the region TLVs list
+   device memories by address and size and the periphery registers that
+   exist (finding M3).
+5. **Register names in `iwl-prph.h`**: a partial public register model
+   (TXF/RXF FIFOs, FSEQ block, chip IDs, ...).
+6. **Silicon snapshots from public AX210 error dumps**: iwlwifi prints the
+   LMAC/UMAC error tables and the FSEQ/ID registers when firmware crashes.
+   One dump is from a card running exactly this firmware (89.6b44fa0b.0).
+   Only registers the firmware never writes give hardware values.
+
+**Where the evidence is:** `~/Projects/ax210/ref-silicon/README.md` indexes
+every source (original URL, fetch date, local copy, which findings use it):
+the saved dumps (`ref-silicon/*.txt`, raw pages beside them), the decoded
+region TLVs (`ini_regions.txt`, `scripts/ini_regions.py`), and the Linux
+headers (`ref-linux-iwl/`, `ref-linux-arc/`).
+
+Rows marked **silicon** rest on (6); rows marked [F] vendor on (1), (4) or
+(5). Everything else is "consistent with what the signed firmware images do
+when run against this model", not a claim about real silicon.
 
 ## Findings
 
@@ -79,7 +95,7 @@ firmware images do when run against this model."
 | A6 | ARC700 XMAC `AUX_MACMODE`, `AUX_XMAC0-2` (aux `0x41`, `0x44-0x46`) | **yes** (storage) | Saved/restored per thread by UMAC (`0xc00816f6`); no MAC instruction executed so far. |
 | A7 | ARCompact `RTIE`: encoding `0x242F003F`; AE → `ERET`, else A2 → `ILINK2/STATUS32_L2/BTA_L2`, else `ILINK1/STATUS32_L1/BTA_L1` | **yes**, [F] firmware | The table knew only `0x246F003F` (same zero-operand instruction, `u6` form), and `RTIE` followed ARCv2 rules. UMAC starts threads from non-interrupt context (`STATUS32` = 0) by loading `ILINK1`, `STATUS32_L1` (aux `0xb`, now defined for ARCv1 with `0xc` `STATUS32_L2`) and `BTA_L1` and executing `rtie` (`0xc008171a`), which only works with the level-1 fallback. |
 | A8 | ARCompact interrupt delivery: lines 3-31, `AUX_IENABLE`, `AUX_IRQ_LEV` levels, `E1/E2`/`A1/A2`, `ILINKn`/`STATUS32_Ln`/`BTA_Ln`, `ICAUSE1/2`, sticky `AUX_IRQ_LV12`, vector slot `8n` | **yes**, architectural | Register numbers and bits from Linux `arch/arc` (`irqflags-compact.h`, `entry-compact.S`: `AUX_IRQ_LV12` write-1-to-clear). `AUX_IENABLE` resets all-enabled: nothing in the `.ucode` writes it, yet UMAC handles IRQ5/6/8. UMAC's table at `0xc0080000` confirms the layout: IRQ3/4 (timers) are `flag 1` halts, IRQ5/6/8 have handlers, IRQ7/9 share an `ICAUSE`-reporting default; `0x100-0x120` are the A4 exception slots. Interrupt priority within a level: lowest line first. |
-| K2 | Chip IDs, read-only: `CNVI_AUX_MISC_CHIP` `0xa200b0` = `0x400410`, `SD_REG_VER_GEN2`/`CNVR_AUX_MISC_CHIP` `0xa2b800` = `0x400410`, `WFPM_OTP_CFG1_ADDR` `0xd03098` = `0x80000000` | **yes**, silicon | AX210 dmesg "Detected crf-id 0x400410, cnv-id 0x400410 wfpm id 0x80000000" (two independent logs: Intel community, Ubuntu 23.10; freebsd-wireless 2025-03, Framework 16); the driver reads exactly these registers (`pcie/trans.c`, names and addresses `iwl-prph.h`; WFPM at UMAC periphery offset `0x300000`). UMAC `0x80448ca4` writes the expected IDs to `FSEQ_CNVI_ID` `0xa3408c` / `FSEQ_CNVR_ID` `0xa34090` and compares (`0xa200b0` masked `0xff0fffff`; CNVR through the W1 window as `0xb800`); a mismatch is fatal `0x1013f1`. Now passes on the silicon values (status `0x20000061`, bit 1 clear). Replaces an earlier [I] model of these as write/readback aliases, which the register names contradicted. Tested `/ax210/lmac/indirect-target-chip-ids`. |
+| K2 | Chip IDs, read-only: `CNVI_AUX_MISC_CHIP` `0xa200b0` = `0x400410`, `SD_REG_VER_GEN2`/`CNVR_AUX_MISC_CHIP` `0xa2b800` = `0x400410`, `WFPM_OTP_CFG1_ADDR` `0xd03098` = `0x80000000` | **yes**, silicon | Three AX210 cards' dmesg: `ref-silicon/fw89-framework16-dmesg.txt` (this firmware, 89.6b44fa0b.0: "Detected crf-id 0x400410, cnv-id 0x400410 wfpm id 0x80000000" and `0x00400410 | CNVI_AUX_MISC_CHIP` / `CNVR_AUX_MISC_CHIP`), `ref-silicon/fw67-freebsd262150-dmesg.txt` (same IDs, fw 67), an Intel community log (URL in `ref-silicon/README.md`). `FSEQ_OTP_VERSION` `0xa340fc` = `0xa652` on both saved cards; the firmware only reads it (UMAC `0x80448cae` branches on `>= 0xa440`); per-card OTP value; the driver reads exactly these registers (`pcie/trans.c`, names and addresses `iwl-prph.h`; WFPM at UMAC periphery offset `0x300000`). UMAC `0x80448ca4` writes the expected IDs to `FSEQ_CNVI_ID` `0xa3408c` / `FSEQ_CNVR_ID` `0xa34090` and compares (`0xa200b0` masked `0xff0fffff`; CNVR through the W1 window as `0xb800`); a mismatch is fatal `0x1013f1`. Now passes on the silicon values (status `0x20000061`, bit 1 clear). Replaces an earlier [I] model of these as write/readback aliases, which the register names contradicted. Tested `/ax210/lmac/indirect-target-chip-ids`. |
 | K3 | Cross-core view of LMAC's `0xa0` page: UMAC `0xc0a0xxxx` == LMAC `0x00a0xxxx` | **yes**, [F] | UMAC `0x804a8b80` builds the LMAC-view address `0xa0a404 + 16*ch` and converts it with `(a & 0xff0fffff) \| 0xc0a00000`, the counterpart of K1's `\| 0xc0e20000` for `0xa2/0xa3`. So D1's DMA engine and Q2's FIFO are LMAC `0xa0a500` / `0xa00500`, and Q1 (`0xa00400`) is the same unit UMAC configures at `0xc0a00400` (`0x804a8b18`: per channel, select `+0x3c`, buffer `+0x34`, size `+0x30`). Models are keyed accordingly. |
 | Q2 | CPU2 (UMAC) TX FIFOs at `0xa00500` (UMAC `0xc0a00500`): `TXF_CPU2_*` (`iwl-prph.h`) | modelled, [I] | Q1's layout in UMAC's own `0xc0a0xxxx` MMIO block (now traced, `0xc0a00000-0xc0a0ffff`): UMAC `0xc008d0a0` selects channel `0xe` at `+0x3c` as LMAC does at `0xa0043c`, free = `max(cap - fill - 8, 0)`, push via `0x804a8d48` to `+0x40`; error `0x100efa` when it does not fit. Modelled as Q1. Tested `/ax210/lmac/msg-fifo-space`. |
 | I1 | Indirect `0x940c` (device `0xa2940c`, W1) bit 0 | [?], harness-supplied | UMAC `0x8044a49a` requires it after init call `0x8049f934` (else fatal `0x10133c`); no firmware writes it, so it is hardware status. Not modelled: supplied by the harness via `AX210_IND=940c=1` (seeds the W1 store). |
