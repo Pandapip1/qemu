@@ -9407,8 +9407,13 @@ static bool efr32_soc_load_identity(Efr32Bg22SoCState *s, Error **errp)
                        EFR32_BGM220_HNA2_FLASH_KB |
                        (EFR32_BGM220_HNA2_SRAM_KB <<
                         EFR32_DEVINFO_MSIZE_SRAM_SHIFT));
+        /*
+         * Each SoC of a multi-SoC machine is another unit of the same module:
+         * its EUI-64 is the kit's plus its endpoint number, as consecutive
+         * serials would be.  [I] Only the one kit's page was read.
+         */
         efr32_info_put(devinfo, EFR32_DEVINFO_EUI64L,
-                       EFR32_BGM220_HNA2_EUI64L);
+                       EFR32_BGM220_HNA2_EUI64L + s->endpoint_id);
         efr32_info_put(devinfo, EFR32_DEVINFO_EUI64H,
                        EFR32_BGM220_HNA2_EUI64H);
         for (unsigned i = 0; i < EFR32_DEVINFO_MODULENAME_WORDS; i++) {

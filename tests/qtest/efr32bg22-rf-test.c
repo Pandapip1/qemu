@@ -1026,6 +1026,38 @@ static void test_rxsearch_after_preamble_misses_frame(void)
 #define WDOG_CFG                 0x08
 #define WDOG_TIMEOUT_NS          (UINT64_C(9) * 1000000000 / 32768 + 1)
 
+/*
+ * Each SoC reads its own DEVINFO through its own M33 (CPU 0 is soc0's,
+ * CPU 2 soc1's): the default identity gives soc1 the EUI-64 after soc0's.
+ */
+#define DEVINFO_EUI64L 0x0fe08048u
+#define SOC0_M33_CPU   0
+#define SOC1_M33_CPU   2
+
+static uint32_t cpu_readl(int cpu, uint32_t address)
+{
+    g_autofree gchar *command = g_strdup_printf("x /1wx 0x%08x", address);
+    QDict *rsp = qtest_qmp(global_qtest,
+                           "{'execute':'human-monitor-command','arguments':"
+                           "{'command-line':%s,'cpu-index':%d}}",
+                           command, cpu);
+    const char *text = qdict_get_str(rsp, "return");
+    const char *value = strstr(text, ": 0x");
+    uint32_t word;
+
+    g_assert_nonnull(value);
+    word = strtoul(value + 2, NULL, 16);
+    qobject_unref(rsp);
+    return word;
+}
+
+static void test_socs_have_distinct_eui64(void)
+{
+    uint32_t soc0 = cpu_readl(SOC0_M33_CPU, DEVINFO_EUI64L);
+
+    g_assert_cmphex(cpu_readl(SOC1_M33_CPU, DEVINFO_EUI64L), ==, soc0 + 1);
+}
+
 static void test_wdog_resets_one_soc(void)
 {
     rf_reset_with_clocks();
@@ -2691,6 +2723,8 @@ int main(int argc, char **argv)
                    test_rxsearch_after_preamble_misses_frame);
     qtest_add_func("/efr32bg22/rf/system-reset-with-deferred-offer",
                    test_system_reset_with_deferred_offer);
+    qtest_add_func("/efr32bg22/rf/socs-have-distinct-eui64",
+                   test_socs_have_distinct_eui64);
     qtest_add_func("/efr32bg22/rf/wdog-resets-one-soc",
                    test_wdog_resets_one_soc);
     qtest_add_func("/efr32bg22/rf/tx-disable-withdraws-deferred-offer",
