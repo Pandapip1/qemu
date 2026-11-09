@@ -106,8 +106,12 @@ Two tiers exist, and they should not be confused:
 - Real timing of T1, or of anything else — this model has no timing
   fidelity goal (unlike the EFR32 project this methodology is modelled
   on, nothing here has silicon timing access to fit to).
-- The board runs one core at a time (`-cpu arc700` for UMAC/IML, `-cpu arcem`
-  for LMAC). The real die has both; S1 and Q1 are where they would meet.
+- Both cores run in one machine (GDB thread 1 / monitor cpu 0 = UMAC ARC700,
+  thread 2 / cpu 1 = LMAC ARCv2EM; `-cpu` is ignored) over one flat address
+  space, so they share the K1 register store, S1 and RAM. Started together
+  (`dual_boot.py`), each reaches its idle state (U2 `sleep`, L2 main loop).
+  The message FIFOs (Q1, Q2) still drain on push; nothing delivers one core's
+  messages to the other, because the receive side is [?].
 - LMAC interrupt sources (V1 expiry, Q1 inbound, anything giving the main
   loop at `0x4d08fa` work): [?].
 - UMAC IRQ5 and IRQ8 (level 2) sources: [?]. IRQ8's handler (`0xc0080658`) reads `0xd02fa0`, `0xd00ee0`, `0xd05498`, `0xd03944`, `0xc0a01c64`.

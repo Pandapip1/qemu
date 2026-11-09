@@ -13,7 +13,8 @@
  *     discovered iteratively.
  *
  * Firmware sections are loaded by the harness over the gdbstub; this board
- * only lays out memory and peripherals and brings up one ARC700 core.
+ * lays out the shared memory map and brings up both cores: the ARC700 UMAC
+ * and the ARCv2EM LMAC, over one flat physical address space.
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later
  */
@@ -265,16 +266,17 @@ static hwaddr alias_key(hwaddr a)
 #define TMR_COUNT0 (TMR_BASE + 0xac)
 #define TMR_NCH    32
 static QEMUTimer *tmr[TMR_NCH];
-static CPUState *ax210_cs;
+static CPUState *umac_cs;   /* ARC700 (UMAC) */
+static CPUState *lmac_cs;   /* ARCv2EM (LMAC), NULL until dual-core */
 
 
 static void tmr_expire(void *opaque)
 {
     int ch = (int)(uintptr_t)opaque;
     trace_log("TMR.X", TMR_COUNT0 + 4 * ch, ch, 4);
-    if (ax210_cs && ax210_cs->halted) {
-        ax210_cs->halted = 0;          /* event wake: resume after wevt */
-        qemu_cpu_kick(ax210_cs);
+    if (lmac_cs && lmac_cs->halted) {
+        lmac_cs->halted = 0;          /* event wake: resume after wevt */
+        qemu_cpu_kick(lmac_cs);
     }
 }
 
@@ -313,7 +315,7 @@ static bool tout_fired;
 
 static void tout_set(bool fired)
 {
-    CPUARCState *env = &ARC_CPU(ax210_cs)->env;
+    CPUARCState *env = &ARC_CPU(umac_cs)->env;
 
     tout_fired = fired;
     qemu_set_irq(env->irq[TOUT_IRQ], fired);
@@ -327,7 +329,7 @@ static void tout_expire(void *opaque)
 
 static void tout_arm(uint32_t n)
 {
-    if (!ax210_cs || !(ARC_CPU(ax210_cs)->family & ARC_OPCODE_ARC700)) {
+    if (!umac_cs || !(ARC_CPU(umac_cs)->family & ARC_OPCODE_ARC700)) {
         return;
     }
     if (!tout) {
@@ -733,38 +735,53 @@ static struct arc_boot_info ax210_boot_info;   /* zeroed: no kernel/cmdline */
  * busy bits clear; AX210_R32 overrides. Only applied to the ARCv2 (LMAC)
  * core; the ARC700 (UMAC) core has no such use. */
 static uint32_t r32_init = 1u << 29;
-static bool is_lmac_core;
 
 static void ax210_reset(void *opaque)
 {
     ARCCPU *cpu = opaque;
 
     arc_cpu_reset(cpu);
-    if (is_lmac_core) {
+    if (cpu->family & ARC_OPCODE_ARCv2EM) {
         cpu->env.r[32] = r32_init;
     }
 }
 
 static void ax210_init(MachineState *machine)
 {
-    ARCCPU *cpu = ARC_CPU(object_new(machine->cpu_type));
-    if (!strcmp(machine->cpu_type, TYPE_ARC_CPU_ARCEM)) {
-        /* LMAC programs 13 MPU region pairs (aux 0x422..0x43b, at
-         * 0x4be574); ARCv2 MPUs come in power-of-two sizes. Finding M2. */
-        object_property_set_uint(OBJECT(cpu), "mpu-numreg", 16, &error_fatal);
-    }
-    object_property_set_uint(OBJECT(cpu), "freq_hz", 1000000, &error_fatal);
-    object_property_set_bool(OBJECT(cpu), "rtc-opt", true, &error_fatal);
-    object_property_set_bool(OBJECT(cpu), "realized", true, &error_fatal);
-    cpu_arc_pic_init(cpu);
-    cpu_arc_clock_init(cpu);
-    cpu->env.boot_info = &ax210_boot_info;
-    is_lmac_core = !strcmp(machine->cpu_type, TYPE_ARC_CPU_ARCEM);
+    ARCCPU *umac = ARC_CPU(object_new(TYPE_ARC_CPU_ARC700));
+    ARCCPU *lmac = ARC_CPU(object_new(TYPE_ARC_CPU_ARCEM));
+
+    (void)machine;   /* both cores are fixed; -cpu/-smp are not consulted */
+
+    /* LMAC programs 13 MPU region pairs (aux 0x422..0x43b, at
+     * 0x4be574); ARCv2 MPUs come in power-of-two sizes. Finding M2. */
+    object_property_set_uint(OBJECT(lmac), "mpu-numreg", 16, &error_fatal);
+
+    object_property_set_uint(OBJECT(umac), "freq_hz", 1000000, &error_fatal);
+    object_property_set_uint(OBJECT(lmac), "freq_hz", 1000000, &error_fatal);
+    object_property_set_bool(OBJECT(umac), "rtc-opt", true, &error_fatal);
+    object_property_set_bool(OBJECT(lmac), "rtc-opt", true, &error_fatal);
+    object_property_set_bool(OBJECT(umac), "realized", true, &error_fatal);
+    object_property_set_bool(OBJECT(lmac), "realized", true, &error_fatal);
+
+    cpu_arc_pic_init(umac);
+    cpu_arc_pic_init(lmac);
+    cpu_arc_clock_init(umac);
+    cpu_arc_clock_init(lmac);
+
+    umac->env.boot_info = &ax210_boot_info;
+    lmac->env.boot_info = &ax210_boot_info;
+
     if (getenv("AX210_R32")) {
         r32_init = strtoul(getenv("AX210_R32"), 0, 0);
     }
-    qemu_register_reset(ax210_reset, cpu);
-    ax210_cs = CPU(cpu);
+
+    qemu_register_reset(ax210_reset, umac);
+    qemu_register_reset(ax210_reset, lmac);
+
+    umac_cs = CPU(umac);
+    lmac_cs = CPU(lmac);
+
     arc_unknown_aux_write = ax210_aux_write;
     arc_unknown_aux_read = ax210_aux_read;
 
@@ -773,23 +790,25 @@ static void ax210_init(MachineState *machine)
 
     /* RAM windows (firmware load addresses). ARC cache aliases 0x8.. and 0xc..
      * are modelled as independent RAM here; coherence between aliases is a
-     * known simplification to revisit if firmware relies on it. */
-    if (is_lmac_core) {
-        /* LMAC map from the firmware's own MPU programming (finding M2, [F]
-         * for the firmware's view; read live at the main loop, decoded with
-         * the ARCv2 RDB/RDP encoding of Zephyr arc_mpu_v2_internal.h).
-         * Peripheral regions 0xa00000-0xbfffff and 0xd00000-0xefffff are
-         * the lmac_periph traces below; everything else is unmapped and
-         * reaches the catch-all tracer. */
-        add_ram("ax210.lmac.iccm",  0x00000000, 0x00018000); /* MPU 0-1, X   */
-        add_ram("ax210.lmac.romwin",0x00440000, 0x00074000); /* MPU 12, R    */
-        add_ram("ax210.lmac.code",  0x004b4000, 0x0004c000); /* MPU 7-11, RWX*/
-        add_ram("ax210.lmac.sram",  0x00600000, 0x00040000); /* MPU 5, RW    */
-        add_ram("ax210.lmac.shbuf", 0x00660800, 0x00000800); /* MPU 6, RW    */
-        add_ram("ax210.lmac.dccm",  0x00800000, 0x00008000); /* MPU 2, RW    */
-    } else {
-        add_ram("ax210.lmac",  0x00000000, 0x01100000); /* UMAC/IML runs: flat low window incl. paged image */
-    }
+     * known simplification to revisit if firmware relies on it.
+     *
+     * Both cores share one flat physical address space. The UMAC/IML runs from
+     * a contiguous low window (incl. the paged image); the LMAC's own MPU
+     * programming carves named regions out of that same window (finding M2,
+     * [F] for the firmware's view; read live at the main loop, decoded with
+     * the ARCv2 RDB/RDP encoding of Zephyr arc_mpu_v2_internal.h). Adding the
+     * flat window first lets the LMAC regions overlay it at equal priority so
+     * the MPU view stays visible in `info mtree`; both are plain RAM, so the
+     * two cores see the same bytes either way. Peripheral regions
+     * 0xa00000-0xbfffff and 0xd00000-0xefffff are the lmac_periph traces
+     * below; everything else unmapped reaches the catch-all tracer. */
+    add_ram("ax210.lmac",  0x00000000, 0x01100000); /* UMAC/IML flat low window */
+    add_ram("ax210.lmac.iccm",  0x00000000, 0x00018000); /* MPU 0-1, X   */
+    add_ram("ax210.lmac.romwin",0x00440000, 0x00074000); /* MPU 12, R    */
+    add_ram("ax210.lmac.code",  0x004b4000, 0x0004c000); /* MPU 7-11, RWX*/
+    add_ram("ax210.lmac.sram",  0x00600000, 0x00040000); /* MPU 5, RW    */
+    add_ram("ax210.lmac.shbuf", 0x00660800, 0x00000800); /* MPU 6, RW    */
+    add_ram("ax210.lmac.dccm",  0x00800000, 0x00008000); /* MPU 2, RW    */
     add_ram("ax210.umac",  0x80000000, 0x00800000); /* UMAC code/data (0x80400000+) */
     add_ram("ax210.unc",   0xc0000000, 0x01000000); /* uncached window: code @0xc0080000, bss @0xc0880000 */
 
@@ -885,9 +904,10 @@ static void ax210_init(MachineState *machine)
 
 static void ax210_machine_init(MachineClass *mc)
 {
-    mc->desc = "Intel AX210 Wi-Fi MAC (ARC700) RE scaffold";
+    mc->desc = "Intel AX210 Wi-Fi MAC (ARC700 UMAC + ARCv2EM LMAC) RE scaffold";
     mc->init = ax210_init;
-    mc->max_cpus = 1;
+    mc->max_cpus = 2;
+    mc->default_cpus = 2;   /* both cores always instantiated by ax210_init */
     mc->no_serial = 1;
     mc->default_cpu_type = TYPE_ARC_CPU_ARC700;
 }
