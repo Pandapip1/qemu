@@ -170,7 +170,7 @@ space (M3), FSEQ_OTP_VERSION 0 vs `0xa652`.
 | R2 | contradicts | S (two dumps) + V (field names) | Status/clear semantics and event sources not modelled; R1 readback shows impossible values. |
 | N1 | no | V (iwl-prph.h, rxf_config) | MAC TX/RX engines: TXF drain, RX FIFOs (0xa00c00, 0xd00e00, 0xd05a00) and the RX DMA to the host (ALIVE and notifications). |
 | N2 | no | - | PCI device model: the real iwlwifi driver cannot bind to the simulation; the host side is the scripted H1/M1 model. |
-| N3 | no | F (structure) | UMAC IRQ5 cause aggregator (0xd02e00 groups, summary 0xd02e64) and IRQ8; LMAC IRQ19 (timer/event) and IRQ22 (NIC, cause 0xa01e80 & 0xa01e84): handlers known, sources not modelled. |
+| N3 | no | F (structure) | Per-CPU interrupt blocks, handlers known, sources not modelled. UMAC `0xd02e00`: IRQ5 summary `0xd02e64` over groups (mask `+4n`, status `+0x20+4n`); IRQ8 (level 2) cause `[0xd02e84] & [0xd02e80]`, highest bit dispatched (`0xc0080658`: bits 1, 2, 5, 15, 21, 23-26). LMAC `0xa01e00`: IRQ22 cause `[0xa01e80] & [0xa01e84]` (`0xdac`), ISR0-4 at `+0x20-0x30` (R2); IRQ19 timer/event. The two blocks mirror each other. |
 | N4 | no | - | Inter-core message path ([?]; not the TX FIFOs). |
 | N5 | no | V (TLV PHY register list) | PHY/radio registers (0xa44400-0xad3dd8): 3911 listed, none modelled. |
 | N6 | no | - | Timing: core clocks, bus and peripheral latencies (no silicon timing evidence available). |
