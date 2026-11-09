@@ -3452,7 +3452,12 @@ static void test_seq_systick_calib_follows_stctrl(void)
     qtest_writel(qts, RAC_BASE + RAC_STCTRL, RAC_STCTRL_STOCK_VALUE);
     qtest_writel(qts, SEQRAM_NS_BASE + SEQ_SPARE0, 0);
     seq_load_and_release(qts, insn, 6, literals, 2);
-    g_usleep(5000);
+    for (unsigned attempt = 0; attempt < 1000; attempt++) {
+        if (qtest_readl(qts, SEQRAM_NS_BASE + SEQ_SPARE0)) {
+            break;
+        }
+        g_usleep(1000);
+    }
     qtest_qmp_assert_success(qts, "{'execute':'stop'}");
     g_assert_cmphex(qtest_readl(qts, SEQRAM_NS_BASE + SEQ_SPARE0), ==,
                     SEQ_SYSTICK_CALIB_STOCK);
