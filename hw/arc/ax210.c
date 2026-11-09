@@ -42,9 +42,14 @@
  * addresses with (a & 0xff0fffff) | 0xc0e20000 (IML 0x804441a6, 0x80447082):
  * LMAC 0x00axxxxx == UMAC 0xc0exxxxx [F, from that code]. UMAC 0xc0d0xxxx ==
  * LMAC 0x00d0xxxx [I]: UMAC's semaphore set sits at the same block +0x20.
+ * UMAC 0xc0a0xxxx == LMAC 0x00a0xxxx (K3) [F]: UMAC 0x804a8b80 converts
+ * the LMAC-view 0xa0a404 + 16 * ch with (a & 0xff0fffff) | 0xc0a00000.
  * Every shared-register model is keyed by the LMAC-view address. */
 static hwaddr lmac_view(hwaddr a)
 {
+    if (a >= 0xc0a00000 && a < 0xc0a10000) {
+        return a - 0xc0000000;
+    }
     if (a >= 0xc0d00000 && a < 0xc0e00000) {
         return a - 0xc0000000;
     }
@@ -104,7 +109,7 @@ static int n_ctrs = 1;
  * The driver's IMR copy uses channel 0 of the same block with the same field
  * order, CTRL last with bit 31 DMA_EN (iwl-fh.h IMR_TFH_SRV_DMA_CHNL0_* at
  * 0xa0a51c, pcie/trans.c iwl_trans_pcie_copy_imr_fh): +0x34 is channel 1. */
-#define DMA_BASE  0xc0a0a500u
+#define DMA_BASE  0x00a0a500u      /* UMAC 0xc0a0a500 (K3) */
 #define DMA_STAT  0x00d02e24u   /* UMAC 0xc0d02e24 */
 static uint32_t dma_done;
 static unsigned dma_count;
@@ -184,7 +189,7 @@ static uint32_t fsm_read(void)
  * +0x3c (LMAC does the same at 0xa0043c), takes free = max([+0x30] - [+0x38]
  * - 8, 0) and pushes through 0x804a8d48 to +0x40; error 0x100efa if the
  * message does not fit. Modelled as Q1. */
-#define MFIFO_UMAC 0xc0a00500u
+#define MFIFO_UMAC 0x00a00500u     /* UMAC 0xc0a00500 (K3) */
 
 static bool is_mfifo(hwaddr a, unsigned off)
 {
