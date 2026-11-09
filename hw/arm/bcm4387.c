@@ -154,6 +154,15 @@ static bool model_read(BCM4387MachineState *s, hwaddr a, uint32_t *v)
         *v = s->cr4_bankidx < s->nab + s->nbb ?
              s->bank_info[s->cr4_bankidx] : 0;
         return true;
+    case CR4_BASE + 0x70:
+        /*
+         * Patch-unit command/status: the firmware writes a command here (and an
+         * operand at +0x74) and polls bit31 for completion (RAM 0x82c440).
+         * Report "done" so the per-patch commit doesn't burn its full retry
+         * budget (~101 polls each) and fall through to an error path.
+         */
+        *v = 0x80000000;
+        return true;
     }
     return false;
 }
