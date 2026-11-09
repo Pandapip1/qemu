@@ -41,6 +41,8 @@
 #include "sysemu/reset.h"
 #include "sysemu/runstate.h"
 #include "sysemu/cpu-timers.h"
+#include "sysemu/sysemu.h"
+#include "qapi/visitor.h"
 #include "target/arm/cpu.h"
 #include "target/arm/idau.h"
 #include "trace.h"
@@ -523,8 +525,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_DCDC_STATUS_RUNNING (1u << 2)
 
 #define EFR32_EMU_BASE 0x40004000u
+#define EFR32_EMU_CTRL 0x074u
+#define EFR32_EMU_CTRL_RESET 0x00000200u /* EM23VSCALE = VSCALE2 */
+#define EFR32_EMU_CTRL_EM23VSCALE_SHIFT 8
+#define EFR32_EMU_CTRL_EM23VSCALE_MASK 0x3u
 #define EFR32_EMU_STATUS 0x084u
 #define EFR32_EMU_STATUS_RESET 0x00000080u
+#define EFR32_EMU_STATUS_VSCALE_SHIFT 6
+#define EFR32_EMU_STATUS_VSCALE_MASK 0x3u
+#define EFR32_EMU_STATUS_RACACTIVE (1u << 10)
+#define EFR32_EMU_STATUS_EM2ENTERED (1u << 14)
 /*
  * EMU.RSTCAUSE (RM SS12.3.x, SS12.5.15): the cause of the last reset, kept
  * across resets until software writes EMU_CMD.RSTCAUSECLR ("Once read,
@@ -1023,9 +1033,30 @@ struct Efr32Periph
     GBytes *rx_frame;
     QEMUTimer *rac_frame_timer;
     QEMUTimer *rac_ack_timer;
+    /* EMU energy modes (efr32_emu_*). */
+    bool m33_sleeping;
+    bool m33_sleepdeep;
+    bool m33_wakeup;
+    bool debug_powered;
+    /* EM2: the high-frequency clocks are stopped. */
+    bool em2;
+    bool em2_entering;
+    bool em2_exiting;
+    bool em2_entered;
+    /* PROTIMER started (CMD), so it counts outside EM2. */
+    bool protimer_running;
+    /* HFRCODPLL's rate once EM2 has disabled the DPLL, 0 otherwise. */
+    uint64_t hfrco_freerun_hz;
+    QEMUTimer *em2_timer;
+    qemu_irq gpio_em2;
+    /* Virtual time spent in EM0, EM1 and EM2, up to em_since_ns. */
+    uint64_t em_ns[3];
+    int64_t em_since_ns;
+    Notifier em_exit_notifier;
 };
 
 static uint32_t efr32_register_get(Efr32Periph *s, uint32_t address);
+static void efr32_emu_update(Efr32Periph *s);
 static void efr32_register_put(Efr32Periph *s, uint32_t address,
                                uint32_t value);
 
@@ -1687,6 +1718,7 @@ static void efr32_rac_set_state(Efr32Periph *s, uint32_t state)
 
     previous_state = s->rac_state;
     s->rac_state = state;
+    efr32_emu_update(s);
     s->rac_stimer_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     efr32_register_put(s, EFR32_RAC_BASE + EFR32_RAC_IF,
                        efr32_register_get(s, EFR32_RAC_BASE + EFR32_RAC_IF) |
@@ -3220,6 +3252,10 @@ static uint32_t efr32_protimer_counter(Efr32Periph *s)
 static void efr32_protimer_command(Efr32Periph *s, uint32_t command)
 {
     if (command & EFR32_PROTIMER_CMD_START) {
+        s->protimer_running = true;
+        if (s->em2) {
+            return;
+        }
         ptimer_transaction_begin(s->protimer_counter);
         ptimer_run(s->protimer_counter, 0);
         ptimer_transaction_commit(s->protimer_counter);
@@ -3257,7 +3293,7 @@ static uint64_t efr32_hfrcodpll_hz(Efr32Periph *s)
     uint64_t ref;
 
     if (!efr32_dpll_enabled(s)) {
-        return EFR32_HFRCO_RESET_HZ;
+        return s->hfrco_freerun_hz ? s->hfrco_freerun_hz : EFR32_HFRCO_RESET_HZ;
     }
     switch (efr32_register_get(s, EFR32_CMU_BASE + EFR32_CMU_DPLLREFCLKCTRL) & 0x3u) {
     case EFR32_CMU_DPLLREFCLKCTRL_CLKSEL_HFXO:
@@ -3279,6 +3315,9 @@ static bool efr32_hfxo_hw_requested(Efr32Periph *s);
 /* HFXO on: FORCEEN or an on-demand consumer (SYSCLK, EM01GRPA, DPLL ref). */
 static bool efr32_hfxo_requested(Efr32Periph *s)
 {
+    if (s->em2) {
+        return false; /* RM Table 12.2: no high-frequency oscillator in EM2 */
+    }
     return (efr32_register_get(s, EFR32_HFXO_BASE + EFR32_HFXO_CTRL) &
             EFR32_HFXO_CTRL_FORCEEN) || efr32_hfxo_hw_requested(s);
 }
@@ -3481,6 +3520,7 @@ static void efr32_osc_update(Efr32Periph *s)
     }
     if (dpll && s->dpll_enable_ns < 0) {
         s->dpll_enable_ns = now;
+        s->hfrco_freerun_hz = 0;
         timer_mod(s->dpll_lock_timer, efr32_dpll_lock_ns(s));
     } else if (!dpll && s->dpll_enable_ns >= 0) {
         s->dpll_enable_ns = -1;
@@ -4071,9 +4111,10 @@ static bool efr32_timer_started(Efr32Periph *s, int i)
            !(efr32_timer_reg(s, i, EFR32_TIMER_CFG) & EFR32_TIMER_CFG_MODE_MASK);
 }
 
+/* EM01GRPACLK, the TIMERs' clock, stops in EM2 (RM Table 12.2). */
 static bool efr32_timer_counting(Efr32Periph *s, int i)
 {
-    return efr32_timer_started(s, i) &&
+    return efr32_timer_started(s, i) && !s->em2 &&
            !efr32_debug_frozen(s, efr32_timer_reg(s, i, EFR32_TIMER_CFG) &
                                       EFR32_TIMER_CFG_DEBUGRUN);
 }
@@ -5375,10 +5416,10 @@ static void efr32_rtcc_reset(Efr32Rtcc *r)
  * counter is frozen and continues where it left off on resume.  A stopped
  * QEMU (gdbstub, monitor stop) stops virtual time altogether; that is not a
  * debug halt, and it freezes every timer.
- * [U] Not modelled: freezing in EM2/EM3 (EM2RUN/EM3RUN, SS27.3.3; the
- * machine does not distinguish sleep depths, so the counter runs in every
- * sleep mode, which is the EM2RUN = EM3RUN = 1 behaviour; enabling with
- * either bit clear is logged as unimplemented), the enable delay of EN
+ * CFG.EM2RUN (SS27.3.3): with it clear the counter is frozen in EM2
+ * (efr32_emu_*), as in a debug halt.
+ * [U] Not modelled: EM3 (EM3RUN; the part never enters EM3 here, enabling
+ * with it clear is logged as unimplemented), the enable delay of EN
  * (2 - 3 cycles, SS4.2.4.4.5), the window interrupt, PRS clear and
  * monitoring, EM4BLOCK, and the requirement that CLEAR be written 4 cycles
  * before the timeout (SS27.5.4).
@@ -5574,13 +5615,21 @@ static void efr32_wdog_sync_done(void *opaque)
     efr32_wdog_schedule(s);
 }
 
-/* SS27.3.2: DEBUGRUN = 0 freezes the counter while the core is halted. */
-static void efr32_wdog_debug_halt(Efr32Periph *s)
+/*
+ * SS27.3.2: DEBUGRUN = 0 freezes the counter while the core is halted;
+ * SS27.3.3: EM2RUN = 0 freezes it in EM2.
+ */
+static bool efr32_wdog_freezes(Efr32Periph *s, uint32_t cfg)
+{
+    return (s->m33_debug_halted && !(cfg & EFR32_WDOG_CFG_DEBUGRUN)) ||
+           (s->em2 && !(cfg & EFR32_WDOG_CFG_EM2RUN));
+}
+
+static void efr32_wdog_freeze_update(Efr32Periph *s)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    bool freeze = s->m33_debug_halted && s->wdog_running &&
-                  !(efr32_wdog_get(s, EFR32_WDOG_CFG) &
-                    EFR32_WDOG_CFG_DEBUGRUN);
+    bool freeze = s->wdog_running &&
+                  efr32_wdog_freezes(s, efr32_wdog_get(s, EFR32_WDOG_CFG));
 
     if (freeze == s->wdog_frozen) {
         return;
@@ -5632,7 +5681,312 @@ static void efr32_m33_debug_halted(void *opaque, int n, int level)
     for (int i = 0; i < EFR32_RTCC_INSTANCES; i++) {
         efr32_rtcc_process(&s->rtcc[i]);
     }
-    efr32_wdog_debug_halt(s);
+    efr32_wdog_freeze_update(s);
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * EMU energy modes (RM SS12.3): EM0 while the M33 runs, EM1 while it sleeps
+ * in WFI, EM2 from a deep sleep (SCR.SLEEPDEEP).  The M33's sleep signals
+ * come from its NVIC ("SLEEPING", "SLEEPDEEP", and "WAKEUP", the interrupt
+ * that ends the sleep).
+ *
+ * Entry (RM SS12.3.2.2): EM2 "may be entered when ... the radio state
+ * machine is in OFF state ... a debugger is not currently connected", and
+ * EMU_STATUS.RACACTIVE "System can not enter EM2 or lower if set"; until
+ * then the part sleeps in EM1 and enters EM2 once the radio is idle.  [I]
+ * SHUTDOWN (RAC.CTRL.FORCEDISABLE) counts as idle.  A probe that has
+ * powered the debug domain (DP CTRL/STAT.CDBGPWRUPREQ) keeps the part out of
+ * EM2 whatever EMU_CTRL.EM2DBGEN: EM2ENTERED stayed 0 with OpenOCD attached
+ * (owo-open-fw docs/radio-tables.md SS7.74 [F]).  EM2 is reached
+ * tEM2_ENT = 5.23 us after the sleep (data sheet Table 4.10); [P] a wake-up
+ * request before then ends the sleep in EM1.
+ *
+ * In EM2 (RM Table 12.2, SS12.3.1.4): the high-frequency oscillators and
+ * clocks stop: both cores (the M0+, the radio controller, is an EM1 block,
+ * data sheet Figure 1.1; it stopped whenever the M33 was in EM2, SS7.74
+ * [F]), the TIMERs and the PROTIMER; the HFXO is off.  On the xG22 the
+ * hardware also disables the DPLL on entry and does not re-enable it on exit
+ * (Simplicity SDK em_emu.c, dpllState(): "the DPLL is disabled automatically
+ * when entering EM2, EM3. But exiting EM2, EM3 won't re-enable automatically
+ * the DPLL"), as seen on silicon: after the wake HFXO.STATUS = 0x40000000,
+ * DPLL.STATUS = 0 and SYSCLK ran from the free-running HFRCODPLL, 76.748 MHz
+ * against the LFXO from a 76.8 MHz lock (SS7.74 [F]; [I] the same ratio from
+ * other lock rates).  The LF clocks, BURTC, RTCC/PRORTC, LETIMER, WDOG0 (with
+ * CFG.EM2RUN), the IADC and GPIO ports A and B run on; ports C and D hold
+ * their pads (efr32-gpio.c).  RAM, SEQRAM, FRCRAM and the registers are
+ * retained (RM SS6.6.1 resets and SS12.3.6; the model never powers them
+ * down).
+ *
+ * Exit: any interrupt the NVIC would take wakes the part to EM0 (RM
+ * SS12.3.3), after tEM2_WU (data sheet Table 4.10): 13.22 us without
+ * voltage scaling, 37.89 us scaling up one level and 50.56 us two, from
+ * EMU_CTRL.EM23VSCALE below the EM0/EM1 level (SS12.3.5.2).  [I] The M0+
+ * resumes from its reset vector if it had been released: after an EM2 wake
+ * on silicon it was found in its idle loop with the values its reset
+ * handler writes (SS7.74 [F]; whether it was reset or lost its context is
+ * open).  EMU_STATUS.EM2ENTERED sets at the entry; [P] what clears it is not
+ * in the RM, so it stays set until a reset.
+ *
+ * [U] Not modelled: EM2 entry waiting for LDMA requests and flash
+ * program/erase (RM SS12.3.2.2), EM1P and peripheral wake-ups to EM1, RAM
+ * retention control, EM3 and EM4; USART, I2C and EUSART transfers in flight
+ * are not frozen; the M33 SysTick keeps counting.
+ */
+#define EFR32_EM2_ENTRY_NS 5230                 /* tEM2_ENT */
+#define EFR32_EM2_WAKEUP_NS 13220               /* tEM2_WU, no scaling */
+#define EFR32_EM2_WAKEUP_VSCALE_UP1_NS 37890
+#define EFR32_EM2_WAKEUP_VSCALE_UP2_NS 50560
+#define EFR32_HFRCO_EM2_FREERUN_KHZ 76748ULL    /* SS7.74 */
+#define EFR32_HFRCO_EM2_LOCKED_KHZ 76800ULL
+
+enum { EFR32_EM0, EFR32_EM1, EFR32_EM2 };
+
+static unsigned efr32_emu_mode(Efr32Periph *s)
+{
+    return s->em2 ? EFR32_EM2 : s->m33_sleeping ? EFR32_EM1 : EFR32_EM0;
+}
+
+/* Charge the time since the last change to the mode in force until now. */
+static void efr32_emu_account(Efr32Periph *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    s->em_ns[efr32_emu_mode(s)] += now - s->em_since_ns;
+    s->em_since_ns = now;
+}
+
+static bool efr32_emu_rac_active(Efr32Periph *s)
+{
+    return s->rac_state != EFR32_RAC_STATE_OFF &&
+           s->rac_state != EFR32_RAC_STATE_SHUTDOWN;
+}
+
+static uint32_t efr32_emu_status(Efr32Periph *s)
+{
+    return efr32_register_get(s, EFR32_EMU_BASE + EFR32_EMU_STATUS) |
+           (efr32_emu_rac_active(s) ? EFR32_EMU_STATUS_RACACTIVE : 0) |
+           (s->em2_entered ? EFR32_EMU_STATUS_EM2ENTERED : 0);
+}
+
+static bool efr32_emu_em2_allowed(Efr32Periph *s)
+{
+    return s->m33_sleepdeep && !s->m33_wakeup && !s->debug_powered &&
+           !efr32_emu_rac_active(s);
+}
+
+static int64_t efr32_emu_wakeup_ns(Efr32Periph *s)
+{
+    uint32_t em01 = (efr32_register_get(s, EFR32_EMU_BASE + EFR32_EMU_STATUS) >>
+                     EFR32_EMU_STATUS_VSCALE_SHIFT) &
+                    EFR32_EMU_STATUS_VSCALE_MASK;
+    uint32_t em23 = (efr32_register_get(s, EFR32_EMU_BASE + EFR32_EMU_CTRL) >>
+                     EFR32_EMU_CTRL_EM23VSCALE_SHIFT) &
+                    EFR32_EMU_CTRL_EM23VSCALE_MASK;
+
+    switch (em23 < em01 ? em01 - em23 : 0) {
+    case 0:
+        return EFR32_EM2_WAKEUP_NS;
+    case 1:
+        return EFR32_EM2_WAKEUP_VSCALE_UP1_NS;
+    default:
+        return EFR32_EM2_WAKEUP_VSCALE_UP2_NS;
+    }
+}
+
+/* The TIMERs' counts up to now, before their clock stops or restarts. */
+static void efr32_emu_timers_rebase(Efr32Periph *s)
+{
+    for (int i = 0; i < EFR32_TIMER_COUNT; i++) {
+        efr32_timer_rebase(s, i);
+    }
+}
+
+static void efr32_emu_timers_schedule(Efr32Periph *s)
+{
+    for (int i = 0; i < EFR32_TIMER_COUNT; i++) {
+        efr32_timer_schedule(s, i);
+        efr32_timer_pwm_update(s, i);
+    }
+}
+
+static void efr32_cpu_clocks_update(Efr32Periph *s);
+
+static void efr32_emu_em2_enter(Efr32Periph *s)
+{
+    uint64_t hfrco = efr32_hfrcodpll_hz(s);
+    bool locked = efr32_dpll_status(s) & EFR32_DPLL_STATUS_RDY;
+
+    efr32_emu_account(s);
+    efr32_emu_timers_rebase(s);
+    s->em2_entering = false;
+    s->em2 = true;
+    s->em2_entered = true;
+    if (efr32_dpll_enabled(s)) {
+        efr32_register_put(s, EFR32_DPLL0_BASE + EFR32_DPLL_EN, 0);
+    }
+    if (locked) {
+        s->hfrco_freerun_hz = hfrco * EFR32_HFRCO_EM2_FREERUN_KHZ /
+                              EFR32_HFRCO_EM2_LOCKED_KHZ;
+    }
+    efr32_osc_update(s);
+    if (s->protimer_running) {
+        ptimer_transaction_begin(s->protimer_counter);
+        ptimer_stop(s->protimer_counter);
+        ptimer_transaction_commit(s->protimer_counter);
+    }
+    efr32_emu_timers_schedule(s);
+    efr32_wdog_freeze_update(s);
+    efr32_cpu_clocks_update(s);
+    qemu_set_irq(s->gpio_em2, 1);
+    trace_efr32bg22_emu(s->endpoint_id, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                        "em2-enter", s->em_ns[EFR32_EM0],
+                        s->em_ns[EFR32_EM1], s->em_ns[EFR32_EM2]);
+}
+
+/* The M0+ resumes from its reset vector (see above). */
+static void efr32_emu_seq_restart(Efr32Periph *s)
+{
+    if (!s->seq_cpu || !s->seq_released) {
+        return;
+    }
+    device_cold_reset(DEVICE(ARM_CPU(s->seq_cpu)->env.nvic));
+    cpu_reset(s->seq_cpu);
+    icount_cpu_clocks_wake(s->seq_cpu);
+    s->seq_cpu->halted = 0;
+    s->seq_cpu->stopped = false;
+    qemu_cpu_kick(s->seq_cpu);
+}
+
+static void efr32_emu_em2_exit(Efr32Periph *s)
+{
+    efr32_emu_account(s);
+    efr32_emu_timers_rebase(s);
+    s->em2 = false;
+    s->em2_exiting = false;
+    qemu_set_irq(s->gpio_em2, 0);
+    efr32_osc_update(s);
+    if (s->protimer_running) {
+        ptimer_transaction_begin(s->protimer_counter);
+        ptimer_run(s->protimer_counter, 0);
+        ptimer_transaction_commit(s->protimer_counter);
+    }
+    efr32_emu_timers_schedule(s);
+    efr32_wdog_freeze_update(s);
+    efr32_cpu_clocks_update(s);
+    efr32_emu_seq_restart(s);
+    if (s->m33_cpu) {
+        icount_cpu_clocks_wake(s->m33_cpu);
+        qemu_cpu_kick(s->m33_cpu);
+    }
+    trace_efr32bg22_emu(s->endpoint_id, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                        "em2-exit", s->em_ns[EFR32_EM0], s->em_ns[EFR32_EM1],
+                        s->em_ns[EFR32_EM2]);
+}
+
+static void efr32_emu_timer_expired(void *opaque)
+{
+    Efr32Periph *s = EFR32_PERIPH(opaque);
+
+    if (s->em2_exiting) {
+        efr32_emu_em2_exit(s);
+    } else if (s->em2_entering && efr32_emu_em2_allowed(s)) {
+        efr32_emu_em2_enter(s);
+    }
+}
+
+/* Re-evaluate after a sleep, wake-up, debug or radio state change. */
+static void efr32_emu_update(Efr32Periph *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (s->em2) {
+        if (s->m33_wakeup && !s->em2_exiting) {
+            s->em2_exiting = true;
+            timer_mod(s->em2_timer, now + efr32_emu_wakeup_ns(s));
+        }
+        return;
+    }
+    if (s->em2_entering && !efr32_emu_em2_allowed(s)) {
+        s->em2_entering = false;
+        timer_del(s->em2_timer);
+    }
+    if (!s->em2_entering && efr32_emu_em2_allowed(s)) {
+        s->em2_entering = true;
+        timer_mod(s->em2_timer, now + EFR32_EM2_ENTRY_NS);
+    }
+}
+
+static void efr32_emu_m33_sleeping(void *opaque, int n, int level)
+{
+    Efr32Periph *s = EFR32_PERIPH(opaque);
+
+    efr32_emu_account(s);
+    s->m33_sleeping = level;
+    efr32_emu_update(s);
+}
+
+static void efr32_emu_m33_sleepdeep(void *opaque, int n, int level)
+{
+    Efr32Periph *s = EFR32_PERIPH(opaque);
+
+    s->m33_sleepdeep = level;
+    efr32_emu_update(s);
+}
+
+static void efr32_emu_m33_wakeup(void *opaque, int n, int level)
+{
+    Efr32Periph *s = EFR32_PERIPH(opaque);
+
+    s->m33_wakeup = level;
+    efr32_emu_update(s);
+}
+
+static void efr32_emu_debug_powered(void *opaque, int n, int level)
+{
+    Efr32Periph *s = EFR32_PERIPH(opaque);
+
+    s->debug_powered = level;
+    efr32_emu_update(s);
+}
+
+static void efr32_emu_reset(Efr32Periph *s)
+{
+    bool was_em2 = s->em2;
+
+    efr32_emu_account(s);
+    timer_del(s->em2_timer);
+    s->em2 = false;
+    s->em2_entering = false;
+    s->em2_exiting = false;
+    s->em2_entered = false;
+    s->hfrco_freerun_hz = 0;
+    qemu_set_irq(s->gpio_em2, 0);
+    if (was_em2) {
+        efr32_cpu_clocks_update(s);
+    }
+}
+
+static void efr32_emu_get_ns(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp)
+{
+    Efr32Periph *s = EFR32_PERIPH(obj);
+    uint64_t value;
+
+    efr32_emu_account(s);
+    value = s->em_ns[(uintptr_t)opaque];
+    visit_type_uint64(v, name, &value, errp);
+}
+
+/* The totals once more as the machine stops (a run's last word). */
+static void efr32_emu_machine_exit(Notifier *n, void *data)
+{
+    Efr32Periph *s = container_of(n, Efr32Periph, em_exit_notifier);
+
+    efr32_emu_account(s);
+    trace_efr32bg22_emu(s->endpoint_id, s->em_since_ns, "total",
+                        s->em_ns[EFR32_EM0], s->em_ns[EFR32_EM1],
+                        s->em_ns[EFR32_EM2]);
 }
 
 static bool efr32_wdog_read(Efr32Periph *s, uint32_t address,
@@ -5733,14 +6087,11 @@ static bool efr32_wdog_write(Efr32Periph *s, uint32_t offset, uint32_t next)
             s->wdog_running = true;
             s->wdog_epoch_ns = now;
             s->wdog_warned = false;
-            s->wdog_frozen = s->m33_debug_halted &&
-                             !(cfg & EFR32_WDOG_CFG_DEBUGRUN);
+            s->wdog_frozen = efr32_wdog_freezes(s, cfg);
             s->wdog_frozen_ns = now;
-            if ((cfg & (EFR32_WDOG_CFG_EM2RUN | EFR32_WDOG_CFG_EM3RUN)) !=
-                (EFR32_WDOG_CFG_EM2RUN | EFR32_WDOG_CFG_EM3RUN)) {
-                qemu_log_mask(LOG_UNIMP, "efr32bg22: WDOG0 EM2RUN/EM3RUN = 0 "
-                              "is not modelled; the counter runs in every "
-                              "sleep mode\n");
+            if (!(cfg & EFR32_WDOG_CFG_EM3RUN)) {
+                qemu_log_mask(LOG_UNIMP, "efr32bg22: WDOG0 EM3RUN = 0 is not "
+                              "modelled (no EM3)\n");
             }
         }
         trace_efr32_wdog(s->endpoint_id, now, "enable", next);
@@ -6900,6 +7251,9 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
     if (efr32_radio_ipversion(address, &ipversion)) {
         return ipversion;
     }
+    if (address == EFR32_EMU_BASE + EFR32_EMU_STATUS) {
+        return efr32_emu_status(s);
+    }
     if (s->pa_ramp_pending &&
         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >= s->pa_ramp_done_ns &&
         (address == EFR32_MODEM_BASE + EFR32_MODEM_IF ||
@@ -7892,10 +8246,12 @@ static void efr32_cpu_clocks_update(Efr32Periph *s)
                                              EFR32_CMU_RADIOCLKCTRL) &
                        EFR32_CMU_RADIOCLKCTRL_EN;
 
-    efr32_cpu_clock_set(s->m33_cpu, s->m33_cpuclk, sysclk / hclk_div,
+    /* EM2 stops both cores' clocks (efr32_emu_*). */
+    efr32_cpu_clock_set(s->m33_cpu, s->m33_cpuclk,
+                        s->em2 ? 0 : sysclk / hclk_div,
                         EFR32_M33_CYCLES_PER_INSN_MILLI);
     efr32_cpu_clock_set(s->seq_cpu, s->seq_cpuclk,
-                        radio_clock ? sysclk / radio_div : 0,
+                        radio_clock && !s->em2 ? sysclk / radio_div : 0,
                         EFR32_SEQ_CYCLES_PER_INSN_MILLI);
     efr32_cpu_clock_set(NULL, s->pclk,
                         sysclk / hclk_div /
@@ -8323,6 +8679,27 @@ static void efr32_periph_init(Object *o)
     /* DHCSR.S_HALT of the M33, from its debug unit (WDOG0 DEBUGRUN). */
     qdev_init_gpio_in_named(DEVICE(o), efr32_m33_debug_halted,
                             "m33-debug-halted", 1);
+    /* Energy modes: the M33's sleep signals, the probe's debug power. */
+    qdev_init_gpio_in_named(DEVICE(o), efr32_emu_m33_sleeping,
+                            "m33-sleeping", 1);
+    qdev_init_gpio_in_named(DEVICE(o), efr32_emu_m33_sleepdeep,
+                            "m33-sleepdeep", 1);
+    qdev_init_gpio_in_named(DEVICE(o), efr32_emu_m33_wakeup,
+                            "m33-wakeup", 1);
+    qdev_init_gpio_in_named(DEVICE(o), efr32_emu_debug_powered,
+                            "debug-powered", 1);
+    qdev_init_gpio_out_named(DEVICE(o), &s->gpio_em2, "gpio-em2", 1);
+    s->em2_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_emu_timer_expired,
+                                s);
+    /* Virtual time in each energy mode so far (ns). */
+    object_property_add(o, "em0-ns", "uint64", efr32_emu_get_ns, NULL, NULL,
+                        (void *)(uintptr_t)EFR32_EM0);
+    object_property_add(o, "em1-ns", "uint64", efr32_emu_get_ns, NULL, NULL,
+                        (void *)(uintptr_t)EFR32_EM1);
+    object_property_add(o, "em2-ns", "uint64", efr32_emu_get_ns, NULL, NULL,
+                        (void *)(uintptr_t)EFR32_EM2);
+    s->em_exit_notifier.notify = efr32_emu_machine_exit;
+    qemu_add_exit_notifier(&s->em_exit_notifier);
     /* Fault injection (qom-set at run time): conversions never complete. */
     object_property_add_uint32_ptr(o, "x-iadc-stall", &s->iadc_stall,
                                  OBJ_PROP_FLAG_READWRITE);
@@ -8393,6 +8770,7 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
     s->dpll_off_ns = -1;
     ptimer_transaction_begin(s->protimer_counter);
     ptimer_stop(s->protimer_counter);
+    s->protimer_running = false;
     ptimer_set_period_from_clock(s->protimer_counter, s->protimer_clk, 1);
     ptimer_set_limit(s->protimer_counter, UINT32_MAX, 1);
     /* Stopped at 0 until started (efr32_protimer_command). */
@@ -8419,6 +8797,9 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
                        EFR32_HFXO_CTRL_DISONDEMAND);
     efr32_register_put(s, EFR32_EMU_BASE + EFR32_EMU_STATUS,
                        EFR32_EMU_STATUS_RESET);
+    efr32_register_put(s, EFR32_EMU_BASE + EFR32_EMU_CTRL,
+                       EFR32_EMU_CTRL_RESET);
+    efr32_emu_reset(s);
     efr32_register_put(s, EFR32_EMU_BASE + EFR32_EMU_RSTCAUSE, s->rstcause);
     efr32_register_put(s, EFR32_EMU_BASE + EFR32_EMU_RSTCTRL, s->rstctrl);
     /*
@@ -9491,6 +9872,24 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
         qdev_connect_gpio_out_named(dap, "erase-reset", 0,
                                     qemu_allocate_irq(efr32_soc_erase_reset,
                                                       s, 0));
+        qdev_connect_gpio_out_named(dap, "debug-powered", 0,
+                                    qdev_get_gpio_in_named(
+                                        DEVICE(&s->periph), "debug-powered",
+                                        0));
+    }
+    {
+        static const char *const sleep_lines[][2] = {
+            { "SLEEPING", "m33-sleeping" },
+            { "SLEEPDEEP", "m33-sleepdeep" },
+            { "WAKEUP", "m33-wakeup" },
+        };
+
+        for (unsigned i = 0; i < ARRAY_SIZE(sleep_lines); i++) {
+            qdev_connect_gpio_out_named(
+                DEVICE(&s->armv7m), sleep_lines[i][0], 0,
+                qdev_get_gpio_in_named(DEVICE(&s->periph), sleep_lines[i][1],
+                                       0));
+        }
     }
     efr32_rf_medium_attach(s->rf_medium, EFR32_RF_RADIO(&s->periph), errp);
     if (*errp) {
@@ -9618,6 +10017,9 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
                 DEVICE(&s->periph), "timer-cc", n,
                 qdev_get_gpio_in_named(gpio, EFR32_GPIO_TIMER_CC, n));
         }
+        qdev_connect_gpio_out_named(DEVICE(&s->periph), "gpio-em2", 0,
+                                    qdev_get_gpio_in_named(gpio,
+                                                           EFR32_GPIO_EM2, 0));
         efr32_i2c_create(OBJECT(s), s->memory, nvic, s->pclk,
                          &s->periph.bus_model, 0, EFR32_I2C0_BASE,
                          PERIPH_NONSECURE_OFFSET, EFR32_I2C0_IRQ);

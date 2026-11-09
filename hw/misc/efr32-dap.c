@@ -232,6 +232,7 @@ static void efr32_dap_set_nreset(SWDTarget *t, bool asserted)
         s->select_shift = 0;
         s->ones = 0;
         s->ctrl_stat = 0;
+        qemu_set_irq(s->debug_powered, 0);
         s->select = 0;
         s->rdbuff = 0;
         s->awaiting_dpidr = false;
@@ -610,6 +611,12 @@ static void dap_write(Efr32DapState *s, bool apndp, unsigned a,
         if ((s->select & SELECT_DPBANKSEL_MASK) == DP_BANK_CTRL_STAT) {
             s->ctrl_stat = (s->ctrl_stat & (CTRL_STICKY | CTRL_READOK)) |
                            (data & (CTRL_WRITABLE));
+            /*
+             * A probe that powers the debug domain keeps the part out of
+             * EM2 (owo-open-fw docs/radio-tables.md SS7.74).
+             */
+            qemu_set_irq(s->debug_powered,
+                         !!(s->ctrl_stat & CTRL_CDBGPWRUPREQ));
         }
         break;
     case DP_SELECT:
@@ -813,6 +820,8 @@ static void efr32_dap_init(Object *obj)
     qdev_init_gpio_in_named(DEVICE(obj), dap_debug_wedge, "debug-wedge", 1);
     qdev_init_gpio_out_named(DEVICE(obj), &s->nreset_out, "nreset", 1);
     qdev_init_gpio_out_named(DEVICE(obj), &s->erase_reset, "erase-reset", 1);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->debug_powered, "debug-powered",
+                             1);
     memory_region_init(&s->dci_root, obj, "efr32-dci-bus", DCI_BUS_SIZE);
     memory_region_init_io(&s->dci_regs, obj, &dci_ops, s, "efr32-dci",
                           DCI_SIZE);

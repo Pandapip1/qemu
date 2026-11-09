@@ -79,6 +79,7 @@ struct Efr32DapState {
     bool nreset_asserted;
     qemu_irq nreset_out;    /* to the SoC: pin reset */
     qemu_irq erase_reset;   /* to the SoC: the reset after a DCI erase */
+    qemu_irq debug_powered; /* to the SoC: CTRL/STAT.CDBGPWRUPREQ */
     /* Debug port wedged by the radio's clock retiming (efr32-dap.c) */
     bool wedged;
 
