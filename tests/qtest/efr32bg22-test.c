@@ -1865,6 +1865,33 @@ static void protimer_start(void)
     writel(PROTIMER_BASE + PROTIMER_CMD, PROTIMER_CMD_START);
 }
 
+/*
+ * Reset values read from the bank on silicon before the counter starts
+ * (hw/arm/efr32bg22.c); +0x014 bit 0 once it runs; CMD reads 0.
+ */
+#define PROTIMER_IPVERSION    0x000
+#define PROTIMER_STATUS       0x014
+#define PROTIMER_034          0x034
+#define PROTIMER_040          0x040
+#define PROTIMER_04C          0x04c
+
+static void test_protimer_reset_values(void)
+{
+    reset_with_radio_clocks();
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_IPVERSION), ==, 1);
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_STATE), ==, 0x00ffff00);
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_034), ==, 0x0000ffff);
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_PERIOD), ==, 0xffffffff);
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_040), ==, 0x00ff00ff);
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_04C), ==, 0x00ff00ff);
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_STATUS), ==, 0);
+    writel(PROTIMER_BASE + PROTIMER_EN, 1);
+    writel(PROTIMER_BASE + PROTIMER_CMD, 1);
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_STATUS), ==, 1);
+    g_assert_cmphex(readl(PROTIMER_BASE + PROTIMER_CMD), ==, 0);
+    reset_with_radio_clocks();
+}
+
 static void test_protimer_counter(void)
 {
     uint32_t before;
@@ -5913,6 +5940,8 @@ int main(int argc, char **argv)
                    test_protimer_interrupt_banks_are_aliasable);
     qtest_add_func("/efr32bg22/protimer-compare-slot-clear-alias",
                    test_protimer_compare_slot_clear_alias);
+    qtest_add_func("/efr32bg22/protimer-reset-values",
+                   test_protimer_reset_values);
     qtest_add_func("/efr32bg22/protimer-counter", test_protimer_counter);
     qtest_add_func("/efr32bg22/protimer-counter-is-independent-from-radio-setup",
                    test_protimer_counter_is_independent_from_radio_setup);

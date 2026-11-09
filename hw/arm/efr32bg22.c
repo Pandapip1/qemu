@@ -432,6 +432,26 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_PROTIMER_CMP2 0x120u
 #define EFR32_PROTIMER_CMP3 0x130u
 #define EFR32_PROTIMER_CMP4 0x140u
+/*
+ * Read on silicon (register dumps of the bank, owo-bg22-proprietary-
+ * baselines release-boundary/stock-protimer.bin before the counter starts,
+ * hardware-lockstep/stage2-*-protimer.bin with it running under RAIL):
+ * +0x000 reads 1 throughout, as the IPVERSION word of the other radio
+ * blocks; +0x030, +0x034, +0x038, +0x040 and +0x04c leave reset as below;
+ * +0x014 reads 1 once the counter runs, 0 before; CMD (+0x00c) reads 0
+ * after RAIL's start command.
+ */
+#define EFR32_PROTIMER_IPVERSION 0x000u
+#define EFR32_PROTIMER_IPVERSION_RESET 0x00000001u
+#define EFR32_PROTIMER_STATUS 0x014u
+#define EFR32_PROTIMER_STATUS_RUNNING (1u << 0)
+#define EFR32_PROTIMER_STATE_RESET 0x00ffff00u
+#define EFR32_PROTIMER_034 0x034u
+#define EFR32_PROTIMER_034_RESET 0x0000ffffu
+#define EFR32_PROTIMER_PERIOD_RESET 0xffffffffu
+#define EFR32_PROTIMER_040 0x040u
+#define EFR32_PROTIMER_04C 0x04cu
+#define EFR32_PROTIMER_040_04C_RESET 0x00ff00ffu
 
 /* Minimal clock/power state required by the stock boot path. */
 #define EFR32_CMU_BASE 0x40008000u
@@ -7491,6 +7511,12 @@ static uint32_t efr32_peripheral_read_word(Efr32Periph *s, uint32_t address)
     {
         return efr32_protimer_counter(s);
     }
+    if (address == EFR32_PROTIMER_BASE + EFR32_PROTIMER_STATUS) {
+        return s->protimer_running ? EFR32_PROTIMER_STATUS_RUNNING : 0;
+    }
+    if (address == EFR32_PROTIMER_BASE + EFR32_PROTIMER_CMD) {
+        return 0;
+    }
     if (address == EFR32_AGC_BASE + EFR32_AGC_CMD)
         return 0; /* AGC.CMD is write-only in the public register model. */
     return efr32_register_get(s, address);
@@ -8890,6 +8916,18 @@ static void efr32_periph_reset_hold(Object *o, ResetType t)
                        EFR32_MODEM_RAMPCTRL_RESET);
     efr32_register_put(s, EFR32_MODEM_BASE + EFR32_MODEM_RAMPLEV,
                        EFR32_MODEM_RAMPLEV_RESET);
+    efr32_register_put(s, EFR32_PROTIMER_BASE + EFR32_PROTIMER_IPVERSION,
+                       EFR32_PROTIMER_IPVERSION_RESET);
+    efr32_register_put(s, EFR32_PROTIMER_BASE + EFR32_PROTIMER_STATE,
+                       EFR32_PROTIMER_STATE_RESET);
+    efr32_register_put(s, EFR32_PROTIMER_BASE + EFR32_PROTIMER_034,
+                       EFR32_PROTIMER_034_RESET);
+    efr32_register_put(s, EFR32_PROTIMER_BASE + EFR32_PROTIMER_PERIOD,
+                       EFR32_PROTIMER_PERIOD_RESET);
+    efr32_register_put(s, EFR32_PROTIMER_BASE + EFR32_PROTIMER_040,
+                       EFR32_PROTIMER_040_04C_RESET);
+    efr32_register_put(s, EFR32_PROTIMER_BASE + EFR32_PROTIMER_04C,
+                       EFR32_PROTIMER_040_04C_RESET);
     efr32_msc_reset(s);
     for (int i = 0; i < EFR32_RTCC_INSTANCES; i++) {
         efr32_rtcc_reset(&s->rtcc[i]);
