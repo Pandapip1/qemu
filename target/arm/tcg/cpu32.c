@@ -526,6 +526,15 @@ static void cortex_r5_initfn(Object *obj)
     cpu->mp_is_up = true;
     cpu->pmsav7_dregion = 16;
     cpu->isar.reset_pmcr_el0 = 0x41151800;
+    /*
+     * The BCM4387 WLAN core (modelled on the r5) has Advanced SIMD; its PHY/cal
+     * firmware uses NEON (e.g. vhadd at ROM 0x40a5b4). Give the r5 VFP+NEON
+     * (cortex-a8 FP/SIMD id values).
+     */
+    set_feature(&cpu->env, ARM_FEATURE_NEON);
+    cpu->reset_fpsid = 0x410330c0;
+    cpu->isar.mvfr0 = 0x11110222;
+    cpu->isar.mvfr1 = 0x00011111;
     define_arm_cp_regs(cpu, cortexr5_cp_reginfo);
 }
 
