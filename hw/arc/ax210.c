@@ -247,6 +247,11 @@ static void sem_update(int core, uint32_t mask, bool request)
 #define IND_WR   (1u << 17)
 #define IND_ADDR 0x1ffffu
 #define IND_BASE 0x00a20000u
+/* Request/grant pair behind the window (finding W2, [F]): LMAC 0x4bdf90
+ * writes 1 to 0x8c38 (0x4bdfb8) and spins on 0x8c50 bit 0 with no
+ * timeout. Model: the grant follows the request bit. */
+#define IND_REQ  (IND_BASE + 0x8c38)
+#define IND_GNT  (IND_BASE + 0x8c50)
 
 /* Chip identification (finding K2): read-only, silicon values. AX210 dmesg
  * reads "Detected crf-id 0x400410, cnv-id 0x400410 wfpm id 0x80000000"; the
@@ -535,46 +540,75 @@ static uint32_t f14_pop(void)
     return w;
 }
 
-/* PHY register sync read and the 0xad13xx engine (finding P1, [F]; the
- * addresses are in the ucode's PHY periphery list, V). LMAC 0x1697c reads
- * a PHY register by writing (addr & 0xfffff) | bit 28 to 0xadfc0c and
- * loading 0xadfc1c. PHY engines are started by a bit 0 pulse on a
- * control register and polled for bit 30 on a status register: handling
- * 0xfd11, LMAC 0x4d58a0 clears with 0xad1324 bit 29, pulses 0xad131c and
- * polls 0xad13c0 (assert 0x13c1); 0x4d7a64 pulses 0xad32d0 + 4i and polls
- * 0xad3680 + 4i (assert 0x13c0). 0xad131c also has a bit 1 start whose
- * completion is 0xad13c0 bit 23 (0x4d57d0 via 0x4bbd40, assert 0x28a9).
+/* PHY register sync read and PHY engines (finding P1, [F]; the addresses
+ * are in the ucode's PHY periphery list, V). LMAC 0x1697c reads a PHY
+ * register by writing (addr & 0xfffff) | bit 28 to 0xadfc0c and loading
+ * 0xadfc1c; UMAC 0x804a9d70 uses a second port: address to 0xadfc14, wait
+ * for 0xadfc24 bit 15, data at 0xadfc20. An engine is started by a pulse on control bit 0 or 1 and
+ * polled on its status register for bit 30 or 23 (code site, assert):
+ *   0xad131c -> 0xad13c0: b0 (0x4d58a0, 0x13c1; 0xad1324 b29 clears),
+ *                         b1 (0x4d57d0 via 0x4bbd40, 0x28a9)
+ *   0xad32d0 + 4i -> 0xad3680 + 4i: b0 (0x4d7a64, 0x13c0),
+ *                         b1 (0x4d5f38 via 0x4d75a4, 0x28aa)
+ * A capture block counts to the length written at 0xac0450 and reports
+ * progress at 0xac0458: LMAC 0x4d39a4 reads it twice 5 ticks apart, stores
+ * it once stable and non-zero, and 0x4c9988 requires it to equal the 0x1000
+ * it programmed (assert 0x14b5).
  * Model: the window reads the register at 0xa00000 | addr; a pulse
- * completes at once. */
+ * completes at once and a capture is complete when first read. */
 #define PHY_SYNC_ADDR 0x00adfc0cu
 #define PHY_SYNC_DATA 0x00adfc1cu
+#define PHY_SYNC2_ADDR 0x00adfc14u
+#define PHY_SYNC2_DATA 0x00adfc20u
+#define PHY_SYNC2_RDY  0x00adfc24u
 #define PHY_ENG_CLR   0x00ad1324u
-#define PHY_ENG_DONE  (1u << 30)
-#define PHY_ENG_DONE2 (1u << 23)
+#define PHY_CAP_LEN   0x00ac0450u
+#define PHY_CAP_CNT   0x00ac0458u
 static const struct { hwaddr ctl, stat; } phy_eng[] = {
     { 0x00ad131c, 0x00ad13c0 },
     { 0x00ad32d0, 0x00ad3680 }, { 0x00ad32d4, 0x00ad3684 },
     { 0x00ad32d8, 0x00ad3688 }, { 0x00ad32dc, 0x00ad368c },
 };
-static uint32_t phy_done;
-static bool phy_done2;
+static const uint32_t phy_done_bit[2] = { 1u << 30, 1u << 23 };
+static uint8_t phy_done[ARRAY_SIZE(phy_eng)];
 
-static int phy_eng_find(hwaddr a, bool stat)
+static bool phy_is_stat(hwaddr a)
 {
+    if (a == PHY_CAP_CNT) {
+        return true;
+    }
     for (int i = 0; i < ARRAY_SIZE(phy_eng); i++) {
-        if ((stat ? phy_eng[i].stat : phy_eng[i].ctl) == a) {
-            return i;
+        if (phy_eng[i].stat == a) {
+            return true;
         }
     }
-    return -1;
+    return false;
 }
 
 static uint32_t phy_reg(hwaddr a)
 {
-    int i = phy_eng_find(a, true);
+    uint32_t v = a == PHY_CAP_CNT ? rs_get(PHY_CAP_LEN) : rs_get(a);
 
-    return rs_get(a) | (i >= 0 && (phy_done & (1u << i)) ? PHY_ENG_DONE : 0) |
-           (i == 0 && phy_done2 ? PHY_ENG_DONE2 : 0);
+    for (int i = 0; i < ARRAY_SIZE(phy_eng); i++) {
+        for (int b = 0; b < 2; b++) {
+            if (phy_eng[i].stat == a && (phy_done[i] & (1u << b))) {
+                v |= phy_done_bit[b];
+            }
+        }
+    }
+    return v;
+}
+
+static void phy_write(hwaddr a, uint32_t val)
+{
+    if (a == PHY_ENG_CLR && (val & (1u << 29))) {
+        phy_done[0] = 0;
+    }
+    for (int i = 0; i < ARRAY_SIZE(phy_eng); i++) {
+        if (phy_eng[i].ctl == a) {
+            phy_done[i] |= val & 3;
+        }
+    }
 }
 
 #define MBX_BASE 0x00d00000u    /* UMAC 0xc0d00000 */
@@ -641,7 +675,18 @@ static uint64_t trace_read(void *opaque, hwaddr addr, unsigned size)
         trace_log("R.phy", t, v, size);
         return v;
     }
-    if (phy_eng_find(a, true) >= 0 && !hit) {
+    if (a == PHY_SYNC2_DATA && !hit) {
+        hwaddr t = 0x00a00000u | (rs_get(PHY_SYNC2_ADDR) & 0xfffffu);
+        v = phy_reg(t);
+        trace_log("R.phy", t, v, size);
+        return v;
+    }
+    if (a == PHY_SYNC2_RDY && !hit) {
+        v = rs_get(a) | (1u << 15);
+        trace_log("R.phy", ra, v, size);
+        return v;
+    }
+    if (phy_is_stat(a) && !hit) {
         v = phy_reg(a);
         trace_log("R.phy", ra, v, size);
         return v;
@@ -799,6 +844,9 @@ static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
             if (!chip_id_read(ta, &d)) {
                 d = rs_get(ta);
             }
+            if (ta == IND_GNT) {
+                d = (d & ~1u) | (rs_get(IND_REQ) & 1);
+            }
             g_hash_table_insert(regstore, GUINT_TO_POINTER(IND_DATA),
                                 GUINT_TO_POINTER(d));
             trace_log("IND.R", ia, d, 4);
@@ -810,14 +858,7 @@ static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     if (a == DMA_BASE + 0x34) {
         dma_kick();
     }
-    if (a == PHY_ENG_CLR && (val & (1u << 29))) {
-        phy_done &= ~1u;
-        phy_done2 = false;
-    } else if (phy_eng_find(a, false) >= 0 && (val & 1)) {
-        phy_done |= 1u << phy_eng_find(a, false);
-    } else if (phy_eng_find(a, false) == 0 && (val & 2)) {
-        phy_done2 = true;
-    }
+    phy_write(a, (uint32_t)val);
     if (a == NIC_STAT) {
         nic_stat &= ~(uint32_t)val;
     } else if (a == NIC_SET) {
