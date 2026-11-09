@@ -477,6 +477,106 @@ static void nic_update(void)
                  (nic_stat & rs_get(NIC_MASK)) != 0);
 }
 
+/* UMAC -> LMAC command path (finding Q5, [F]): UMAC selects FIFO 14 at
+ * TXF_CPU2_NUM (0xa0053c) and pushes {cmd header, byte length, payload} to
+ * 0xa00540. LMAC's IRQ19 (0x1bbc) takes cause [0xa01e60] & 0x58902167;
+ * bit 28's handler (0x4b78d0) selects FIFO 14 at TXF_LARC_NUM, waits for
+ * TXF_FIFO_ITEM_CNT (0xa00438) >= 8 bytes, reads header and length from
+ * 0xa00408, then dispatches by group/ID (0x4cd49c). UMAC configured FIFO 14
+ * as one SMEM ring (0x23000), so both blocks see the same queue. Model: one
+ * word queue that takes whole frames; bit 28 and IRQ19 follow its fill
+ * level. */
+#define TXF_CPU2_SEL  (MFIFO_UMAC + 0x3c)
+#define TXF_TO_LMAC   0xe
+#define TXF_POP       (MFIFO_BASE + 0x08)
+#define TXF_CNT       (MFIFO_BASE + 0x38)
+#define LEV_CAUSE     0x00a01e60u
+#define LEV_CMD       (1u << 28)
+#define LEV_IRQ       19
+static uint32_t txf2_sel;
+static uint32_t f14_frame[URXF_CAP];
+static unsigned f14_n;
+static uint32_t f14[URXF_CAP];
+static unsigned f14_rd, f14_wr;
+
+static void f14_update(void)
+{
+    if (!lmac_cs) {
+        return;
+    }
+    qemu_set_irq(ARC_CPU(lmac_cs)->env.irq[LEV_IRQ], f14_rd != f14_wr);
+}
+
+static void f14_push(uint32_t w)
+{
+    if (f14_n < URXF_CAP) {
+        f14_frame[f14_n++] = w;
+    }
+    if (f14_n < 2 || f14_n < 2 + ((f14_frame[1] + 3) >> 2)) {
+        return;
+    }
+    for (unsigned i = 0; i < f14_n && f14_wr - f14_rd < URXF_CAP; i++) {
+        f14[f14_wr++ % URXF_CAP] = f14_frame[i];
+    }
+    trace_log("TXF.L", TXF_CPU2_SEL, f14_frame[0], f14_frame[1]);
+    f14_n = 0;
+    f14_update();
+    yield_to_peer();
+}
+
+static uint32_t f14_pop(void)
+{
+    uint32_t w = 0;
+
+    if (f14_rd != f14_wr) {
+        w = f14[f14_rd++ % URXF_CAP];
+    }
+    f14_update();
+    return w;
+}
+
+/* PHY register sync read and the 0xad13xx engine (finding P1, [F]; the
+ * addresses are in the ucode's PHY periphery list, V). LMAC 0x1697c reads
+ * a PHY register by writing (addr & 0xfffff) | bit 28 to 0xadfc0c and
+ * loading 0xadfc1c. PHY engines are started by a bit 0 pulse on a
+ * control register and polled for bit 30 on a status register: handling
+ * 0xfd11, LMAC 0x4d58a0 clears with 0xad1324 bit 29, pulses 0xad131c and
+ * polls 0xad13c0 (assert 0x13c1); 0x4d7a64 pulses 0xad32d0 + 4i and polls
+ * 0xad3680 + 4i (assert 0x13c0). 0xad131c also has a bit 1 start whose
+ * completion is 0xad13c0 bit 23 (0x4d57d0 via 0x4bbd40, assert 0x28a9).
+ * Model: the window reads the register at 0xa00000 | addr; a pulse
+ * completes at once. */
+#define PHY_SYNC_ADDR 0x00adfc0cu
+#define PHY_SYNC_DATA 0x00adfc1cu
+#define PHY_ENG_CLR   0x00ad1324u
+#define PHY_ENG_DONE  (1u << 30)
+#define PHY_ENG_DONE2 (1u << 23)
+static const struct { hwaddr ctl, stat; } phy_eng[] = {
+    { 0x00ad131c, 0x00ad13c0 },
+    { 0x00ad32d0, 0x00ad3680 }, { 0x00ad32d4, 0x00ad3684 },
+    { 0x00ad32d8, 0x00ad3688 }, { 0x00ad32dc, 0x00ad368c },
+};
+static uint32_t phy_done;
+static bool phy_done2;
+
+static int phy_eng_find(hwaddr a, bool stat)
+{
+    for (int i = 0; i < ARRAY_SIZE(phy_eng); i++) {
+        if ((stat ? phy_eng[i].stat : phy_eng[i].ctl) == a) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static uint32_t phy_reg(hwaddr a)
+{
+    int i = phy_eng_find(a, true);
+
+    return rs_get(a) | (i >= 0 && (phy_done & (1u << i)) ? PHY_ENG_DONE : 0) |
+           (i == 0 && phy_done2 ? PHY_ENG_DONE2 : 0);
+}
+
 #define MBX_BASE 0x00d00000u    /* UMAC 0xc0d00000 */
 static uint32_t host_csr[0x1000];   /* 0x0000-0x3fff */
 static void host_alive_restock(void);
@@ -524,6 +624,32 @@ static uint64_t trace_read(void *opaque, hwaddr addr, unsigned size)
     if (is_mfifo(a, 0x30) && !hit) {
         trace_log("R.mfifo", ra, MFIFO_CAP, size);
         return MFIFO_CAP;
+    }
+    if (a == TXF_CNT && txf_sel == TXF_TO_LMAC && !hit) {
+        v = 4 * (f14_wr - f14_rd);
+        trace_log("R.f14n", ra, v, size);
+        return v;
+    }
+    if (a == TXF_POP && txf_sel == TXF_TO_LMAC && !hit) {
+        v = f14_pop();
+        trace_log("R.f14", ra, v, size);
+        return v;
+    }
+    if (a == PHY_SYNC_DATA && !hit) {
+        hwaddr t = 0x00a00000u | (rs_get(PHY_SYNC_ADDR) & 0xfffffu);
+        v = phy_reg(t);
+        trace_log("R.phy", t, v, size);
+        return v;
+    }
+    if (phy_eng_find(a, true) >= 0 && !hit) {
+        v = phy_reg(a);
+        trace_log("R.phy", ra, v, size);
+        return v;
+    }
+    if (a == LEV_CAUSE && !hit) {
+        v = rs_get(LEV_CAUSE) | (f14_rd != f14_wr ? LEV_CMD : 0);
+        trace_log("R.lev", ra, v, size);
+        return v;
     }
     if (is_mfifo(a, 0x38) && !hit) {
         trace_log("R.mfifo", ra, 0, size);
@@ -633,6 +759,11 @@ static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         txf_n = 0;
     } else if (a == MFIFO_BASE + 0x40) {
         txf_lmac_push((uint32_t)val);
+    } else if (a == TXF_CPU2_SEL) {
+        txf2_sel = (uint32_t)val;
+        f14_n = 0;
+    } else if (a == MFIFO_UMAC + 0x40 && txf2_sel == TXF_TO_LMAC) {
+        f14_push((uint32_t)val);
     }
     if (a == SEM_BASE || a == SEM_BASE + 0x20) {
         sem_update(a == SEM_BASE + 0x20, (uint32_t)val, true);
@@ -678,6 +809,14 @@ static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
                         (gpointer)(uintptr_t)(uint32_t)val);
     if (a == DMA_BASE + 0x34) {
         dma_kick();
+    }
+    if (a == PHY_ENG_CLR && (val & (1u << 29))) {
+        phy_done &= ~1u;
+        phy_done2 = false;
+    } else if (phy_eng_find(a, false) >= 0 && (val & 1)) {
+        phy_done |= 1u << phy_eng_find(a, false);
+    } else if (phy_eng_find(a, false) == 0 && (val & 2)) {
+        phy_done2 = true;
     }
     if (a == NIC_STAT) {
         nic_stat &= ~(uint32_t)val;
