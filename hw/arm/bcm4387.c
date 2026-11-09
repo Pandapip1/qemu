@@ -518,13 +518,37 @@ static void bcm4387_init(MachineState *machine)
         }
         if (s->relocraw) {
             /*
-             * relocraw=on: run the real ASLR relocator with its genuine,
-             * unmodified placement helpers (0x8a3e48 / 0x8a3eb8). The RNG seed
-             * is fixed by the hostblob, so the section placement is
-             * deterministic. No forced offset, no stub: whatever the firmware
-             * copies/re-links is by definition correct. Used to observe the
-             * true copy destination(s) and then map RAM to cover them.
+             * relocraw=on: run the real ASLR relocator with its genuine
+             * intra-page placement helper (0x8a3e48, which returns the real
+             * +0x400), and the genuine PAGE placement helper (0x8a3eb8) — RNG,
+             * bounds checks and all, so the RNG stream (stack canary, later
+             * placements) stays faithful — but force the page offset it RETURNS
+             * to 0 by patching its epilogue "mov r0,r4" (0x8a3f04) to
+             * "movs r0,#0".
+             *
+             * Why: each section descriptor is filled as [+0]=place_page() (page
+             * ASLR) and [+4]=place_intra() (=+0x400); the re-linker computes a
+             * branch fixup delta of [+0]-[+4]. For a branch whose target is in a
+             * FIXED section (ROM at 0x4xxxxx, which does not move in our model —
+             * we map it once at 0x400000), the correct delta is -0x400 (only the
+             * instruction moved +0x400, the ROM target stays put), which needs
+             * [+0]=0. Genuine place_page instead returns a random page offset
+             * (observed -0x270be8) that lands in ROM and corrupts every
+             * ROM-target branch (e.g. 0x82c430 "bl 0x47eb84" -> bl 0x20df9c,
+             * which sleds into the dead gap and aborts). On real hardware the
+             * host applies that page placement by actually loading the image at
+             * the random page; our model keeps the image at its link base and
+             * only honours the +0x400 intra-page shift, so the faithful page
+             * offset here is 0.
              */
+            static const uint8_t movs_r0_0[] = { 0x00, 0x20 };
+            gsize op = 0x8a3f04 - RAM_BASE;
+
+            if (op + 2 > fwlen) {
+                error_report("bcm4387: firmware too small for relocraw patch");
+                exit(1);
+            }
+            memcpy(fw + op, movs_r0_0, sizeof(movs_r0_0));
         } else if (s->identity && !s->relocate) {
             static const uint8_t ret0[] = { 0x00, 0x20, 0x70, 0x47 };
             static const uint8_t bxlr[] = { 0x70, 0x47, 0x00, 0xbf };
