@@ -114,6 +114,21 @@ static int n_ctrs = 1;
 static uint32_t dma_done;
 static unsigned dma_count;
 
+/* SMEM range watcher and the engine it watches (finding W3, [F]; data not
+ * modelled). After LMAC answers 0xfd11, UMAC moves data in 512-byte chunks:
+ * 0x8049da44 clears 0xd02e24 bit 7, arms channel 0 with a range at
+ * 0xd0c154 and bit 31 of 0xd0c150, then 0xc0084a0c starts an engine through
+ * the W1 window (0xb044 start, 0xb00c end, 0xb008 control 0x61e000) and
+ * 0x80486638 waits, without timeout, for 0xd02e24 bit 7 (0x80485fd4).
+ * Model: starting the engine with channel 0 armed sets bit 7 at once; the
+ * engine's data (from the 0xa2b0xx block, no vendor or silicon record) is
+ * not produced, so the watched range keeps its contents. */
+#define WATCH_CTL   0x00d0c150u
+#define WATCH_ARM   (1u << 31)
+#define WATCH_EVT   (1u << 7)
+#define ENG_CTL     (0x00a20000u + 0xb008)
+static uint32_t watch_evt;
+
 static void dma_kick(void);
 
 /* LMAC AES-128 engine at 0xa01800 (finding A1). [F]: LMAC's boot self-test
@@ -646,7 +661,7 @@ static uint64_t trace_read(void *opaque, hwaddr addr, unsigned size)
     hwaddr a = lmac_view(ra);           /* model key */
     int hit; uint32_t v = override_lookup(a, &hit);
     if (a == DMA_STAT && !hit) {
-        v = dma_done ? (1u << 29) : 0;
+        v = (dma_done ? (1u << 29) : 0) | watch_evt;
         trace_log("R.dma", ra, v, size);
         return v;
     }
@@ -784,6 +799,9 @@ static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     if (a == DMA_STAT && (val & (1u << 29))) {
         dma_done = 0;
     }
+    if (a == DMA_STAT) {
+        watch_evt &= ~((uint32_t)val & WATCH_EVT);
+    }
     if (!regstore) {
         regstore = g_hash_table_new(g_direct_hash, g_direct_equal);
     }
@@ -839,6 +857,10 @@ static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
             g_hash_table_insert(regstore, GUINT_TO_POINTER((guint)ta),
                                 GUINT_TO_POINTER(d));
             trace_log("IND.W", ia, d, 4);
+            if (ta == ENG_CTL && d && (rs_get(WATCH_CTL) & WATCH_ARM)) {
+                watch_evt |= WATCH_EVT;
+                trace_log("WATCH", WATCH_CTL, d, 4);
+            }
         } else {
             uint32_t d;
             if (!chip_id_read(ta, &d)) {
