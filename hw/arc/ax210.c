@@ -375,6 +375,77 @@ static void tout_arm(uint32_t n)
     timer_mod(tout, qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) + n);
 }
 
+/* LMAC -> UMAC command path (finding Q3, [F]): LMAC selects TX FIFO 13 at
+ * TXF_LARC_NUM and pushes {cmd header, byte length, payload}. UMAC's IRQ5
+ * cause 14 handler (0xc00823d0) pops {len_n_flags, cmd header, payload} from
+ * 0xd00e68: bit 27 required, (len & 0xfffc) - 4 payload bytes, and
+ * 0xd05498 bit 31 required (0x80497898). Model: reframe each complete LMAC
+ * frame into that layout; IRQ5 summary bit 14 stays set while words remain.
+ * The flag bits and the FIFO number are read off the firmware, not silicon. */
+#define TXF_LARC_SEL (MFIFO_BASE + 0x3c)
+#define TXF_TO_UMAC  0xd
+#define URXF_POP     0x00d00e68u
+#define URXF_STAT    0x00d05498u
+#define IRQ5_SUM     0x00d02e64u
+#define URXF_CAUSE   (1u << 14)
+#define URXF_IRQ     5
+#define URXF_CAP     0x400u          /* words */
+static uint32_t txf_sel;
+static uint32_t txf_frame[URXF_CAP];
+static unsigned txf_n;
+static uint32_t urxf[URXF_CAP];
+static unsigned urxf_rd, urxf_wr;
+
+static void urxf_update(void)
+{
+    CPUARCState *env;
+
+    if (!umac_cs) {
+        return;
+    }
+    env = &ARC_CPU(umac_cs)->env;
+    qemu_set_irq(env->irq[URXF_IRQ], urxf_rd != urxf_wr);
+}
+
+static void urxf_push(uint32_t w)
+{
+    if (urxf_wr - urxf_rd < URXF_CAP) {
+        urxf[urxf_wr++ % URXF_CAP] = w;
+    }
+}
+
+static uint32_t urxf_pop(void)
+{
+    uint32_t w = 0;
+
+    if (urxf_rd != urxf_wr) {
+        w = urxf[urxf_rd++ % URXF_CAP];
+    }
+    urxf_update();
+    return w;
+}
+
+static void txf_lmac_push(uint32_t w)
+{
+    if (txf_sel != TXF_TO_UMAC) {
+        return;
+    }
+    if (txf_n < URXF_CAP) {
+        txf_frame[txf_n++] = w;
+    }
+    if (txf_n < 2 || txf_n < 2 + ((txf_frame[1] + 3) >> 2)) {
+        return;
+    }
+    urxf_push((1u << 27) | ((txf_frame[1] + 4) & 0xfffc));
+    urxf_push(txf_frame[0]);
+    for (unsigned i = 2; i < txf_n; i++) {
+        urxf_push(txf_frame[i]);
+    }
+    trace_log("TXF.U", TXF_LARC_SEL, txf_frame[0], txf_frame[1]);
+    txf_n = 0;
+    urxf_update();
+}
+
 #define MBX_BASE 0x00d00000u    /* UMAC 0xc0d00000 */
 static uint32_t host_csr[0x1000];   /* 0x0000-0x3fff */
 static void host_alive_restock(void);
@@ -442,6 +513,21 @@ static uint64_t trace_read(void *opaque, hwaddr addr, unsigned size)
         trace_log("R.istat", ra, v, size);
         return v;
     }
+    if (a == URXF_POP && !hit) {
+        v = urxf_pop();
+        trace_log("R.rxf", ra, v, size);
+        return v;
+    }
+    if (a == IRQ5_SUM && !hit) {
+        v = rs_get(IRQ5_SUM) | (urxf_rd != urxf_wr ? URXF_CAUSE : 0);
+        trace_log("R.sum", ra, v, size);
+        return v;
+    }
+    if (a == URXF_STAT && !hit) {
+        v = rs_get(URXF_STAT) | (1u << 31);
+        trace_log("R.rxfs", ra, v, size);
+        return v;
+    }
     if (a == FSM_BASE && !hit) {
         v = fsm_read();
         trace_log("R.fsm", ra, v, size);
@@ -506,6 +592,12 @@ static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     }
     if (is_mfifo(a, 0x40)) {
         trace_log("MSG", ra, val, size);
+    }
+    if (a == TXF_LARC_SEL) {
+        txf_sel = (uint32_t)val;
+        txf_n = 0;
+    } else if (a == MFIFO_BASE + 0x40) {
+        txf_lmac_push((uint32_t)val);
     }
     if (a == SEM_BASE || a == SEM_BASE + 0x20) {
         sem_update(a == SEM_BASE + 0x20, (uint32_t)val, true);
