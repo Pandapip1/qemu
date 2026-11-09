@@ -103,6 +103,7 @@ struct BCM4387MachineState {
     char *patch;
     uint32_t atcm_size;
     bool identity;
+    bool relocate;
 
     ARMCPU *cpu;
     MemoryRegion atcm, atcm_alias, btcm, socram, rom_mr, erom, scratch, trace;
@@ -514,7 +515,7 @@ static void bcm4387_init(MachineState *machine)
             error_report("bcm4387: cannot read firmware %s", machine->firmware);
             exit(1);
         }
-        if (s->identity) {
+        if (s->identity && !s->relocate) {
             static const uint8_t ret0[] = { 0x00, 0x20, 0x70, 0x47 };
             static const uint8_t bxlr[] = { 0x70, 0x47, 0x00, 0xbf };
             gsize o1 = 0x8a3e48 - RAM_BASE, o2 = 0x8a3eb8 - RAM_BASE;
@@ -527,6 +528,35 @@ static void bcm4387_init(MachineState *machine)
             memcpy(fw + o1, ret0, 4);
             memcpy(fw + o2, ret0, 4);
             memcpy(fw + o3, bxlr, 4);
+        } else if (s->relocate) {
+            /*
+             * relocate=on: let the real ASLR relocator run, but force a
+             * deterministic, model-mapped section offset. Keep each placement
+             * helper's prologue (which sets up the [ctx+0x40] magic the copy
+             * loop needs) and override only its RETURN: intra-page offset 0,
+             * page offset +0x108ffc (into mapped BTCM/socram). The relocator
+             * then re-links per its tables by itself.
+             * - 0x8a3e4e (after 0x8a3e48's prologue): "movs r0,#0; pop {r3,pc}"
+             * - 0x8a3ec0 (after 0x8a3eb8's prologue): "ldr r0,[pc,#0];
+             *   pop {r4,r5,r6,pc}; .word 0x108ffc"
+             * STATUS: the relocator runs and re-links (the stack-canary RNG
+             * 0x47eb10 is re-linked away and the canary clears), but the
+             * re-link currently also moves a ROM target (0x40a5b4 -> 0x5135b0),
+             * faulting. The per-region (RAM +0x108ffc, ROM 0) descriptor setup
+             * still needs work.
+             */
+            static const uint8_t intra0[] = { 0x00, 0x20, 0x08, 0xbd };
+            static const uint8_t page_off[] = { 0x00, 0x48, 0x70, 0xbd,
+                                                0xfc, 0x8f, 0x10, 0x00 };
+            gsize o1 = (0x8a3e48 + 6) - RAM_BASE;
+            gsize o2 = (0x8a3eb8 + 8) - RAM_BASE;
+
+            if (o2 + 8 > fwlen) {
+                error_report("bcm4387: firmware too small for relocate patch");
+                exit(1);
+            }
+            memcpy(fw + o1, intra0, sizeof(intra0));
+            memcpy(fw + o2, page_off, sizeof(page_off));
         }
         /*
          * Mirror the ROM-patch redirect unit's read-side effect: copy each
@@ -608,6 +638,16 @@ static void set_identity(Object *o, bool v, Error **errp)
     BCM4387_MACHINE(o)->identity = v;
 }
 
+static bool get_relocate(Object *o, Error **errp)
+{
+    return BCM4387_MACHINE(o)->relocate;
+}
+
+static void set_relocate(Object *o, bool v, Error **errp)
+{
+    BCM4387_MACHINE(o)->relocate = v;
+}
+
 static void bcm4387_instance_init(Object *obj)
 {
     BCM4387_MACHINE(obj)->atcm_size = 0x140000;
@@ -634,6 +674,7 @@ static void bcm4387_class_init(ObjectClass *oc, const void *data)
     object_class_property_add(oc, "atcm-size", "uint32", get_atcm, set_atcm,
                               NULL, NULL);
     object_class_property_add_bool(oc, "identity", get_identity, set_identity);
+    object_class_property_add_bool(oc, "relocate", get_relocate, set_relocate);
 }
 
 static const TypeInfo bcm4387_machine_types[] = {
