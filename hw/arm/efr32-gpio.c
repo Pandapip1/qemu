@@ -27,7 +27,14 @@
  *  - the PRS producers GPIO PIN0-7 (the EXTI0-7 pins' levels);
  *  - the configuration lock (RM SS25.3.5): any value but 0xA534 written to
  *    LOCK freezes CTRL, MODEL/MODEH, the bus allocations, the external
- *    interrupt selects and the routes; GPIOLOCKSTATUS reports it.
+ *    interrupt selects and the routes; GPIOLOCKSTATUS reports it;
+ *  - EM2 (the "em2" input): ports A and B work on (data sheet SS3.3: "All of
+ *    the pins on ports A and port B are EM2 capable ... may also be used as
+ *    EM2/3 pin wake-ups"); ports C and D "are latched/retained in their
+ *    current state when entering EM2 until EM2 exit", what they drive and,
+ *    [I], what their inputs read, so an edge there sets its flag only at
+ *    the exit, if the level still differs then (owo-open-fw
+ *    docs/radio-tables.md SS7.95).
  *
  * [U] Not modelled: slew rate and drive strength, the glitch filters, EM4
  * retention and wake-up, the debug pins' default pulls, the other
@@ -116,6 +123,8 @@ enum {
     GPIO_MODE_WIREDANDALTPULLUP = 14,
     GPIO_MODE_WIREDANDALTPULLUPFILTER = 15,
 };
+/* Ports C (2) and D are latched in EM2 (data sheet SS3.3). */
+#define GPIO_EM2_LATCHED_PORT 2
 #define GPIO_MODE_BITS 4
 #define GPIO_MODE_MASK 0xfu
 #define GPIO_PINS_PER_MODE_REG 8
@@ -148,6 +157,8 @@ struct Efr32GpioState {
     bool out_sent[EFR32_GPIO_LINES];
     bool oe_sent[EFR32_GPIO_LINES];
     bool level[EFR32_GPIO_LINES];
+    /* In EM2: ports C and D hold their pads. */
+    bool em2;
 };
 
 static uint32_t gpio_reg(Efr32GpioState *s, uint32_t offset)
@@ -341,6 +352,10 @@ static void gpio_update(Efr32GpioState *s)
         bool out;
         bool oe = gpio_drives(s, line, &out);
 
+        if (s->em2 && line >= EFR32_GPIO_LINE(GPIO_EM2_LATCHED_PORT, 0)) {
+            continue;
+        }
+
         if (oe != s->oe_sent[line] || (oe && out != s->out_sent[line])) {
             trace_efr32_gpio_pin(line / EFR32_GPIO_PINS_PER_PORT,
                                  line % EFR32_GPIO_PINS_PER_PORT, oe, out);
@@ -524,6 +539,14 @@ static void gpio_letimer_out(void *opaque, int n, int level)
     gpio_update(s);
 }
 
+static void gpio_em2(void *opaque, int n, int level)
+{
+    Efr32GpioState *s = opaque;
+
+    s->em2 = level != 0;
+    gpio_update(s);
+}
+
 static void gpio_reset_hold(Object *obj, ResetType type)
 {
     Efr32GpioState *s = EFR32_GPIO(obj);
@@ -567,6 +590,7 @@ static void gpio_init(Object *obj)
                             EFR32_GPIO_LETIMER_OUTS);
     qdev_init_gpio_out_named(dev, s->prs_pin, EFR32_GPIO_PRS_PIN,
                              EFR32_GPIO_PRS_PINS);
+    qdev_init_gpio_in_named(dev, gpio_em2, EFR32_GPIO_EM2, 1);
 }
 
 static void gpio_class_init(ObjectClass *klass, void *data)

@@ -46,6 +46,8 @@
 /* Outputs: the PRS producers GPIO PIN0-7. */
 #define EFR32_GPIO_PRS_PIN "prs-pin"
 #define EFR32_GPIO_PRS_PINS 8
+/* Input: the part is in EM2 (ports C and D latched). */
+#define EFR32_GPIO_EM2 "em2"
 
 /* The register block, including its SET, CLR and TGL aliases. */
 #define EFR32_GPIO_BLOCK_SIZE 0x4000u

@@ -7,6 +7,7 @@
 #include <sys/un.h>
 #include "libqtest-single.h"
 #include "qemu/bswap.h"
+#include "qapi/qmp/qdict.h"
 
 static char *tx_snapshot_trace_path;
 
@@ -5190,6 +5191,333 @@ static void test_ldma_peripheral_request(void)
     qtest_quit(qts);
 }
 
+/*
+ * EMU energy modes (RM SS12.3; owo-open-fw docs/radio-tables.md SS7.95).  The
+ * SoC sees the M33's sleep through its NVIC's SLEEPING, SLEEPDEEP and WAKEUP
+ * lines; these tests drive them on the SoC directly, and em2-wfi runs the
+ * M33 into a deep-sleep WFI.
+ */
+#define EMU_PERIPH_PATH       "/machine/soc/periph"
+#define EMU_GPIO_PATH         "/machine/soc/gpio"
+#define EMU_STATUS_EM2ENTERED (1u << 14)
+#define EMU_STATUS_RACACTIVE  (1u << 10)
+/* Data sheet Table 4.10: tEM2_ENT, tEM2_WU without voltage scaling. */
+#define EM2_ENTRY_NS          5230
+#define EM2_WAKEUP_NS         13220
+#define CMU_SYSCLK_HFRCODPLL  2u
+#define EM2_GPIO_MODE_INPUT   1u
+#define EM2_GPIO_MODEL        0x04u
+#define EM2_GPIO_EXTIPSELL    0x400u
+#define EM2_GPIO_EXTIPINSELL  0x408u
+#define EM2_GPIO_EXTIFALL     0x414u
+#define EM2_GPIO_IF           0x420u
+#define EM2_GPIO_BASE         0x4003c000u
+#define EM2_PORT_A            0
+#define EM2_PORT_C            2
+#define EM2_LINE(port, pin)   ((port) * 16 + (pin))
+
+static void emu_signal(const char *name, int level)
+{
+    qtest_set_irq_in(global_qtest, EMU_PERIPH_PATH, name, 0, level);
+}
+
+static void emu_deep_sleep(void)
+{
+    emu_signal("m33-sleepdeep", 1);
+    emu_signal("m33-sleeping", 1);
+}
+
+static void emu_wake(void)
+{
+    emu_signal("m33-wakeup", 1);
+}
+
+/* Back in EM0 once the core runs: its NVIC drops the lines. */
+static void emu_running(void)
+{
+    emu_signal("m33-sleepdeep", 0);
+    emu_signal("m33-sleeping", 0);
+    emu_signal("m33-wakeup", 0);
+}
+
+static uint64_t emu_ns(const char *mode)
+{
+    QDict *r = qtest_qmp(global_qtest, "{'execute':'qom-get','arguments':"
+                         "{'path':'" EMU_PERIPH_PATH "','property':%s}}",
+                         mode);
+    uint64_t ns = qdict_get_int(r, "return");
+
+    qobject_unref(r);
+    return ns;
+}
+
+/* SYSCLK and TIMER0 on HFRCODPLL locked to the HFXO at 76.8 MHz. */
+static void emu_dpll_76m8_timer0(void)
+{
+    reset_with_radio_clocks();
+    writel(CMU_BASE_ADDR + CMU_DPLLREFCLKCTRL, 1);
+    writel(DPLL0_BASE_ADDR + DPLL_CFG1, (3839u << 16) | 1919u);
+    writel(DPLL0_BASE_ADDR + DPLL_EN, 1);
+    writel(CMU_BASE + CMU_SYSCLKCTRL, CMU_SYSCLK_HFRCODPLL);
+    writel(TIMER0_NS_BASE + TIMER_EN, TIMER_EN_EN);
+    writel(TIMER0_NS_BASE + TIMER_TOP, 0xffffffff);
+    writel(TIMER0_NS_BASE + TIMER_CNT, 0);
+    writel(TIMER0_NS_BASE + TIMER_CMD, TIMER_CMD_START);
+    timer0_step(HFXO_RDY_NS + DPLL_LOCK_NS);
+    g_assert_cmphex(readl(DPLL0_BASE + DPLL_STATUS) & DPLL_STATUS_RDY, ==,
+                    DPLL_STATUS_RDY);
+}
+
+/*
+ * EM2 is entered tEM2_ENT after a deep sleep starts; then the high-frequency
+ * clocks stop (TIMER0 holds its count), the HFXO is off and the DPLL is
+ * disabled, as after an EM2 wake on silicon (HFXO.STATUS 0x40000000,
+ * DPLL.STATUS 0, SS7.74).  A wake-up request returns the part tEM2_WU later
+ * with SYSCLK on the free-running HFRCODPLL, 76.748 MHz (SS7.74), until the
+ * DPLL is enabled again.
+ */
+static void test_emu_em2_entry_exit(void)
+{
+    uint32_t count;
+    uint64_t em2_before;
+
+    emu_dpll_76m8_timer0();
+    emu_deep_sleep();
+    timer0_step(EM2_ENTRY_NS - 1);
+    g_assert_cmphex(readl(EMU_BASE + EMU_STATUS) & EMU_STATUS_EM2ENTERED, ==, 0);
+    em2_before = emu_ns("em2-ns");
+    timer0_step(1);
+    g_assert_cmphex(readl(EMU_BASE + EMU_STATUS) & EMU_STATUS_EM2ENTERED, ==,
+                    EMU_STATUS_EM2ENTERED);
+    g_assert_cmphex(readl(DPLL0_BASE + DPLL_EN), ==, 0);
+    g_assert_cmphex(readl(HFXO_BASE + HFXO_STATUS) &
+                    (HFXO_STATUS_RDY | HFXO_STATUS_ENS), ==, 0);
+    count = readl(TIMER0_BASE + TIMER_CNT);
+    timer0_step(1000000);
+    g_assert_cmphex(readl(TIMER0_BASE + TIMER_CNT), ==, count);
+
+    emu_wake();
+    timer0_step(EM2_WAKEUP_NS - 1);
+    g_assert_cmphex(readl(TIMER0_BASE + TIMER_CNT), ==, count);
+    timer0_step(1);
+    g_assert_cmpuint(emu_ns("em2-ns") - em2_before, ==,
+                     1000000 + EM2_WAKEUP_NS);
+    emu_running();
+    /* 76.748 MHz: 7674 or 7675 counts in 100 us. */
+    timer0_step(100000);
+    g_assert_cmpuint(readl(TIMER0_BASE + TIMER_CNT) - count, >=, 7674);
+    g_assert_cmpuint(readl(TIMER0_BASE + TIMER_CNT) - count, <=, 7675);
+    g_assert_cmphex(readl(DPLL0_BASE + DPLL_STATUS), ==, 0);
+
+    /* Software relocks: the HFXO starts on the DPLL's request, then locks. */
+    writel(DPLL0_BASE + DPLL_EN + REGISTER_SET_WINDOW, DPLL_EN_EN);
+    timer0_step(HFXO_RDY_NS + DPLL_LOCK_NS);
+    g_assert_cmphex(readl(DPLL0_BASE + DPLL_STATUS) & DPLL_STATUS_RDY, ==,
+                    DPLL_STATUS_RDY);
+    count = readl(TIMER0_BASE + TIMER_CNT);
+    timer0_step(10000);
+    g_assert_cmpuint(readl(TIMER0_BASE + TIMER_CNT) - count, ==, 768);
+}
+
+/*
+ * No EM2: a wake-up before tEM2_ENT, or a probe that has powered the debug
+ * domain (SS7.74: EM2ENTERED stayed 0 with OpenOCD attached).  The part
+ * sleeps in EM1 instead, its clocks running.
+ */
+static void test_emu_em2_not_entered(void)
+{
+    uint32_t count;
+    uint64_t em1_before;
+
+    emu_dpll_76m8_timer0();
+    emu_deep_sleep();
+    timer0_step(EM2_ENTRY_NS - 1);
+    emu_wake();
+    emu_running();
+    timer0_step(EM2_ENTRY_NS);
+    g_assert_cmphex(readl(EMU_BASE + EMU_STATUS) & EMU_STATUS_EM2ENTERED, ==, 0);
+
+    emu_signal("debug-powered", 1);
+    em1_before = emu_ns("em1-ns");
+    emu_deep_sleep();
+    count = readl(TIMER0_BASE + TIMER_CNT);
+    timer0_step(10000);
+    g_assert_cmphex(readl(EMU_BASE + EMU_STATUS) & EMU_STATUS_EM2ENTERED, ==, 0);
+    g_assert_cmpuint(readl(TIMER0_BASE + TIMER_CNT) - count, ==, 768);
+    g_assert_cmpuint(emu_ns("em1-ns") - em1_before, ==, 10000);
+    emu_running();
+    emu_signal("debug-powered", 0);
+}
+
+/*
+ * GPIO in EM2 (data sheet SS3.3): port A pins keep detecting edges (an EM2
+ * wake-up source), port C pins are latched until the exit, where a level
+ * that still differs raises its flag.
+ */
+static void test_emu_em2_gpio_latch(void)
+{
+    const unsigned pc4 = EM2_LINE(EM2_PORT_C, 4), pa4 = EM2_LINE(EM2_PORT_A, 4);
+    const uint32_t exti_pc4 = 1u << 4, exti_pa4 = 1u << 5;
+
+    emu_dpll_76m8_timer0();
+    /* PC4 and PA4 inputs; EXTI4 on port C, EXTI5 on port A, falling edges. */
+    writel(EM2_GPIO_BASE + 0x30u * EM2_PORT_C + EM2_GPIO_MODEL,
+           EM2_GPIO_MODE_INPUT << 16);
+    writel(EM2_GPIO_BASE + 0x30u * EM2_PORT_A + EM2_GPIO_MODEL,
+           EM2_GPIO_MODE_INPUT << 16);
+    writel(EM2_GPIO_BASE + EM2_GPIO_EXTIPSELL,
+           (EM2_PORT_C << 16) | (EM2_PORT_A << 20));
+    writel(EM2_GPIO_BASE + EM2_GPIO_EXTIPINSELL, 0);
+    writel(EM2_GPIO_BASE + EM2_GPIO_EXTIFALL, exti_pc4 | exti_pa4);
+    qtest_set_irq_in(global_qtest, EMU_GPIO_PATH, "pin-in", pc4, 1);
+    qtest_set_irq_in(global_qtest, EMU_GPIO_PATH, "pin-in", pa4, 1);
+    writel(EM2_GPIO_BASE + EM2_GPIO_IF + REGISTER_CLEAR_WINDOW, UINT32_MAX);
+
+    emu_deep_sleep();
+    timer0_step(EM2_ENTRY_NS);
+    qtest_set_irq_in(global_qtest, EMU_GPIO_PATH, "pin-in", pc4, 0);
+    qtest_set_irq_in(global_qtest, EMU_GPIO_PATH, "pin-in", pa4, 0);
+    g_assert_cmphex(readl(EM2_GPIO_BASE + EM2_GPIO_IF) &
+                    (exti_pc4 | exti_pa4), ==, exti_pa4);
+    emu_wake();
+    timer0_step(EM2_WAKEUP_NS);
+    g_assert_cmphex(readl(EM2_GPIO_BASE + EM2_GPIO_IF) &
+                    (exti_pc4 | exti_pa4), ==, exti_pc4 | exti_pa4);
+    emu_running();
+}
+
+/*
+ * WDOG0 in EM2 (RM SS27.3.3): with CFG.EM2RUN clear the counter stops in EM2,
+ * with it set it runs on.  PERSEL 0 times out after 9 LF cycles (275 us);
+ * WDOGRSTDIS keeps the timeout a flag.
+ */
+#define EM2_WDOG0_BASE        0x4a018000u
+#define EM2_WDOG_EN           0x004u
+#define EM2_WDOG_CFG          0x008u
+#define EM2_WDOG_IF           0x018u
+#define EM2_WDOG_CFG_EM2RUN   (1u << 1)
+#define EM2_WDOG_CFG_EM3RUN   (1u << 2)
+#define EM2_WDOG_CFG_RSTDIS   (1u << 8)
+#define EM2_WDOG_IF_TOUT      (1u << 0)
+
+static uint32_t emu_em2_wdog_timeouts(uint32_t em2run)
+{
+    uint32_t flags;
+
+    emu_dpll_76m8_timer0();
+    writel(EM2_WDOG0_BASE + EM2_WDOG_CFG,
+           em2run | EM2_WDOG_CFG_EM3RUN | EM2_WDOG_CFG_RSTDIS);
+    writel(EM2_WDOG0_BASE + EM2_WDOG_EN, 1);
+    emu_deep_sleep();
+    timer0_step(EM2_ENTRY_NS);
+    timer0_step(1000000);
+    flags = readl(EM2_WDOG0_BASE + EM2_WDOG_IF) & EM2_WDOG_IF_TOUT;
+    emu_wake();
+    timer0_step(EM2_WAKEUP_NS);
+    emu_running();
+    return flags;
+}
+
+static void test_emu_em2_wdog(void)
+{
+    g_assert_cmphex(emu_em2_wdog_timeouts(0), ==, 0);
+    g_assert_cmphex(emu_em2_wdog_timeouts(EM2_WDOG_CFG_EM2RUN), ==,
+                    EM2_WDOG_IF_TOUT);
+}
+
+/*
+ * The M33's own deep sleep: SCR.SLEEPDEEP reads back (QEMU made it RAZ/WI),
+ * a WFI enters EM2 and a BURTC compare wakes the part; the core then runs on
+ * from the WFI after its interrupt.
+ */
+#define EM2_WFI_CODE          0x100u
+#define EM2_WFI_HANDLER       0x180u
+#define EM2_WFI_RESULT        0x20001000u
+#define EM2_NVIC_ISER0        0xe000e100u
+#define EM2_SCB_SCR           0xe000ed10u
+#define EM2_SCR_SLEEPDEEP     (1u << 2)
+#define EM2_BURTC_IRQ         18
+#define EM2_BURTC_VECTOR      (16 + EM2_BURTC_IRQ)
+#define THUMB16_BX_LR         0x4770u
+
+static void test_emu_em2_wfi(void)
+{
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel tcg "
+                                  "-icount shift=5,sleep=off -S");
+    const uint32_t code = EM2_WFI_CODE, lit = code + 32;
+    const uint32_t handler = EM2_WFI_HANDLER, hlit = handler + 8;
+    uint16_t insn[16], hinsn[4];
+    QDict *r;
+    size_t i;
+
+    insn[0] = thumb_ldr_pc(0, code + 0, lit + 0);   /* NVIC ISER0 */
+    insn[1] = thumb_ldr_pc(1, code + 2, lit + 4);   /* BURTC IRQ bit */
+    insn[2] = thumb_str_imm(1, 0, 0);
+    insn[3] = thumb_ldr_pc(0, code + 6, lit + 8);   /* SCB SCR */
+    insn[4] = thumb_movs_imm8(1, EM2_SCR_SLEEPDEEP);
+    insn[5] = thumb_str_imm(1, 0, 0);
+    insn[6] = THUMB16_WFI;
+    insn[7] = thumb_ldr_imm(3, 0, 0);               /* SCR read back */
+    insn[8] = thumb_ldr_pc(0, code + 16, lit + 12); /* EMU STATUS */
+    insn[9] = thumb_ldr_imm(1, 0, 0);
+    insn[10] = thumb_ldr_pc(2, code + 20, lit + 16); /* result */
+    insn[11] = thumb_str_imm(3, 2, 1);
+    insn[12] = thumb_str_imm(1, 2, 0);
+    insn[13] = THUMB16_BRANCH_SELF;
+    insn[14] = THUMB16_BRANCH_SELF;
+    insn[15] = THUMB16_BRANCH_SELF;
+    hinsn[0] = thumb_ldr_pc(0, handler + 0, hlit);   /* BURTC IF clear */
+    hinsn[1] = thumb_movs_imm8(1, BURTC_IF_COMP);
+    hinsn[2] = thumb_str_imm(1, 0, 0);
+    hinsn[3] = THUMB16_BX_LR;
+
+    qtest_writel(qts, 0x00000000, 0x20008000);
+    qtest_writel(qts, 0x00000004, code | 1);
+    qtest_writel(qts, 4 * EM2_BURTC_VECTOR, handler | 1);
+    for (i = 0; i < G_N_ELEMENTS(insn); i += 2) {
+        qtest_writel(qts, code + 2 * i, THUMB16_PAIR(insn[i], insn[i + 1]));
+    }
+    qtest_writel(qts, lit + 0, EM2_NVIC_ISER0);
+    qtest_writel(qts, lit + 4, 1u << EM2_BURTC_IRQ);
+    qtest_writel(qts, lit + 8, EM2_SCB_SCR);
+    qtest_writel(qts, lit + 12, EMU_BASE + EMU_STATUS);
+    qtest_writel(qts, lit + 16, EM2_WFI_RESULT);
+    for (i = 0; i < G_N_ELEMENTS(hinsn); i += 2) {
+        qtest_writel(qts, handler + 2 * i,
+                     THUMB16_PAIR(hinsn[i], hinsn[i + 1]));
+    }
+    qtest_writel(qts, hlit, BURTC_BASE + BURTC_IF + REGISTER_CLEAR_WINDOW);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    qtest_writel(qts, EM2_WFI_RESULT, 0);
+    qtest_writel(qts, EM2_WFI_RESULT + 4, 0);
+    qtest_writel(qts, CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW,
+                 CMU_CLKEN0_BURTC);
+    qtest_writel(qts, BURTC_BASE + BURTC_EN + REGISTER_SET_WINDOW, BURTC_EN_EN);
+    qtest_writel(qts, BURTC_BASE + BURTC_COMP, 64);
+    qtest_writel(qts, BURTC_BASE + BURTC_IEN + REGISTER_SET_WINDOW,
+                 BURTC_IF_COMP);
+    qtest_writel(qts, BURTC_BASE + BURTC_CMD, BURTC_CMD_START);
+    qtest_qmp_assert_success(qts, "{'execute':'cont'}");
+    /* Real time only bounds a hung QEMU; the outcome is fixed by icount. */
+    for (unsigned attempt = 0; attempt < 60000; attempt++) {
+        if (qtest_readl(qts, EM2_WFI_RESULT)) {
+            break;
+        }
+        g_usleep(1000);
+    }
+    qtest_qmp_assert_success(qts, "{'execute':'stop'}");
+    g_assert_cmphex(qtest_readl(qts, EM2_WFI_RESULT) &
+                    EMU_STATUS_EM2ENTERED, ==, EMU_STATUS_EM2ENTERED);
+    g_assert_cmphex(qtest_readl(qts, EM2_WFI_RESULT + 4) & EM2_SCR_SLEEPDEEP,
+                    ==, EM2_SCR_SLEEPDEEP);
+    r = qtest_qmp(qts, "{'execute':'qom-get','arguments':"
+                  "{'path':'" EMU_PERIPH_PATH "','property':'em2-ns'}}");
+    /* Asleep from the WFI until the compare: about 64 LF cycles. */
+    g_assert_cmpuint(qdict_get_int(r, "return"), >, 60 * LF_PERIOD_NS);
+    qobject_unref(r);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     int result;
@@ -5416,6 +5744,12 @@ int main(int argc, char **argv)
                    test_radio_sequencer_executes_open_code);
     qtest_add_func("/efr32bg22/radio-sequencer-release-is-idempotent",
                    test_radio_sequencer_release_is_idempotent);
+    qtest_add_func("/efr32bg22/emu-em2-entry-exit", test_emu_em2_entry_exit);
+    qtest_add_func("/efr32bg22/emu-em2-not-entered",
+                   test_emu_em2_not_entered);
+    qtest_add_func("/efr32bg22/emu-em2-gpio-latch", test_emu_em2_gpio_latch);
+    qtest_add_func("/efr32bg22/emu-em2-wfi", test_emu_em2_wfi);
+    qtest_add_func("/efr32bg22/emu-em2-wdog", test_emu_em2_wdog);
 
     result = g_test_run();
     qtest_end();

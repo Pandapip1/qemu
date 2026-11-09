@@ -75,6 +75,7 @@ bcm2838_gic_set_irq(int irq, int level) "gic irq:%d lvl:%d"
 efr32bg22_rac_command(unsigned endpoint, uint64_t now, uint32_t command, uint32_t state) "endpoint=%u now=%" PRIu64 " RAC.CMD=0x%08x state=%u"
 efr32bg22_rac_state(unsigned endpoint, uint64_t now, uint32_t previous, uint32_t state) "endpoint=%u now=%" PRIu64 " RAC state %u -> %u"
 efr32bg22_rf_rx_handoff(unsigned endpoint, uint64_t now, unsigned length) "endpoint=%u now=%" PRIu64 " RF RX handoff bytes=%u"
+efr32bg22_emu(unsigned endpoint, uint64_t now, const char *event, uint64_t em0_ns, uint64_t em1_ns, uint64_t em2_ns) "endpoint=%u now=%" PRIu64 " EMU %s em0_ns=%" PRIu64 " em1_ns=%" PRIu64 " em2_ns=%" PRIu64
 efr32bg22_radio_write(uint32_t pc, uint32_t address, uint32_t value, unsigned size) "pc=0x%08x addr=0x%08x value=0x%08x size=%u"
 efr32bg22_tx_snapshot(unsigned endpoint, uint64_t sequence, unsigned length, uint32_t first_word) "endpoint=%u TX snapshot sequence=%" PRIu64 " bytes=%u first=0x%08x"
 efr32bg22_ook_tx(unsigned endpoint, uint64_t khz, uint64_t baud, unsigned lead_symbols, unsigned octets, int64_t airtime_ns, int in_range, const char *bits) "endpoint=%u OOK TX khz=%" PRIu64 " baud=%" PRIu64 " lead=%u octets=%u airtime_ns=%" PRId64 " synth_in_range=%d bits=%s"
