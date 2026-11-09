@@ -367,7 +367,8 @@ static void tout_arm(uint32_t n)
 }
 
 #define MBX_BASE 0x00d00000u    /* UMAC 0xc0d00000 */
-static uint32_t host_csr[0x400];
+static uint32_t host_csr[0x1000];   /* 0x0000-0x3fff */
+static void host_alive_restock(void);
 static uint32_t mbx_idx, mbx_data;
 
 static target_ulong cur_pc(void)
@@ -438,7 +439,7 @@ static uint64_t trace_read(void *opaque, hwaddr addr, unsigned size)
         return v;
     }
     if (a == MBX_BASE + 0x28 && !hit) {
-        v = host_csr[(mbx_idx >> 2) & 0x3ff];
+        v = host_csr[(mbx_idx >> 2) & 0xfff];
         trace_log("R.csr", mbx_idx, v, size);
         return v;
     }
@@ -473,7 +474,10 @@ static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     } else if (a == MBX_BASE + 0x24) {
         mbx_data = val;
     } else if (a == MBX_BASE + 0x1c && (val >> 24) == 0x69) {
-        host_csr[(mbx_idx >> 2) & 0x3ff] = mbx_data;
+        host_csr[(mbx_idx >> 2) & 0xfff] = mbx_data;
+        if (mbx_idx == 0x008 && (mbx_data & 1)) {   /* CSR_INT_BIT_ALIVE */
+            host_alive_restock();
+        }
         trace_log("W.csr", mbx_idx, mbx_data, size);
     }
     if (a == DMA_STAT && (val & (1u << 29))) {
@@ -610,6 +614,44 @@ static void host_csr_write64(unsigned off, uint64_t v)
     host_csr[(off + 4) >> 2] = v >> 32;
 }
 
+/* The driver's answer to the ALIVE interrupt (H1): on gen2 parts it does not
+ * restock RX before the kick ("Restock will be done at alive, after firmware
+ * configured the RFH", pcie/rx.c iwl_pcie_gen2_rx_init); on CSR_INT_BIT_ALIVE
+ * iwl_pcie_rxmq_restock posts every free buffer as a 16-byte transfer
+ * descriptor {rbid, addr} (iwl_pcie_restock_bd) and writes the index, rounded
+ * down to 8, to RFH_Q0_FRBDCB_WIDX_TRG (CSR 0x1c80). 4096 buffers, one kept
+ * back (iwl_trans_get_num_rbds: 2 * IWL_NUM_RBDS_HE); RB IDs follow the
+ * pool (the allocator keeps IDs 1-6). The device-side RFH_Q0_FRBDCB_WIDX
+ * (0xa08080, iwl-fh.h) is given the same value [I]. */
+#define HOST_RX_NBUF    4095
+#define HOST_RX_RBID0   7
+static hwaddr host_rx_bd;
+
+static void host_alive_restock(void)
+{
+    static bool done;
+    uint8_t d[16] = { 0 };
+    uint32_t widx = HOST_RX_NBUF & ~7u;
+
+    if (!host_rx_bd || done) {
+        return;
+    }
+    done = true;
+    for (uint32_t k = 0; k < HOST_RX_NBUF; k++) {
+        stw_le_p(d, HOST_RX_RBID0 + k);
+        stq_le_p(d + 8, host_alloc(HOST_PAGE));
+        address_space_write(&address_space_memory, host_rx_bd + 16 * k,
+                            MEMTXATTRS_UNSPECIFIED, d, sizeof(d));
+    }
+    host_csr[0x1c80 >> 2] = widx;
+    if (!regstore) {
+        regstore = g_hash_table_new(g_direct_hash, g_direct_equal);
+    }
+    g_hash_table_insert(regstore, GUINT_TO_POINTER(0x00a08080u),
+                        GUINT_TO_POINTER(widx));
+    trace_log("HOST.restock", host_rx_bd, widx, 4);
+}
+
 static void ax210_host_driver_init(const char *path)
 {
     gchar *buf;
@@ -646,6 +688,7 @@ static void ax210_host_driver_init(const char *path)
 
     /* iwl_pcie_gen2_nic_init(): RX queue and command queue rings. */
     rx_bd = host_alloc(4096 * 16);         /* 2 * IWL_NUM_RBDS_HE transfer descs */
+    host_rx_bd = rx_bd;
     rx_used = host_alloc(4096 * 32);       /* completion descs */
     rx_stts = host_alloc(HOST_PAGE);
     cmdq = host_alloc(128 * 256);          /* min_txq_size TFDs, 256B format */
@@ -903,7 +946,7 @@ static void ax210_init(MachineState *machine)
             char *eq = strchr(t3, '=');
             if (!eq) continue;
             *eq = 0;
-            host_csr[(strtoul(t3, 0, 16) >> 2) & 0x3ff] = strtoul(eq + 1, 0, 0);
+            host_csr[(strtoul(t3, 0, 16) >> 2) & 0xfff] = strtoul(eq + 1, 0, 0);
         }
         g_free(c);
     }
