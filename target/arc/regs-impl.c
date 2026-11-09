@@ -315,6 +315,9 @@ arc_general_regs_set(const struct arc_aux_reg_detail *aux_reg_detail,
         env->status32_l2 = val;
         break;
 
+    case AUX_ID_bpu_flush:      /* ARC700: no branch predictor to flush */
+        break;
+
     case AUX_ID_aux_irq_lv12:
         env->aux_irq_lv12 &= ~val;
         break;
