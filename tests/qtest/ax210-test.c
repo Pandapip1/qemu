@@ -293,7 +293,7 @@ static void test_host_csr_driver_defaults(void)
 
     qtest_writel(s, 0xc0d00020, 0x028);       /* CSR_HW_REV */
     qtest_writel(s, 0xc0d0001c, 0x6a000000);
-    g_assert_cmphex(qtest_readl(s, 0xc0d00028) & 0xfff0, ==, 0x420); /* TY */
+    g_assert_cmphex(qtest_readl(s, 0xc0d00028), ==, 0x420); /* silicon */
     qtest_writel(s, 0xc0d00020, 0x000);       /* CSR_HW_IF_CONFIG_REG */
     qtest_writel(s, 0xc0d0001c, 0x6a000000);
     g_assert_cmphex(qtest_readl(s, 0xc0d00028) & 0xf, ==, 0x2);
