@@ -267,6 +267,15 @@ static const struct {
     { 0x00a2b800, 0x00400410 },     /* SD_REG_VER_GEN2 = CNVR_AUX_MISC_CHIP */
     { 0x00d03098, 0x80000000 },     /* WFPM_OTP_CFG1_ADDR */
     { 0x00a340fc, 0x0000a652 },     /* FSEQ_OTP_VERSION (per card) */
+    /* LMPM_NIC_ISR0-4 (finding R2): an idle AX210's values (LKML dump, the
+     * firmware booted and waiting on the host); the Framework card agrees
+     * on ISR0/ISR2. LMAC's writes (0xffffffff, ...) never show on silicon.
+     * Event sources that would set or clear bits are not modelled. */
+    { 0x00a01e20, 0x00020000 },     /* ISR0 */
+    { 0x00a01e24, 0x00000000 },     /* ISR1 */
+    { 0x00a01e28, 0x48f00002 },     /* ISR2 */
+    { 0x00a01e2c, 0x00c0001c },     /* ISR3 */
+    { 0x00a01e30, 0x00000000 },     /* ISR4 */
 };
 
 static bool chip_id_read(hwaddr a, uint32_t *v)

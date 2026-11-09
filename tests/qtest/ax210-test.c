@@ -242,6 +242,9 @@ static void test_lmac_indirect_target_and_chip_ids(void)
     g_assert_cmphex(qtest_readl(s, 0xa2ac00), ==, 0x400410);
     g_assert_cmphex(qtest_readl(s, 0xd03098), ==, 0x80000000);
     g_assert_cmphex(qtest_readl(s, 0xa340fc), ==, 0xa652);
+    qtest_writel(s, 0xa01e20, 0xffffffff);  /* ISR0 (R2): writes do not show */
+    g_assert_cmphex(qtest_readl(s, 0xa01e20), ==, 0x00020000);
+    g_assert_cmphex(qtest_readl(s, 0xa01e28), ==, 0x48f00002);
     qtest_quit(s);
 }
 
