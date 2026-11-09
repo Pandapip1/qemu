@@ -114,6 +114,7 @@ Two tiers exist, and they should not be confused:
   messages to the other, because the receive side is [?].
 - LMAC interrupt sources (V1 expiry, Q1 inbound, anything giving the main
   loop at `0x4d08fa` work): [?].
+- UMAC IRQ5 is a cause aggregator [F structure, not modelled]: `0xc0083f60` reads the summary word `0xd02e64` (fatal `0x100116` if 0), takes the highest set bit k and calls `table[k]` at `0xc0880a64` (filled at runtime; at idle ~18 bits have handlers, `0xc0082100` is the empty entry). The `0xd02e00` block holds groups n: mask `+4n`, status `+0x20+4n`, acknowledged by writing the bit (handlers `0xc008214c` n=1, `0xc00822e8` n=2, `0xc0082334` n=4, `0xc008208c` n=6); D1's DMA-done bit (`+0x24` bit 29) and G2's bit (`+0x2c` bit 4) sit in groups 1 and 3. Which group bit an LMAC message raises, and where UMAC reads it, are [?]; `0xd00e00` (UMAC `0xc00824b8` compares `0xd00e4c`/`0xd00e50`; LMAC `0x1544` polls `0xd00e40`) is the next lead.
 - UMAC IRQ5 and IRQ8 (level 2) sources: [?]. IRQ8's handler (`0xc0080658`) reads `0xd02fa0`, `0xd00ee0`, `0xd05498`, `0xd03944`, `0xc0a01c64`.
 - Signatures UMAC `0x80448ca4` checks: `0xa340f0` == `0x4552414e` is written by UMAC itself later (`0x804490fc`), so it is a warm-boot marker; the writer of `0xa34048` (`|0xe == 0x5442440f`) is unknown. Both read 0 on this cold boot.
 - The crypto coprocessor path (`0xa248xx`/`0xc0e2xxxx`): traced as a
