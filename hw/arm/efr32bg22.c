@@ -2457,6 +2457,22 @@ static void efr32_rac_rx_handoff(void *opaque)
     data = g_bytes_get_data(efr32_rf_rx_delivery_request_get_data(request),
                             &length);
 
+    if (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >
+        metadata->air_start_ns + EFR32_RF_FRAMESENT_TO_PEER_EOF_NS) {
+        /*
+         * As on the released-sequencer path above: a receiver that was not
+         * searching when the preamble reached it cannot synchronise to this
+         * frame, whichever path would have handed it over.
+         */
+        efr32_rf_rx_delivery_request_free(request);
+        s->rx_offer_pending = efr32_rf_medium_has_rx_offer_for_radio(
+            s->rf_medium, EFR32_RF_RADIO(s));
+        if (s->rx_offer_pending) {
+            efr32_rac_schedule_rx_handoff(s);
+        }
+        return;
+    }
+
     descriptor_configured = efr32_bufc_descriptor_channel_configured(s);
     if (descriptor_configured && !efr32_bufc_descriptor_has_room(s)) {
         /*

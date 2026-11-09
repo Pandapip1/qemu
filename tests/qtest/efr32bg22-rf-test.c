@@ -961,6 +961,56 @@ static void test_tx_offer_waits_for_receiver_rxsearch(void)
 }
 
 /*
+ * A receiver that reaches RXSEARCH after a frame's preamble has reached it
+ * cannot synchronise to that frame, on the QEMU-only handoff path as on the
+ * released-sequencer one: the transmission is still on air, but the peer
+ * receives nothing from it.
+ */
+static void test_rxsearch_after_preamble_misses_frame(void)
+{
+    const uint8_t payload[] = { 0x5a, 0x3c };
+    const uint32_t fifo_guest_address = 0x20000600;
+    const uint64_t peer_rx_channel = peer(BUFC_BASE + BUFC_CH1);
+    const uint32_t source_tx_channel = BUFC_BASE + BUFC_CH0;
+
+    qtest_writel(global_qtest, RAC_BASE + RAC_CMD, RAC_CMD_TXDIS);
+    qtest_writel(global_qtest, peer(RAC_BASE + RAC_CMD), RAC_CMD_RXDIS);
+    qtest_writel(global_qtest, peer(FRC_BASE + FRC_IF + REGISTER_CLEAR_WINDOW),
+                 FRC_IF_RXDONE);
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_CMD, 1);
+    qtest_writel(global_qtest, peer_rx_channel + BUFC_ADDR, fifo_guest_address);
+    qtest_writel(global_qtest, peer_rx_channel, 0); /* 64-byte peer RX FIFO */
+
+    qtest_writel(global_qtest, source_tx_channel + BUFC_CMD, 1);
+    for (size_t index = 0; index < G_N_ELEMENTS(payload); index++) {
+        qtest_writeb(global_qtest, fifo_guest_address + index, payload[index]);
+    }
+    qtest_writel(global_qtest, source_tx_channel + BUFC_ADDR, fifo_guest_address);
+    qtest_writel(global_qtest, source_tx_channel, 0); /* 64-byte source TX FIFO */
+    qtest_writel(global_qtest, source_tx_channel + BUFC_WRITEOFFSET,
+                 G_N_ELEMENTS(payload));
+    qtest_writel(global_qtest, RAC_BASE + RAC_CMD, RAC_CMD_TXEN);
+
+    /* Well past the preamble and access address, before the frame's end. */
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(60000);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+
+    qtest_writel(global_qtest,
+                 peer(RAC_BASE + RAC_RXENSRCEN + REGISTER_SET_WINDOW),
+                 RAC_RXENSRCEN_SWRXEN);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'cont'}");
+    clock_step(1);
+    qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
+
+    g_assert_cmphex(qtest_readl(global_qtest, peer(FRC_BASE + FRC_IF)) &
+                        FRC_IF_RXDONE,
+                    ==, 0);
+    g_assert_cmphex(qtest_readl(global_qtest,
+                                peer_rx_channel + BUFC_WRITEOFFSET), ==, 0);
+}
+
+/*
  * Two chips on a bench reset independently: a WDOG0 timeout in the second
  * SoC (CFG 0: PERSEL 0, 2^3 + 1 LF cycles, RM SS27.3.2) resets that SoC
  * alone, RSTCAUSE.WDOG0 (RM SS12.5.15); the first keeps its clocks and its
@@ -2637,6 +2687,8 @@ int main(int argc, char **argv)
                    test_completed_tx_withdraws_deferred_offer);
     qtest_add_func("/efr32bg22/rf/tx-offer-waits-for-receiver-rxsearch",
                    test_tx_offer_waits_for_receiver_rxsearch);
+    qtest_add_func("/efr32bg22/rf/rxsearch-after-preamble-misses-frame",
+                   test_rxsearch_after_preamble_misses_frame);
     qtest_add_func("/efr32bg22/rf/system-reset-with-deferred-offer",
                    test_system_reset_with_deferred_offer);
     qtest_add_func("/efr32bg22/rf/wdog-resets-one-soc",
