@@ -44,6 +44,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(BCM4387MachineState, BCM4387_MACHINE)
 #define RAM_BASE        0x740000
 #define RAM_SIZE        0x1f9000
 #define RAM_TOP         (RAM_BASE + RAM_SIZE)
+
+/*
+ * RAM above the TCM. The firmware's ROM-patch veneers (0x750000) branch to
+ * patch code in 0x939000-0xb36000, above the TCM window; the image is not
+ * compressed, so the firmware is expected to populate this region itself at
+ * runtime. Map it as plain RAM (separate from the TCM banks so the ramsize
+ * calc at RAM 0x82c354 is unaffected) so those writes land instead of being
+ * dropped by the catch-all tracer.
+ */
+#define SOCRAM_BASE     RAM_TOP
+#define SOCRAM_SIZE     0x207000
 #define ROM_BASE        0x400000
 /*
  * The dumped ROM is 0x180000 (0x400000-0x580000), but one ROM-patch entry
@@ -93,7 +104,7 @@ struct BCM4387MachineState {
     bool identity;
 
     ARMCPU *cpu;
-    MemoryRegion atcm, atcm_alias, btcm, rom_mr, erom, scratch, trace;
+    MemoryRegion atcm, atcm_alias, btcm, socram, rom_mr, erom, scratch, trace;
     GHashTable *store;
     uint32_t cr4_bankidx;
     uint32_t bank_info[8];
@@ -393,6 +404,11 @@ static void bcm4387_init(MachineState *machine)
     memory_region_init_ram(&s->btcm, NULL, "bcm4387.btcm",
                            RAM_SIZE - s->atcm_size, &error_fatal);
     memory_region_add_subregion(sysmem, RAM_BASE + s->atcm_size, &s->btcm);
+
+    /* RAM above the TCM for the firmware's ROM-patch code (see SOCRAM_BASE). */
+    memory_region_init_ram(&s->socram, NULL, "bcm4387.socram", SOCRAM_SIZE,
+                           &error_fatal);
+    memory_region_add_subregion(sysmem, SOCRAM_BASE, &s->socram);
 
     s->nab = banks_fill(s->bank_info, 0, s->atcm_size);
     s->nbb = banks_fill(s->bank_info, s->nab, RAM_SIZE - s->atcm_size) -
