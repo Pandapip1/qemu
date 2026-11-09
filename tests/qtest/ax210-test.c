@@ -340,6 +340,20 @@ static void test_lmac_to_umac_frame(void)
     qtest_quit(s);
 }
 
+static void test_lmac_nic_doorbell(void)
+{
+    QTestState *s = qtest_init("-M ax210 -m 32M -nographic -monitor none "
+                               "-serial none -S");
+
+    qtest_writel(s, 0xc0a01e80, 0x10);          /* mask */
+    g_assert_cmphex(qtest_readl(s, 0xc0a01e84), ==, 0);
+    qtest_writel(s, 0xc0a01e88, 0x10);          /* UMAC sets cause bit 4 */
+    g_assert_cmphex(qtest_readl(s, 0xc0a01e84), ==, 0x10);
+    qtest_writel(s, 0xc0a01e84, 0x10);          /* write 1 to clear */
+    g_assert_cmphex(qtest_readl(s, 0xc0a01e84), ==, 0);
+    qtest_quit(s);
+}
+
 static void test_semaphore_two_cores(void)
 {
     QTestState *s = qtest_init("-M ax210 -m 32M -nographic -monitor none "
@@ -501,6 +515,7 @@ int main(int argc, char **argv)
     qtest_add_func("/ax210/cfg-unit-start-done", test_cfg_unit_start_done);
     qtest_add_func("/ax210/umac-timeout-timer", test_umac_timeout_timer);
     qtest_add_func("/ax210/lmac-to-umac-frame", test_lmac_to_umac_frame);
+    qtest_add_func("/ax210/lmac-nic-doorbell", test_lmac_nic_doorbell);
     qtest_add_func("/ax210/umac-windows-alias-device",
                    test_umac_windows_alias_device);
 

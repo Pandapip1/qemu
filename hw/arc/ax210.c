@@ -396,6 +396,16 @@ static unsigned txf_n;
 static uint32_t urxf[URXF_CAP];
 static unsigned urxf_rd, urxf_wr;
 
+/* Cross-core signals end the sender's round-robin timeslice, so the
+ * receiver runs before the sender's busy-wait timeouts (counted in reads of
+ * the 0xd02c68 counter, not time) expire. */
+static void yield_to_peer(void)
+{
+    if (current_cpu) {
+        cpu_exit(current_cpu);
+    }
+}
+
 static void urxf_update(void)
 {
     CPUARCState *env;
@@ -444,6 +454,27 @@ static void txf_lmac_push(uint32_t w)
     trace_log("TXF.U", TXF_LARC_SEL, txf_frame[0], txf_frame[1]);
     txf_n = 0;
     urxf_update();
+    yield_to_peer();
+}
+
+/* LMAC NIC interrupt, IRQ22 (finding Q4, [F]): LMAC's handler (0xdac)
+ * takes cause = [0xa01e80] & [0xa01e84]; LMAC builds the mask at 0xa01e80
+ * bit by bit at boot. UMAC writes 0x10 to 0xa01e88 right after pushing a
+ * message for LMAC on TXF_CPU2. Model: +0x84 status (write 1 to clear),
+ * +0x88 sets status bits; IRQ22 follows status & mask. */
+#define NIC_MASK 0x00a01e80u
+#define NIC_STAT 0x00a01e84u
+#define NIC_SET  0x00a01e88u
+#define NIC_IRQ  22
+static uint32_t nic_stat;
+
+static void nic_update(void)
+{
+    if (!lmac_cs) {
+        return;
+    }
+    qemu_set_irq(ARC_CPU(lmac_cs)->env.irq[NIC_IRQ],
+                 (nic_stat & rs_get(NIC_MASK)) != 0);
 }
 
 #define MBX_BASE 0x00d00000u    /* UMAC 0xc0d00000 */
@@ -512,6 +543,10 @@ static uint64_t trace_read(void *opaque, hwaddr addr, unsigned size)
         v = (rs_get(ISTAT) & ~TOUT_BIT) | (tout_fired ? TOUT_BIT : 0);
         trace_log("R.istat", ra, v, size);
         return v;
+    }
+    if (a == NIC_STAT && !hit) {
+        trace_log("R.nic", ra, nic_stat, size);
+        return nic_stat;
     }
     if (a == URXF_POP && !hit) {
         v = urxf_pop();
@@ -643,6 +678,16 @@ static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
                         (gpointer)(uintptr_t)(uint32_t)val);
     if (a == DMA_BASE + 0x34) {
         dma_kick();
+    }
+    if (a == NIC_STAT) {
+        nic_stat &= ~(uint32_t)val;
+    } else if (a == NIC_SET) {
+        nic_stat |= (uint32_t)val;
+        trace_log("NIC.S", ra, nic_stat, size);
+        yield_to_peer();
+    }
+    if (a == NIC_MASK || a == NIC_STAT || a == NIC_SET) {
+        nic_update();
     }
 }
 

@@ -99,6 +99,8 @@ when run against this model", not a claim about real silicon.
 | A8 | ARCompact interrupt delivery: lines 3-31, `AUX_IENABLE`, `AUX_IRQ_LEV` levels, `E1/E2`/`A1/A2`, `ILINKn`/`STATUS32_Ln`/`BTA_Ln`, `ICAUSE1/2`, sticky `AUX_IRQ_LV12`, vector slot `8n` | **yes**, architectural | Register numbers and bits from Linux `arch/arc` (`irqflags-compact.h`, `entry-compact.S`: `AUX_IRQ_LV12` write-1-to-clear). `AUX_IENABLE` resets all-enabled: nothing in the `.ucode` writes it, yet UMAC handles IRQ5/6/8. UMAC's table at `0xc0080000` confirms the layout: IRQ3/4 (timers) are `flag 1` halts, IRQ5/6/8 have handlers, IRQ7/9 share an `ICAUSE`-reporting default; `0x100-0x120` are the A4 exception slots. Interrupt priority within a level: lowest line first. |
 | A9 | ARC700 `BPU_FLUSH` (aux `0xf`) write | **yes** | Architectural; declared without a setter, so UMAC's `sr 0xf,[bpu_flush]` in its ALIVE builder (`0x80493954`) raised an instruction error. QEMU has no branch predictor, so the write is a no-op. Found by calling the message-30 handler directly (Q3 experiment). |
 | A10 | ARC700 `mpyh`/`mpyhu` | **yes** | Architectural; same encodings as ARCv2 `mpym`/`mpymu` (`0x201B..`/`0x201C..`) but unmapped for ARC700, so UMAC's 64-bit multiply helper (`0xc0081d36`, on the ALIVE path) raised an instruction error. Mapped to the `MPYM`/`MPYMU` semantics. |
+| A11 | ARCv2 interrupt vector fetch | **yes** (F) | LMAC's MPU region 0 (ICCM, base 0) is execute-only (`--x`), and its vector table lives there; IRQ22 still works on silicon, so the vector entry is fetched through the instruction path. The fork read it as data (`cpu_ldl_data`), raising Protection Violation `ecr 0x00060104` on the first LMAC interrupt; now `cpu_ldl_code`. (Exception entry already read the vector physically.) |
+| Q4 | NIC doorbells between the cores | **partial** (F) | LMAC: `0xa01e80` mask (built bit by bit at boot, `0x09109b31`), `0xa01e84` status, `0xa01e88` set; IRQ22 (`0xdac`) maps cause bits to events (`0x20` RX, `0x10` -> `0x71`, `0x100`/`0x200` -> `0x90`/`0x91`, `0x800` -> `0x46`, `0x1000` -> `0x4c`, `0x8000` -> `0x68`, `0x100000` -> `0x65`, `0x8000000` -> `0x72`, others `0x84`). UMAC writes `0x10` to `0xa01e88` in its fatal path after the `0xfd11` timeout (`0x804839b2`), then waits for `0xd02e84` bit 1 (`0x80483b4c`); LMAC answers event `0x71` by dumping its ISRs and writing 2 to `0xd02e88` before halting (`0x1560`), so UMAC's `0xd02e80/84/88` is the mirror block. Modelled: LMAC's block (status write-1-to-clear assumed, qtest `lmac-nic-doorbell`); UMAC's mirror is not. Both cross-core signals (this and Q3) end the sender's round-robin timeslice, since the fork runs both cores on one TCG thread (100 ms kick) and UMAC's busy-waits count reads of the `0xd02c68` counter, not time. |
 | K2 | Chip IDs, read-only: `CNVI_AUX_MISC_CHIP` `0xa200b0` = `0x400410`, `SD_REG_VER_GEN2`/`CNVR_AUX_MISC_CHIP` `0xa2b800` = `0x400410`, `WFPM_OTP_CFG1_ADDR` `0xd03098` = `0x80000000` | **yes**, silicon | Three AX210 cards' dmesg: `ref-silicon/fw89-framework16-dmesg.txt` (firmware 89.6b44fa0b, same API version as the model's 89.b20dcd1f: "Detected crf-id 0x400410, cnv-id 0x400410 wfpm id 0x80000000" and `0x00400410 | CNVI_AUX_MISC_CHIP` / `CNVR_AUX_MISC_CHIP`), `ref-silicon/fw67-freebsd262150-dmesg.txt` (same IDs, fw 67), an Intel community log (URL in `ref-silicon/README.md`). `FSEQ_OTP_VERSION` `0xa340fc` = `0xa652` on all three saved cards; the firmware only reads it (UMAC `0x80448cae` branches on `>= 0xa440`); per-card OTP value; the driver reads exactly these registers (`pcie/trans.c`, names and addresses `iwl-prph.h`; WFPM at UMAC periphery offset `0x300000`). UMAC `0x80448ca4` writes the expected IDs to `FSEQ_CNVI_ID` `0xa3408c` / `FSEQ_CNVR_ID` `0xa34090` and compares (`0xa200b0` masked `0xff0fffff`; CNVR through the W1 window as `0xb800`); a mismatch is fatal `0x1013f1`. Now passes on the silicon values (status `0x20000061`, bit 1 clear). Replaces an earlier [I] model of these as write/readback aliases, which the register names contradicted. Tested `/ax210/lmac/indirect-target-chip-ids`. |
 | K3 | Cross-core view of LMAC's `0xa0` page: UMAC `0xc0a0xxxx` == LMAC `0x00a0xxxx` | **yes**, [F] | UMAC `0x804a8b80` builds the LMAC-view address `0xa0a404 + 16*ch` and converts it with `(a & 0xff0fffff) \| 0xc0a00000`, the counterpart of K1's `\| 0xc0e20000` for `0xa2/0xa3`. So D1's DMA engine and Q2's FIFO are LMAC `0xa0a500` / `0xa00500`, and Q1 (`0xa00400`) is the same unit UMAC configures at `0xc0a00400` (`0x804a8b18`: per channel, select `+0x3c`, buffer `+0x34`, size `+0x30`). Models are keyed accordingly. |
 | Q2 | CPU2 (UMAC) TX FIFOs at `0xa00500` (UMAC `0xc0a00500`): `TXF_CPU2_*` (`iwl-prph.h`) | modelled, [I] | Q1's layout in UMAC's own `0xc0a0xxxx` MMIO block (now traced, `0xc0a00000-0xc0a0ffff`): UMAC `0xc008d0a0` selects channel `0xe` at `+0x3c` as LMAC does at `0xa0043c`, free = `max(cap - fill - 8, 0)`, push via `0x804a8d48` to `+0x40`; error `0x100efa` when it does not fit. Modelled as Q1. Tested `/ax210/lmac/msg-fifo-space`. |
@@ -111,7 +113,9 @@ when run against this model", not a claim about real silicon.
 ## Acceptance criteria: "accurate enough" (timing out of scope), 2026-11-09
 
 1. Both cores boot from their entry points to their idle states with no
-   exception and no fatal error. **Met** (U2, L2; `dual_boot.py`).
+   exception and no fatal error. **Met** up to LMAC's ALIVE report (U2, L2;
+   `dual_boot.py`). With Q3 delivery UMAC goes on to request `0xfd11`
+   from LMAC and stops at fatal `0x100ef8` (timeout) when it gets no reply.
 2. The firmware completes the documented host boot protocol: ALIVE
    interrupt, the driver's RX restock, then the ALIVE notification in a
    host RX buffer with fields matching `fw/api/alive.h` and the ucode's
@@ -139,7 +143,7 @@ inferred, **?** unknown. N-rows list hardware not modelled at all.
 
 | | yes | partial | no | contradicts | n/a | total |
 |---|---|---|---|---|---|---|
-| 2026-11-09 | 17 | 25 | 8 | 0 | 1 | 51 |
+| 2026-11-09 | 18 | 26 | 8 | 0 | 1 | 53 |
 
 Contradictions resolved in this pass (now **yes**): K2 (write/readback
 aliases vs. read-only chip IDs, by iwl-prph.h names and silicon values),
@@ -185,6 +189,8 @@ space (M3), FSEQ_OTP_VERSION 0 vs `0xa652`.
 | A8 | yes | V (Linux arch/arc) + F | Priority within a level assumed lowest line first. |
 | A9 | yes | Architectural | - |
 | A10 | yes | Architectural | - |
+| A11 | yes | F (LMAC MPU config) | - |
+| Q4 | partial | F | UMAC's mirror block `0xd02e80/84/88` (LMAC's halt ack) not modelled. |
 | K2 | yes | S (three cards) + V | - |
 | K3 | yes | F | - |
 | Q2 | partial | V (iwl-prph.h TXF_CPU2_*) | As Q1. |

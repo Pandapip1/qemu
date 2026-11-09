@@ -33,9 +33,11 @@
 #if defined(TARGET_ARC32)
 #define TARGET_LONG_LOAD(ENV, ADDR) cpu_ldl_data(ENV, ADDR)
 #define TARGET_LONG_STORE(ENV, ADDR, VALUE) cpu_stl_data(ENV, ADDR, VALUE)
+#define TARGET_VECTOR_LOAD(ENV, ADDR) cpu_ldl_code(ENV, ADDR)
 #elif defined(TARGET_ARC64)
 #define TARGET_LONG_LOAD(ENV, ADDR) cpu_ldq_data(ENV, ADDR)
 #define TARGET_LONG_STORE(ENV, ADDR, VALUE) cpu_stq_data(ENV, ADDR, VALUE)
+#define TARGET_VECTOR_LOAD(ENV, ADDR) cpu_ldq_code(ENV, ADDR)
 #else
 #error "This should never happen !!!!"
 #endif
@@ -617,7 +619,7 @@ bool arc_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
 
     /* XX. The PC is set with the appropriate exception vector. */
     offset = OFFSET_FOR_VECTOR(vectno);
-    env->pc = TARGET_LONG_LOAD(env, env->intvec + offset);
+    env->pc = TARGET_VECTOR_LOAD(env, env->intvec + offset);
     CPU_PCL(env) = env->pc & (~((target_ulong) 3));
 
     qemu_log_mask(CPU_LOG_INT, "[IRQ] isr=0x" TARGET_FMT_lx
