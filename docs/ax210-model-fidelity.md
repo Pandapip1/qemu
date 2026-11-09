@@ -103,6 +103,7 @@ when run against this model", not a claim about real silicon.
 | I1 | Indirect `0x940c` (device `0xa2940c`, W1) bit 0 | [?], harness-supplied | UMAC `0x8044a49a` requires it after init call `0x8049f934` (else fatal `0x10133c`); no firmware writes it, so it is hardware status. Not modelled: supplied by the harness via `AX210_IND=940c=1` (seeds the W1 store). |
 | G1 | Configure-and-start unit at `0xd03f00`: config `+0x0/+0x4/+0x8`, start `+0x10` bit 0, done `+0x14` bit 0 | modelled, [I] | UMAC `0x8044acd0` loads three words from `0xc088400c` (the last two are addresses it then writes through), `0x804a6c94` starts and waits ~20 timebase ticks for done, else fatal `0x101035`. No firmware on either core writes `+0x14`. Model: done follows start at once. Tested `/ax210/cfg-unit-start-done`. |
 | G2 | UMAC timeout timer: write N to `0xd02c78` arms; expiry sets `0xd02e2c` bit 4 and raises IRQ6; writing bit 4 clears | modelled, [I]; tick rate [?] | UMAC's idle loop re-arms `0x30d40` at `0x804a66a0` before each `sleep`; its IRQ6 handler `0xc0080b30` writes `0x10` to `0xd02e2c` and re-arms. Model: one-shot, 1 tick = 1 us of virtual time. Under it UMAC takes IRQ6 every 200 ms from its idle `sleep` and returns. Tested `/ax210/umac-timeout-timer`. |
+| R2 | `LMPM_NIC_ISR0-4` at `0xa01e20-0xa01e30` (LMAC interrupt status) | **contradicts** | LMAC's fatal handler `0x4d1eaa` copies these five registers into its error table as isr0-isr4 (field names `fw/dump.c`; table `0x4f2358`), and `lmpm_pmg_sel` from `0xa01c0c`. Silicon at idle (`ref-silicon/fw89-lkml-2407-00526-dmesg.txt`): `0x00020000`, `0`, `0x48F00002`, `0x00C0001C`, `0`, pmg_sel `9`; the Framework card (after a fault) agrees on isr0/isr2/pmg_sel. The model reads back LMAC's init writes (`0xffffffff`, `0xf5ffff7f`, ... from `0x986c`/`0xa964`, the pattern of write-1-to-clear), via R1, and `0xb` for pmg_sel: values silicon never shows. Not changed: LMAC reads these in ~30 places (event handling), so their semantics belong with LMAC's interrupt sources (L2 gap, N3); a guessed constant could make LMAC process events that never occurred. |
 
 ## Audit (EFR32 method), 2026-11-09
 
@@ -116,7 +117,7 @@ inferred, **?** unknown. N-rows list hardware not modelled at all.
 
 | | yes | partial | no | contradicts | n/a | total |
 |---|---|---|---|---|---|---|
-| 2026-11-09 | 15 | 23 | 8 | 0 | 1 | 47 |
+| 2026-11-09 | 15 | 23 | 8 | 1 | 1 | 48 |
 
 Contradictions resolved in this pass (now **yes**): K2 (write/readback
 aliases vs. read-only chip IDs, by iwl-prph.h names and silicon values),
@@ -166,6 +167,7 @@ space (M3), FSEQ_OTP_VERSION 0 vs `0xa652`.
 | I1 | no | ? | Hardware status bit supplied by the harness, not modelled. |
 | G1 | partial | I | Done follows start at once; register meaning [?]. |
 | G2 | partial | I | Tick rate [?] (1 us assumed); one-shot assumed. |
+| R2 | contradicts | S (two dumps) + V (field names) | Status/clear semantics and event sources not modelled; R1 readback shows impossible values. |
 | N1 | no | V (iwl-prph.h, rxf_config) | MAC TX/RX engines: TXF drain, RX FIFOs (0xa00c00, 0xd00e00, 0xd05a00) and the RX DMA to the host (ALIVE and notifications). |
 | N2 | no | - | PCI device model: the real iwlwifi driver cannot bind to the simulation; the host side is the scripted H1/M1 model. |
 | N3 | no | F (structure) | UMAC IRQ5 cause aggregator (0xd02e00 groups, summary 0xd02e64); IRQ8 and LMAC IRQ19/22 sources. |
