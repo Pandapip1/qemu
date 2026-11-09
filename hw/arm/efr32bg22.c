@@ -260,6 +260,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(Efr32Periph, EFR32_PERIPH)
 #define EFR32_RAC_IEN 0x020u
 #define EFR32_RAC_SEQIF 0x028u
 #define EFR32_RAC_SEQIEN 0x02cu
+/*
+ * RAC.STCTRL (RAC_S register model: STCAL bits 23:0, STSKEW bit 24) is the M0+ SysTick's
+ * calibration: SYST_CALIB reads NOREF (the core has no reference clock), SKEW = STSKEW and
+ * TENMS = STCAL. Silicon (owo-open-fw docs/radio-tables.md SS7.75): the firmware writes
+ * STCTRL = 0x01061a7f and the M0+ reads CALIB = 0xC0061A7F.
+ */
+#define EFR32_RAC_STCTRL 0x050u
+#define EFR32_RAC_STCTRL_STCAL 0x00ffffffu
+#define EFR32_RAC_STCTRL_STSKEW (1u << 24)
+#define EFR32_SYST_CALIB_NOREF (1u << 31)
+#define EFR32_SYST_CALIB_SKEW (1u << 30)
 #define EFR32_RAC_CMD_TXEN (1u << 0)
 #define EFR32_RAC_CMD_TXDIS (1u << 5)
 #define EFR32_RAC_CMD_RXDIS (1u << 8)
@@ -952,6 +963,8 @@ struct Efr32Periph
     qemu_irq seq_irq_state[EFR32_RAC_SEQ_STATE_EVENTS];
     qemu_irq seq_irq_mailbox;
     CPUState *seq_cpu;
+    /* The M0+'s SysTick: its SYST_CALIB follows RAC.STCTRL. */
+    SysTickState *seq_systick;
     /* Per-CPU clocks: the M33, and both cores' SysTick processor clocks. */
     CPUState *m33_cpu;
     Clock *m33_cpuclk;
@@ -5691,6 +5704,14 @@ static bool efr32_wdog_write_rejected(Efr32Periph *s, uint32_t address,
 }
 
 /* Returns true when the WDOG write is fully handled. */
+static void efr32_seq_systick_calib(Efr32Periph *s, uint32_t stctrl)
+{
+    systick_set_calib(s->seq_systick,
+                      EFR32_SYST_CALIB_NOREF |
+                      ((stctrl & EFR32_RAC_STCTRL_STSKEW) ? EFR32_SYST_CALIB_SKEW : 0) |
+                      (stctrl & EFR32_RAC_STCTRL_STCAL));
+}
+
 static bool efr32_wdog_write(Efr32Periph *s, uint32_t offset, uint32_t next)
 {
     bool locked = efr32_wdog_get(s, EFR32_WDOG_STATUS) &
@@ -7529,6 +7550,10 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
         efr32_rf_medium_withdraw_active_tx(s->rf_medium, EFR32_RF_RADIO(s));
         efr32_rac_cancel_turnaround(s);
         efr32_rac_set_state(s, EFR32_RAC_STATE_SHUTDOWN);
+    }
+
+    if (register_address == EFR32_RAC_BASE + EFR32_RAC_STCTRL && s->seq_systick) {
+        efr32_seq_systick_calib(s, next);
     }
 
     if (register_address == EFR32_RAC_BASE + EFR32_RAC_CTRL && s->seq_cpu) {
@@ -9544,6 +9569,9 @@ static void efr32_soc_realize(DeviceState *dev, Error **errp)
     }
     s->periph.seq_cpu = CPU(s->seq_armv7m.cpu);
     s->periph.seq_cpu->halted = 1;
+    s->periph.seq_systick = &s->seq_armv7m.systick[M_REG_NS];
+    efr32_seq_systick_calib(&s->periph,
+                            efr32_register_get(&s->periph, EFR32_RAC_BASE + EFR32_RAC_STCTRL));
     s->periph.m33_cpu = CPU(s->armv7m.cpu);
     s->periph.m33_cpuclk = s->clk;
     s->periph.seq_cpuclk = s->seq_clk;

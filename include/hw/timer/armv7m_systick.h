@@ -45,6 +45,15 @@ struct SysTickState {
     qemu_irq irq;
     Clock *refclk;
     Clock *cpuclk;
+    /*
+     * SYST_CALIB as the SoC wires it (systick_set_calib), instead of the value derived from
+     * refclk; for a core whose calibration is a register of another block.
+     */
+    bool calib_set;
+    uint32_t calib;
 };
+
+/* Report @calib in SYST_CALIB from now on. */
+void systick_set_calib(SysTickState *s, uint32_t calib);
 
 #endif

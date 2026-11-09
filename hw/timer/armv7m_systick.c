@@ -86,6 +86,10 @@ static MemTxResult systick_read(void *opaque, hwaddr addr, uint64_t *data,
         val = ptimer_get_count(s->ptimer);
         break;
     case 0xc: /* SysTick Calibration Value.  */
+        if (s->calib_set) {
+            val = s->calib;
+            break;
+        }
         /*
          * In real hardware it is possible to make this register report
          * a different value from what the reference clock is actually
@@ -196,6 +200,12 @@ static const MemoryRegionOps systick_ops = {
     .valid.min_access_size = 4,
     .valid.max_access_size = 4,
 };
+
+void systick_set_calib(SysTickState *s, uint32_t calib)
+{
+    s->calib_set = true;
+    s->calib = calib;
+}
 
 static void systick_reset(DeviceState *dev)
 {

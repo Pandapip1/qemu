@@ -3421,6 +3421,45 @@ static void test_seq_systick_counts(void)
 }
 
 /*
+ * The M0+ SysTick's CALIB follows RAC.STCTRL: NOREF, SKEW = STSKEW, TENMS = STCAL. Silicon
+ * (owo-open-fw docs/radio-tables.md SS7.75): with STCTRL = 0x01061a7f the M0+ reads
+ * CALIB = 0xC0061A7F, and the sequencer's reload, TENMS x 25, is 9999975.
+ */
+#define SEQ_SYSTICK_CALIB_STOCK 0xc0061a7fu
+
+static void test_seq_systick_calib_follows_stctrl(void)
+{
+    static const uint32_t systick_base = 0xe000e010;
+    const uint32_t code_base = SEQRAM_NS_BASE + 0x100;
+    uint16_t insn[6];
+    uint32_t literals[2];
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel tcg -S");
+
+    insn[0] = thumb_ldr_pc(0, code_base + 0, code_base + 12);
+    insn[1] = thumb_ldr_pc(1, code_base + 2, code_base + 16);
+    insn[2] = thumb_ldr_imm(4, 0, 3);    /* r4 = CALIB (base+12) */
+    insn[3] = thumb_str_imm(4, 1, 0);    /* SPARE0 = CALIB */
+    insn[4] = THUMB16_BRANCH_SELF;
+    insn[5] = THUMB16_BRANCH_SELF;
+    literals[0] = systick_base;
+    literals[1] = SEQ_SPARE0;
+
+    qtest_writel(qts, 0x00000000, 0x20008000);
+    qtest_writel(qts, 0x00000004, 0x00000101);
+    qtest_writel(qts, 0x00000100, 0x0000e7fe);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    qtest_seq_enable_radio_bus_clocks(qts);
+    qtest_writel(qts, RAC_BASE + RAC_STCTRL, RAC_STCTRL_STOCK_VALUE);
+    qtest_writel(qts, SEQRAM_NS_BASE + SEQ_SPARE0, 0);
+    seq_load_and_release(qts, insn, 6, literals, 2);
+    g_usleep(5000);
+    qtest_qmp_assert_success(qts, "{'execute':'stop'}");
+    g_assert_cmphex(qtest_readl(qts, SEQRAM_NS_BASE + SEQ_SPARE0), ==,
+                    SEQ_SYSTICK_CALIB_STOCK);
+    qtest_quit(qts);
+}
+
+/*
  * Per-CPU clocks under -icount (owo-open-fw docs/radio-tables.md SS7.73).
  * On silicon the M33 runs at HCLK and the M0+ at SYSCLK / (RHCLKPRESC + 1),
  * each at its own rate while the other runs; both count cycles per
@@ -5406,6 +5445,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/seq-nvic-ipr-byte-isolation",
                    test_seq_nvic_ipr_byte_isolation);
     qtest_add_func("/efr32bg22/seq-systick-counts", test_seq_systick_counts);
+    qtest_add_func("/efr32bg22/seq-systick-calib-follows-stctrl",
+                   test_seq_systick_calib_follows_stctrl);
     qtest_add_func("/efr32bg22/core-clocks-per-cpu-rates",
                    test_core_clocks_per_cpu_rates);
     qtest_add_func("/efr32bg22/core-clocks-m33-access-costs",
