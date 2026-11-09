@@ -106,6 +106,25 @@ when run against this model", not a claim about real silicon.
 | R2 | `LMPM_NIC_ISR0-4` at `0xa01e20-0xa01e30` (LMAC interrupt status) | **contradicts** | LMAC's fatal handler `0x4d1eaa` copies these five registers into its error table as isr0-isr4 (field names `fw/dump.c`; table `0x4f2358`), and `lmpm_pmg_sel` from `0xa01c0c`. Silicon at idle (`ref-silicon/fw89-lkml-2407-00526-dmesg.txt`): `0x00020000`, `0`, `0x48F00002`, `0x00C0001C`, `0`, pmg_sel `9`; the Framework card (after a fault) agrees on isr0/isr2/pmg_sel. The model reads back LMAC's init writes (`0xffffffff`, `0xf5ffff7f`, ... from `0x986c`/`0xa964`, the pattern of write-1-to-clear), via R1, and `0xb` for pmg_sel: values silicon never shows. Not changed: LMAC reads these in ~30 places (event handling), so their semantics belong with LMAC's interrupt sources (L2 gap, N3); a guessed constant could make LMAC process events that never occurred. |
 | Q3 | LMAC reports ALIVE to UMAC through its TX FIFO `0xe` (`TXF_LARC_NUM` 14): header `0x0000ffff`, byte length `0x9c`, then `struct iwl_lmac_alive` and a memory-region list | **no** (contents [F] + V; delivery not modelled) | The 41 words LMAC pushes at boot (send routine `0x13140`, push `0xa00440`) decode exactly as `iwl_lmac_alive` (`fw/api/alive.h`, `UCODE_ALIVE_NTFY_API_S_VER_3`): major `0x59`, minor `0xb20dcd1f` (this build), ver_type 1, `error_event_table_ptr` `0x4f2358` and `scd_base_ptr` `0x620000`, both matching the ucode region TLVs (`error_table_lmac1`, `chmem`); then (addr, size, flag) triples including `hw_smem` `0x400000`/`0x38000`. UMAC must receive this to build the host ALIVE notification; the model drains it (Q1), which is the likely reason ALIVE is never sent (H1). UMAC reads RX FIFO data by popping `0xd00e68` after writing 0 to `0xd00e10` (`0xc008e49c`, 18-word header; the driver's RXF read protocol names these `RXF_FIFO_RD_FENCE_INC`/`RXF_LD_FENCE_OFFSET_ADDR`). Which UMAC FIFO or event receives TXF 14, and how, is [?]. UMAC's RX FIFO `0xd00e00` is its host-command intake, not this path [F]: IRQ5 cause bit 14 (`0xc00823d0`) pops two header words from `0xd00e68` (after writing 0 to `0xd00e10`; first word: bit 27 required, else fatal `0x100124`, byte length in bits 15:2; second word: command header, ID in bits 15:0) and `0x80497938` dispatches by command ID (special cases `0x31`, `0xc1`; handler lookup `0x804903f4`). Where LMAC's TXF 14 report is consumed is [?]. Tested and rejected: that UMAC has queued the ALIVE notification and only waits for output space. With `0xd00e34` reporting `0xb400` and IRQ5 cause 13 raised after the restock (experiment, not kept), UMAC's sender `0x8049305c` ran but found its queue (`0x80467870`) empty. So UMAC has not composed ALIVE, consistent with it waiting for LMAC's report. |
 
+## Acceptance criteria: "accurate enough" (timing out of scope), 2026-11-09
+
+1. Both cores boot from their entry points to their idle states with no
+   exception and no fatal error. **Met** (U2, L2; `dual_boot.py`).
+2. The firmware completes the documented host boot protocol: ALIVE
+   interrupt, the driver's RX restock, then the ALIVE notification in a
+   host RX buffer with fields matching `fw/api/alive.h` and the ucode's
+   region TLVs. **Partly met**: interrupt and restock done (H1); the
+   notification is not composed (Q3: LMAC's report is not delivered to
+   UMAC).
+3. No row graded **contradicts**. **Not met**: R2 (LMAC NIC ISR registers).
+4. Every value with silicon evidence matches it (chip IDs, FSEQ, CSR_HW_REV,
+   CNVR SCU registers, ISR registers). **Met except R2.**
+5. Every modelled behaviour is graded with its evidence class in the audit
+   table, and no harness-supplied value hides a model gap without a row.
+   **Met** (I1 is the one harness-supplied value, graded **no**).
+6. qtests pin every modelled register behaviour that has a row. **Met** for
+   the rows marked tested.
+
 ## Audit (EFR32 method), 2026-11-09
 
 Method of `~/Projects/owo-open-fw/docs/model-fidelity.md`: every finding
