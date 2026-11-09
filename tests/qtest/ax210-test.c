@@ -425,6 +425,22 @@ static void test_umac_timeout_timer(void)
     qtest_quit(s);
 }
 
+/* Device address space (finding M3): UMAC's 0x80000000 (cached) and
+ * 0xc0000000 (uncached) windows are views of the device addresses LMAC
+ * uses; dccm_umac at 0x880000 is UMAC's 0xc0880000. */
+static void test_umac_windows_alias_device(void)
+{
+    QTestState *s = qtest_init("-M ax210 -m 32M -nographic -monitor none "
+                               "-serial none -S");
+
+    qtest_writel(s, 0x00880000, 0x5a5a1234);
+    g_assert_cmphex(qtest_readl(s, 0xc0880000), ==, 0x5a5a1234);
+    g_assert_cmphex(qtest_readl(s, 0x80880000), ==, 0x5a5a1234);
+    qtest_writel(s, 0x80471488, 0x0badf00d);
+    g_assert_cmphex(qtest_readl(s, 0x00471488), ==, 0x0badf00d);
+    qtest_quit(s);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -456,6 +472,8 @@ int main(int argc, char **argv)
     qtest_add_func("/ax210/host-driver-ctxt-info", test_host_driver_ctxt_info);
     qtest_add_func("/ax210/cfg-unit-start-done", test_cfg_unit_start_done);
     qtest_add_func("/ax210/umac-timeout-timer", test_umac_timeout_timer);
+    qtest_add_func("/ax210/umac-windows-alias-device",
+                   test_umac_windows_alias_device);
 
     return g_test_run();
 }

@@ -687,19 +687,29 @@ static const MemoryRegionOps trace_ops = {
     .valid.max_access_size = 8,
 };
 
-static void add_ram(const char *name, hwaddr base, uint64_t size)
+static void add_ram(MemoryRegion *parent, const char *name, hwaddr base,
+                    uint64_t size)
 {
     MemoryRegion *r = g_new(MemoryRegion, 1);
     memory_region_init_ram(r, NULL, name, size, &error_fatal);
-    memory_region_add_subregion(get_system_memory(), base, r);
+    memory_region_add_subregion(parent, base, r);
 }
 
-static void add_trace(const char *name, hwaddr base, uint64_t size, int prio)
+static void add_trace(MemoryRegion *parent, const char *name, hwaddr base,
+                      uint64_t size, int prio)
 {
     MemoryRegion *r = g_new(MemoryRegion, 1);
     memory_region_init_io(r, NULL, &trace_ops, (void *)(uintptr_t)base,
                           name, size);
-    memory_region_add_subregion_overlap(get_system_memory(), base, r, prio);
+    memory_region_add_subregion_overlap(parent, base, r, prio);
+}
+
+static void add_alias(const char *name, MemoryRegion *target, hwaddr base,
+                      uint64_t size)
+{
+    MemoryRegion *r = g_new(MemoryRegion, 1);
+    memory_region_init_alias(r, NULL, name, target, 0, size);
+    memory_region_add_subregion(get_system_memory(), base, r);
 }
 
 /* ---- vendor aux registers ---------------------------------------------- */
@@ -790,14 +800,20 @@ static void ax210_init(MachineState *machine)
     arc_unknown_aux_write = ax210_aux_write;
     arc_unknown_aux_read = ax210_aux_read;
 
-    /* Catch-all tracer over the whole 32-bit space (lowest priority). */
-    add_trace("ax210.catchall", 0x00000000, 0x100000000ULL, -1000);
+    MemoryRegion *sys = get_system_memory();
+    MemoryRegion *dev = g_new(MemoryRegion, 1);
 
-    /* RAM windows (firmware load addresses). ARC cache aliases 0x8.. and 0xc..
-     * are modelled as independent RAM here; coherence between aliases is a
-     * known simplification to revisit if firmware relies on it.
+    /* Catch-all tracer over the whole 32-bit space (lowest priority). */
+    add_trace(sys, "ax210.catchall", 0x00000000, 0x100000000ULL, -1000);
+
+    /* Device address space (finding M3, [F]): what LMAC addresses directly
+     * and the driver's debug dumps name (the .ucode's region TLVs: hw_smem
+     * 0x400000, sw_smem 0x440000, chmem 0x620000, dccm_lmac1 0x800000,
+     * dccm_umac 0x880000, UMAC error table 0x471488). UMAC sees it through
+     * its cached 0x80000000 and uncached 0xc0000000 windows: UMAC names its
+     * error table 0x80471488, its bss 0xc0880000.
      *
-     * Both cores share one flat physical address space. The UMAC/IML runs from
+     * Both cores share this one address space. The UMAC/IML runs from
      * a contiguous low window (incl. the paged image); the LMAC's own MPU
      * programming carves named regions out of that same window (finding M2,
      * [F] for the firmware's view; read live at the main loop, decoded with
@@ -807,15 +823,14 @@ static void ax210_init(MachineState *machine)
      * two cores see the same bytes either way. Peripheral regions
      * 0xa00000-0xbfffff and 0xd00000-0xefffff are the lmac_periph traces
      * below; everything else unmapped reaches the catch-all tracer. */
-    add_ram("ax210.lmac",  0x00000000, 0x01100000); /* UMAC/IML flat low window */
-    add_ram("ax210.lmac.iccm",  0x00000000, 0x00018000); /* MPU 0-1, X   */
-    add_ram("ax210.lmac.romwin",0x00440000, 0x00074000); /* MPU 12, R    */
-    add_ram("ax210.lmac.code",  0x004b4000, 0x0004c000); /* MPU 7-11, RWX*/
-    add_ram("ax210.lmac.sram",  0x00600000, 0x00040000); /* MPU 5, RW    */
-    add_ram("ax210.lmac.shbuf", 0x00660800, 0x00000800); /* MPU 6, RW    */
-    add_ram("ax210.lmac.dccm",  0x00800000, 0x00008000); /* MPU 2, RW    */
-    add_ram("ax210.umac",  0x80000000, 0x00800000); /* UMAC code/data (0x80400000+) */
-    add_ram("ax210.unc",   0xc0000000, 0x01000000); /* uncached window: code @0xc0080000, bss @0xc0880000 */
+    memory_region_init(dev, NULL, "ax210.dev", 0x01100000);
+    add_ram(dev, "ax210.lmac",  0x00000000, 0x01100000); /* UMAC/IML flat low window */
+    add_ram(dev, "ax210.lmac.iccm",  0x00000000, 0x00018000); /* MPU 0-1, X   */
+    add_ram(dev, "ax210.lmac.romwin",0x00440000, 0x00074000); /* MPU 12, R    */
+    add_ram(dev, "ax210.lmac.code",  0x004b4000, 0x0004c000); /* MPU 7-11, RWX*/
+    add_ram(dev, "ax210.lmac.sram",  0x00600000, 0x00040000); /* MPU 5, RW    */
+    add_ram(dev, "ax210.lmac.shbuf", 0x00660800, 0x00000800); /* MPU 6, RW    */
+    add_ram(dev, "ax210.lmac.dccm",  0x00800000, 0x00008000); /* MPU 2, RW    */
 
     /* Traced peripheral windows (overlay RAM; higher priority). */
     /* LMAC peripheral space 0xa00000-0xafffff (finding P1, [I]): LMAC code
@@ -823,13 +838,16 @@ static void ax210_init(MachineState *machine)
      * 0xa01ec0, indirect window 0xa2ac00, crypto 0xa248xx, power FSM
      * 0xd03380, markers 0xd0c110); no firmware section loads in
      * 0xa00000-0xffffff. */
-    add_trace("ax210.lmac_periph",  0x00a00000, 0x00200000, 10); /* MPU 3 */
-    add_trace("ax210.lmac_periph2", 0x00d00000, 0x00200000, 10); /* MPU 4 */
-    add_trace("ax210.umac_d",   0xc0d00000, 0x00100000, 10); /* == LMAC 0xd0xxxx (K1) */
-    add_trace("ax210.umac_e",   0xc0e00000, 0x00100000, 10); /* == LMAC 0xaxxxxx (K1) */
-    add_ram("ax210.host",  0x20000000, 0x10000000);   /* modelled host DRAM */
-    add_trace("ax210.umac_a",   0xc0a00000, 0x00010000, 10); /* UMAC MMIO: Q2, DMA */
-    add_trace("ax210.csr",      0xf0000000, 0x01000000, 10); /* chip CSRs */
+    add_trace(dev, "ax210.lmac_periph",  0x00a00000, 0x00200000, 10); /* MPU 3 */
+    add_trace(dev, "ax210.lmac_periph2", 0x00d00000, 0x00200000, 10); /* MPU 4 */
+    memory_region_add_subregion(sys, 0, dev);
+    add_alias("ax210.umac", dev, 0x80000000, 0x01000000); /* cached */
+    add_alias("ax210.unc",  dev, 0xc0000000, 0x01000000); /* uncached */
+    add_trace(sys, "ax210.umac_d",   0xc0d00000, 0x00100000, 10); /* == LMAC 0xd0xxxx (K1) */
+    add_trace(sys, "ax210.umac_e",   0xc0e00000, 0x00100000, 10); /* == LMAC 0xaxxxxx (K1) */
+    add_ram(sys, "ax210.host",  0x20000000, 0x10000000);   /* modelled host DRAM */
+    add_trace(sys, "ax210.umac_a",   0xc0a00000, 0x00010000, 10); /* UMAC MMIO: Q2, DMA */
+    add_trace(sys, "ax210.csr",      0xf0000000, 0x01000000, 10); /* chip CSRs */
 
     if (getenv("AX210_TRACECAP")) trace_cap = strtoul(getenv("AX210_TRACECAP"), 0, 0);
 
