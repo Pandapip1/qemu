@@ -147,6 +147,18 @@ static void store_set(BCM4387MachineState *s, hwaddr a, uint32_t v)
 
 static bool model_read(BCM4387MachineState *s, hwaddr a, uint32_t *v)
 {
+    if (a >= 0x18000000 && a < 0x18100000 && (a & 0xfff) == 0x1e0) {
+        /*
+         * clk_ctl_st on every core: clocks are up (silicon ChipCommon reads
+         * 0x020b0040 at reset): ALP avail 0x10000, HT avail 0x20000, backplane
+         * on HT 0x80000; external-resource status [26:24] follows the
+         * request bits [10:8]. [F]/[I]
+         */
+        uint32_t r = store_get(s, a) & 0xffff;
+
+        *v = r | 0x000b0000 | ((r & 0x700) << 16);
+        return true;
+    }
     switch (a) {
     case CC_BASE + 0x00:
         *v = chipid();

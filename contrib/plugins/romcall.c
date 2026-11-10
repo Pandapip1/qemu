@@ -1,12 +1,15 @@
 /*
  * Log every call into a ROM window from code outside it: caller (lr),
- * target, r0-r3 and the first four stack words. Consecutive repeats of the
- * same (caller, target) collapse into one line with a count.
+ * target, r0-r3 and the first four stack words, in order. Each (lr, target)
+ * pair is logged for its first `each` occurrences only; at exit a summary of
+ * every pair's total count is appended, so hot loops stay bounded.
  *
  * Arguments:
  *   lo=ADDR,hi=ADDR  ROM window [lo, hi) (default 0x400000-0x59b000)
  *   out=FILE         output TSV (default romcall.tsv)
  *   start=ADDR       begin logging when a TB at ADDR first runs (default 0)
+ *   stop=ADDR        stop logging when a TB at ADDR runs (default none)
+ *   each=N           log each (lr, target) pair at most N times (default 3)
  *
  * A call is a ROM TB entered from a TB outside the window whose lr does not
  * point back at it (that would be a RAM callee returning into ROM).
@@ -22,16 +25,14 @@
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
-static uint64_t lo = 0x400000, hi = 0x59b000, start;
+static uint64_t lo = 0x400000, hi = 0x59b000, start, stop = UINT64_MAX;
+static uint64_t each = 3;
+static GHashTable *pairs;      /* (lr << 32 | target) -> count */
 static bool logging;
 static FILE *out;
 static uint64_t prev_tb, seq;
 static struct qemu_plugin_register *reg[16];
 
-/* the pending (collapsed) record */
-static bool have;
-static uint32_t rec[11];        /* lr, prev, target, r0-r3, s0-s3 */
-static uint64_t rec_seq, rec_count;
 
 static bool in_rom(uint64_t a)
 {
@@ -47,18 +48,6 @@ static uint32_t rd(int n)
         memcpy(&v, buf->data, 4);
     }
     return v;
-}
-
-static void flush(void)
-{
-    if (!have) {
-        return;
-    }
-    fprintf(out, "%" PRIu64 "\t%08x\t%08x\t%08x\t%08x\t%08x\t%08x\t%08x"
-            "\t%08x\t%08x\t%08x\t%08x\t%" PRIu64 "\n", rec_seq,
-            rec[0], rec[1], rec[2], rec[3], rec[4], rec[5], rec[6],
-            rec[7], rec[8], rec[9], rec[10], rec_count);
-    have = false;
 }
 
 static void vcpu_init(unsigned int vcpu_index, void *userdata)
@@ -83,24 +72,31 @@ static void vcpu_init(unsigned int vcpu_index, void *userdata)
     }
 }
 
+static void check_bounds(uint64_t tb)
+{
+    if (!logging && tb == start) {
+        logging = true;
+    }
+    if (logging && tb == stop) {
+        logging = false;
+        start = UINT64_MAX;             /* never restart */
+    }
+}
+
 static void tb_outside(unsigned int vcpu_index, void *userdata)
 {
     prev_tb = (uint64_t)userdata;
-    if (!logging && prev_tb == start) {
-        logging = true;
-    }
+    check_bounds(prev_tb);
 }
 
 static void tb_rom(unsigned int vcpu_index, void *userdata)
 {
-    uint64_t tb = (uint64_t)userdata, from = prev_tb;
+    uint64_t tb = (uint64_t)userdata, from = prev_tb, key, n;
     uint32_t lr, sp, st[4] = { 0 };
     g_autoptr(GByteArray) buf = NULL;
 
     prev_tb = tb;
-    if (!logging && tb == start) {
-        logging = true;
-    }
+    check_bounds(tb);
     if (!logging || in_rom(from)) {
         return;
     }
@@ -109,26 +105,20 @@ static void tb_rom(unsigned int vcpu_index, void *userdata)
         return;                         /* RAM callee returning into ROM */
     }
     seq++;
-    if (have && rec[0] == lr && rec[2] == tb) {
-        rec_count++;
+    key = (uint64_t)lr << 32 | tb;
+    n = GPOINTER_TO_SIZE(g_hash_table_lookup(pairs, (gpointer)key)) + 1;
+    g_hash_table_insert(pairs, (gpointer)key, GSIZE_TO_POINTER(n));
+    if (n > each) {
         return;
     }
-    flush();
     sp = rd(13);
     buf = g_byte_array_new();
     if (qemu_plugin_read_memory_vaddr(sp, buf, 16) && buf->len >= 16) {
         memcpy(st, buf->data, 16);
     }
-    rec[0] = lr;
-    rec[1] = from;
-    rec[2] = tb;
-    for (int i = 0; i < 4; i++) {
-        rec[3 + i] = rd(i);
-        rec[7 + i] = st[i];
-    }
-    rec_seq = seq;
-    rec_count = 1;
-    have = true;
+    fprintf(out, "%" PRIu64 "\t%08x\t%08" PRIx64 "\t%08" PRIx64 "\t%08x\t%08x"
+            "\t%08x\t%08x\t%08x\t%08x\t%08x\t%08x\t%" PRIu64 "\n", seq, lr,
+            from, tb, rd(0), rd(1), rd(2), rd(3), st[0], st[1], st[2], st[3], n);
 }
 
 static void vcpu_tb_trans(struct qemu_plugin_tb *tb, void *userdata)
@@ -147,7 +137,15 @@ static void vcpu_tb_trans(struct qemu_plugin_tb *tb, void *userdata)
 
 static void plugin_exit(void *userdata)
 {
-    flush();
+    GHashTableIter it;
+    gpointer k, v;
+
+    fprintf(out, "# totals: lr\ttarget\tcount\n");
+    g_hash_table_iter_init(&it, pairs);
+    while (g_hash_table_iter_next(&it, &k, &v)) {
+        fprintf(out, "#\t%08x\t%08x\t%zu\n", (uint32_t)((uint64_t)k >> 32),
+                (uint32_t)(uint64_t)k, GPOINTER_TO_SIZE(v));
+    }
     fclose(out);
 }
 
@@ -170,6 +168,10 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             hi = g_ascii_strtoull(kv[1], NULL, 0);
         } else if (!strcmp(kv[0], "start")) {
             start = g_ascii_strtoull(kv[1], NULL, 0);
+        } else if (!strcmp(kv[0], "stop")) {
+            stop = g_ascii_strtoull(kv[1], NULL, 0);
+        } else if (!strcmp(kv[0], "each")) {
+            each = g_ascii_strtoull(kv[1], NULL, 0);
         } else if (!strcmp(kv[0], "out")) {
             path = argv[i] + 4;
         } else {
@@ -184,8 +186,9 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     }
     setvbuf(out, NULL, _IOFBF, 1 << 20);
     fprintf(out, "seq\tlr\tprev_tb\ttarget\tr0\tr1\tr2\tr3\tsp0\tsp4\tsp8\tsp12"
-            "\tcount\n");
+            "\tnth\n");
     logging = start == 0;
+    pairs = g_hash_table_new(g_direct_hash, g_direct_equal);
     qemu_plugin_register_vcpu_init_cb(id, vcpu_init, NULL);
     qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans, NULL);
     qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
