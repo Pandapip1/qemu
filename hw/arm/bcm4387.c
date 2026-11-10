@@ -540,6 +540,13 @@ static void bcm4387_init(MachineState *machine)
              * the random page; our model keeps the image at its link base and
              * only honours the +0x400 intra-page shift, so the faithful page
              * offset here is 0.
+             *
+             * TODO (fidelity): boot then stops at the ROM-patch verify (RAM
+             * 0x82c3f0), because the re-linker rewrites the veneers at 0x750000
+             * (e.g. 5c f3 1e bf -> 5d f3 1e b9) after the load-time veneer->ROM
+             * copy below has already run. Faithful fix: make ROM reads of a
+             * patched address return the live RAM veneer (a dynamic TCAM
+             * redirect) instead of a static copy.
              */
             static const uint8_t movs_r0_0[] = { 0x00, 0x20 };
             gsize op = 0x8a3f04 - RAM_BASE;
