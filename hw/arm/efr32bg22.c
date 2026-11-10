@@ -8154,13 +8154,15 @@ static void efr32_peripheral_write(Efr32Periph *s, uint32_t address,
 #define EFR32_RADIO_HOLE_B_BASE 0xa8030000u
 #define EFR32_RADIO_HOLE_B_END 0xa8100000u
 
+static bool efr32_bus_error_radio_clock(Efr32Periph *s)
+{
+    return efr32_register_get(s, EFR32_CMU_BASE + EFR32_CMU_RADIOCLKCTRL) &
+           EFR32_CMU_RADIOCLKCTRL_EN;
+}
+
 static bool efr32_bus_error(Efr32Periph *s, uint32_t address)
 {
     uint32_t block = efr32_peripheral_canonical_address(address) & ~0x3fffu;
-    uint32_t clken1 = efr32_register_get(s, EFR32_CMU_BASE + EFR32_CMU_CLKEN1);
-    bool radio_clock =
-        efr32_register_get(s, EFR32_CMU_BASE + EFR32_CMU_RADIOCLKCTRL) &
-        EFR32_CMU_RADIOCLKCTRL_EN;
     uint32_t gate;
 
     if (efr32_timer_clock_gated(s, block)) {
@@ -8175,7 +8177,7 @@ static bool efr32_bus_error(Efr32Periph *s, uint32_t address)
         return true;
     }
     if (block == EFR32_BUFC_BASE) {
-        return !radio_clock;
+        return !efr32_bus_error_radio_clock(s);
     }
     /*
      * CRYPTOACC (PK control, DMA, RNG control, RNG FIFO, PK RAM;
@@ -8185,7 +8187,8 @@ static bool efr32_bus_error(Efr32Periph *s, uint32_t address)
      * fault.  [I] Not measured on silicon for this block.
      */
     if (block >= EFR32_CRYPTOACC_BASE && block < EFR32_CRYPTOACC_END) {
-        return !(clken1 & EFR32_CMU_CLKEN1_CRYPTOACC);
+        return !(efr32_register_get(s, EFR32_CMU_BASE + EFR32_CMU_CLKEN1) &
+                 EFR32_CMU_CLKEN1_CRYPTOACC);
     }
     /*
      * RADIOAES behind CMU_CLKEN0.RADIOAES (bit 2) and the radio bridge clock
@@ -8196,7 +8199,7 @@ static bool efr32_bus_error(Efr32Periph *s, uint32_t address)
      */
     if (block == EFR32_RADIOAES_BASE) {
         return !(efr32_register_get(s, EFR32_CMU_BASE + EFR32_CMU_CLKEN0) &
-                 EFR32_CMU_CLKEN0_RADIOAES) || !radio_clock;
+                 EFR32_CMU_CLKEN0_RADIOAES) || !efr32_bus_error_radio_clock(s);
     }
     /* GPCRC behind CMU_CLKEN0.GPCRC (bit 3, efr32bg22_cmu.h), as above. */
     if (block == EFR32_GPCRC_BASE) {
@@ -8204,7 +8207,9 @@ static bool efr32_bus_error(Efr32Periph *s, uint32_t address)
                  EFR32_CMU_CLKEN0_GPCRC);
     }
     gate = efr32_radio_bus_clock(block);
-    return gate && (!radio_clock || !(clken1 & gate));
+    return gate && (!efr32_bus_error_radio_clock(s) ||
+                    !(efr32_register_get(s, EFR32_CMU_BASE + EFR32_CMU_CLKEN1) &
+                      gate));
 }
 
 /*
