@@ -125,6 +125,8 @@ struct BCM4387MachineState {
     Bcm4387PmuState *pmu;
     Bcm4387GciState *gci;
     Bcm4387CcState *cc;
+    Bcm4387Sc *sc[3];
+    char *iq_source, *iq_format;
 
     bool strict;                /* unmodelled MMIO -> AXI slave error */
     MemoryRegion lowtcm, hole;
@@ -790,7 +792,8 @@ static MemTxResult d11_gate(BCM4387MachineState *s, hwaddr a)
         cpu_exit(current_cpu);
         return MEMTX_OK;
     }
-    if (a - D11_BASE(n) >= 0x3d8 && !d11_phy_ready(s, n)) {
+    if (a - D11_BASE(n) >= 0x3d8 && a - D11_BASE(n) < 0x400 &&
+        !d11_phy_ready(s, n)) {
         qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: AXI slave error: d11 %d PHY "
                       "window without PHYPLL, 0x%08" HWADDR_PRIx " pc~0x%08x\n",
                       n, a, bcm4387_pc());
@@ -841,22 +844,16 @@ static const struct { hwaddr a; const char *name; } plain_regs[] = {
     { 0x18001c14, "pcie 0xc14" },
     { 0x18001c18, "pcie 0xc18" },
     { 0x18001120, "pcie configaddr" }, { 0x18001124, "pcie configdata" },
-    { 0x18031130, "d11.0 tplatewrptr" },
-    { 0x18031134, "d11.0 tplatewrdata" },
     { 0x1803115c, "d11.0 machwcap" },
     { 0x18031160, "d11.0 objaddr" },
     { 0x18031164, "d11.0 objdata" },
     { 0x1803118c, "d11.0 tsf_cfpstart" },
     { 0x180311a4, "d11.0 machwcap1" },
-    { 0x18032130, "d11.1 tplatewrptr" },
-    { 0x18032134, "d11.1 tplatewrdata" },
     { 0x1803215c, "d11.1 machwcap" },
     { 0x18032160, "d11.1 objaddr" },
     { 0x18032164, "d11.1 objdata" },
     { 0x1803218c, "d11.1 tsf_cfpstart" },
     { 0x180321a4, "d11.1 machwcap1" },
-    { 0x18033130, "d11.2 tplatewrptr" },
-    { 0x18033134, "d11.2 tplatewrdata" },
     { 0x1803315c, "d11.2 machwcap" },
     { 0x18033160, "d11.2 objaddr" },
     { 0x18033164, "d11.2 objdata" },
@@ -978,6 +975,9 @@ static const struct { hwaddr a; const char *name; } plain_regs[] = {
     { 0x180332a0, "d11.2 dma rcv2 control" },
     { 0x180332a4, "d11.2 dma rcv2 ptr" },
     { 0x180332a8, "d11.2 dma rcv2 addrlow" },
+    { 0x180313e4, "d11.0 0x3e6 (phyanacore, classic layout)" },
+    { 0x180323e4, "d11.1 0x3e6 (phyanacore, classic layout)" },
+    { 0x180333e4, "d11.2 0x3e6 (phyanacore, classic layout)" },
     { 0x18101000, "pcie wrapper 0x000" }, { 0x18101004, "pcie wrapper 0x004" },
     { 0x18101064, "pcie wrapper 0x064" },
 };
@@ -1009,9 +1009,43 @@ static bool reg_known(hwaddr a)
     if (d11_core(a) >= 0) {
         hwaddr o = a - D11_BASE(d11_core(a));
 
-        return o == 0x1e0 || o == 0x120 || o >= 0x3d8;
+        return o == 0x1e0 || o == 0x120 || o == 0x3e0 || o == 0x3e6;
     }
     return false;
+}
+
+static bool sc_hook_live(void *opaque, int n)
+{
+    return port_live(opaque, n);
+}
+
+static uint16_t sc_hook_phyreg(void *opaque, int n, uint16_t reg)
+{
+    BCM4387MachineState *s = opaque;
+    gpointer key = PORT_KEY(PORT_PHY, n, reg);
+
+    return GPOINTER_TO_UINT(g_hash_table_lookup(
+        g_hash_table_contains(s->phyregs, key) ? s->phyregs : s->phyknown, key));
+}
+
+/* template RAM / SampleCollect registers of a d11 slice */
+static bool sc_port(BCM4387MachineState *s, hwaddr a, unsigned size, bool wr,
+                    uint64_t *v)
+{
+    int n = d11_core(a);
+    bool hit;
+
+    if (n < 0) {
+        return false;
+    }
+    hit = bcm4387_sc_access(s->sc[n], a - D11_BASE(n), size, wr, v);
+    if (hit) {
+        qemu_log_mask(LOG_UNIMP, "bcm4387: SC%d  %c%u +0x%03" HWADDR_PRIx
+                      " %s 0x%08" PRIx64 " pc~0x%08x\n", n, wr ? 'W' : 'R',
+                      size * 8, a - D11_BASE(n), wr ? "<-" : "->", *v,
+                      bcm4387_pc());
+    }
+    return hit;
 }
 
 static MemTxResult trace_read(void *opaque, hwaddr addr, uint64_t *data,
@@ -1027,6 +1061,9 @@ static MemTxResult trace_read(void *opaque, hwaddr addr, uint64_t *data,
     }
     if (phy_port(s, addr, size, false, 0, &v)) {
         *data = v;
+        return MEMTX_OK;
+    }
+    if (sc_port(s, addr, size, false, data)) {
         return MEMTX_OK;
     }
     modelled = model_read(s, addr, &v);
@@ -1058,6 +1095,9 @@ static MemTxResult trace_write(void *opaque, hwaddr addr, uint64_t val,
         return r;
     }
     if (phy_port(s, addr, size, true, val, NULL)) {
+        return MEMTX_OK;
+    }
+    if (sc_port(s, addr, size, true, &val)) {
         return MEMTX_OK;
     }
     if (s->strict && !reg_known(addr)) {
@@ -1261,6 +1301,9 @@ static void bcm4387_reset(void *opaque)
     BCM4387MachineState *s = opaque;
 
     cpu_reset(CPU(s->cpu));
+    for (int n = 0; n < 3; n++) {
+        bcm4387_sc_reset(s->sc[n]);
+    }
     /*
      * brcmf_chip_cr4_set_active(): the host writes only image word 0 (the
      * reset vector) to address 0; the rest of that TCM is never written.
@@ -1419,6 +1462,18 @@ static void bcm4387_init(MachineState *machine)
     s->pmu = bcm4387_pmu_create(PMU_BASE);
     s->gci = bcm4387_gci_create(GCI_BASE, s->pmu);
     s->cc = bcm4387_cc_create(CC_BASE, s->pmu);
+    {
+        Bcm4387ScHooks hooks = {
+            .opaque = s, .phy_live = sc_hook_live, .phyreg = sc_hook_phyreg,
+        };
+
+        for (int n = 0; n < 3; n++) {
+            s->sc[n] = bcm4387_sc_new(n, &hooks);
+        }
+        if (s->iq_source) {
+            bcm4387_iq_load(s->iq_source, s->iq_format);
+        }
+    }
     memory_region_init_io(&s->trace, NULL, &trace_ops, s, "bcm4387.trace",
                           UINT64_MAX);
     memory_region_add_subregion_overlap(sysmem, 0, &s->trace, -1000);
@@ -1565,6 +1620,8 @@ static char *get_str(char **field)
 STR_PROP("hostblob", hostblob)
 STR_PROP("rom", rom)
 STR_PROP("socram", patch)
+STR_PROP("iq-source", iq_source)
+STR_PROP("iq-format", iq_format)
 
 static void get_atcm(Object *o, Visitor *v, const char *name, void *opaque,
                      Error **errp)
@@ -1642,6 +1699,8 @@ static void bcm4387_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_str(oc, "hostblob", get_hostblob, set_hostblob);
     object_class_property_add_str(oc, "rom", get_rom, set_rom);
     object_class_property_add_str(oc, "socram", get_patch, set_patch);
+    object_class_property_add_str(oc, "iq-source", get_iq_source, set_iq_source);
+    object_class_property_add_str(oc, "iq-format", get_iq_format, set_iq_format);
     object_class_property_add(oc, "atcm-size", "uint32", get_atcm, set_atcm,
                               NULL, NULL);
     object_class_property_add_bool(oc, "identity", get_identity, set_identity);

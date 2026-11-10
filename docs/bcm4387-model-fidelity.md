@@ -34,6 +34,19 @@ The per-register gap list is generated from the source tables:
 `scripts/strict_gaps.py > fw/trace/strict_gaps.tsv` (sibling repo). Values
 stock reads that the model lacks are in `fw/trace/strict_unknown_reads.tsv`.
 
+### SDR test bench: SampleCollect + template RAM
+
+`bcm4387-d11sc.c` models each slice's template RAM (port +0x130/+0x134)
+and SampleCollect engine (+0xaa0..+0xade). An armed capture (PlayCtrl START,
+source 0) stores one I/Q word per 20 MHz sample from StartPtr through
+StopPtr while the slice's PHY ports are live and PHY 0x467 bit 13 is set.
+The samples come from `-M bcm4387,...,iq-source=<file>,iq-format=s16|cf32`
+(interleaved I/Q at 20 MHz, played back by virtual time and looped), or
+from deterministic noise. Completion semantics are [I] and are listed in
+the gap file for run 17. The d11 core window is strict: offsets with no
+model are AXI slave errors. `model_regress.py` feeds a 1.25 MHz tone through
+our capture image and checks the recovered frequency.
+
 ### Enable chain (what the model says makes the PHY usable)
 
 In stock's order, each a single write followed by a read-back of the same

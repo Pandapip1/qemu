@@ -118,4 +118,20 @@ typedef struct Bcm4387CcState Bcm4387CcState;
 Bcm4387CcState *bcm4387_cc_create(hwaddr base, Bcm4387PmuState *pmu);
 uint32_t bcm4387_cc_srpwr_status(Bcm4387CcState *cc);
 
+/* ---- d11 template RAM + SampleCollect (bcm4387-d11sc.c) ----------------- */
+
+typedef struct Bcm4387Sc Bcm4387Sc;
+typedef struct Bcm4387ScHooks {
+    void *opaque;
+    bool (*phy_live)(void *opaque, int slice);
+    uint16_t (*phyreg)(void *opaque, int slice, uint16_t reg);
+} Bcm4387ScHooks;
+
+void bcm4387_iq_load(const char *path, const char *fmt);
+Bcm4387Sc *bcm4387_sc_new(int slice, const Bcm4387ScHooks *hooks);
+void bcm4387_sc_reset(Bcm4387Sc *s);
+/* true if off is a template-RAM or SampleCollect register of the slice */
+bool bcm4387_sc_access(Bcm4387Sc *s, hwaddr off, unsigned size, bool wr,
+                       uint64_t *val);
+
 #endif

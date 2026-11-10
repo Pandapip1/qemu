@@ -116,6 +116,11 @@ bcm4387_gci_write(uint64_t off, uint64_t v) "+0x%03" PRIx64 " <- 0x%08" PRIx64
 bcm4387_gci_index(uint32_t old, uint32_t idx) "indirect index %u -> %u"
 bcm4387_gci_chipctrl(uint32_t idx, uint32_t old, uint64_t v) "chipcontrol[%u] 0x%08x -> 0x%08" PRIx64
 
+# bcm4387-d11sc.c
+bcm4387_sc_playctrl(int slice, uint32_t old, uint32_t v) "d11.%d SampleCollect PlayCtrl 0x%04x -> 0x%04x"
+bcm4387_sc_start(int slice, uint32_t start, uint32_t stop, bool sampling) "d11.%d SampleCollect start words 0x%x..0x%x (sampling %d)"
+bcm4387_sc_done(int slice, uint32_t cur) "d11.%d SampleCollect reached StopPtr, CurPtr 0x%x"
+
 # bcm4387-cc.c
 bcm4387_cc_read(uint64_t off, uint32_t v) "+0x%03" PRIx64 " -> 0x%08x"
 bcm4387_cc_write(uint64_t off, uint64_t v) "+0x%03" PRIx64 " <- 0x%08" PRIx64
