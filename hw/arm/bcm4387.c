@@ -127,6 +127,7 @@ struct BCM4387MachineState {
     int32_t phy_pending[3];     /* phyversion value for the next PHY read */
     GHashTable *phyregs;        /* values written through the ports */
     GHashTable *phyknown;       /* values known (silicon / exploration seeds) */
+    GHashTable *banks;          /* indirect register-bank entries */
 
     bool strict;                /* unmodelled MMIO -> AXI slave error */
     MemoryRegion lowtcm, hole;
@@ -242,8 +243,14 @@ static int d11_core(hwaddr a)
     return -1;
 }
 
+static bool bank_access(BCM4387MachineState *s, hwaddr a, bool wr, uint32_t val,
+                        uint32_t *v);
+
 static bool model_read(BCM4387MachineState *s, hwaddr a, uint32_t *v)
 {
+    if (bank_access(s, a, false, 0, v)) {
+        return true;
+    }
     if (d11_extra_wrap(a)) {
         *v = (a & 0xfff) == WRAP_RESETCTRL ? store_get(s, a) : 0;
         return true;
@@ -412,11 +419,76 @@ static bool model_read(BCM4387MachineState *s, hwaddr a, uint32_t *v)
     return false;
 }
 
+/*
+ * Indirect register banks: an index register and one or two data registers
+ * (PMU chipcontrol 0x650/0x654, regcontrol 0x658/0x65c, pllcontrol
+ * 0x660/0x664, res_table_sel 0x620 with res_dep_mask 0x624 and
+ * res_updn_timer 0x628; GCI chipcontrol 0x40/0x200). The index reads back
+ * what was written; data accesses go to the entry for the current index.
+ * Silicon initial values are not known yet (queue run 12 dumps them): an
+ * entry never written reads 0xdead with an "unknown" log in strict mode,
+ * 0 with strict=off. [F: structure; values pending]
+ */
+static const struct {
+    hwaddr index, data;
+} reg_banks[] = {
+    { PMU_BASE + 0x650, PMU_BASE + 0x654 },
+    { PMU_BASE + 0x658, PMU_BASE + 0x65c },
+    { PMU_BASE + 0x660, PMU_BASE + 0x664 },
+    { PMU_BASE + 0x620, PMU_BASE + 0x624 },
+    { PMU_BASE + 0x620, PMU_BASE + 0x628 },
+    { GCI_BASE + 0x040, GCI_BASE + 0x200 },
+};
+
+static gpointer bank_key(hwaddr data, uint32_t index)
+{
+    return (gpointer)(uintptr_t)((uint64_t)data << 32 | index);
+}
+
+/* true if a is a bank index or data register; *v gets the read value */
+static bool bank_access(BCM4387MachineState *s, hwaddr a, bool wr, uint32_t val,
+                        uint32_t *v)
+{
+    for (int i = 0; i < ARRAY_SIZE(reg_banks); i++) {
+        if (a == reg_banks[i].index) {
+            if (wr) {
+                store_set(s, a, val);
+            } else {
+                *v = store_get(s, a);
+            }
+            return true;
+        }
+        if (a == reg_banks[i].data) {
+            uint32_t idx = store_get(s, reg_banks[i].index);
+            gpointer k = bank_key(a, idx);
+
+            if (wr) {
+                g_hash_table_insert(s->banks, k, GUINT_TO_POINTER(val));
+            } else if (g_hash_table_contains(s->banks, k)) {
+                *v = GPOINTER_TO_UINT(g_hash_table_lookup(s->banks, k));
+            } else if (s->strict) {
+                qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: unknown bank entry "
+                              "0x%08" HWADDR_PRIx "[%u] read (returns 0xdead) "
+                              "pc~0x%08x\n", a, idx, current_pc());
+                *v = 0xdead;
+            } else {
+                *v = 0;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 static void tcam_program(BCM4387MachineState *s, uint32_t slot);
 
 static bool model_write(BCM4387MachineState *s, hwaddr a, uint32_t v)
 {
     int n = d11_core(a);
+
+    if (bank_access(s, a, true, v, NULL)) {
+        return true;
+    }
 
     if (n >= 0 && a == D11_BASE(n) + 0x1e0) {
         uint32_t old = store_get(s, a);
@@ -792,6 +864,9 @@ static bool reg_known(hwaddr a)
         { CR4_BASE + 0x04, 0x04 }, { CR4_BASE + 0x40, 0x08 },
         { CR4_BASE + 0x68, 0x10 },      /* TCAM */
         { PMU_BASE + 0x600, 0x20 },     /* ctl, caps, status, res_* , timer */
+        { PMU_BASE + 0x620, 0x0c },     /* res_table_sel bank */
+        { PMU_BASE + 0x650, 0x18 },     /* chipcontrol/regcontrol/pllcontrol */
+        { GCI_BASE + 0x040, 0x04 }, { GCI_BASE + 0x200, 0x04 },  /* chipctl */
         { GCI_BASE + 0x038, 0x08 },     /* semaphores */
         { GCI_BASE + 0x310, 0x1c },     /* handshake, OTP control/status */
         { GCI_BASE + 0xc04, 0x04 }, { GCI_BASE + 0xc1c, 0x08 },  /* LPO */
@@ -1200,6 +1275,7 @@ static void bcm4387_init(MachineState *machine)
     erom_build(s);
 
     s->store = g_hash_table_new(g_direct_hash, g_direct_equal);
+    s->banks = g_hash_table_new(g_direct_hash, g_direct_equal);
     oobr_init(s);
     phy_init(s);
     /* register state at the host->firmware handoff, read on silicon [F] */
