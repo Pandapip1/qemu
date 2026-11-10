@@ -354,6 +354,46 @@ static void test_lmac_nic_doorbell(void)
     qtest_quit(s);
 }
 
+static void sha_abc(QTestState *s, bool wide, const uint32_t *want, int n)
+{
+    int words = wide ? 32 : 16;
+
+    qtest_writel(s, 0xc0e26410, wide);          /* mode */
+    qtest_writel(s, 0xc0e25064, 1);             /* init */
+    for (int i = 0; i < words; i++) {
+        uint32_t w = i == 0 ? 0x61626380 : 0;   /* "abc", 0x80 pad */
+        if (i == words - 1) {
+            w = 24;                             /* bit length */
+        }
+        qtest_writel(s, i < 16 ? 0xc0e25000 + 4 * i
+                               : 0xc0e25080 + 4 * (i - 16), w);
+    }
+    g_assert_cmphex(qtest_readl(s, 0xc0e25060) & 3, ==, 2);
+    for (int i = 0; i < n; i++) {
+        g_assert_cmphex(qtest_readl(s, i < 8 ? 0xc0e25040 + 4 * i
+                                             : 0xc0e250c0 + 4 * (i - 8)),
+                        ==, want[n - 1 - i]);  /* LS word first */
+    }
+}
+
+static void test_sha_engine_fips(void)
+{
+    QTestState *s = qtest_init("-M ax210 -m 32M -nographic -monitor none "
+                               "-serial none -S");
+    static const uint32_t sha256[8] = {
+        0xba7816bf, 0x8f01cfea, 0x414140de, 0x5dae2223,
+        0xb00361a3, 0x96177a9c, 0xb410ff61, 0xf20015ad,
+    };
+    static const uint32_t sha384[12] = {
+        0xcb00753f, 0x45a35e8b, 0xb5a03d69, 0x9ac65007, 0x272c32ab, 0x0eded163,
+        0x1a8b605a, 0x43ff5bed, 0x8086072b, 0xa1e7cc23, 0x58baeca1, 0x34c825a7,
+    };
+
+    sha_abc(s, false, sha256, 8);
+    sha_abc(s, true, sha384, 12);
+    qtest_quit(s);
+}
+
 static void test_semaphore_two_cores(void)
 {
     QTestState *s = qtest_init("-M ax210 -m 32M -nographic -monitor none "
@@ -516,6 +556,7 @@ int main(int argc, char **argv)
     qtest_add_func("/ax210/umac-timeout-timer", test_umac_timeout_timer);
     qtest_add_func("/ax210/lmac-to-umac-frame", test_lmac_to_umac_frame);
     qtest_add_func("/ax210/lmac-nic-doorbell", test_lmac_nic_doorbell);
+    qtest_add_func("/ax210/sha-engine-fips", test_sha_engine_fips);
     qtest_add_func("/ax210/umac-windows-alias-device",
                    test_umac_windows_alias_device);
 

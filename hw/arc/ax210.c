@@ -26,6 +26,7 @@
 #include "hw/boards.h"
 #include "hw/irq.h"
 #include "qemu/guest-random.h"
+#include "ax210-crypto.h"
 #include "hw/qdev-properties.h"
 #include "exec/memory.h"
 #include "exec/address-spaces.h"
@@ -148,6 +149,132 @@ static uint32_t watch_evt;
 #define PGE_CMD   0x00d04800u
 #define PGE_STAT  0x00d04820u
 static uint32_t pge_stat;
+
+/* SHA-256/384 engine at 0xa25000 (finding W5, [F]): 0x804a2170 writes the
+ * mode to 0xa26410 (1 = SHA-384, 32-word blocks; 0 = SHA-256, 16) and 1 to
+ * 0xa2506c and 0xa25064; 0x804a2290 reads the word count at 0xa25068, writes
+ * big-endian block words to 0xa25000 + 4i (SHA-384 words 16-31 at 0xa25080)
+ * and per block waits for 0xa25060 bit 0 clear (fatal 0x308); 0x804a2228
+ * waits for (0xa25060 & 3) == 2 (fatal 0x30c); 0x804a2138 reads the digest
+ * from 0xa25040 + 4i (SHA-384 words 8-11 at 0xa250c0), least significant
+ * word first: the firmware's ECDSA check (W5 below) verifies Intel's
+ * signature only with that order. Padding is done in software (0x804a2054).
+ * Model: FIPS 180-4 compression per full block. */
+#define SHA_BASE  0x00a25000u
+#define SHA_MODE  0x00a26410u
+#define SHA_INIT  (SHA_BASE + 0x64)
+#define SHA_STAT  (SHA_BASE + 0x60)
+#define SHA_CNT   (SHA_BASE + 0x68)
+static AX210Sha sha;
+static uint8_t sha_buf[128];
+static unsigned sha_cnt;
+static bool sha_done;
+
+static int sha_in_word(hwaddr a)
+{
+    if (a >= SHA_BASE && a < SHA_BASE + 0x40) {
+        return (a - SHA_BASE) / 4;
+    }
+    if (sha.wide && a >= SHA_BASE + 0x80 && a < SHA_BASE + 0xc0) {
+        return 16 + (a - SHA_BASE - 0x80) / 4;
+    }
+    return -1;
+}
+
+static int sha_out_word(hwaddr a)
+{
+    if (a >= SHA_BASE + 0x40 && a < SHA_BASE + 0x60) {
+        return (a - SHA_BASE - 0x40) / 4;
+    }
+    if (sha.wide && a >= SHA_BASE + 0xc0 && a < SHA_BASE + 0xe0) {
+        return 8 + (a - SHA_BASE - 0xc0) / 4;
+    }
+    return -1;
+}
+
+static uint32_t sha_digest(int i)
+{
+    i = (sha.wide ? 11 : 7) - i;
+    if (sha.wide) {
+        uint64_t h = sha.h64[i / 2];
+        return i & 1 ? (uint32_t)h : (uint32_t)(h >> 32);
+    }
+    return sha.h32[i];
+}
+
+static void sha_write(hwaddr a, uint32_t v)
+{
+    int i;
+
+    if (a == SHA_INIT && (v & 1)) {
+        ax210_sha_init(&sha, rs_get(SHA_MODE) & 1);
+        sha_cnt = 0;
+        sha_done = false;
+        return;
+    }
+    i = sha_in_word(a);
+    if (i < 0) {
+        return;
+    }
+    stl_be_p(sha_buf + 4 * i, v);
+    if (++sha_cnt == (sha.wide ? 32 : 16)) {
+        ax210_sha_block(&sha, sha_buf);
+        sha_cnt = 0;
+        sha_done = true;
+    }
+}
+
+/* Public-key engine at 0xa24c00 (finding W5, [F]): ECDSA P-384 verify in
+ * 0x804a1978. 0xc008c0e4 selects operand slot n with 0x100 | 2n at +0 and
+ * writes 12 words to 0xa24cac down to 0xa24c80 (most significant first);
+ * slots 1/2 G, 3/4 Q, 5 p, 6 a, 0x10 n, 0x11 r, 0x12 SHA-384 digest,
+ * 0x13 s (constants identify the curve). Command 0x11e (286) runs the
+ * verify; 0xc008c0a0 requires +4 bit 0 (busy) set at once, then
+ * 0xc008c018 waits for it to clear (fatal 0x30f); 0xc008bf70 accepts if
+ * all 24 words at 0xa24d00-2c and 0xa24d80-ac are zero. 0x11a (282) is a
+ * set-up command with G loaded. Model: FIPS 186-4 verify of the slots;
+ * the result words are zero on success, 1 otherwise. */
+#define PKA_CMD   0x00a24c00u
+#define PKA_STAT  0x00a24c04u
+#define PKA_DATA  0x00a24c80u
+#define PKA_RES0  0x00a24d00u
+#define PKA_RES1  0x00a24d80u
+#define PKA_SLOTS 0x20
+static uint32_t pka_slot[PKA_SLOTS][P384_WORDS];
+static int pka_sel = -1;
+static unsigned pka_busy;
+static uint32_t pka_res;
+
+static void pka_cmd(uint32_t v)
+{
+    if (v >= 0x100 && v < 0x100 + 2 * PKA_SLOTS && !(v & 1) &&
+        v != 0x11a && v != 0x11e) {
+        pka_sel = (v - 0x100) / 2;
+        return;
+    }
+    pka_sel = -1;
+    if (v == 0x11a || v == 0x11e) {
+        pka_busy = 2;
+    }
+    if (v == 0x11e) {
+        bool ok = ax210_p384_verify(pka_slot[3], pka_slot[4], pka_slot[0x11],
+                                    pka_slot[0x13], pka_slot[0x12]);
+        pka_res = ok ? 0 : 1;
+        for (int n = 3; n < PKA_SLOTS; n++) {
+            for (int i = 0; i < P384_WORDS; i++) {
+                trace_log(n == 3 && i == 0 ? "PKA.S" : "PKA.s",
+                          PKA_DATA + 4 * i, pka_slot[n][i], n);
+            }
+            if (n == 4) {
+                n = 0x10;
+            }
+            if (n == 0x13) {
+                break;
+            }
+        }
+        trace_log("PKA.V", PKA_CMD, ok, 4);
+    }
+}
 
 static void dma_kick(void);
 
@@ -731,6 +858,29 @@ static uint64_t trace_read(void *opaque, hwaddr addr, unsigned size)
         trace_log("R.phy", ra, v, size);
         return v;
     }
+    if (sha_out_word(a) >= 0 && !hit) {
+        v = sha_digest(sha_out_word(a));
+        trace_log("R.sha", ra, v, size);
+        return v;
+    }
+    if ((a == SHA_STAT || a == SHA_CNT) && !hit) {
+        v = a == SHA_CNT ? sha_cnt : (sha_done ? 2 : 0);
+        trace_log("R.sha", ra, v, size);
+        return v;
+    }
+    if (a == PKA_STAT && !hit) {
+        v = pka_busy ? 1 : 0;
+        if (pka_busy) {
+            pka_busy--;
+        }
+        trace_log("R.pka", ra, v, size);
+        return v;
+    }
+    if (((a >= PKA_RES0 && a < PKA_RES0 + 0x30) ||
+         (a >= PKA_RES1 && a < PKA_RES1 + 0x30)) && !hit) {
+        trace_log("R.pka", ra, pka_res, size);
+        return pka_res;
+    }
     if (a == PGE_STAT && !hit) {
         trace_log("R.pge", ra, pge_stat, size);
         return pge_stat;
@@ -835,6 +985,12 @@ static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     }
     if (a == DMA_STAT) {
         watch_evt &= ~((uint32_t)val & WATCH_EVT);
+    }
+    sha_write(a, (uint32_t)val);
+    if (a == PKA_CMD) {
+        pka_cmd((uint32_t)val);
+    } else if (a >= PKA_DATA && a < PKA_DATA + 0x30 && pka_sel >= 0) {
+        pka_slot[pka_sel][(a - PKA_DATA) / 4] = (uint32_t)val;
     }
     if (a == PGE_CMD) {
         pge_stat = val == 1 ? 4 : val == 2 ? 1 : 0;

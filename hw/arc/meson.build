@@ -5,6 +5,7 @@ arc_ss.add(files(
   'boot.c',
   'arc_virt.c',
   'ax210.c',
+  'ax210-crypto.c',
 ))
 arc_ss.add(when: 'CONFIG_ARC_VIRT', if_true: files('virt.c'))
 
