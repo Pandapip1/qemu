@@ -167,15 +167,24 @@ enum { USART_ALIAS_NONE, USART_ALIAS_SET, USART_ALIAS_CLR, USART_ALIAS_TGL };
 #define USART_IF_TCMP1 (1u << 15)
 #define USART_IF_TCMP2 (1u << 16)
 #define USART_IF_MASK 0x1ffffu
-/* Flags that follow their buffer condition rather than latching. */
-#define USART_IF_LEVEL (USART_IF_TXBL | USART_IF_RXDATAV | USART_IF_RXFULL)
+/*
+ * Flags that follow their buffer condition rather than latching: RM
+ * SS21.3.2.8 (TXBL "cleared automatically when [its] condition becomes
+ * false") and SS21.3.2.9 (RXDATAV likewise; the RXFULL interrupt flag, unlike
+ * the status bit, "must be cleared by software", so it latches).  [P] Whether
+ * a software clear of TXBL or RXDATAV while the condition holds is undone at
+ * once (as here: the flag simply follows the condition) is not in the RM.
+ */
+#define USART_IF_LEVEL (USART_IF_TXBL | USART_IF_RXDATAV)
 /*
  * Which flags drive the RX and which the TX interrupt line.  The device
  * header names the two lines (USART0_RX_IRQn, USART0_TX_IRQn) but not the
  * split; this one follows the flag names and the receive/transmit timer
  * comparators the Zephyr async driver uses (TCMP1 for RX timeout, TCMP2
  * for TX).  Zephyr routes both lines to one handler, so the split is not
- * observable to it.  Unverified on silicon.
+ * observable to it.  [P] The RM says only "separate interrupt vectors for
+ * receive and transmit interrupts" (SS21.2); the split per flag is owed to
+ * silicon.
  */
 #define USART_IF_RX_LINE (USART_IF_RXDATAV | USART_IF_RXFULL | USART_IF_RXOF | \
                           USART_IF_RXUF | USART_IF_PERR | USART_IF_FERR |     \
@@ -344,8 +353,7 @@ static uint32_t usart_if(Efr32UsartState *s)
 
     return s->if_latched |
            (status & USART_STATUS_TXBL ? USART_IF_TXBL : 0) |
-           (status & USART_STATUS_RXDATAV ? USART_IF_RXDATAV : 0) |
-           (status & USART_STATUS_RXFULL ? USART_IF_RXFULL : 0);
+           (status & USART_STATUS_RXDATAV ? USART_IF_RXDATAV : 0);
 }
 
 static void usart_update_irq(Efr32UsartState *s)
@@ -624,6 +632,10 @@ static void usart_receive_frame_ferr(Efr32UsartState *s, uint8_t value,
     trace_efr32_usart_rx(s->index, value);
     s->rx_ferr[fifo8_num_used(&s->rx_fifo)] = ferr;
     fifo8_push(&s->rx_fifo, value);
+    if (fifo8_is_full(&s->rx_fifo)) {
+        /* Set as the buffer becomes full; software clears it (SS21.3.2.9). */
+        s->if_latched |= USART_IF_RXFULL;
+    }
 }
 
 static void usart_receive_frame(Efr32UsartState *s, uint8_t value)

@@ -1049,6 +1049,51 @@ static void test_usart_frame_time(void)
 #define USART_BIT_NS          416
 #define USART_TIMECMP1_RXTIMEOUT ((2u << 20) | (4u << 16) | (1u << 24) | 8)
 
+/*
+ * RM SS21.3.2.9: RXDATAV and the status bit RXFULL follow the receive
+ * buffer, but the RXFULL interrupt flag "must be cleared by software".
+ * Two looped-back frames fill the two-frame buffer.
+ */
+#define USART_CTRL            0x008
+#define USART_RXDATA          0x024
+#define USART_CTRL_LOOPBK     (1u << 1)
+#define USART_STATUS_RXFULL   (1u << 8)
+#define USART_IF_RXDATAV      (1u << 2)
+#define USART_IF_RXFULL       (1u << 3)
+
+static void test_usart_rxfull_if_latches(void)
+{
+    QTestState *qts = qtest_initf("-machine efr32bg22 -accel qtest");
+
+    qtest_writel(qts, CMU_BASE + CMU_SYSCLKCTRL, CMU_SYSCLKCTRL_HFXO);
+    qtest_writel(qts, USART0_BASE + USART_CTRL, USART_CTRL_LOOPBK);
+    qtest_writel(qts, USART0_BASE + USART_CMD, USART_CMD_RXEN | USART_CMD_TXEN);
+    qtest_writel(qts, USART0_BASE + USART_TXDATA, 0x11);
+    qtest_writel(qts, USART0_BASE + USART_TXDATA, 0x22);
+    qtest_clock_step(qts, 2 * USART_FRAME_2M4_NS + 10);
+    g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_STATUS) &
+                    (USART_STATUS_RXDATAV | USART_STATUS_RXFULL), ==,
+                    USART_STATUS_RXDATAV | USART_STATUS_RXFULL);
+    g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_IF) &
+                    (USART_IF_RXDATAV | USART_IF_RXFULL), ==,
+                    USART_IF_RXDATAV | USART_IF_RXFULL);
+
+    g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_RXDATA), ==, 0x11);
+    g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_STATUS) &
+                    USART_STATUS_RXFULL, ==, 0);
+    g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_IF) &
+                    USART_IF_RXFULL, ==, USART_IF_RXFULL);
+    g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_RXDATA), ==, 0x22);
+    /* RXDATAV clears with its condition, RXFULL only when software says. */
+    g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_IF) &
+                    (USART_IF_RXDATAV | USART_IF_RXFULL), ==, USART_IF_RXFULL);
+    qtest_writel(qts, USART0_BASE + USART_IF + REGISTER_CLEAR_WINDOW,
+                 USART_IF_RXFULL);
+    g_assert_cmphex(qtest_readl(qts, USART0_BASE + USART_IF) &
+                    USART_IF_RXFULL, ==, 0);
+    qtest_quit(qts);
+}
+
 static int unix_connect(const char *path)
 {
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
@@ -5899,6 +5944,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/dpll-lock", test_dpll_lock);
     qtest_add_func("/efr32bg22/usart-tx-polling", test_usart_tx_polling);
     qtest_add_func("/efr32bg22/usart-frame-time", test_usart_frame_time);
+    qtest_add_func("/efr32bg22/usart-rxfull-if-latches",
+                   test_usart_rxfull_if_latches);
     qtest_add_func("/efr32bg22/usart-timer-and-break",
                    test_usart_timer_and_break);
     qtest_add_func("/efr32bg22/modem-masks", test_modem_masks);
