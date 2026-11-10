@@ -111,13 +111,19 @@ flag?), and the 0x1f4 bit 5 -> bit 13 handshake.
 In stock's order, each a single write followed by a read-back of the same
 register (stock's ai_corereg pattern):
 
-1. PMU mac_res_req_mask (+0x68c) = 0x40000000 (MACPHY_CLK_MAIN; the PMU
-   closes the dependencies), mac_res_req_timer (+0x688) = 0x15000000. [F]
-   values from stock, [B] si_pmu_set_mac_rsrc_req.
+1. Stock's si_lhl_timer_config (RAM 0x82b0be): GCI 0xc70 |= 3, PMU
+   mac_res_req_mask (+0x68c) = 0x56cac1ff (MACPHY_CLK_MAIN and all its
+   dependencies; the PMU does **not** close the mask), poll pmustatus bit
+   10 (PST_SLOW_WR_PENDING) clear, mac_res_req_timer (+0x688) = 0x15000000,
+   GCI 0xc78 = 0. [F] values (run 30 read-backs), [B] sequence. See "MAC
+   resource request" below.
 2. srpwr request domain 3 (MAC main) or 0x1e; poll status. [F]
 3. d11 core reset with PHY clock+reset held, ioctl to 0x145. [F]
-   With step 1 done, the PHY clock (MACPHY_CLK_MAIN) is up as soon as the
-   core is out of reset with its clock on. [I]
+   This alone asserts no MAC clock request: nothing is granted (run 30:
+   clk_ctl_st 0x150b0040, res_state 0x1e4efbdf, PHY data read slave
+   error). [F] The model asserts it once the slice's ucode memory has been
+   written, which is what separates stock's working attach read from run
+   30. [I]
 4. d11 maccontrol (+0x120) = 0x04000400 (MCTL_WAKE | MCTL_IHR_EN). [B]
    After this the clk_ctl_st PHY PLL request no longer reaches the PMU, so
    step 1 must come first. [F] run 16. Gives SISF_FCLKA (iostatus 0x11006).
@@ -147,6 +153,95 @@ chipstatus[15] bit 1 (index write 15 to GCI +0x40, read back, read +0x204),
 |= 0x200, then the CC request 0x110. [B] names, [I] that this gates bit 24.
 Before touching any PMU/GCI index register, either read every write back or
 set pmucontrol_ext bit 0 (FAST_TRANS_ENAB) as stock does (0x281). [F] run 15.
+
+### MAC resource request and reload-persistent PMU/GCI state (2026-11-10)
+
+The bug the model missed: our firmware programmed mac_res_req_mask =
+0x40000000 because stock, traced in an older model whose res_dep_mask table
+read 0, computed that value. On silicon stock writes the closure
+0x56cac1ff; with 0x40000000 silicon never granted MACPHY_CLK_MAIN (runs 23,
+26-29: res_state 0x1e4efbdf, d11 clk_ctl_st 0x150b0342), while the model,
+which closed every requested mask over the dependency table, granted it
+every time. Now:
+
+- **Reload-persistent state** [F]: brcmfmac's reload resets the cores and
+  slice domains but not the PMU or GCI/LHL (notes/36 §3.1). The model's
+  handoff state is stock's: res_dep_mask, res_updn_timer, chipcontrol,
+  regcontrol, pllcontrol and GCI chipcontrol from run 14
+  (`fw/trace/indirect_stock_run14.tsv`, 94 entries); pmucontrol 0x380, min
+  1, max 0x7fffffff; pmucontrol_ext **0x14291** and GCI 0xc70 = 3, 0xc78 =
+  0 (run 30). Inferred to persist too, never read on silicon: GCI 0xc40 = 3
+  and res_req_mask/timer = 0x160880df/0x15000000 (stock's values over the
+  run-14 table). [I] The MAC request registers do not persist (run 16
+  failed with WAKE and no programming). [F]
+- **Request timers honour their mask as written** (bcm4387-pmu.c
+  res_update). min_res_mask and the requester inputs still get the
+  dependency closure; a timer's mask does not: a masked resource comes up
+  only once its own dependencies are up for another reason or are masked
+  and up. [B] bcmdhd builds every such mask as resource | si_pmu_res_deps
+  (si_pmu_rsrc_macphy_clk_deps); [F] runs 23, 26-29 lack exactly
+  closure(30) minus what was up (bits 30/23/5).
+- **When the MAC asks** (bcm4387.c d11_mac_request): out of reset with its
+  clock on and MCTL_WAKE, the clk_ctl_st PHY PLL request (0x200), or ucode
+  memory written. Out of reset alone is not enough [F run 30]; the ucode
+  condition is [I] (stock writes slice 0's ucode from seq 4605, before its
+  attach read at 63881, which answers on silicon; run 30 had not). The
+  other candidate is stock's first-pass attach (notes/36 §6.2). [U]
+- **pmustatus PST_SLOW_WR_PENDING**: set while a posted always-on index
+  write is pending, and for 3 ILP cycles after a write to an ILP-domain
+  register (pmuwatchdog, res_req_timer, mac_res_req_timer 0/1/2) made with
+  FAST_TRANS_ENAB clear. [B] register list (siutils.c
+  PMUREGS_ILP_SENSITIVE, HND_PMU_SYNC_WR), [I] gating and duration. A
+  second ILP write in that window is **dropped** (reads back the old
+  value). bcmdhd calls the hazard a backplane stall [B]; silicon has no
+  double ILP write, but its one double always-on write (run 15) was
+  dropped, not stalled [F], so the model drops. [I] The mask is not an ILP
+  register, so mask-then-timer with no wait (runs 16-29) is not a double
+  write; with FAST_TRANS set at handoff it never pends for us (run 30: 0
+  polls). [F] So SLOW_WR does not explain runs 23-29; the mask does.
+- **Always-on index synchroniser**: still posted (run 15) although
+  pmucontrol_ext reads FAST_TRANS set at handoff (run 30). The gate is now
+  the firmware's own write of pmucontrol_ext with FAST_TRANS (stock's 0x281
+  RMW), not the register bit. [I] What really separates run 15 from stock
+  is unknown. [U]
+- **GCI LHL timers** (bcm4387-gci.c): named per sbgci.h. MAC timers
+  0xc70/0xc74/0xc78/0xc7c (and 1/2): stored; a write to int_adr clears the
+  status ("This also resets the interrupt status", hndlhl.c) [B]; they do
+  not gate the MAC grant [F run 30: stock's values, no grant at attach].
+  ARM timer 0xc40/0xc44/0xc48: a non-zero 0xc48 count expires that many
+  ILP cycles later, sets 0xc44 bit 0 (W1C) and asserts the PMU ARM request
+  (res_req mask, plus XTAL_HQ for FORCE_HQ) until the status is cleared or
+  the count rewritten. [I] notes/36 §6, queue run 31 tests it. In the model
+  stock starts it with 0x39 at seq 63244 and has XTAL_HQ before its attach
+  read (0x1e4efbff).
+- **ChipCommon SECI clock** (ERSRC0): FLL running is no longer enough,
+  because the FLL already runs at handoff (0x14291) and runs 10/11 never
+  got bit 24: SECI_config bit 2 (SECI_ENAB_SECI_ECI, which stock sets) is
+  also required. [I]
+- **PHY window writes without PHYPLL** no longer abort: the attach probe's
+  +0x3fc write went through and the +0x3fe read aborted (runs 22/30). [F]
+  The write is dropped. [U]
+
+Regressions (`scripts/model_regress.py`, sibling repo): queued-27/1 and
+queued-29/2 ctrl (mask 0x40000000) must decode "enable_phy FAILED at stage
+1 ... res_state then 0x1e4efbdf", queued-30/1 macreq must be SAME (nothing
+at attach, abort at 0x180313fe), and fw/open/open-ctrl.bin (stock's
+sequence, no probe) must reach PHYPLL, a model prediction [I] that silicon
+has not tested (run 30's probe aborted first). New probes
+`pmu_mac_res_req_mask_without_deps` (runs 23/26-29) and
+`pmu_mac_res_req_not_granted_at_attach` (run 30).
+
+**Expected divergence: run 21's binary and run 17.** fw/open/open-run21.bin
+(queued-28/1, queued-29/1) and the run-17 probe
+(`d11_mac_res_req_then_wake`) got MACPHY_CLK_MAIN on silicon with the
+0x40000000 mask, while every later binary with the same MMIO sequence did
+not (0/7). The model now predicts the failure for all of them. notes/36 §1
+shows the run21 and ctrl binaries make the same accesses with a few cycles'
+timing difference; the success is attributed to ILP-domain timing (§1a)
+[I], which the model does not reproduce and should not. The harness reports
+these as EXPECTED DIVERGENCE and does not count them. queued-21/2 replay
+(another run-21-era binary) stays a counted DIFF: it already differed on
+its ports, and now also on the PLL grant for the same reason.
 
 ## Evidence sources
 

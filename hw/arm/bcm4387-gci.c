@@ -31,6 +31,28 @@
  *    0x41249c acquire and release by writing the same bit). [I]
  *  - CNCB LUTs: +0x484 selects the entry of the 2G (+0x488) and 5G
  *    (+0x48c) tables (gci_cncb_lut_indirect_addr). [B] layout; [U] effect.
+ *  - LHL ARM timer 0 (+0xc40 intrp_adr, +0xc44 st_adr, +0xc48 armtim0_adr;
+ *    bcmdhd sbgci.h / hndlhl.c si_lhl_timer_config(LHL_ARM_TIMER),
+ *    si_lhl_timer_reset: count 0 then status write-1-to-clear) [B]. A
+ *    non-zero write to +0xc48 starts it; it expires that many ILP cycles
+ *    later, sets +0xc44 bit 0 and asserts the PMU ARM resource request
+ *    (res_req_mask/timer) until the status is cleared or the count is
+ *    rewritten. [I] (notes/36 §6.1: stock starts it with 0x39 at seq 63244;
+ *    queue run 31 tests whether the expiry brings up XTAL_HQ). No
+ *    interrupt is raised. [U] The interrupt enable bits are stored only.
+ *  - LHL MAC timers 0/1/2 (+0xc70..+0xc9c, bcmdhd sbgci.h
+ *    lhl_wl_mactimN_intrp_adr / _st_adr / lhl_wl_mactim_intN_adr /
+ *    _fracN_adr) [B]: stock's si_lhl_timer_config sets intrp_adr bits 0/1
+ *    (LHL_WL_MACTIM_INTRP_EN | _EDGE_TRIGGER) and then writes int_adr = 0,
+ *    "Reset MAC Main Timer if in case it is running due to previous
+ *    instance. This also resets the interrupt status" (hndlhl.c) [B]. The
+ *    block is always-on: at handoff 0xc70 reads 3 and 0xc78 0, stock's
+ *    values (run 30). [F] The timers do not count and never raise their
+ *    status (st_adr bit 0, write 1 to clear per LHL_WL_MACTIMER_INT_ST_MASK
+ *    [B]), so int_adr writes only clear it; the PMU MAC resource request
+ *    does not depend on these registers in the model: run 30 had them at
+ *    stock's values and nothing was granted before the MAC asked. [F]
+ *    Whether they take part in the grant at all is unknown. [U]
  *  - every other register in gci_regs[] is plain storage: its effect is
  *    not known and it is listed as a gap. [U]
  *
@@ -38,6 +60,7 @@
  */
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 #include "qapi/error.h"
 #include "hw/core/sysbus.h"
 #include "hw/arm/bcm4387.h"
@@ -100,21 +123,26 @@ static const Bcm4387Reg gci_regs[] = {
     /* low byte 7: stock caches it at si_pub+0x46 [F] */
     { 0xc00, "gci_0xc00", 0x00000007, 0, "F low byte (si_pub cache); rest U" },
     { 0xc04, "lpo_sel", 0, ~0u, "I see LPO" },
-    { 0xc40, "gci_0xc40", 0, ~0u, "U (stock 0x3)" },
-    { 0xc44, "lhl_wl_armtim0_0xc44", 0, ~0u, "B block; U" },
-    { 0xc48, "gci_0xc48", 0, ~0u, "U (stock 0x3c)" },
-    { 0xc70, "gci_0xc70", 0, ~0u, "U (stock 0x3)" },
-    { 0xc78, "gci_0xc78", 0, ~0u, "U" },
-    { 0xc74, "lhl_wl_mactim_0xc74", 0, ~0u, "B block; U" },
-    { 0xc7c, "lhl_wl_mactim_0xc7c", 0, ~0u, "B block; U" },
-    { 0xc84, "lhl_wl_mactim_0xc84", 0, ~0u, "B block; U" },
-    { 0xc8c, "lhl_wl_mactim_0xc8c", 0, ~0u, "B block; U" },
-    { 0xc94, "lhl_wl_mactim_0xc94", 0, ~0u, "B block; U" },
-    { 0xc9c, "lhl_wl_mactim_0xc9c", 0, ~0u, "B block; U" },
-    { 0xc80, "lhl_wl_mactim0_0xc80", 0, ~0u, "B block; U" },
-    { 0xc88, "lhl_wl_mactim_0xc88", 0, ~0u, "B block; U" },
-    { 0xc90, "lhl_wl_mactim_0xc90", 0, ~0u, "B block; U" },
-    { 0xc98, "lhl_wl_mactim_0xc98", 0, ~0u, "B block; U" },
+    /* LHL ARM timer 0, see LHL ARM timer above */
+    { 0xc40, "lhl_wl_armtim0_intrp_adr", 0x3, 0x3,
+      "B name/bits; I handoff 3 (stock's, persists like 0xc70)" },
+    { 0xc44, "lhl_wl_armtim0_st_adr", 0, 0, "B name, W1C bit 0; I set on expiry" },
+    { 0xc48, "lhl_wl_armtim0_adr", 0, ~0u, "B name; I ILP count to expiry" },
+    /* LHL MAC timers 0/1/2 (main/aux/scan), see LHL MAC timers above */
+    { 0xc70, "lhl_wl_mactim0_intrp_adr", 0x3, 0x3,
+      "B name/bits; F handoff 3 (run 30); U effect" },
+    { 0xc74, "lhl_wl_mactim0_st_adr", 0, 0, "B name; I W1C status, never set" },
+    { 0xc78, "lhl_wl_mactim_int0_adr", 0, ~0u,
+      "B name; F handoff 0 (run 30); I write clears status; U count" },
+    { 0xc7c, "lhl_wl_mactim_frac0_adr", 0, ~0u, "B name; U" },
+    { 0xc80, "lhl_wl_mactim1_intrp_adr", 0, 0x3, "B name/bits; U effect" },
+    { 0xc84, "lhl_wl_mactim1_st_adr", 0, 0, "B name; I as mactim0_st" },
+    { 0xc88, "lhl_wl_mactim_int1_adr", 0, ~0u, "B name; I as mactim_int0" },
+    { 0xc8c, "lhl_wl_mactim_frac1_adr", 0, ~0u, "B name; U" },
+    { 0xc90, "lhl_wl_mactim2_intrp_adr", 0, 0x3, "B name/bits; U effect" },
+    { 0xc94, "lhl_wl_mactim2_st_adr", 0, 0, "B name; I as mactim0_st" },
+    { 0xc98, "lhl_wl_mactim_int2_adr", 0, ~0u, "B name; I as mactim_int0" },
+    { 0xc9c, "lhl_wl_mactim_frac2_adr", 0, ~0u, "B name; U" },
     { 0xd70, "gci_0xd70", 0, ~0u, "U (stock table RAM 0x82b3a7)" },
     { 0xd74, "gci_0xd74", 0, ~0u, "U" },
     { 0xdc4, "gci_0xdc4", 0, ~0u, "U" },
@@ -154,6 +182,7 @@ struct Bcm4387GciState {
     uint32_t sema_req, sema_rsv;
     uint32_t lut_addr, lut[2][1024];
     uint32_t hs_status, otp_layout, lpo_ctl, lpo_status;
+    QEMUTimer *armtim;
 };
 
 static uint32_t *gci_reg(Bcm4387GciState *s, hwaddr off)
@@ -171,6 +200,15 @@ static uint32_t gci_chipstatus(Bcm4387GciState *s, uint32_t idx)
     default:
         return 0;
     }
+}
+
+static void gci_armtim_expire(void *opaque)
+{
+    Bcm4387GciState *s = opaque;
+
+    *gci_reg(s, 0xc44) |= 1;
+    trace_bcm4387_gci_armtim(*gci_reg(s, 0xc48), true);
+    bcm4387_pmu_arm_timer_req(s->pmu, true);
 }
 
 static void gci_set_index(void *opaque, hwaddr addr, uint32_t v)
@@ -304,6 +342,27 @@ static MemTxResult gci_write(void *opaque, hwaddr off, uint64_t val,
     if (!r || size != 4) {
         return bcm4387_unknown("gci", BCM4387_GCI_BASE, off, true, &val, size);
     }
+    if (off == 0xc78 || off == 0xc88 || off == 0xc98) {
+        *gci_reg(s, off - 4) = 0;
+    }
+    if (off == 0xc44) {
+        *r &= ~(val & 1);
+        bcm4387_pmu_arm_timer_req(s->pmu, *r & 1);
+        return MEMTX_OK;
+    }
+    if (off == 0xc48) {
+        *r = val;
+        trace_bcm4387_gci_armtim(val, false);
+        bcm4387_pmu_arm_timer_req(s->pmu, false);
+        *gci_reg(s, 0xc44) &= ~1;
+        if (val) {
+            timer_mod(s->armtim, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      muldiv64(val, NANOSECONDS_PER_SECOND, BCM4387_ILP_HZ));
+        } else {
+            timer_del(s->armtim);
+        }
+        return MEMTX_OK;
+    }
     *r = (*r & ~gci_regs[r - s->reg].wmask) |
          (val & gci_regs[r - s->reg].wmask);
     return MEMTX_OK;
@@ -337,12 +396,14 @@ static void gci_reset(DeviceState *dev)
     s->lut_addr = 0;
     memset(s->lut, 0, sizeof(s->lut));
     s->hs_status = s->otp_layout = s->lpo_ctl = s->lpo_status = 0;
+    timer_del(s->armtim);
 }
 
 static void gci_init(Object *obj)
 {
     Bcm4387GciState *s = BCM4387_GCI(obj);
 
+    s->armtim = timer_new_ns(QEMU_CLOCK_VIRTUAL, gci_armtim_expire, s);
     memory_region_init_io(&s->mmio, obj, &gci_ops, s, "bcm4387.gci",
                           2 * BCM4387_CORE_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);

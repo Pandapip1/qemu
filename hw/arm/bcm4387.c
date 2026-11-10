@@ -269,9 +269,9 @@ static bool model_read(BCM4387MachineState *s, hwaddr a, uint32_t *v)
          * and the backplane on HT (0xb0000); bits 24/26/28 read set once the
          * core is out of reset (0x150b0040, meaning unknown); the PHY clock
          * request (0x200) adds bits 25/27 once MACPHY_CLK is up (stock and
-         * run 11: 0x1f0b0342). Not without the request: run 17 has
-         * MACPHY_CLK up through the MAC resource request at core clock
-         * enable and reads 0x150b0040 there. [F] Bit 25 is the status of
+         * run 11: 0x1f0b0342). [F] Not without the request [I]: the
+         * model has MACPHY_CLK up from the MAC resource request at stock's
+         * attach and reads 0x150b0040 there. Bit 25 is the status of
          * request bit 9 in hndsoc.h's CCS_ERSRC_REQ/STS layout [B]; bit 27
          * is unknown. [U]
          */
@@ -346,10 +346,21 @@ static void tcam_program(BCM4387MachineState *s, uint32_t slot);
  *    request (0x200) asks for MACPHY_CLK directly. [F] runs 7-11: our
  *    firmware, maccontrol never written, request 0x342 -> 0x1f0b0342 and
  *    res_state 0x5ecefbff.
- *  - out of reset with its clock on, the MAC's own clock request goes
- *    through the PMU MAC resource request (mac_res_req_timer/mask for this
- *    slice; see bcm4387-pmu.c): stock reads phyversion (RAM 0x82ee50) with
- *    only that programmed, before any clk_ctl_st PHY PLL request.
+ *  - the MAC asserts its clock request to the PMU MAC resource request
+ *    (mac_res_req_timer/mask for this slice; see bcm4387-pmu.c) while it is
+ *    out of reset with its clock on AND held awake (MCTL_WAKE), asking for
+ *    the PHY PLL (clk_ctl_st 0x200), or with its ucode memory written.
+ *    Out of reset with the clock on alone is not enough: [F] run 30,
+ *    request programmed as stock (mask 0x56cac1ff, timer 0x15000000, GCI
+ *    0xc70 3, 0xc78 0), right after the attach (IOCTL 0x145, maccontrol
+ *    and clk_ctl_st not written, no ucode yet): d11 clk_ctl_st 0x150b0040,
+ *    res_state 0x1e4efbdf, PHY data read AXI slave error. Yet stock, in the
+ *    same wrapper/maccontrol/clk_ctl_st state, reads phyversion (seq 63881,
+ *    RAM 0x82ee50) and its PHY port answers there (run 22). [F] The ucode
+ *    condition is the model's choice of what separates the two: stock has
+ *    written slice 0's ucode memory (seq 4605 on) by then, run 30 had not.
+ *    [I] Stock's first-pass attach of slice 0 alone (seq 4601-4604) is the
+ *    other candidate (notes/36 §3.2 rank 2). [U]
  *  - MAC held awake (MCTL_WAKE): the clk_ctl_st request no longer reaches
  *    the PMU, only the MAC resource request does. [F] run 16: maccontrol
  *    0x04000400 written before the 0x302 request, mac_res_req never
@@ -366,7 +377,9 @@ static void d11_mac_request(BCM4387MachineState *s, int n)
     bool up = !(store_get(s, D11_WRAP(n) + WRAP_RESETCTRL) & 1) &&
               (store_get(s, D11_WRAP(n) + WRAP_IOCTL) & 1);
 
-    bcm4387_pmu_mac_active(s->pmu, n, up);
+    bcm4387_pmu_mac_active(s->pmu, n, up &&
+                           (awake || s->ucode_loaded[n] ||
+                            (store_get(s, D11_BASE(n) + 0x1e0) & 0x200)));
     bcm4387_pmu_request(s->pmu, BCM4387_REQ_MAC0 + n,
                         !awake && (store_get(s, D11_BASE(n) + 0x1e0) & 0x200) ?
                         BIT(d11_macphy_res[n]) : 0);
@@ -819,10 +832,14 @@ MemTxResult bcm4387_unknown(const char *dev, hwaddr base, hwaddr off,
  * - core left reset without PHY clock+reset held (ioctl & 0xc) and later
  *   given bandwidth/0x100 cflags: register reads get no response (stall).
  * - PHY window (radio port 0x3d8/0x3da, phyversion 0x3e0, PHY port
- *   0x3fc/0x3fe): slave error until the PHY side is clocked
- *   (d11_phy_ready). [F]/[I]
+ *   0x3fc/0x3fe): reads get a slave error until the PHY side is clocked
+ *   (d11_phy_ready). [F]/[I] Writes there do not abort: in runs 22 and 30
+ *   the attach probe's address write to +0x3fc went through and the data
+ *   read of +0x3fe took the abort (DFSR 0x1008, DFAR 0x180313fe). [F]
+ *   Whether such a write reaches the port is unknown; it is dropped. [U]
  */
-static MemTxResult d11_gate(BCM4387MachineState *s, hwaddr a)
+static MemTxResult d11_gate(BCM4387MachineState *s, hwaddr a, bool wr,
+                            bool *dropped)
 {
     int n = d11_core(a);
     uint32_t ioctl;
@@ -850,6 +867,14 @@ static MemTxResult d11_gate(BCM4387MachineState *s, hwaddr a)
         qemu_system_vmstop_request_prepare();
         qemu_system_vmstop_request(RUN_STATE_PAUSED);
         cpu_exit(current_cpu);
+        return MEMTX_OK;
+    }
+    if (a - D11_BASE(n) >= 0x3d8 && a - D11_BASE(n) < 0x400 &&
+        !d11_phy_ready(s, n) && wr) {
+        qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: d11 %d PHY window write "
+                      "without PHYPLL dropped, 0x%08" HWADDR_PRIx " pc~0x%08x\n",
+                      n, a, bcm4387_pc());
+        *dropped = true;
         return MEMTX_OK;
     }
     if (a - D11_BASE(n) >= 0x3d8 && a - D11_BASE(n) < 0x400 &&
@@ -1117,8 +1142,10 @@ static bool obj_port(BCM4387MachineState *s, hwaddr a, unsigned size, bool wr,
     if (n < 0 || (off != 0x160 && off != 0x164 && off != 0x166)) {
         return false;
     }
-    if (wr && off != 0x160 && !(store_get(s, D11_BASE(n) + 0x160) & 0x7f0000)) {
+    if (wr && off != 0x160 && !(store_get(s, D11_BASE(n) + 0x160) & 0x7f0000) &&
+        !s->ucode_loaded[n]) {
         s->ucode_loaded[n] = true;
+        d11_mac_request(s, n);
     }
     if (wr && off == 0x160) {
         store_set(s, a, *v);
@@ -1200,8 +1227,8 @@ static MemTxResult trace_read(void *opaque, hwaddr addr, uint64_t *data,
 {
     BCM4387MachineState *s = opaque;
     uint32_t v = 0;
-    bool modelled;
-    MemTxResult r = d11_gate(s, addr);
+    bool modelled, dropped = false;
+    MemTxResult r = d11_gate(s, addr, false, &dropped);
 
     if (r != MEMTX_OK) {
         return r;
@@ -1236,10 +1263,10 @@ static MemTxResult trace_write(void *opaque, hwaddr addr, uint64_t val,
                                unsigned size, MemTxAttrs attrs)
 {
     BCM4387MachineState *s = opaque;
-    bool modelled;
-    MemTxResult r = d11_gate(s, addr);
+    bool modelled, dropped = false;
+    MemTxResult r = d11_gate(s, addr, true, &dropped);
 
-    if (r != MEMTX_OK) {
+    if (r != MEMTX_OK || dropped) {
         return r;
     }
     if (phy_port(s, addr, size, true, val, NULL)) {

@@ -14,10 +14,13 @@
  *    handoff and in every run. [F] (meaning unknown [U])
  *    Bit 24 (CCS_SECI_AVAIL) answers the SECI clock request (bit 8,
  *    CCS_SECICLKREQ) [B] once the FLL LPO runs (pmucontrol_ext
- *    FASTLPO_ENAB, FLL locked). [I] hypothesis: our firmware's 0x110
- *    request left bit 24 clear (queue run 11); stock enables the FLL LPO
- *    (RAM 0x82b6f8) before its SECI clock request (ROM 0x483964) and gets
- *    0x030b0152.
+ *    FASTLPO_ENAB, FLL locked) and SECI is enabled (SECI_config bit 2,
+ *    SECI_ENAB_SECI_ECI [B]). [I] hypothesis: our firmware's 0x110/0x150
+ *    requests left bit 24 clear (queue runs 10, 11) although the FLL
+ *    already runs at handoff (pmucontrol_ext 0x14291, run 30 [F]); stock
+ *    writes SECI_config 1, 0xd, 0xc, 0x4 (ROM 0x483394.., seq 4391-4401)
+ *    before its SECI clock request (ROM 0x483964) and gets 0x030b0152.
+ *    SECI_config is ChipCommon state, reset by a reload. [I]
  *  - powerctl (srpwr, +0x1e8): PowerOnRequest [12:8] per domain (0 PCIE,
  *    1 ARM/BP, 2 MAC aux, 3 MAC main, 4 MAC scan), ExtPwrStatus [20:16]
  *    and BT status [21] read-only. [B] Domains 0, 1 and the BT bit read on
@@ -171,7 +174,8 @@ static uint32_t clk_ctl_st(Bcm4387CcState *s)
 
     v |= (alp ? CCS_ALPAVAIL : 0) | (ht ? CCS_HTAVAIL | CCS_BP_ON_HT : 0) |
          (!ht && alp ? CCS_BP_ON_ALP : 0);
-    if ((s->clk_req & CCS_SECICLKREQ) && bcm4387_pmu_fll_locked(s->pmu)) {
+    if ((s->clk_req & CCS_SECICLKREQ) && bcm4387_pmu_fll_locked(s->pmu) &&
+        (*cc_reg(s, 0x130) & 0x4)) {
         v |= CCS_SECI_AVAIL;
     }
     return v;

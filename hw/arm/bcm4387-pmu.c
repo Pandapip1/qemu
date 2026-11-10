@@ -13,16 +13,26 @@
  *    the requesters (bcm4387_pmu_request: srpwr power domains, d11 MAC
  *    clock requests, the external/BT side, ChipCommon), or by the mask of
  *    a resource request timer while its force ALP/HT/HQ flags are set:
- *    res_req (the ARM's, always asserted), mac_res_req 0/1/2 while that d11
- *    slice asserts its clock request (out of reset, clock on; see
- *    d11_mac_request in bcm4387.c). Stock enables the main PHY this way:
- *    mac_res_req_timer 0x15000000, mask 0x56cac1ff = MACPHY_CLK_MAIN and
- *    its dependencies (si_pmu_set_mac_rsrc_req), before its first
- *    phyversion read. [B] flags/names, [I] the request condition.
- *    These timers are reset by a reload (handoff res_state lacks resource
- *    30). [F] The PMU brings up the
+ *    res_req (the ARM's) while the LHL ARM timer 0 has expired and its
+ *    status is not cleared (GCI +0xc44, bcm4387-gci.c) [I: PMU in LHL timer
+ *    mode, pmucontrol_ext USE_LHL_TIMER; notes/36 §6, run 31 tests it],
+ *    plus XTAL_HQ when its FORCE_HQ flag is set [I]; its handoff
+ *    mask/timer are stock's 0x160880df (= si_pmu_rsrc_ht_avail_clk_deps |
+ *    si_pmu_rsrc_cb_ready_deps over the run-14 table) / 0x15000000, taken
+ *    to persist like the rest of the PMU [I] (never read on silicon; the MAC
+ *    ones do not persist, run 16), mac_res_req 0/1/2 while that d11
+ *    slice's MAC asserts its clock request (see d11_mac_request in
+ *    bcm4387.c). Stock programs the main one in si_lhl_timer_config (RAM
+ *    0x82b0be): mac_res_req_mask 0x56cac1ff = MACPHY_CLK_MAIN and its
+ *    dependencies (si_pmu_rsrc_macphy_clk_deps), wait for SLOW_WR, timer
+ *    0x15000000. [B] flags/names, [I] the request condition.
+ *    The MAC timers are reset by a reload (run 16: WAKE and the PLL
+ *    request with no programming got nothing). [F] For min_res_mask and the requesters the PMU brings up the
  *    dependency closure of everything requested (res_dep_mask table),
- *    limited to max_res_mask, and drops the rest. Transitions complete at
+ *    limited to max_res_mask, and drops the rest. A request timer's mask is
+ *    honoured as written, with no closure: a masked resource comes up only
+ *    when its dependencies are up (see res_update). [B] by construction,
+ *    [F] runs 23, 26-29: mask 0x40000000 never granted. Transitions complete at
  *    once (res_pending reads 0); timing is not modelled. [B] semantics
  *    (bcmdhd si_pmu_res_deps, si_pmu_res_init), [F] check: the closure of
  *    the run-14 table reproduces every res_state seen on silicon:
@@ -35,10 +45,17 @@
  *    res_updn_timer; chipcontrol, regcontrol and pllcontrol behind their
  *    address/data pairs. They are not reset by a firmware reload (queue run
  *    15 read stock's values at our handoff), so they hold stock's run-14
- *    values at handoff. [F] A dep_mask write re-evaluates the resources. [B]
+ *    values at handoff. [F] This is the reload-persistent state: a firmware
+ *    reload (brcmfmac's ChipCommon watchdog with PCIe function 0 kept)
+ *    resets the cores and slice domains but not the PMU or GCI/LHL
+ *    (notes/36 §3.1: handoff pmucontrol 0x380, min 1, max 0x7fffffff,
+ *    pmucontrol_ext 0x14291 are stock's values) [F], so every boot of our
+ *    firmware starts on stock's tables, including the res_dep_mask table
+ *    whose closure of bit 30 is 0x56cac1ff. A dep_mask write re-evaluates
+ *    the resources. [B]
  *    pllcontrol is committed by pmucontrol.PLLCTL_UPD (self-clearing). [B]
- *  - Always-on write synchroniser (pmucontrol_ext bit 0, FAST_TRANS_ENAB,
- *    clear at handoff): while it is clear, a write to an index register
+ *  - Always-on write synchroniser: until the firmware itself writes
+ *    pmucontrol_ext with FAST_TRANS_ENAB (bit 0) set, a write to an index register
  *    (PMU 0x620/0x650/0x658/0x660, GCI 0x40) is posted. It lands when the
  *    register is read back, or after the next read of the always-on block
  *    has returned (the old state). A second write to the same register before it has
@@ -47,7 +64,18 @@
  *    write-index/read-data dump at handoff: first read old index, all later
  *    reads the first index written, srpwr dead afterwards); stock always
  *    reads back (ai_corereg) until it sets FAST_TRANS_ENAB (RAM 0x82bf93),
- *    then writes res_table_sel without read-back. [I] mechanism.
+ *    then writes res_table_sel without read-back. [I] mechanism. The gate
+ *    is not the register bit: pmucontrol_ext already reads 0x14291
+ *    (FAST_TRANS set) at handoff (run 30) [F], yet run 15's writes were
+ *    posted. What really separates run 15 from stock is unknown [U]; the
+ *    model keys it on the firmware's own FAST_TRANS write. [I]
+ *  - pmustatus PST_SLOW_WR_PENDING: set while a posted index write is
+ *    pending, and for 3 ILP cycles after a write to an ILP-domain register
+ *    (pmuwatchdog, res_req_timer, mac_res_req_timer 0/1/2) made while the
+ *    register bit FAST_TRANS_ENAB is clear; a second such write in that
+ *    window is dropped (pmu_ilp_reg). [B] register list and status bit,
+ *    [I] FAST_TRANS gating, duration and the drop. With stock's 0x14291 at
+ *    handoff it never pends for our firmware (run 30: 0 polls). [F]
  *  - pmucontrol_ext FASTLPO_ENAB (bit 7) starts the 1 MHz FLL LPO; its lock
  *    shows in GCI chipstatus[15] bit 1 (GCI_CS_4387_FLL1MHZ_LOCK_MASK). [B]
  *    Lock is immediate. [I]
@@ -69,6 +97,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Bcm4387PmuState, BCM4387_PMU)
 
 #define NRES            31
 #define RES(n)          (1u << (n))
+#define RES_XTAL_HQ     5
 #define RES_BTMAIN      9
 #define RES_CORE_RDY_SCAN 13
 #define RES_DIG         17
@@ -153,13 +182,15 @@ static const Bcm4387Reg pmu_regs[] = {
     { 0x618, "min_res_mask", 0x00000001, ~0u, "F handoff; B" },
     { 0x61c, "max_res_mask", 0x7fffffff, ~0u, "F handoff; B" },
     { 0x634, "pmuwatchdog", 0, ~0u, "B name; U (no reset modelled)" },
-    { 0x644, "res_req_timer", 0, ~0u, "B; I force bits request res_req_mask" },
-    { 0x648, "res_req_mask", 0, ~0u, "B" },
+    { 0x644, "res_req_timer", 0x15000000, ~0u,
+      "B; I handoff = stock's (persists); I asserted on LHL ARM timer expiry" },
+    { 0x648, "res_req_mask", 0x160880df, ~0u,
+      "B; I handoff = stock's value over the run-14 table (persists)" },
     { 0x64c, "core_cap_ext", 2u << 20, 0, "B field; I 3 MAC req timers" },
     { 0x630, "clkstretch", 0, ~0u, "B name; U" },
     { 0x688, "mac_res_req_timer", 0, ~0u, "B; I force flags request the mask" },
     { 0x68c, "mac_res_req_mask", 0, ~0u, "B" },
-    { 0x6d8, "pmucontrol_ext", 0, ~0u, "B bits; I handoff 0 (run 15)" },
+    { 0x6d8, "pmucontrol_ext", 0x00014291, ~0u, "F handoff (run 30); B bits" },
     { 0x6dc, "slowclkperiod", 0, ~0u, "B name; U" },
     { 0x6f0, "mac_res_req_timer1", 0, ~0u, "B; I as mac_res_req_timer" },
     { 0x6f4, "mac_res_req_mask1", 0, ~0u, "B" },
@@ -199,9 +230,12 @@ struct Bcm4387PmuState {
     uint32_t sel[4];            /* res_table_sel, cc/reg/pll address */
     uint32_t req[BCM4387_REQ_N];
     bool mac_active[3];         /* d11 slice clock request asserted */
+    bool arm_req;               /* LHL ARM timer 0 expired (GCI) */
     uint32_t res_state;
     SyncSlot sync[NSYNC];
     bool sync_any_wedged;
+    bool aon_fast;              /* firmware set FAST_TRANS_ENAB itself */
+    int64_t slow_wr_until;      /* PST_SLOW_WR_PENDING until (ns, virtual) */
 };
 
 static uint32_t *pmu_reg(Bcm4387PmuState *s, hwaddr off)
@@ -244,23 +278,51 @@ static const hwaddr req_timers[][2] = {
 static void res_update(Bcm4387PmuState *s)
 {
     uint32_t want = *pmu_reg(s, PMU_MIN_RES), old = s->res_state;
+    uint32_t max = *pmu_reg(s, PMU_MAX_RES) & (RES(NRES) - 1);
+    uint32_t timed = 0, up, prev;
 
     for (int i = 0; i < BCM4387_REQ_N; i++) {
         want |= s->req[i];
     }
+    up = res_closure(s, want) & max;
     /*
      * Resource request timers: the force ALP/HT/HQ flags (bits 26..28,
      * MAC_RSRC_REQ_TIMER_FORCE_*; PRRT_*_REQ << 14) request the timer's
-     * mask while set. [B] flags, [I] request held while a flag is set.
+     * mask while set; a MAC timer only while its slice's MAC asserts its
+     * clock request (d11_mac_request in bcm4387.c). [B] flags, [I] request
+     * held while a flag is set.
+     * The mask is taken as it is, without walking res_dep_mask: a masked
+     * resource comes up only once each of its dependencies is up, for
+     * another reason or because it is itself masked and up. bcmdhd builds
+     * every such mask as the resource plus si_pmu_res_deps() (hndpmu.c
+     * si_pmu_rsrc_macphy_clk_deps) [B]; silicon runs 23, 26-29 (mask
+     * 0x40000000 = MACPHY_CLK_MAIN alone, MAC awake and requesting) never
+     * got bits 30/23/5, exactly closure(30) minus what was up. [F]
      */
     for (int i = 0; i < ARRAY_SIZE(req_timers); i++) {
-        if ((i == 0 || s->mac_active[i - 1]) &&
+        if ((i == 0 ? s->arm_req : s->mac_active[i - 1]) &&
             (*pmu_reg(s, req_timers[i][0]) & (7u << 26))) {
-            want |= *pmu_reg(s, req_timers[i][1]);
+            timed |= *pmu_reg(s, req_timers[i][1]);
         }
     }
-    s->res_state = res_closure(s, want) & *pmu_reg(s, PMU_MAX_RES) &
-                   (RES(NRES) - 1);
+    /*
+     * The ARM request's FORCE_HQ flag (bit 28) also asks for XTAL_HQ, which
+     * stock's res_req_mask does not contain (notes/36 §6.1). [I] (queue run
+     * 31 tests it)
+     */
+    if (s->arm_req && (*pmu_reg(s, PMU_REQ_TIMER) & (1u << 28))) {
+        timed |= RES(RES_XTAL_HQ);
+    }
+    want |= timed;
+    do {
+        prev = up;
+        for (int r = 0; r < NRES; r++) {
+            if ((timed & max & ~up & RES(r)) && !(s->file[F_DEP][r] & ~up)) {
+                up |= RES(r);
+            }
+        }
+    } while (up != prev);
+    s->res_state = up;
     if (s->res_state != old) {
         trace_bcm4387_pmu_res_state(old, s->res_state, want);
     }
@@ -281,6 +343,15 @@ void bcm4387_pmu_mac_active(Bcm4387PmuState *s, int n, bool on)
     if (s->mac_active[n] != on) {
         trace_bcm4387_pmu_mac_active(n, on);
         s->mac_active[n] = on;
+        res_update(s);
+    }
+}
+
+void bcm4387_pmu_arm_timer_req(Bcm4387PmuState *s, bool on)
+{
+    if (s->arm_req != on) {
+        trace_bcm4387_pmu_arm_req(on);
+        s->arm_req = on;
         res_update(s);
     }
 }
@@ -317,8 +388,35 @@ static uint32_t pmu_status(Bcm4387PmuState *s)
     if (bcm4387_pmu_res_up(s, RES_ALP)) {
         v |= PST_ALPAVAIL;
     }
+    pend |= qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) < s->slow_wr_until;
     return v | (pend ? PST_SLOW_WR_PENDING : 0);
 }
+
+/*
+ * ILP-domain registers: "if such a register is written, it takes multiple
+ * ILP clocks for the PMU block to absorb the write. During that time the
+ * 'SlowWritePending' bit in the PMUStatus register is set" (bcmdhd
+ * siutils.c PMUREGS_ILP_SENSITIVE: pmutimer, pmuwatchdog, res_req_timer)
+ * [B]; the MAC timers are written the same way (HND_PMU_SYNC_WR, hndlhl.c
+ * si_lhl_timer_config) [B]. Not the masks: stock writes mac_res_req_mask
+ * with no wait. Only while FAST_TRANS_ENAB is clear, for 3 ILP cycles. [I]
+ * A second such write while the first is pending is dropped (the register
+ * keeps, and reads back, its old value). bcmdhd calls the hazard a
+ * "backplane stall" [B]; silicon has no double write here, but the one
+ * double always-on write it has (queue run 15, index registers) was dropped,
+ * not stalled [F], so dropping is the model's rule. [I]
+ */
+static bool pmu_ilp_reg(hwaddr off)
+{
+    switch (off) {
+    case 0x634: case PMU_REQ_TIMER: case 0x688: case 0x6f0: case 0x738:
+        return true;
+    }
+    return false;
+}
+
+#define SLOW_WR_ILP_CYCLES 3
+
 
 /* ---- always-on write synchroniser ---------------------------------------- */
 
@@ -367,7 +465,7 @@ void bcm4387_pmu_sync_post(Bcm4387PmuState *s, Bcm4387SyncApply apply,
         trace_bcm4387_aon_sync_drop(addr, val);
         return;
     }
-    if (*pmu_reg(s, PMU_CTL_EXT) & PCTL_EXT_FAST_TRANS) {
+    if (s->aon_fast) {
         apply(opaque, addr, val);
         return;
     }
@@ -527,6 +625,20 @@ static MemTxResult pmu_write(void *opaque, hwaddr off, uint64_t val,
     if (!r) {
         return bcm4387_unknown("pmu", BCM4387_PMU_BASE, off, true, &val, size);
     }
+    if (pmu_ilp_reg(off) && !(*pmu_reg(s, PMU_CTL_EXT) & PCTL_EXT_FAST_TRANS)) {
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+        if (now < s->slow_wr_until) {
+            qemu_log_mask(LOG_GUEST_ERROR, "bcm4387-pmu: +0x%03" HWADDR_PRIx
+                          " <- 0x%08" PRIx64 " while PST_SLOW_WR_PENDING: "
+                          "dropped pc~0x%08x\n", off, val, bcm4387_pc());
+            trace_bcm4387_pmu_slow_wr_drop(off, val);
+            return MEMTX_OK;
+        }
+        s->slow_wr_until = now + muldiv64(SLOW_WR_ILP_CYCLES,
+                                          NANOSECONDS_PER_SECOND,
+                                          BCM4387_ILP_HZ);
+    }
     *r = (*r & ~pmu_regs[r - s->reg].wmask) | (val & pmu_regs[r - s->reg].wmask);
     switch (off) {
     case PMU_CONTROL:
@@ -535,6 +647,9 @@ static MemTxResult pmu_write(void *opaque, hwaddr off, uint64_t val,
             trace_bcm4387_pmu_pll_commit();
             *r &= ~PCTL_PLL_PLLCTL_UPD;
         }
+        break;
+    case PMU_CTL_EXT:
+        s->aon_fast |= val & PCTL_EXT_FAST_TRANS;
         break;
     case PMU_MIN_RES:
     case PMU_MAX_RES:
@@ -581,8 +696,11 @@ static void pmu_reset(DeviceState *dev)
     s->sel[3] = 0;
     memset(s->sync, 0, sizeof(s->sync));
     s->sync_any_wedged = false;
+    s->aon_fast = false;
+    s->slow_wr_until = 0;
     memset(s->req, 0, sizeof(s->req));
     memset(s->mac_active, 0, sizeof(s->mac_active));
+    s->arm_req = false;
     s->req[BCM4387_REQ_EXTERNAL] = RES(RES_BTMAIN) | RES(RES_DIG) |
                                    RES(RES_ARMCLK) | RES(RES_HT);
     res_update(s);
