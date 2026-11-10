@@ -21,6 +21,8 @@
 #define EFR32_EUSART_PRS_RXFL "prs-rxfl"
 #define EFR32_EUSART_DMA_REQ "dma-req"
 #define EFR32_EUSART_PRS_TRIGGER "prs-trigger"
+/* Input: the SoC is in EM2 (its EUSART0CLK may have stopped; see the .c). */
+#define EFR32_EUSART_EM2 "em2"
 
 DeviceState *efr32_eusart_create(Object *soc, MemoryRegion *memory,
                                  const Efr32SocLink *link, hwaddr base,

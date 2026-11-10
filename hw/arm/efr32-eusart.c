@@ -41,12 +41,16 @@
  *    transmitter on a rising edge); producers TXC and RXFL (the status
  *    levels);
  *  - DMA requests: the TXFL and RXFL levels ("dma-req" 0 and 1);
- *  - CMU_CLKEN0.EUART0 clear: accesses fault ([I] RM SS4.2.1.2's rule).
+ *  - CMU_CLKEN0.EUART0 clear: accesses fault ([I] RM SS4.2.1.2's rule);
+ *  - EM2 (eu_em2): HF mode stops, frames in flight hold; LF mode
+ *    runs on, and its interrupts wake the part through the NVIC like any
+ *    other.
  * [I] The RX/TX interrupt split follows the flag names, as for the USART.
  * [U] Not modelled: parity errors (the chardev carries bytes, not bits),
  * IrDA, auto-baud, collision detection, CTS/RTS flow control (the chardev
- * paces itself), the PRS RX input, the PRS producers TX/RTS/IRDATX, EM2
- * wake-up, DBGHALT.
+ * paces itself), the PRS RX input, the PRS producers TX/RTS/IRDATX, the LF
+ * mode TXFL wake-up flag (set only after a FIFO read frees TXFIW + 1, RM
+ * SS22.3.7; [P] its use as an EM2 wake source), DBGHALT.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -257,6 +261,12 @@ struct Efr32EusartState {
     QEMUTimer *sync_timer;
     bool prs_trigger;
     bool sent[4];
+    /*
+     * The kernel clock stopped (HF mode in EM2): each timer's time still to
+     * run when it stopped, -1 for a timer that was not pending.
+     */
+    bool clk_stopped;
+    int64_t frozen_ns[3];
 };
 
 static uint64_t eu_clk_hz(Efr32EusartState *s)
@@ -904,11 +914,53 @@ static void eu_reset_hold(Object *obj, ResetType type)
     timer_del(s->rx_timer);
     timer_del(s->sync_timer);
     memset(s->pend, 0, sizeof(s->pend));
+    s->clk_stopped = false;
+    s->frozen_ns[0] = s->frozen_ns[1] = s->frozen_ns[2] = -1;
 }
 
 static void eu_reset_exit(Object *obj, ResetType type)
 {
     eu_update(EFR32_EUSART(obj));
+}
+
+/*
+ * EM2 (RM SS22.3.1): in HF mode (EUSART0CLK from EM01GRPACLK) the EUART
+ * runs in EM0 and EM1 only, and its clock stops in EM2; in LF mode
+ * (EM23GRPACLK) it keeps running.  The SoC reports the stopped clock as
+ * 0 Hz.  [I] A frame on the wire, a TXDELAY wait and an LFSYNC write in
+ * flight then hold where they are and finish once the clock runs again, the
+ * remaining time unchanged (the RM does not say; the clock simply has no
+ * edges).  While stopped nothing new starts: TX frames wait in the FIFO and
+ * the line side is not accepted ([I] on a real line those frames would be
+ * lost; the chardev holds them instead).
+ */
+static void eu_em2(void *opaque, int n, int level)
+{
+    Efr32EusartState *s = opaque;
+    QEMUTimer *timers[] = { s->tx_timer, s->rx_timer, s->sync_timer };
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    /* Entering EM2, the SoC reports an HF-mode clock as stopped. */
+    bool stopped = level && eu_clk_hz(s) == 0;
+
+    if (stopped == s->clk_stopped) {
+        return;
+    }
+    s->clk_stopped = stopped;
+    for (unsigned i = 0; i < ARRAY_SIZE(timers); i++) {
+        if (stopped) {
+            int64_t at = timer_expire_time_ns(timers[i]);
+
+            s->frozen_ns[i] = at < 0 ? -1 : MAX(at - now, 0);
+            timer_del(timers[i]);
+        } else if (s->frozen_ns[i] >= 0) {
+            timer_mod(timers[i], now + s->frozen_ns[i]);
+            s->frozen_ns[i] = -1;
+        }
+    }
+    if (!stopped) {
+        eu_tx_start(s);
+        qemu_chr_fe_accept_input(&s->chr);
+    }
 }
 
 static void eu_realize(DeviceState *dev, Error **errp)
@@ -934,6 +986,8 @@ static void eu_init(Object *obj)
     qdev_init_gpio_out_named(dev, &s->prs_rxfl, EFR32_EUSART_PRS_RXFL, 1);
     qdev_init_gpio_out_named(dev, s->dma_req, EFR32_EUSART_DMA_REQ, 2);
     qdev_init_gpio_in_named(dev, eu_prs_trigger, EFR32_EUSART_PRS_TRIGGER, 1);
+    qdev_init_gpio_in_named(dev, eu_em2, EFR32_EUSART_EM2, 1);
+    s->frozen_ns[0] = s->frozen_ns[1] = s->frozen_ns[2] = -1;
     s->tx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, eu_tx_frame_end, s);
     s->rx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, eu_rx_frame_end, s);
     s->sync_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, eu_sync_expired, s);

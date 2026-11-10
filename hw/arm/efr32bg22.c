@@ -1069,6 +1069,8 @@ struct Efr32Periph
     uint64_t hfrco_freerun_hz;
     QEMUTimer *em2_timer;
     qemu_irq gpio_em2;
+    /* EM2 to EUART0, whose HF-mode clock stops there (RM SS22.3.1). */
+    qemu_irq eusart_em2;
     /* Virtual time spent in EM0, EM1 and EM2, up to em_since_ns. */
     uint64_t em_ns[3];
     int64_t em_since_ns;
@@ -5875,6 +5877,7 @@ static void efr32_emu_em2_enter(Efr32Periph *s)
     efr32_wdog_freeze_update(s);
     efr32_cpu_clocks_update(s);
     qemu_set_irq(s->gpio_em2, 1);
+    qemu_set_irq(s->eusart_em2, 1);
     trace_efr32bg22_emu(s->endpoint_id, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
                         "em2-enter", s->em_ns[EFR32_EM0],
                         s->em_ns[EFR32_EM1], s->em_ns[EFR32_EM2]);
@@ -5901,6 +5904,7 @@ static void efr32_emu_em2_exit(Efr32Periph *s)
     s->em2 = false;
     s->em2_exiting = false;
     qemu_set_irq(s->gpio_em2, 0);
+    qemu_set_irq(s->eusart_em2, 0);
     efr32_osc_update(s);
     if (s->protimer_running) {
         ptimer_transaction_begin(s->protimer_counter);
@@ -5998,6 +6002,7 @@ static void efr32_emu_reset(Efr32Periph *s)
     s->em2_entered = false;
     s->hfrco_freerun_hz = 0;
     qemu_set_irq(s->gpio_em2, 0);
+    qemu_set_irq(s->eusart_em2, 0);
     if (was_em2) {
         efr32_cpu_clocks_update(s);
     }
@@ -8664,14 +8669,15 @@ static uint64_t efr32_soc_tree_hz(void *opaque, Efr32ClockTree tree)
         return clock_get_hz(s->m33_cpuclk);
     case EFR32_TREE_PCLK:
         return clock_get_hz(s->pclk);
+    /* The EM01 group stops in EM2 (RM SS22.3.1: HF mode in EM0/EM1 only). */
     case EFR32_TREE_EM01GRPACLK:
-        return efr32_em01grpa_hz(s);
+        return s->em2 ? 0 : efr32_em01grpa_hz(s);
     case EFR32_TREE_EM23GRPACLK:
         return efr32_lf_group_hz(s, EFR32_CMU_EM23GRPACLKCTRL);
     case EFR32_TREE_EUSART0CLK:
         switch (efr32_cmu_get(s, EFR32_CMU_EUART0CLKCTRL) & 0x3u) {
         case EFR32_CMU_EUART0CLKCTRL_EM01GRPACLK:
-            return efr32_em01grpa_hz(s);
+            return s->em2 ? 0 : efr32_em01grpa_hz(s);
         case EFR32_CMU_EUART0CLKCTRL_EM23GRPACLK:
             return efr32_lf_group_hz(s, EFR32_CMU_EM23GRPACLKCTRL);
         default:
@@ -8803,6 +8809,7 @@ static void efr32_periph_init(Object *o)
     qdev_init_gpio_in_named(DEVICE(o), efr32_emu_debug_powered,
                             "debug-powered", 1);
     qdev_init_gpio_out_named(DEVICE(o), &s->gpio_em2, "gpio-em2", 1);
+    qdev_init_gpio_out_named(DEVICE(o), &s->eusart_em2, "eusart-em2", 1);
     s->em2_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, efr32_emu_timer_expired,
                                 s);
     /* Virtual time in each energy mode so far (ns). */
@@ -9857,6 +9864,9 @@ static void efr32_soc_create_reflex(Efr32Bg22SoCState *s, DeviceState *gpio)
                                     EFR32_LDMA_REQ_LINE(
                                         EFR32_LDMA_SRC_EUART0,
                                         EFR32_LDMA_SIG_EUART_RXFL)));
+    qdev_connect_gpio_out_named(periph, "eusart-em2", 0,
+                                qdev_get_gpio_in_named(euart, EFR32_EUSART_EM2,
+                                                       0));
     for (unsigned u = 0; u < 2; u++) {
         DeviceState *usart = DEVICE(object_resolve_path_component(
             OBJECT(s), u ? "usart1" : "usart0"));

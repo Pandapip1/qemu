@@ -5774,6 +5774,48 @@ static void test_emu_em2_wfi(void)
     qtest_quit(qts);
 }
 
+/*
+ * EUART0 in HF mode (EUSART0CLK from EM01GRPACLK) runs in EM0 and EM1 only
+ * (RM SS22.3.1): a frame on the wire when the part enters EM2 holds there
+ * and finishes after the wake-up, its remaining time unchanged ([I]).
+ */
+static void test_euart_em2_hf_mode_holds(void)
+{
+    const int64_t before = EU_FRAME_NS / 2;
+
+    reset_with_radio_clocks();
+    writel(CMU_BASE + CMU_CLKEN0 + REGISTER_SET_WINDOW, CMU_CLKEN0_EUART0);
+    writel(CMU_BASE_ADDR + CMU_EM01GRPACLKCTRL, CMU_EM01GRPACLK_HFXO);
+    writel(EUART0_BASE + EU_CFG0, EU_CFG0_LOOPBK);
+    writel(EUART0_BASE + EU_CLKDIV, EU_CLKDIV_115200);
+    writel(EUART0_BASE + EU_EN, 1);
+    writel(EUART0_BASE + EU_CMD, EU_CMD_RXEN | EU_CMD_TXEN);
+    timer0_step(3 * 27);
+    writel(EUART0_BASE + EU_TXDATA, 0x5a);
+    timer0_step(before);
+
+    emu_deep_sleep();
+    timer0_step(EM2_ENTRY_NS);
+    g_assert_cmphex(readl(EMU_BASE + EMU_STATUS) & EMU_STATUS_EM2ENTERED, ==,
+                    EMU_STATUS_EM2ENTERED);
+    timer0_step(1000000);
+    g_assert_cmphex(readl(EUART0_BASE + EU_STATUS) &
+                    (EU_STATUS_TXC | EU_STATUS_RXFL), ==, 0);
+
+    emu_wake();
+    timer0_step(EM2_WAKEUP_NS);
+    emu_running();
+    timer0_step(EU_FRAME_NS - before - EM2_ENTRY_NS - 1);
+    g_assert_cmphex(readl(EUART0_BASE + EU_STATUS) &
+                    (EU_STATUS_TXC | EU_STATUS_RXFL), ==, 0);
+    timer0_step(1);
+    g_assert_cmphex(readl(EUART0_BASE + EU_STATUS) &
+                    (EU_STATUS_TXC | EU_STATUS_RXFL), ==,
+                    EU_STATUS_TXC | EU_STATUS_RXFL);
+    g_assert_cmphex(readl(EUART0_BASE + EU_RXDATA), ==, 0x5a);
+    writel(EUART0_BASE + EU_EN, 0);
+}
+
 int main(int argc, char **argv)
 {
     int result;
@@ -6014,6 +6056,8 @@ int main(int argc, char **argv)
     qtest_add_func("/efr32bg22/emu-em2-gpio-latch", test_emu_em2_gpio_latch);
     qtest_add_func("/efr32bg22/emu-em2-wfi", test_emu_em2_wfi);
     qtest_add_func("/efr32bg22/emu-em2-wdog", test_emu_em2_wdog);
+    qtest_add_func("/efr32bg22/euart-em2-hf-mode-holds",
+                   test_euart_em2_hf_mode_holds);
 
     result = g_test_run();
     qtest_end();
