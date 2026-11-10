@@ -141,6 +141,7 @@ struct BCM4387MachineState {
     bool d11_phyflags[3];   /* left reset with PCLKE|PRST (0xc) held */
     bool ucode_loaded[3];   /* ucode memory written through objaddr/objdata */
     char *phy_live;         /* port liveness: auto, on or off */
+    char *psm_dead_port;    /* PSM access to a dead port: abort or busy */
 };
 
 /* ---- catch-all tracer and modelled backplane registers ------------------ */
@@ -1611,6 +1612,11 @@ static void bcm4387_init(MachineState *machine)
         error_report("bcm4387: phy-live must be auto, on or off");
         exit(1);
     }
+    if (s->psm_dead_port && strcmp(s->psm_dead_port, "abort") &&
+        strcmp(s->psm_dead_port, "busy")) {
+        error_report("bcm4387: psm-dead-port must be abort or busy");
+        exit(1);
+    }
     bcm4387_strict = s->strict;
     the_machine = s;
     s->pmu = bcm4387_pmu_create(PMU_BASE);
@@ -1624,6 +1630,8 @@ static void bcm4387_init(MachineState *machine)
         Bcm4387PsmHooks psm_hooks = {
             .opaque = s, .clocked = psm_hook_clocked, .ihr = psm_hook_ihr,
             .port = psm_hook_port,
+            .dead_port_busy = s->psm_dead_port &&
+                              !strcmp(s->psm_dead_port, "busy"),
         };
 
         for (int n = 0; n < 3; n++) {
@@ -1783,6 +1791,7 @@ STR_PROP("socram", patch)
 STR_PROP("iq-source", iq_source)
 STR_PROP("iq-format", iq_format)
 STR_PROP("phy-live", phy_live)
+STR_PROP("psm-dead-port", psm_dead_port)
 
 static void get_atcm(Object *o, Visitor *v, const char *name, void *opaque,
                      Error **errp)
@@ -1863,6 +1872,8 @@ static void bcm4387_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_str(oc, "iq-source", get_iq_source, set_iq_source);
     object_class_property_add_str(oc, "iq-format", get_iq_format, set_iq_format);
     object_class_property_add_str(oc, "phy-live", get_phy_live, set_phy_live);
+    object_class_property_add_str(oc, "psm-dead-port", get_psm_dead_port,
+                                  set_psm_dead_port);
     object_class_property_add(oc, "atcm-size", "uint32", get_atcm, set_atcm,
                               NULL, NULL);
     object_class_property_add_bool(oc, "identity", get_identity, set_identity);

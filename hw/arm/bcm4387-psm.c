@@ -42,6 +42,10 @@
  *    data 0x094, address 0x095. Opcode 0x102 issues the access: second
  *    operand 0 = read into the data register, 0x20 = write it [I]. The
  *    access completes at once (busy and the bit-14 status read 0) [I].
+ *    What a port the machine refuses (not live) does is unknown: a strict
+ *    abort, or with the machine's psm-dead-port=busy the command is
+ *    dropped and the port's busy bit stays set until core reset [U], to
+ *    exercise microcode that bounds its busy-waits.
  * The machine supplies the others it models (SampleCollect). Every other
  * IHR, external condition other than 0x5f (always true [I]), an opcode
  * with unknown semantics, and nap (its wake sources) are gaps: in strict
@@ -115,6 +119,7 @@ struct Bcm4387Psm {
     uint16_t stack[STACK_N];
     int sp;
     bool carry, borrow;
+    bool port_stuck[2];         /* psm-dead-port=busy: PHY, radio */
 
     QEMUTimer *timer;
     int64_t last_ns;
@@ -183,7 +188,9 @@ static bool ihr_unknown(Bcm4387Psm *p, uint16_t idx, bool wr, uint16_t v)
 static bool ihr_read(Bcm4387Psm *p, uint16_t idx, uint16_t *v)
 {
     if (idx == IHR_PHY_ADDR || idx == IHR_RADIO_ADDR) {
-        *v = p->ihr[idx] & 0x3fff;      /* busy (15) and status (14) clear */
+        /* status (14) clear; busy (15) only on a refused port */
+        *v = (p->ihr[idx] & 0x3fff) |
+             (p->port_stuck[idx == IHR_RADIO_ADDR] ? 0x8000 : 0);
     } else if (ihr_own(idx)) {
         *v = p->ihr[idx];
     } else if (!p->hooks.ihr(p->hooks.opaque, p->slice, idx, false, v)) {
@@ -234,6 +241,16 @@ static bool port_cmd(Bcm4387Psm *p, uint16_t addr, uint16_t cmd, uint16_t dst)
     p->ihr[dst] = addr;
     if (!p->hooks.port(p->hooks.opaque, p->slice, port, wr, addr,
                        &p->ihr[data])) {
+        if (p->hooks.dead_port_busy) {
+            qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: PSM%d %s %s 0x%04x "
+                          "through the PSM port while the port is not "
+                          "live: dropped, busy until core reset "
+                          "(psm-dead-port=busy) pc 0x%04x\n", p->slice,
+                          port ? "radio" : "PHY", wr ? "write" : "read",
+                          addr, p->pc);
+            p->port_stuck[port] = true;
+            return true;
+        }
         psm_abort(p, "%s %s 0x%04x through the PSM port while the port is "
                   "not live (result unknown)", port ? "radio" : "PHY",
                   wr ? "write" : "read", addr);
@@ -618,6 +635,7 @@ void bcm4387_psm_core_reset(Bcm4387Psm *p)
     p->pc = 0;
     p->sp = 0;
     p->carry = p->borrow = false;
+    p->port_stuck[0] = p->port_stuck[1] = false;
     p->mctl = 0;
     psm_update(p);
 }

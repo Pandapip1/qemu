@@ -75,6 +75,10 @@ downloads it.
 - Its own PHY port (IHR 0x91 data / 0x92 address, opcode 0x102: 0 = read,
   0x20 = write) and radio port (0x94/0x95) [I]. Both ports reach the same
   PHY/radio register files as the host ports, gated by `port_live` [I].
+  A PSM port command while the port is not live is a strict abort; machine
+  option `psm-dead-port=busy` instead drops the command and keeps the port's
+  busy bit (address register bit 15) set until core reset [U], to test
+  microcode that bounds its busy-waits (bcm4387 `fw/ucode/phyprobe.asm`).
 - SampleCollect through IHR i = host +0x400+2i [I].
 
 **Strict aborts.** Every other IHR, every external condition except 0x5f, the

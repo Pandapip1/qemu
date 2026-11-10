@@ -146,6 +146,8 @@ typedef struct Bcm4387PsmHooks {
     /* PSM-side PHY (port 0) / radio (port 1) access; false = result unknown */
     bool (*port)(void *opaque, int slice, int port, bool wr, uint16_t addr,
                  uint16_t *v);
+    /* port refused: stay busy instead of a strict abort (psm-dead-port) */
+    bool dead_port_busy;
 } Bcm4387PsmHooks;
 
 Bcm4387Psm *bcm4387_psm_new(int slice, const Bcm4387PsmHooks *hooks);
