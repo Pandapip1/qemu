@@ -40,6 +40,7 @@
 #include "system/system.h"
 #include "system/runstate.h"
 #include "hw/arm/bcm4387.h"
+#include "trace.h"
 
 #define TYPE_BCM4387_MACHINE MACHINE_TYPE_NAME("bcm4387")
 OBJECT_DECLARE_SIMPLE_TYPE(BCM4387MachineState, BCM4387_MACHINE)
@@ -140,6 +141,10 @@ struct BCM4387MachineState {
     uint32_t tcam_base, tcam_op;
     bool d11_phyflags[3];   /* left reset with PCLKE|PRST (0xc) held */
     bool ucode_loaded[3];   /* ucode memory written through objaddr/objdata */
+    bool first_pass[3];     /* core left reset without PHY flags (phy-live) */
+    int64_t d11_forceht_ns[3];  /* clk_ctl_st FORCEHT set since, or -1 */
+    bool d11_ht_seen[3];        /* HT avail read back since FORCEHT */
+    bool d11_req_settled[3];    /* 0x200 raised after FORCEHT had settled */
     char *phy_live;         /* port liveness: auto, on or off */
     char *psm_dead_port;    /* PSM access to a dead port: abort or busy */
 };
@@ -225,16 +230,18 @@ static bool d11_extra_wrap(hwaddr a)
     return false;
 }
 
+static bool port_live(BCM4387MachineState *s, int n);
+
 /*
  * The PHY window (radio port, phyversion, PHY port) answers with the PHYPLL
- * locked (queue runs 7-9); without it, AXI slave error (run 6). The stock
- * firmware reads phyversion with no PLL request seen in the model, so it
- * must enable the window some way we have not identified; strict=off
- * (exploration) leaves the window open so stock can be traced. [F]
+ * locked (queue runs 7-9); without it, AXI slave error (runs 6, 22, 30,
+ * 31). [F] Stock's answers at its attach read without PHYPLL, with the
+ * same resources as ours (run 31): there it answers because its ports are
+ * live (port_live). strict=off leaves the window open.
  */
 static bool d11_phy_ready(BCM4387MachineState *s, int n)
 {
-    return !s->strict || d11_phypll(s, n);
+    return !s->strict || d11_phypll(s, n) || port_live(s, n);
 }
 
 /* index of the d11 core whose register space contains a, or -1 */
@@ -269,13 +276,14 @@ static bool model_read(BCM4387MachineState *s, hwaddr a, uint32_t *v)
          * and the backplane on HT (0xb0000); bits 24/26/28 read set once the
          * core is out of reset (0x150b0040, meaning unknown); the PHY clock
          * request (0x200) adds bits 25/27 once MACPHY_CLK is up (stock and
-         * run 11: 0x1f0b0342). [F] Not without the request [I]: the
-         * model has MACPHY_CLK up from the MAC resource request at stock's
-         * attach and reads 0x150b0040 there. Bit 25 is the status of
+         * run 11: 0x1f0b0342). [F] Bit 25 is the status of
          * request bit 9 in hndsoc.h's CCS_ERSRC_REQ/STS layout [B]; bit 27
          * is unknown. [U]
          */
         *v = store_get(s, a) & 0xffff;
+        if ((*v & 0x2) && bcm4387_pmu_res_up(s->pmu, BCM4387_RES_HT_AVAIL)) {
+            s->d11_ht_seen[d11_core(a)] = true;
+        }
         *v |= 0x150b0000 |
               ((*v & 0x200) && d11_phypll(s, d11_core(a)) ? 0x0a000000 : 0);
         return true;
@@ -347,20 +355,26 @@ static void tcam_program(BCM4387MachineState *s, uint32_t slot);
  *    firmware, maccontrol never written, request 0x342 -> 0x1f0b0342 and
  *    res_state 0x5ecefbff.
  *  - the MAC asserts its clock request to the PMU MAC resource request
- *    (mac_res_req_timer/mask for this slice; see bcm4387-pmu.c) while it is
- *    out of reset with its clock on AND held awake (MCTL_WAKE), asking for
- *    the PHY PLL (clk_ctl_st 0x200), or with its ucode memory written.
- *    Out of reset with the clock on alone is not enough: [F] run 30,
- *    request programmed as stock (mask 0x56cac1ff, timer 0x15000000, GCI
- *    0xc70 3, 0xc78 0), right after the attach (IOCTL 0x145, maccontrol
- *    and clk_ctl_st not written, no ucode yet): d11 clk_ctl_st 0x150b0040,
- *    res_state 0x1e4efbdf, PHY data read AXI slave error. Yet stock, in the
- *    same wrapper/maccontrol/clk_ctl_st state, reads phyversion (seq 63881,
- *    RAM 0x82ee50) and its PHY port answers there (run 22). [F] The ucode
- *    condition is the model's choice of what separates the two: stock has
- *    written slice 0's ucode memory (seq 4605 on) by then, run 30 had not.
- *    [I] Stock's first-pass attach of slice 0 alone (seq 4601-4604) is the
- *    other candidate (notes/36 §3.2 rank 2). [U]
+ *    (mac_res_req_timer/mask for this slice; see bcm4387-pmu.c) only while
+ *    it is out of reset with its clock on, held awake (MCTL_WAKE), and its
+ *    PHY PLL request (clk_ctl_st 0x200) was raised after FORCEHT (bit 1)
+ *    had settled: bcmdhd waits D11SCC_SLOW2FAST_TRANSITION = 2 ILP cycles
+ *    (hndpmu.c) [B], stock delays 64 us and polls HT avail (bit 17) between
+ *    FORCEHT and |= 0x300 (ROM 0x4d32c8, 0x4d3eac). The model takes the
+ *    observable part of that as the condition: FORCEHT set by an earlier
+ *    write and HT avail read back from this clk_ctl_st since. [I] The 2-ILP
+ *    time itself is not checked: guest delay loops do not advance QEMU's
+ *    virtual clock faithfully (stock's slices 0 and 1 measure 158 and 34
+ *    us for the same delay), so a time rule would test host speed. The
+ *    trace event bcm4387_d11_pll_req reports the age anyway. A request
+ *    raised together with FORCEHT, as ours (|= 0x302 in one write, no HT
+ *    poll), is lost until 0x200 is dropped and raised again. [I] notes/36
+ *    §7.1; [F] run 31: stock's full
+ *    mask 0x56cac1ff, WAKE and that one-shot request never got PHYPLL
+ *    (0x150b0342); queue run 32 tests stock's form. Out of reset alone is
+ *    not enough [F] run 30 (request programmed, attach done: clk_ctl_st
+ *    0x150b0040, res_state 0x1e4efbdf); nor is ucode memory written [F]
+ *    run 31 (stock at its attach read, ucode written: bit 30 down).
  *  - MAC held awake (MCTL_WAKE): the clk_ctl_st request no longer reaches
  *    the PMU, only the MAC resource request does. [F] run 16: maccontrol
  *    0x04000400 written before the 0x302 request, mac_res_req never
@@ -371,15 +385,36 @@ static void tcam_program(BCM4387MachineState *s, uint32_t slot);
  *  Aux/scan slices are in reset at stock's first PHY write, which is why
  *  their programmed MAC requests do not show in res_state (run 11). [F] check
  */
+/* d11 clk_ctl_st write: track FORCEHT age and whether 0x200 rose settled */
+static void d11_clk_req_write(BCM4387MachineState *s, int n, uint32_t v)
+{
+    uint32_t old = store_get(s, D11_BASE(n) + 0x1e0);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if ((v & 0x2) && !(old & 0x2)) {
+        s->d11_forceht_ns[n] = now;
+        s->d11_ht_seen[n] = false;
+    } else if (!(v & 0x2)) {
+        s->d11_forceht_ns[n] = -1;
+        s->d11_ht_seen[n] = false;
+    }
+    if ((v & 0x200) && !(old & 0x200)) {
+        s->d11_req_settled[n] = (old & 0x2) && s->d11_ht_seen[n];
+        trace_bcm4387_d11_pll_req(n, s->d11_forceht_ns[n] >= 0 ?
+                                  now - s->d11_forceht_ns[n] : -1,
+                                  s->d11_req_settled[n]);
+    } else if (!(v & 0x200)) {
+        s->d11_req_settled[n] = false;
+    }
+}
+
 static void d11_mac_request(BCM4387MachineState *s, int n)
 {
     bool awake = store_get(s, D11_BASE(n) + 0x120) & (1u << 26);
     bool up = !(store_get(s, D11_WRAP(n) + WRAP_RESETCTRL) & 1) &&
               (store_get(s, D11_WRAP(n) + WRAP_IOCTL) & 1);
 
-    bcm4387_pmu_mac_active(s->pmu, n, up &&
-                           (awake || s->ucode_loaded[n] ||
-                            (store_get(s, D11_BASE(n) + 0x1e0) & 0x200)));
+    bcm4387_pmu_mac_active(s->pmu, n, up && awake && s->d11_req_settled[n]);
     bcm4387_pmu_request(s->pmu, BCM4387_REQ_MAC0 + n,
                         !awake && (store_get(s, D11_BASE(n) + 0x1e0) & 0x200) ?
                         BIT(d11_macphy_res[n]) : 0);
@@ -390,6 +425,9 @@ static bool model_write(BCM4387MachineState *s, hwaddr a, uint32_t v)
     int n = d11_core(a);
 
     if (n >= 0 && (a == D11_BASE(n) + 0x1e0 || a == D11_BASE(n) + 0x120)) {
+        if (a == D11_BASE(n) + 0x1e0) {
+            d11_clk_req_write(s, n, v);
+        }
         store_set(s, a, v);
         d11_mac_request(s, n);
         if (a == D11_BASE(n) + 0x120) {
@@ -409,6 +447,7 @@ static bool model_write(BCM4387MachineState *s, hwaddr a, uint32_t v)
             if ((store_get(s, a) & 1) && !(v & 1)) {
                 s->d11_phyflags[n] =
                     (store_get(s, D11_WRAP(n) + WRAP_IOCTL) & 0xc) == 0xc;
+                s->first_pass[n] |= !s->d11_phyflags[n];
             }
             if (!(store_get(s, a) & 1) && (v & 1)) {
                 bcm4387_psm_core_reset(s->psm[n]);
@@ -532,37 +571,33 @@ static bool d11_fclka(BCM4387MachineState *s, int n)
  * A never-written register reads its seed (below) or 0, logged as
  * unknown. [U]
  *
- * Those conditions are not sufficient: run 17 met all of them (res_state
- * 0x5ecefbff, srpwr 0x003f1e00, ioctl 0x105, iostatus 0x11006, clk_ctl_st
- * 0x1f0b0342, maccontrol 0x04000400, +0x18c = +0x3e6 = 0, all = stock) and
- * its ports were still latches. [F] What else stock does is unknown. It
- * decodes PHY 0x02/0x0b values at attach that no latch read gives, so its
- * ports are taken to be live by then. [I] Candidates, all done by stock
- * before its attach reads and never by our firmware: the d11 ucode
- * download (objaddr 0x03000000 + 22.5K objdata words per slice), the SHM
- * test through objaddr 0x10000/+0x166, template RAM writes (+0x130/+0x134),
- * the PMU/GCI indirect writes, and the blocks at 0x18013000/0x18014000/
- * 0x1801f000/0x18020000 (fn 0x79b9cc, bit 0 set per slice after its ucode).
- * phy-live=auto (default) picks the first: a slice's ports go live once its
- * ucode memory has been written (any objdata write while objaddr selects
- * UCM, select field [22:16] = 0 in brcmsmac's d11.h [B]); the flag
- * survives core reset (stock resets slice 0 after its download and does
- * not reload). [I] unconfirmed; queue run 18 (phylog v8) brackets when
- * stock's port goes live. phy-live=on drops this condition (assumes the
- * trigger happened), phy-live=off keeps the ports dead.
+ * Those conditions are neither sufficient nor necessary. Run 17 met all
+ * of them (res_state 0x5ecefbff, srpwr 0x003f1e00, ioctl 0x105, iostatus
+ * 0x11006, clk_ctl_st 0x1f0b0342, maccontrol 0x04000400, all = stock) and
+ * its ports were latches; run 21 also had stock's ucode loaded. [F] Stock's
+ * port is live at its attach read (0x45310c, run 31: PHY 0x000/0x001/0x00b
+ * = 0xdb32/0x1510/0x9bd2) with res_state 0x1e4efbdf (no MACPHY_CLK_MAIN,
+ * RADIO_PU_MAIN or XTAL_HQ), maccontrol 0, d11 clk_ctl_st 0x150b0040,
+ * IOCTL 0x145, i.e. the same resources and clocks as ours. [F] So what
+ * makes it live is in stock's per-boot sequence. [U] phy-live=auto
+ * (default) picks notes/36 §7.2's first candidate: the slice's core has
+ * left reset once without PHY clock/reset held (IOCTL bits 2/3 clear), as
+ * stock's first-pass attach does right after the slice's domain powers up
+ * (seq 4593-4604: IOCTL 0x3 -> 0x1), before the attach with PHY flags. [I]
+ * (queue run 32). Stock's per-slice domain order (srpwr 0x08, 0x0c, 0x1c)
+ * is not part of the condition. [U] Refuted earlier choices: ucode memory
+ * written (run 21 loaded stock's ucode and stayed dead, run 31) and
+ * PHYPLL + SISF_FCLKA + MCTL_IHR_EN (absent in stock at run 31's read).
+ * phy-live=on keeps the old conditions without a trigger (the SDR test
+ * bench's assumption), phy-live=off keeps the ports dead.
  */
-static bool phy_trigger(BCM4387MachineState *s, int n)
-{
-    if (!s->phy_live || !strcmp(s->phy_live, "auto")) {
-        return s->ucode_loaded[n];
-    }
-    return !strcmp(s->phy_live, "on");
-}
-
 static bool port_live(BCM4387MachineState *s, int n)
 {
-    return phy_trigger(s, n) && d11_phypll(s, n) && d11_fclka(s, n) &&
-           (store_get(s, D11_BASE(n) + 0x120) & MCTL_IHR_EN);
+    if (!s->phy_live || !strcmp(s->phy_live, "auto")) {
+        return s->first_pass[n];
+    }
+    return !strcmp(s->phy_live, "on") && d11_phypll(s, n) &&
+           d11_fclka(s, n) && (store_get(s, D11_BASE(n) + 0x120) & MCTL_IHR_EN);
 }
 
 static void phy_init(BCM4387MachineState *s)
@@ -579,6 +614,10 @@ static void phy_init(BCM4387MachineState *s)
         port_seed(s, PORT_PHY, n, 0x02, 1);
         port_seed(s, PORT_PHY, n, 0x0b, ncores[n]);
     }
+    /* stock's attach read, slice 0 (run 31; 0x000 also run 18) [F] */
+    port_seed(s, PORT_PHY, 0, 0x000, 0xdb32);
+    port_seed(s, PORT_PHY, 0, 0x001, 0x1510);
+    port_seed(s, PORT_PHY, 0, 0x00b, 0x9bd2);
 }
 
 static void port_put(BCM4387MachineState *s, int port, int n, uint16_t v)
@@ -1142,10 +1181,8 @@ static bool obj_port(BCM4387MachineState *s, hwaddr a, unsigned size, bool wr,
     if (n < 0 || (off != 0x160 && off != 0x164 && off != 0x166)) {
         return false;
     }
-    if (wr && off != 0x160 && !(store_get(s, D11_BASE(n) + 0x160) & 0x7f0000) &&
-        !s->ucode_loaded[n]) {
+    if (wr && off != 0x160 && !(store_get(s, D11_BASE(n) + 0x160) & 0x7f0000)) {
         s->ucode_loaded[n] = true;
-        d11_mac_request(s, n);
     }
     if (wr && off == 0x160) {
         store_set(s, a, *v);
@@ -1631,6 +1668,7 @@ static void bcm4387_init(MachineState *machine)
             store_set(s, D11_WRAP(n) + WRAP_RESETCTRL, 1);
             store_set(s, D11_WRAP(n) + WRAP_IOSTATUS, iostatus[n]);
             store_set(s, D11_BASE(n) + 0x1e0, 0x40);
+            s->d11_forceht_ns[n] = -1;
 
         }
     }

@@ -13,14 +13,14 @@
  *    the requesters (bcm4387_pmu_request: srpwr power domains, d11 MAC
  *    clock requests, the external/BT side, ChipCommon), or by the mask of
  *    a resource request timer while its force ALP/HT/HQ flags are set:
- *    res_req (the ARM's) while the LHL ARM timer 0 has expired and its
- *    status is not cleared (GCI +0xc44, bcm4387-gci.c) [I: PMU in LHL timer
- *    mode, pmucontrol_ext USE_LHL_TIMER; notes/36 §6, run 31 tests it],
- *    plus XTAL_HQ when its FORCE_HQ flag is set [I]; its handoff
+ *    res_req (the ARM's, always asserted; its handoff
  *    mask/timer are stock's 0x160880df (= si_pmu_rsrc_ht_avail_clk_deps |
  *    si_pmu_rsrc_cb_ready_deps over the run-14 table) / 0x15000000, taken
  *    to persist like the rest of the PMU [I] (never read on silicon; the MAC
- *    ones do not persist, run 16), mac_res_req 0/1/2 while that d11
+ *    ones do not persist, run 16); in stock at its attach read it reads
+ *    0x17000000 with that mask and XTAL_HQ down (run 31) [F], so its
+ *    FORCE_HQ flag does not bring up XTAL_HQ (notes/36 §6's inference,
+ *    refuted by run 31)), mac_res_req 0/1/2 while that d11
  *    slice's MAC asserts its clock request (see d11_mac_request in
  *    bcm4387.c). Stock programs the main one in si_lhl_timer_config (RAM
  *    0x82b0be): mac_res_req_mask 0x56cac1ff = MACPHY_CLK_MAIN and its
@@ -32,7 +32,12 @@
  *    limited to max_res_mask, and drops the rest. A request timer's mask is
  *    honoured as written, with no closure: a masked resource comes up only
  *    when its dependencies are up (see res_update). [B] by construction,
- *    [F] runs 23, 26-29: mask 0x40000000 never granted. Transitions complete at
+ *    consistent with runs 23, 26-29 (mask 0x40000000 never granted) [F];
+ *    not sufficient for a grant: run 31 failed with the full mask (see
+ *    d11_mac_request for why). A timer reads bit 25 (REQ_ACTIVE) while its
+ *    request is asserted and every masked resource is up. [I] fits stock's
+ *    0x17000000 (run 31) and our 0x15000000 read-backs, also at a failed
+ *    grant (run 29). [F] Transitions complete at
  *    once (res_pending reads 0); timing is not modelled. [B] semantics
  *    (bcmdhd si_pmu_res_deps, si_pmu_res_init), [F] check: the closure of
  *    the run-14 table reproduces every res_state seen on silicon:
@@ -97,7 +102,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(Bcm4387PmuState, BCM4387_PMU)
 
 #define NRES            31
 #define RES(n)          (1u << (n))
-#define RES_XTAL_HQ     5
 #define RES_BTMAIN      9
 #define RES_CORE_RDY_SCAN 13
 #define RES_DIG         17
@@ -182,21 +186,21 @@ static const Bcm4387Reg pmu_regs[] = {
     { 0x618, "min_res_mask", 0x00000001, ~0u, "F handoff; B" },
     { 0x61c, "max_res_mask", 0x7fffffff, ~0u, "F handoff; B" },
     { 0x634, "pmuwatchdog", 0, ~0u, "B name; U (no reset modelled)" },
-    { 0x644, "res_req_timer", 0x15000000, ~0u,
+    { 0x644, "res_req_timer", 0x15000000, ~(1u << 25),
       "B; I handoff = stock's (persists); I asserted on LHL ARM timer expiry" },
     { 0x648, "res_req_mask", 0x160880df, ~0u,
       "B; I handoff = stock's value over the run-14 table (persists)" },
     { 0x64c, "core_cap_ext", 2u << 20, 0, "B field; I 3 MAC req timers" },
     { 0x630, "clkstretch", 0, ~0u, "B name; U" },
-    { 0x688, "mac_res_req_timer", 0, ~0u, "B; I force flags request the mask" },
+    { 0x688, "mac_res_req_timer", 0, ~(1u << 25), "B; I force flags request the mask" },
     { 0x68c, "mac_res_req_mask", 0, ~0u, "B" },
     { 0x6d8, "pmucontrol_ext", 0x00014291, ~0u, "F handoff (run 30); B bits" },
     { 0x6dc, "slowclkperiod", 0, ~0u, "B name; U" },
-    { 0x6f0, "mac_res_req_timer1", 0, ~0u, "B; I as mac_res_req_timer" },
+    { 0x6f0, "mac_res_req_timer1", 0, ~(1u << 25), "B; I as mac_res_req_timer" },
     { 0x6f4, "mac_res_req_mask1", 0, ~0u, "B" },
     { 0x700, "pmuintmask0", 0, ~0u, "B name; U (no interrupt)" },
     { 0x720, "rsrc_event0", 0, ~0u, "B name; U" },
-    { 0x738, "mac_res_req_timer2", 0, ~0u, "B; I as mac_res_req_timer" },
+    { 0x738, "mac_res_req_timer2", 0, ~(1u << 25), "B; I as mac_res_req_timer" },
     { 0x73c, "mac_res_req_mask2", 0, ~0u, "B" },
     { 0x780, "pmuintctrl0", 0, ~0u, "B name; U" },
     { 0x7e8, "core_cap_ext1", 0, 0, "B name; U value (0 assumed)" },
@@ -230,7 +234,6 @@ struct Bcm4387PmuState {
     uint32_t sel[4];            /* res_table_sel, cc/reg/pll address */
     uint32_t req[BCM4387_REQ_N];
     bool mac_active[3];         /* d11 slice clock request asserted */
-    bool arm_req;               /* LHL ARM timer 0 expired (GCI) */
     uint32_t res_state;
     SyncSlot sync[NSYNC];
     bool sync_any_wedged;
@@ -300,18 +303,10 @@ static void res_update(Bcm4387PmuState *s)
      * got bits 30/23/5, exactly closure(30) minus what was up. [F]
      */
     for (int i = 0; i < ARRAY_SIZE(req_timers); i++) {
-        if ((i == 0 ? s->arm_req : s->mac_active[i - 1]) &&
+        if ((i == 0 || s->mac_active[i - 1]) &&
             (*pmu_reg(s, req_timers[i][0]) & (7u << 26))) {
             timed |= *pmu_reg(s, req_timers[i][1]);
         }
-    }
-    /*
-     * The ARM request's FORCE_HQ flag (bit 28) also asks for XTAL_HQ, which
-     * stock's res_req_mask does not contain (notes/36 §6.1). [I] (queue run
-     * 31 tests it)
-     */
-    if (s->arm_req && (*pmu_reg(s, PMU_REQ_TIMER) & (1u << 28))) {
-        timed |= RES(RES_XTAL_HQ);
     }
     want |= timed;
     do {
@@ -326,6 +321,20 @@ static void res_update(Bcm4387PmuState *s)
     if (s->res_state != old) {
         trace_bcm4387_pmu_res_state(old, s->res_state, want);
     }
+}
+
+static bool req_active(Bcm4387PmuState *s, hwaddr timer)
+{
+    for (int i = 0; i < ARRAY_SIZE(req_timers); i++) {
+        if (req_timers[i][0] == timer) {
+            uint32_t m = *pmu_reg(s, req_timers[i][1]) &
+                         *pmu_reg(s, PMU_MAX_RES) & (RES(NRES) - 1);
+
+            return (i == 0 || s->mac_active[i - 1]) &&
+                   (*pmu_reg(s, timer) & (7u << 26)) && !(m & ~s->res_state);
+        }
+    }
+    return false;
 }
 
 void bcm4387_pmu_request(Bcm4387PmuState *s, Bcm4387PmuReq who,
@@ -343,15 +352,6 @@ void bcm4387_pmu_mac_active(Bcm4387PmuState *s, int n, bool on)
     if (s->mac_active[n] != on) {
         trace_bcm4387_pmu_mac_active(n, on);
         s->mac_active[n] = on;
-        res_update(s);
-    }
-}
-
-void bcm4387_pmu_arm_timer_req(Bcm4387PmuState *s, bool on)
-{
-    if (s->arm_req != on) {
-        trace_bcm4387_pmu_arm_req(on);
-        s->arm_req = on;
         res_update(s);
     }
 }
@@ -575,6 +575,9 @@ static MemTxResult pmu_read(void *opaque, hwaddr off, uint64_t *data,
         case PMU_RES_PENDING:
             v = 0;
             break;
+        case PMU_REQ_TIMER: case 0x688: case 0x6f0: case 0x738:
+            v = *pmu_reg(s, off) | (req_active(s, off) ? (1u << 25) : 0);
+            break;
         case PMU_TIMER:
             v = muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
                          BCM4387_ILP_HZ, NANOSECONDS_PER_SECOND);
@@ -700,7 +703,6 @@ static void pmu_reset(DeviceState *dev)
     s->slow_wr_until = 0;
     memset(s->req, 0, sizeof(s->req));
     memset(s->mac_active, 0, sizeof(s->mac_active));
-    s->arm_req = false;
     s->req[BCM4387_REQ_EXTERNAL] = RES(RES_BTMAIN) | RES(RES_DIG) |
                                    RES(RES_ARMCLK) | RES(RES_HT);
     res_update(s);

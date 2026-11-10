@@ -81,7 +81,6 @@ void bcm4387_pmu_request(Bcm4387PmuState *pmu, Bcm4387PmuReq who,
                          uint32_t mask);
 uint32_t bcm4387_pmu_res_state(Bcm4387PmuState *pmu);
 void bcm4387_pmu_mac_active(Bcm4387PmuState *pmu, int n, bool on);
-void bcm4387_pmu_arm_timer_req(Bcm4387PmuState *pmu, bool on);
 uint32_t bcm4387_pmu_reg(Bcm4387PmuState *pmu, hwaddr off);
 bool bcm4387_pmu_res_up(Bcm4387PmuState *pmu, unsigned res);
 bool bcm4387_pmu_fll_locked(Bcm4387PmuState *pmu);

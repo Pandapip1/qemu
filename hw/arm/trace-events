@@ -97,6 +97,9 @@ z2_aer915_event(int8_t event, int8_t len) "i2c event =0x%x len=%d bytes"
 # bcm2838.c
 bcm2838_gic_set_irq(int irq, int level) "gic irq:%d lvl:%d"
 
+# bcm4387.c (d11)
+bcm4387_d11_pll_req(int n, int64_t forceht_age_ns, bool settled) "d11.%d PHY PLL request raised, FORCEHT set %" PRId64 " ns before: MAC request %d"
+
 # bcm4387-pmu.c
 bcm4387_pmu_read(uint64_t off, uint32_t v) "+0x%03" PRIx64 " -> 0x%08x"
 bcm4387_pmu_write(uint64_t off, uint64_t v) "+0x%03" PRIx64 " <- 0x%08" PRIx64
@@ -105,7 +108,6 @@ bcm4387_pmu_request(int who, uint32_t old, uint32_t mask) "requester %d: 0x%08x 
 bcm4387_pmu_select(const char *file, uint32_t idx) "%s index <- %u"
 bcm4387_pmu_file(const char *file, uint32_t idx, uint32_t old, uint64_t v) "%s[%u] 0x%08x -> 0x%08" PRIx64
 bcm4387_pmu_mac_active(int n, bool on) "d11 slice %d MAC clock request %d"
-bcm4387_pmu_arm_req(bool on) "LHL ARM timer request %d"
 bcm4387_pmu_pll_commit(void) "pllcontrol committed (PLLCTL_UPD)"
 bcm4387_pmu_slow_wr_drop(uint64_t off, uint64_t v) "+0x%03" PRIx64 " <- 0x%08" PRIx64 " dropped (PST_SLOW_WR_PENDING)"
 bcm4387_aon_sync_land(uint64_t addr, uint32_t v) "always-on write 0x%08" PRIx64 " <- 0x%x landed"

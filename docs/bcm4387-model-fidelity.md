@@ -121,31 +121,38 @@ register (stock's ai_corereg pattern):
 3. d11 core reset with PHY clock+reset held, ioctl to 0x145. [F]
    This alone asserts no MAC clock request: nothing is granted (run 30:
    clk_ctl_st 0x150b0040, res_state 0x1e4efbdf, PHY data read slave
-   error). [F] The model asserts it once the slice's ucode memory has been
-   written, which is what separates stock's working attach read from run
-   30. [I]
+   error), and stock at its live attach read has the same state (run 31).
+   [F]
 4. d11 maccontrol (+0x120) = 0x04000400 (MCTL_WAKE | MCTL_IHR_EN). [B]
-   After this the clk_ctl_st PHY PLL request no longer reaches the PMU, so
-   step 1 must come first. [F] run 16. Gives SISF_FCLKA (iostatus 0x11006).
-   [F] run 17. d11 clk_ctl_st reads 0x150b0040 after step 3 even with
-   MACPHY_CLK up; bits 25/27 need the 0x200 request (0x1f0b0342). [F] run 17
+   After this the clk_ctl_st PHY PLL request no longer reaches the PMU
+   directly, only through the MAC request. [F] run 16. Gives SISF_FCLKA
+   (iostatus 0x11006). [F] run 17.
+4a. Stock's PLL request (ROM 0x4d32c8, 0x4d3eac): clk_ctl_st |= FORCEHT
+   alone, settle (64 us = D11SCC_SLOW2FAST_TRANSITION, 2 ILP [B]), poll HT
+   avail (bit 17), then |= 0x300, settle, poll bits 24|25. The model asserts
+   the MAC request only if 0x200 rises after FORCEHT was set by an earlier
+   write and HT avail was read back from this clk_ctl_st since [I]; our
+   one-shot |= 0x302 is lost [F run 31 hqpll: full mask, 0x150b0342]. The
+   2-ILP time is not checked (guest delay loops do not advance QEMU's
+   virtual clock faithfully); trace event bcm4387_d11_pll_req shows it.
 5. Optional, stock does them, no effect modelled: d11 +0x18c = 0, 16-bit
    +0x3e6 = 0. [U]
-6. **Unknown trigger.** Run 17 did steps 1-5 and matched stock's snapshot
-   in every visible register, yet its PHY/radio ports were still latches.
-   [F] Stock's attach decodes PHY 0x02/0x0b values no latch read gives, so
-   its ports are taken to be live by then. [I] Machine option
-   `phy-live=auto|on|off`: `auto` (default) makes a slice's ports live once
-   its ucode memory has been written (objdata write while objaddr selects
-   UCM, as stock's 0x03000000 download does; sticky across core reset).
-   This choice is **[I], unconfirmed**: stock also does, before its attach
-   reads and unlike our firmware, the SHM test (objaddr 0x10000, +0x166
-   0xaa55/0x55aa/0), template RAM writes (+0x130/+0x134), PMU/GCI indirect
-   writes, and sets bit 0 of +0x4 in the 0x18013000/0x18014000/0x1801f000/
-   0x18020000 blocks (fn 0x79b9cc, once per slice after its ucode); any of
-   these could be the real trigger. Queue run 18 (phylog v8) brackets when
-   stock's port goes live. `on` assumes the trigger happened (steps 1-5
-   suffice; used by the SDR tone check), `off` keeps the ports dead.
+6. **Port liveness, unknown trigger.** Run 17 did steps 1-5 and matched
+   stock's snapshot in every visible register, yet its ports were latches
+   [F]; run 21 had stock's ucode loaded too and stayed dead [F]. Stock's
+   port is live at its attach read (run 31: 0xdb32/0x1510/0x9bd2) with
+   res_state 0x1e4efbdf, maccontrol 0, d11 clk_ctl_st 0x150b0040: no
+   PHYPLL, no FCLKA, no IHR_EN, the same resources as ours [F]. So the
+   trigger is in stock's per-boot sequence [U]. `phy-live=auto` (default)
+   takes notes/36 §7.2's first candidate: the slice's core has once left
+   reset without PHY clock/reset held (stock's first-pass attach, IOCTL
+   0x3 -> 0x1, seq 4593-4604) [I, queue run 32]; live ports also open the
+   PHY window without PHYPLL. Refuted earlier choices: ucode memory written
+   (runs 21, 31) and PHYPLL + FCLKA + IHR_EN (run 31). `on` keeps those
+   old conditions without a trigger (the SDR tone check's assumption, run
+   with fw/open/open-seqpll.bin, which uses stock's PLL request form),
+   `off` keeps the ports dead. Stock's slice-0 attach values (PHY 0x000,
+   0x001, 0x00b) are seeded. [F]
 
 ChipCommon ERSRC0 (clk_ctl_st bit 24, CCS_SECI_AVAIL [B]) needs, in the
 model, the FLL LPO: pmucontrol_ext (PMU +0x6d8) |= 0x80, poll GCI
@@ -170,23 +177,28 @@ every time. Now:
   regcontrol, pllcontrol and GCI chipcontrol from run 14
   (`fw/trace/indirect_stock_run14.tsv`, 94 entries); pmucontrol 0x380, min
   1, max 0x7fffffff; pmucontrol_ext **0x14291** and GCI 0xc70 = 3, 0xc78 =
-  0 (run 30). Inferred to persist too, never read on silicon: GCI 0xc40 = 3
-  and res_req_mask/timer = 0x160880df/0x15000000 (stock's values over the
-  run-14 table). [I] The MAC request registers do not persist (run 16
-  failed with WAKE and no programming). [F]
+  0 (run 30); GCI 0xc44 = 1 (run 31). Inferred to persist too, never read
+  at our handoff: GCI 0xc40 = 3 and res_req_mask/timer =
+  0x160880df/0x15000000 (stock reads exactly that mask at its attach read,
+  run 31). [I] The MAC request registers do not persist (run 16 failed
+  with WAKE and no programming). [F]
 - **Request timers honour their mask as written** (bcm4387-pmu.c
   res_update). min_res_mask and the requester inputs still get the
   dependency closure; a timer's mask does not: a masked resource comes up
   only once its own dependencies are up for another reason or are masked
   and up. [B] bcmdhd builds every such mask as resource | si_pmu_res_deps
   (si_pmu_rsrc_macphy_clk_deps); [F] runs 23, 26-29 lack exactly
-  closure(30) minus what was up (bits 30/23/5).
+  closure(30) minus what was up (bits 30/23/5). Not sufficient: run 31
+  failed with the full mask (see step 4a). A timer reads bit 25
+  (REQ_ACTIVE) while its request is asserted and all its masked resources
+  are up [I]: stock's res_req reads 0x17000000 (run 31), our MAC timers
+  0x15000000 also at a failed grant (run 29). [F]
 - **When the MAC asks** (bcm4387.c d11_mac_request): out of reset with its
-  clock on and MCTL_WAKE, the clk_ctl_st PHY PLL request (0x200), or ucode
-  memory written. Out of reset alone is not enough [F run 30]; the ucode
-  condition is [I] (stock writes slice 0's ucode from seq 4605, before its
-  attach read at 63881, which answers on silicon; run 30 had not). The
-  other candidate is stock's first-pass attach (notes/36 §6.2). [U]
+  clock on, MCTL_WAKE, and the PHY PLL request raised in stock's form (step
+  4a) [I]. Out of reset alone is not enough [F run 30]. **Refuted, removed:**
+  "ucode memory written asserts it" (my choice after run 30): stock has
+  written its ucode by its attach read and MACPHY_CLK_MAIN is down there
+  (run 31). [F]
 - **pmustatus PST_SLOW_WR_PENDING**: set while a posted always-on index
   write is pending, and for 3 ILP cycles after a write to an ILP-domain
   register (pmuwatchdog, res_req_timer, mac_res_req_timer 0/1/2) made with
@@ -209,11 +221,14 @@ every time. Now:
   status ("This also resets the interrupt status", hndlhl.c) [B]; they do
   not gate the MAC grant [F run 30: stock's values, no grant at attach].
   ARM timer 0xc40/0xc44/0xc48: a non-zero 0xc48 count expires that many
-  ILP cycles later, sets 0xc44 bit 0 (W1C) and asserts the PMU ARM request
-  (res_req mask, plus XTAL_HQ for FORCE_HQ) until the status is cleared or
-  the count rewritten. [I] notes/36 §6, queue run 31 tests it. In the model
-  stock starts it with 0x39 at seq 63244 and has XTAL_HQ before its attach
-  read (0x1e4efbff).
+  ILP cycles later, sets 0xc44 bit 0 (W1C) and clears the count [I]; it
+  reads back as written while running (0x39, run 31 hqprobe) and 0 after
+  expiry (stock at its attach read) [F]. **Refuted, removed:** "the expiry
+  asserts the ARM resource request with XTAL_HQ" (notes/36 §6): 0xc44 is
+  already 1 at our handoff with XTAL_HQ down, and stock at its attach read
+  has status 1, res_req_timer 0x17000000 and XTAL_HQ down (run 31). [F]
+  The res_req request is asserted always, as before; its mask is up
+  anyway.
 - **ChipCommon SECI clock** (ERSRC0): FLL running is no longer enough,
   because the FLL already runs at handoff (0x14291) and runs 10/11 never
   got bit 24: SECI_config bit 2 (SECI_ENAB_SECI_ECI, which stock sets) is
@@ -222,26 +237,39 @@ every time. Now:
   +0x3fc write went through and the +0x3fe read aborted (runs 22/30). [F]
   The write is dropped. [U]
 
-Regressions (`scripts/model_regress.py`, sibling repo): queued-27/1 and
-queued-29/2 ctrl (mask 0x40000000) must decode "enable_phy FAILED at stage
-1 ... res_state then 0x1e4efbdf", queued-30/1 macreq must be SAME (nothing
-at attach, abort at 0x180313fe), and fw/open/open-ctrl.bin (stock's
-sequence, no probe) must reach PHYPLL, a model prediction [I] that silicon
-has not tested (run 30's probe aborted first). New probes
-`pmu_mac_res_req_mask_without_deps` (runs 23/26-29) and
-`pmu_mac_res_req_not_granted_at_attach` (run 30).
+Regressions (`scripts/model_regress.py`, sibling repo):
+- queued-27/1 and queued-29/2 ctrl (mask 0x40000000) must decode
+  "enable_phy FAILED at stage 1 ... res_state then 0x1e4efbdf";
+- queued-30/1 macreq SAME (nothing at attach, abort at 0x180313fe);
+- queued-31/2 hqprobe and 3/hqpll SAME (hqpll: stage-1 failure, 0x150b0342,
+  with the full mask);
+- stock at its first PHY read: the run-31 phylog --hq image
+  (queued-31/1-phylog-hq.bin) run in the model, its attach-time record
+  decoded by scripts/phylog_decode.py and compared line by line with
+  silicon's (ChipCommon FORCEHT masked, as in stock_state_check). It
+  depends on stock's LHL ARM timer (0x3c ILP) having expired by then in
+  virtual time.
+- **Refuted, removed prediction:** "fw/open/open-ctrl.bin (stock's MAC
+  request) reaches PHYPLL" -- run 31 hqpll failed with that request. The
+  current prediction is fw/open/open-seqpll.bin (run 32): PHYPLL with
+  stock's PLL request form, ports live after its first-pass attaches [I].
+- probes: `pmu_mac_res_req_mask_without_deps` (runs 23/26-29),
+  `pmu_mac_res_req_not_granted_at_attach` (run 30),
+  `d11_one_shot_pll_request_full_mask` (run 31); hypotheses
+  `d11_stock_pll_request_full_mask` and `d11_first_pass_then_live` (run
+  32). `d11_ucode_then_live` was removed with the ucode trigger.
 
-**Expected divergence: run 21's binary and run 17.** fw/open/open-run21.bin
-(queued-28/1, queued-29/1) and the run-17 probe
-(`d11_mac_res_req_then_wake`) got MACPHY_CLK_MAIN on silicon with the
-0x40000000 mask, while every later binary with the same MMIO sequence did
-not (0/7). The model now predicts the failure for all of them. notes/36 §1
-shows the run21 and ctrl binaries make the same accesses with a few cycles'
-timing difference; the success is attributed to ILP-domain timing (§1a)
-[I], which the model does not reproduce and should not. The harness reports
-these as EXPECTED DIVERGENCE and does not count them. queued-21/2 replay
-(another run-21-era binary) stays a counted DIFF: it already differed on
-its ports, and now also on the PLL grant for the same reason.
+**Expected divergence: run 21's binaries and run 17.** fw/open/open-run21.bin
+(queued-28/1, queued-29/1), the run-21 replay image (queued-21/2) and the
+run-17 probe (`d11_mac_res_req_then_wake`) got PHYPLL on silicon from the
+one-shot |= 0x302 request, while every later binary with the same MMIO
+sequence did not, with the 0x40000000 mask (runs 23, 26-29) or the full one
+(run 31). The model predicts the failure for all of them. notes/36 §1 shows
+the run21 and ctrl binaries make the same accesses with a few cycles'
+timing difference; the success is attributed to where the one-shot write
+falls in the ILP period (§1a, §7.1) [I], which the model does not reproduce
+and should not. The harness reports these as EXPECTED DIVERGENCE and does
+not count them.
 
 ## Evidence sources
 

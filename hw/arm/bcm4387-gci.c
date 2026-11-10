@@ -35,11 +35,15 @@
  *    bcmdhd sbgci.h / hndlhl.c si_lhl_timer_config(LHL_ARM_TIMER),
  *    si_lhl_timer_reset: count 0 then status write-1-to-clear) [B]. A
  *    non-zero write to +0xc48 starts it; it expires that many ILP cycles
- *    later, sets +0xc44 bit 0 and asserts the PMU ARM resource request
- *    (res_req_mask/timer) until the status is cleared or the count is
- *    rewritten. [I] (notes/36 §6.1: stock starts it with 0x39 at seq 63244;
- *    queue run 31 tests whether the expiry brings up XTAL_HQ). No
- *    interrupt is raised. [U] The interrupt enable bits are stored only.
+ *    later, sets +0xc44 bit 0 and clears the count. [I] It reads back as
+ *    written while running (run 31 hqprobe: 0x39) and 0 once expired
+ *    (stock at its attach read: 0 after writing 0x3c, status 1). [F] The
+ *    status is already 1 at our
+ *    handoff and 1 in stock at its attach read (run 31). [F] The expiry
+ *    has no PMU effect in the model: notes/36 §6 inferred it asserts the
+ *    ARM resource request with XTAL_HQ; run 31 refuted that (stock at its
+ *    attach read: status 1, res_req_timer 0x17000000, XTAL_HQ down). [F]
+ *    No interrupt is raised. [U] The interrupt enable bits are stored only.
  *  - LHL MAC timers 0/1/2 (+0xc70..+0xc9c, bcmdhd sbgci.h
  *    lhl_wl_mactimN_intrp_adr / _st_adr / lhl_wl_mactim_intN_adr /
  *    _fracN_adr) [B]: stock's si_lhl_timer_config sets intrp_adr bits 0/1
@@ -126,8 +130,10 @@ static const Bcm4387Reg gci_regs[] = {
     /* LHL ARM timer 0, see LHL ARM timer above */
     { 0xc40, "lhl_wl_armtim0_intrp_adr", 0x3, 0x3,
       "B name/bits; I handoff 3 (stock's, persists like 0xc70)" },
-    { 0xc44, "lhl_wl_armtim0_st_adr", 0, 0, "B name, W1C bit 0; I set on expiry" },
-    { 0xc48, "lhl_wl_armtim0_adr", 0, ~0u, "B name; I ILP count to expiry" },
+    { 0xc44, "lhl_wl_armtim0_st_adr", 0x1, 0,
+      "B name, W1C bit 0; F handoff 1 (run 31); I set on expiry" },
+    { 0xc48, "lhl_wl_armtim0_adr", 0, ~0u,
+      "B name; I ILP count to expiry; F reads back as written, 0 after expiry (run 31)" },
     /* LHL MAC timers 0/1/2 (main/aux/scan), see LHL MAC timers above */
     { 0xc70, "lhl_wl_mactim0_intrp_adr", 0x3, 0x3,
       "B name/bits; F handoff 3 (run 30); U effect" },
@@ -208,7 +214,7 @@ static void gci_armtim_expire(void *opaque)
 
     *gci_reg(s, 0xc44) |= 1;
     trace_bcm4387_gci_armtim(*gci_reg(s, 0xc48), true);
-    bcm4387_pmu_arm_timer_req(s->pmu, true);
+    *gci_reg(s, 0xc48) = 0;
 }
 
 static void gci_set_index(void *opaque, hwaddr addr, uint32_t v)
@@ -347,14 +353,11 @@ static MemTxResult gci_write(void *opaque, hwaddr off, uint64_t val,
     }
     if (off == 0xc44) {
         *r &= ~(val & 1);
-        bcm4387_pmu_arm_timer_req(s->pmu, *r & 1);
         return MEMTX_OK;
     }
     if (off == 0xc48) {
         *r = val;
         trace_bcm4387_gci_armtim(val, false);
-        bcm4387_pmu_arm_timer_req(s->pmu, false);
-        *gci_reg(s, 0xc44) &= ~1;
         if (val) {
             timer_mod(s->armtim, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                       muldiv64(val, NANOSECONDS_PER_SECOND, BCM4387_ILP_HZ));
