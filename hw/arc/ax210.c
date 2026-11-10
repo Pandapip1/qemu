@@ -25,6 +25,7 @@
 #include "hw/hw.h"
 #include "hw/boards.h"
 #include "hw/irq.h"
+#include "qemu/guest-random.h"
 #include "hw/qdev-properties.h"
 #include "exec/memory.h"
 #include "exec/address-spaces.h"
@@ -114,20 +115,39 @@ static int n_ctrs = 1;
 static uint32_t dma_done;
 static unsigned dma_count;
 
-/* SMEM range watcher and the engine it watches (finding W3, [F]; data not
- * modelled). After LMAC answers 0xfd11, UMAC moves data in 512-byte chunks:
+/* SMEM range watcher and the entropy engine it watches (finding W3, [F]).
+ * After LMAC answers 0xfd11, UMAC moves data in 512-byte chunks:
  * 0x8049da44 clears 0xd02e24 bit 7, arms channel 0 with a range at
  * 0xd0c154 and bit 31 of 0xd0c150, then 0xc0084a0c starts an engine through
  * the W1 window (0xb044 start, 0xb00c end, 0xb008 control 0x61e000) and
  * 0x80486638 waits, without timeout, for 0xd02e24 bit 7 (0x80485fd4).
- * Model: starting the engine with channel 0 armed sets bit 7 at once; the
- * engine's data (from the 0xa2b0xx block, no vendor or silicon record) is
- * not produced, so the watched range keeps its contents. */
+ * The samples are entropy: 0x8047f564 packs bit 0 of each into a 0x840-bit
+ * map at 0x660c00, or, on platforms where [0xd038c8] & 0xf2 is 0x32, bit 0
+ * of the software PRNG 0x804a0bc0 (Park-Miller, x 0x41a7) instead;
+ * 0x8049da98 feeds the first 2048 bits to the 0xd04800 engine (fatal
+ * 0x10023f if they XOR to 0 or start with 0xbadc0fee) and 0x80493974 seeds
+ * the PRNG from word 0x660d04.
+ * Model: starting the engine with channel 0 armed fills the watched SMEM
+ * range (0x400000 | range) with random words and sets bit 7 at once. */
 #define WATCH_CTL   0x00d0c150u
 #define WATCH_ARM   (1u << 31)
 #define WATCH_EVT   (1u << 7)
 #define ENG_CTL     (0x00a20000u + 0xb008)
+#define WATCH_RANGE 0x00d0c154u
+#define SMEM_BASE   0x00400000u
 static uint32_t watch_evt;
+
+/* Paging engine at 0xd04800 (finding W4, [F]): UMAC loads the 2048
+ * entropy bits into +0x200 (0x8049da98), sets the page length at +0xc
+ * (0x1000) and per page writes +8/+4 then a command to +0: 1 in the initial
+ * page loop (0xc0084dac, then waits for status bit 2), 2 when paging a page
+ * in from host DRAM (0x8047f0fc, waits for bit 0). 0x8047efd4 polls
+ * [+0x20] for the bit up to 0x32 times; bit 3 is an error (fatal 0x100230).
+ * Model: transparent (pages are not transformed or checked); a command sets
+ * its done bit at once and bit 3 is never set. */
+#define PGE_CMD   0x00d04800u
+#define PGE_STAT  0x00d04820u
+static uint32_t pge_stat;
 
 static void dma_kick(void);
 
@@ -267,6 +287,11 @@ static void sem_update(int core, uint32_t mask, bool request)
  * timeout. Model: the grant follows the request bit. */
 #define IND_REQ  (IND_BASE + 0x8c38)
 #define IND_GNT  (IND_BASE + 0x8c50)
+/* Second request/acknowledge pair (W2, [F]; addresses V): UMAC 0x804a1898
+ * sets 0xa20818 bit 0 (refcounted, 0x804a193c clears it) and waits for
+ * 0xa27cec bit 8 before the image signature check (fatal 0x313). */
+#define REQ2     0x00a20818u
+#define ACK2     0x00a27cecu
 
 /* Chip identification (finding K2): read-only, silicon values. AX210 dmesg
  * reads "Detected crf-id 0x400410, cnv-id 0x400410 wfpm id 0x80000000"; the
@@ -706,6 +731,15 @@ static uint64_t trace_read(void *opaque, hwaddr addr, unsigned size)
         trace_log("R.phy", ra, v, size);
         return v;
     }
+    if (a == PGE_STAT && !hit) {
+        trace_log("R.pge", ra, pge_stat, size);
+        return pge_stat;
+    }
+    if (a == ACK2 && !hit) {
+        v = (rs_get(ACK2) & ~(1u << 8)) | ((rs_get(REQ2) & 1) << 8);
+        trace_log("R.ack", ra, v, size);
+        return v;
+    }
     if (a == LEV_CAUSE && !hit) {
         v = rs_get(LEV_CAUSE) | (f14_rd != f14_wr ? LEV_CMD : 0);
         trace_log("R.lev", ra, v, size);
@@ -802,6 +836,9 @@ static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     if (a == DMA_STAT) {
         watch_evt &= ~((uint32_t)val & WATCH_EVT);
     }
+    if (a == PGE_CMD) {
+        pge_stat = val == 1 ? 4 : val == 2 ? 1 : 0;
+    }
     if (!regstore) {
         regstore = g_hash_table_new(g_direct_hash, g_direct_equal);
     }
@@ -858,6 +895,14 @@ static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
                                 GUINT_TO_POINTER(d));
             trace_log("IND.W", ia, d, 4);
             if (ta == ENG_CTL && d && (rs_get(WATCH_CTL) & WATCH_ARM)) {
+                hwaddr lo = SMEM_BASE | ((rs_get(WATCH_RANGE) & 0xfff) << 8);
+                hwaddr hi = SMEM_BASE | (rs_get(WATCH_CTL) & 0xfffff);
+                for (hwaddr w = lo; w + 4 <= hi; w += 4) {
+                    uint32_t r;
+                    qemu_guest_getrandom_nofail(&r, sizeof(r));
+                    address_space_write(&address_space_memory, w,
+                                        MEMTXATTRS_UNSPECIFIED, &r, 4);
+                }
                 watch_evt |= WATCH_EVT;
                 trace_log("WATCH", WATCH_CTL, d, 4);
             }
