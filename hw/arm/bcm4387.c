@@ -690,8 +690,11 @@ static void phy_init(BCM4387MachineState *s)
     port_seed(s, PORT_PHY, 0, 0x003, 0x0000);
     port_seed(s, PORT_PHY, 0, 0x004, 0x0080);
     port_seed(s, PORT_PHY, 0, 0x005, 0x0000);
+    port_seed(s, PORT_PHY, 0, 0x009, 0xffef);   /* run 41 [F] */
     port_seed(s, PORT_PHY, 0, 0x00b, 0x9bd2);
+    port_seed(s, PORT_PHY, 0, 0x00c, 0xd7f5);   /* run 41 [F] */
     port_seed(s, PORT_PHY, 0, 0x031, 0x03ff);
+    port_seed(s, PORT_PHY, 0, 0x033, 0x11ff);   /* run 41 [F] */
     port_seed(s, PORT_PHY, 0, 0x480, 0xce00);
     port_seed(s, PORT_RADIO, 0, 0x000, 0x000c);
     port_seed(s, PORT_RADIO, 0, 0x001, 0x50dd);
@@ -701,6 +704,15 @@ static void port_put(BCM4387MachineState *s, int port, int n, uint16_t v)
 {
     uint16_t a = port == PORT_PHY ? s->phy_addr[n] : s->radio_addr[n];
 
+    /*
+     * Radio 0x070 does not keep what is written: stock writes 0x0010 twice
+     * (phylog 209, 258; ROM radio-list writer 0x47b310) and nothing later,
+     * yet after our replay of stock's writes it reads 0 (run 42) [F]. Why
+     * (strobe, self-clearing, write-only) is [U]; reads return 0.
+     */
+    if (port == PORT_RADIO && a == 0x070) {
+        v = 0;
+    }
     g_hash_table_insert(s->phyregs, PORT_KEY(port, n, a), GUINT_TO_POINTER(v));
     if (port == PORT_PHY) {
         s->phy_latch[n] = v;
