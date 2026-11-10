@@ -51,7 +51,19 @@ typedef struct QEMUClock {
 
     QEMUClockType type;
     bool enabled;
+    /*
+     * Bumped by every change that can move the clock's earliest expiry: a
+     * timer added, moved or removed (each under its list's lock), a timer
+     * list added or freed, the clock enabled or disabled.  It lets
+     * qemu_clock_deadline_ns_all() reuse the earliest expiry it found last.
+     */
+    uint64_t timers_gen;
 } QEMUClock;
+
+static void qemu_clock_timers_changed(QEMUClock *clock)
+{
+    qatomic_inc(&clock->timers_gen);
+}
 
 QEMUTimerListGroup main_loop_tlg;
 static QEMUClock qemu_clocks[QEMU_CLOCK_MAX];
@@ -107,6 +119,7 @@ QEMUTimerList *timerlist_new(QEMUClockType type,
     timer_list->notify_opaque = opaque;
     qemu_mutex_init(&timer_list->active_timers_lock);
     QLIST_INSERT_HEAD(&clock->timerlists, timer_list, list);
+    qemu_clock_timers_changed(clock);
     return timer_list;
 }
 
@@ -115,6 +128,7 @@ void timerlist_free(QEMUTimerList *timer_list)
     assert(!timerlist_has_timers(timer_list));
     if (timer_list->clock) {
         QLIST_REMOVE(timer_list, list);
+        qemu_clock_timers_changed(timer_list->clock);
     }
     qemu_mutex_destroy(&timer_list->active_timers_lock);
     g_free(timer_list);
@@ -160,6 +174,9 @@ void qemu_clock_enable(QEMUClockType type, bool enabled)
     QEMUTimerList *tl;
     bool old = clock->enabled;
     clock->enabled = enabled;
+    if (enabled != old) {
+        qemu_clock_timers_changed(clock);
+    }
     if (enabled && !old) {
         qemu_clock_notify(type);
     } else if (!enabled && old) {
@@ -247,17 +264,66 @@ int64_t timerlist_deadline_ns(QEMUTimerList *timer_list)
  * ignore whether or not the clock should be used in deadline
  * calculations.
  */
+/*
+ * The earliest expiry over all of @clock's timers (all attributes), or -1
+ * with none, as of generation @gen; each thread keeps the last it found.
+ */
+static __thread struct {
+    uint64_t gen;
+    int64_t expire_time;
+} clock_soonest_cache[QEMU_CLOCK_MAX];
+
 int64_t qemu_clock_deadline_ns_all(QEMUClockType type, int attr_mask)
 {
     int64_t deadline = -1;
     int64_t delta;
     int64_t expire_time;
+    int64_t soonest = -1;
+    uint64_t gen;
     QEMUTimer *ts;
     QEMUTimerList *timer_list;
     QEMUClock *clock = qemu_clock_ptr(type);
 
     if (!clock->enabled) {
         return -1;
+    }
+
+    /*
+     * With every attribute accepted the result only depends on the earliest
+     * expiry: the minimum of the per-list deltas below, each clamped at 0,
+     * is the clamped delta of the minimum.  Reuse that expiry while no timer
+     * of the clock has changed (timers_gen; read before the walk, so a change
+     * during it forces the next call to walk again).
+     */
+    if (attr_mask == QEMU_TIMER_ATTR_ALL) {
+        gen = qatomic_load_acquire(&clock->timers_gen);
+        if (gen != 0 && clock_soonest_cache[type].gen == gen) {
+            soonest = clock_soonest_cache[type].expire_time;
+            if (soonest < 0) {
+                return -1;
+            }
+            delta = soonest - qemu_clock_get_ns(type);
+            return delta <= 0 ? 0 : delta;
+        }
+        QLIST_FOREACH(timer_list, &clock->timerlists, list) {
+            if (!qatomic_read(&timer_list->active_timers)) {
+                continue;
+            }
+            qemu_mutex_lock(&timer_list->active_timers_lock);
+            ts = timer_list->active_timers;
+            expire_time = ts ? ts->expire_time : -1;
+            qemu_mutex_unlock(&timer_list->active_timers_lock);
+            if (expire_time >= 0 && (soonest < 0 || expire_time < soonest)) {
+                soonest = expire_time;
+            }
+        }
+        clock_soonest_cache[type].gen = gen;
+        clock_soonest_cache[type].expire_time = soonest;
+        if (soonest < 0) {
+            return -1;
+        }
+        delta = soonest - qemu_clock_get_ns(type);
+        return delta <= 0 ? 0 : delta;
     }
 
     QLIST_FOREACH(timer_list, &clock->timerlists, list) {
@@ -380,6 +446,7 @@ static void timer_del_locked(QEMUTimerList *timer_list, QEMUTimer *ts)
             break;
         if (t == ts) {
             qatomic_set(pt, t->next);
+            qemu_clock_timers_changed(timer_list->clock);
             break;
         }
         pt = &t->next;
@@ -403,6 +470,7 @@ static bool timer_mod_ns_locked(QEMUTimerList *timer_list,
     ts->expire_time = MAX(expire_time, 0);
     ts->next = *pt;
     qatomic_set(pt, ts);
+    qemu_clock_timers_changed(timer_list->clock);
 
     return pt == &timer_list->active_timers;
 }
@@ -556,6 +624,7 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
 
         /* remove timer from the list before calling the callback */
         timer_list->active_timers = ts->next;
+        qemu_clock_timers_changed(timer_list->clock);
         ts->next = NULL;
         ts->expire_time = -1;
         cb = ts->cb;
