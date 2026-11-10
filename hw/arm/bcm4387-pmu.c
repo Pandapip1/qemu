@@ -29,15 +29,14 @@
  *    The MAC timers are reset by a reload (run 16: WAKE and the PLL
  *    request with no programming got nothing). [F] For min_res_mask and the requesters the PMU brings up the
  *    dependency closure of everything requested (res_dep_mask table),
- *    limited to max_res_mask, and drops the rest. A request timer's mask is
- *    honoured as written, with no closure: a masked resource comes up only
- *    when its dependencies are up (see res_update). [B] by construction,
- *    consistent with runs 23, 26-29 (mask 0x40000000 never granted) [F];
- *    not sufficient for a grant: run 31 failed with the full mask (see
- *    d11_mac_request for why). A timer reads bit 25 (REQ_ACTIVE) while its
- *    request is asserted and every masked resource is up. [I] fits stock's
- *    0x17000000 (run 31) and our 0x15000000 read-backs, also at a failed
- *    grant (run 29). [F] Transitions complete at
+ *    limited to max_res_mask, and drops the rest; the same for a request
+ *    timer's mask. [F] run 38 (Device MMIO): mask 0x40000000 (MACPHY_CLK_MAIN
+ *    alone) was granted with its dependencies (0x5ecefbff), as was
+ *    0x56cac1ff. The "mask honoured without closure" rule fitted to runs
+ *    23, 26-29 is withdrawn: those ran with Normal-memory MMIO. A timer
+ *    reads bit 25 (REQ_ACTIVE) while its request is asserted and every
+ *    masked resource is up. [I] fits stock's 0x17000000 (run 31) and our
+ *    0x15000000 read-backs before the MAC asks. [F] Transitions complete at
  *    once (res_pending reads 0); timing is not modelled. [B] semantics
  *    (bcmdhd si_pmu_res_deps, si_pmu_res_init), [F] check: the closure of
  *    the run-14 table reproduces every res_state seen on silicon:
@@ -281,43 +280,25 @@ static const hwaddr req_timers[][2] = {
 static void res_update(Bcm4387PmuState *s)
 {
     uint32_t want = *pmu_reg(s, PMU_MIN_RES), old = s->res_state;
-    uint32_t max = *pmu_reg(s, PMU_MAX_RES) & (RES(NRES) - 1);
-    uint32_t timed = 0, up, prev;
 
     for (int i = 0; i < BCM4387_REQ_N; i++) {
         want |= s->req[i];
     }
-    up = res_closure(s, want) & max;
     /*
      * Resource request timers: the force ALP/HT/HQ flags (bits 26..28,
      * MAC_RSRC_REQ_TIMER_FORCE_*; PRRT_*_REQ << 14) request the timer's
      * mask while set; a MAC timer only while its slice's MAC asserts its
      * clock request (d11_mac_request in bcm4387.c). [B] flags, [I] request
      * held while a flag is set.
-     * The mask is taken as it is, without walking res_dep_mask: a masked
-     * resource comes up only once each of its dependencies is up, for
-     * another reason or because it is itself masked and up. bcmdhd builds
-     * every such mask as the resource plus si_pmu_res_deps() (hndpmu.c
-     * si_pmu_rsrc_macphy_clk_deps) [B]; silicon runs 23, 26-29 (mask
-     * 0x40000000 = MACPHY_CLK_MAIN alone, MAC awake and requesting) never
-     * got bits 30/23/5, exactly closure(30) minus what was up. [F]
      */
     for (int i = 0; i < ARRAY_SIZE(req_timers); i++) {
         if ((i == 0 || s->mac_active[i - 1]) &&
             (*pmu_reg(s, req_timers[i][0]) & (7u << 26))) {
-            timed |= *pmu_reg(s, req_timers[i][1]);
+            want |= *pmu_reg(s, req_timers[i][1]);
         }
     }
-    want |= timed;
-    do {
-        prev = up;
-        for (int r = 0; r < NRES; r++) {
-            if ((timed & max & ~up & RES(r)) && !(s->file[F_DEP][r] & ~up)) {
-                up |= RES(r);
-            }
-        }
-    } while (up != prev);
-    s->res_state = up;
+    s->res_state = res_closure(s, want) & *pmu_reg(s, PMU_MAX_RES) &
+                   (RES(NRES) - 1);
     if (s->res_state != old) {
         trace_bcm4387_pmu_res_state(old, s->res_state, want);
     }
@@ -550,6 +531,7 @@ static MemTxResult pmu_read(void *opaque, hwaddr off, uint64_t *data,
     if (size != 4) {
         return bcm4387_unknown("pmu", BCM4387_PMU_BASE, off, false, data, size);
     }
+    bcm4387_mmio_attr(BCM4387_PMU_BASE + off, false);
     bcm4387_pmu_sync_read(s, BCM4387_PMU_BASE + off);
     if ((k = sel_of(off)) >= 0) {
         v = s->sel[k];
@@ -606,6 +588,7 @@ static MemTxResult pmu_write(void *opaque, hwaddr off, uint64_t val,
     if (size != 4) {
         return bcm4387_unknown("pmu", BCM4387_PMU_BASE, off, true, &val, size);
     }
+    bcm4387_mmio_attr(BCM4387_PMU_BASE + off, true);
     trace_bcm4387_pmu_write(off, val);
     if (sel_of(off) >= 0) {
         bcm4387_pmu_sync_post(s, sel_apply, s, BCM4387_PMU_BASE + off, val);

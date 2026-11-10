@@ -35,6 +35,9 @@ extern bool bcm4387_strict;
 uint32_t bcm4387_pc(void);
 uint32_t bcm4387_lr(void);
 
+/* Check the CPU's memory attributes for a backplane access (bcm4387.c). */
+void bcm4387_mmio_attr(hwaddr addr, bool write);
+
 /*
  * A plain register: what it holds at the host->firmware handoff, which bits
  * firmware can change, and the evidence for both. Devices keep the value in

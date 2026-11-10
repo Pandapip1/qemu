@@ -142,7 +142,6 @@ struct BCM4387MachineState {
     bool ucode_loaded[3];   /* ucode memory written through objaddr/objdata */
     char *phy_live;         /* port liveness: auto, on or off */
     char *psm_dead_port;    /* PSM access to a dead port: abort or busy */
-    char *mac_pll;          /* MAC request grants the PHY clock: deny/grant */
 };
 
 /* ---- catch-all tracer and modelled backplane registers ------------------ */
@@ -161,6 +160,72 @@ uint32_t bcm4387_pc(void)
 uint32_t bcm4387_lr(void)
 {
     return current_cpu ? cpu_env(current_cpu)->regs[14] : 0;
+}
+
+/*
+ * Memory attributes of backplane accesses. Silicon distinguishes them, the
+ * model cannot: with the MPU off, the ARMv7-R default memory map makes
+ * 0x00000000-0x7fffffff Normal memory, so the Cortex-R4 may merge stores in
+ * its store buffer, let a load overtake an earlier buffered store, or
+ * forward a load from a buffered store (ARMv7 memory model) [B: ARM
+ * architecture]. Stock enables its MPU before its first backplane access
+ * (RAM 0x829c94 + 0x75357a; region 0x18000000/128M and 0xe8000000/32M with
+ * DRACR 0x1305 = shareable Device) [F]. Our firmware ran runs 7-37 with the
+ * MPU off (SCTLR 0x40e50878) and saw a dead/latching PHY port and a PHYPLL
+ * grant that depended on the binary; with stock's MPU both went away (runs
+ * 38/39: port live from attach, PHYPLL granted for every image) [F]. TCG
+ * performs every access in program order with no store buffer, i.e. as a
+ * Device access, so the model's register behaviour is the Device one and a
+ * Normal-memory MMIO run is flagged, once, as not modelled.
+ */
+static bool mmio_attr_flagged;
+
+static bool pmsa_device(CPUARMState *env, ARMCPU *cpu, uint32_t a,
+                        uint32_t *dracr)
+{
+    *dracr = 0;
+    if (!(env->cp15.sctlr_el[1] & SCTLR_M)) {
+        return a >= 0x80000000;         /* default map: Device / SO */
+    }
+    for (int n = cpu->pmsav7_dregion - 1; n >= 0; n--) {
+        uint32_t drsr = env->pmsav7.drsr[n], base = env->pmsav7.drbar[n];
+        uint64_t size = 2ull << extract32(drsr, 1, 5);
+
+        if (!(drsr & 1) || a < base || a - base >= size) {
+            continue;
+        }
+        if (size >= 256 && (drsr & BIT(8 + (a - base) / (size / 8)))) {
+            continue;                   /* subregion disabled */
+        }
+        *dracr = env->pmsav7.dracr[n];
+        /* TEX[5:3] C[1] B[0]: 000 0 x = Strongly-ordered/Device, 010 0 0 Device */
+        return !(*dracr & 2) && (extract32(*dracr, 3, 3) == 0 ||
+               (extract32(*dracr, 3, 3) == 2 && !(*dracr & 1)));
+    }
+    return a >= 0x80000000;             /* background = default map */
+}
+
+void bcm4387_mmio_attr(hwaddr addr, bool write)
+{
+    ARMCPU *cpu;
+    uint32_t dracr;
+
+    if (!current_cpu || mmio_attr_flagged || !bcm4387_strict) {
+        return;
+    }
+    cpu = ARM_CPU(current_cpu);
+    if (pmsa_device(&cpu->env, cpu, addr, &dracr)) {
+        return;
+    }
+    mmio_attr_flagged = true;
+    qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: FIDELITY: Normal-memory MMIO "
+                  "%c 0x%08" HWADDR_PRIx " (SCTLR 0x%08x, %s 0x%x): store "
+                  "merging/reordering/forwarding not modelled; register "
+                  "outcomes follow Device semantics pc~0x%08x\n",
+                  write ? 'W' : 'R', addr,
+                  (uint32_t)cpu->env.cp15.sctlr_el[1],
+                  cpu->env.cp15.sctlr_el[1] & SCTLR_M ? "region DRACR" :
+                  "MPU off, default map; DRACR", dracr, bcm4387_pc());
 }
 
 static uint32_t store_get(BCM4387MachineState *s, hwaddr a)
@@ -365,17 +430,14 @@ static void tcam_program(BCM4387MachineState *s, uint32_t slot);
  *    this slice; see bcm4387-pmu.c). Out of reset alone it does not [F]
  *    run 30 (request programmed, attach done: clk_ctl_st 0x150b0040,
  *    res_state 0x1e4efbdf), nor with ucode written [F] run 31.
- *    Whether that request is granted is UNKNOWN [U]: on silicon it was for
- *    every binary built from the bfa8c1f source (runs 17, 21, 28, 29, 33:
- *    one-shot |= 0x302, mask 0x40000000) and for stock, and never for any
- *    later source (runs 23, 26-32: mask 0x40000000 or stock's full
- *    0x56cac1ff, one-shot or stock's FORCEHT -> 2 ILP -> HT -> 0x300 form,
- *    per-slice power and first passes), with identical MMIO in the model.
- *    Machine option mac-pll: deny (default; every source since bfa8c1f)
- *    or grant (an assumption: stock, the bfa8c1f binaries, and the SDR
- *    test bench). Refuted rules: "granted once ucode is written" (run 31),
- *    "granted when 0x200 rises after FORCEHT settled and HT was read back"
- *    (run 32).
+ *    The PMU grants it (closure of the mask over res_dep_mask). [F] run
+ *    38, with Device MMIO: every image got PHYPLL (0x1f0b0342) from the
+ *    one-shot |= 0x302 request with mask 0x40000000 or 0x56cac1ff. The
+ *    binary-dependent grant of runs 17-37 (bfa8c1f source 4/4, later
+ *    sources 0/11) was measured with the MPU off (Normal-memory MMIO, see
+ *    bcm4387_mmio_attr) and is not modelled; the mac-pll knob fitted to it
+ *    is gone, as are the rules refuted on the way ("granted once ucode is
+ *    written", run 31; "granted after FORCEHT settled", run 32).
  *  - MAC held awake (MCTL_WAKE): the clk_ctl_st request no longer reaches
  *    the PMU, only the MAC resource request does. [F] run 16: maccontrol
  *    0x04000400 written before the 0x302 request, mac_res_req never
@@ -393,8 +455,7 @@ static void d11_mac_request(BCM4387MachineState *s, int n)
               (store_get(s, D11_WRAP(n) + WRAP_IOCTL) & 1);
 
     bcm4387_pmu_mac_active(s->pmu, n, up && awake &&
-                           (store_get(s, D11_BASE(n) + 0x1e0) & 0x200) &&
-                           s->mac_pll && !strcmp(s->mac_pll, "grant"));
+                           (store_get(s, D11_BASE(n) + 0x1e0) & 0x200));
     bcm4387_pmu_request(s->pmu, BCM4387_REQ_MAC0 + n,
                         !awake && (store_get(s, D11_BASE(n) + 0x1e0) & 0x200) ?
                         BIT(d11_macphy_res[n]) : 0);
@@ -427,6 +488,12 @@ static bool model_write(BCM4387MachineState *s, hwaddr a, uint32_t v)
             }
             if (!(store_get(s, a) & 1) && (v & 1)) {
                 bcm4387_psm_core_reset(s->psm[n]);
+                /*
+                 * core reset drops the clk_ctl_st requests: 0x150b0040
+                 * right after the post-PLL PHY reset (runs 38/39, MPU on)
+                 * [F]
+                 */
+                store_set(s, D11_BASE(n) + 0x1e0, 0x40);
             }
             store_set(s, a, v);
             d11_mac_request(s, n);
@@ -532,43 +599,73 @@ static bool d11_fclka(BCM4387MachineState *s, int n)
 }
 
 /*
- * The PHY and radio data ports reach the PHY/radio register files only with
- * the slice's PHY clock up (MACPHY_CLK resource) and the MAC's fast clock
- * (SISF_FCLKA) and internal hardware registers (MCTL_IHR_EN) on; otherwise
- * they are the latches seen on silicon. [I] Runs 7-11 had MACPHY_CLK_MAIN
- * up (run 11: res_state 0x5ecefbff, d11 clk_ctl_st 0x1f0b0342) but never
- * wrote maccontrol and read latches; stock writes maccontrol 0x04000400
- * (MCTL_WAKE | MCTL_IHR_EN, fn 0x4d2a1c) before its first PHY write and
- * its PHY works. Which of WAKE and IHR_EN is needed is not separable from
- * the evidence (stock sets both at once): both are required here.
- * d11 +0x18c and the 16-bit +0x3e6 (phyanacore in the classic layout),
- * which stock zeroes before its first PHY write, have no effect modelled
- * (both are 0 at handoff in the model). [U]
- * A never-written register reads its seed (below) or 0, logged as
- * unknown. [U]
+ * The PHY and radio data ports reach the PHY/radio register files whenever
+ * the core answers at all (powered, out of reset, clocked: d11_gate), from
+ * the attach on, PHY PLL or not. [F] stock at its attach read (runs 22/31:
+ * IOCTL 0x145, res_state 0x1e4efbdf, maccontrol 0, PHY 0x000/0x001/0x00b
+ * = 0xdb32/0x1510/0x9bd2) and ours with the MPU on (run 38 attach probe:
+ * 0x00b 0x9bd2, 0x031 0x03ff, 0x000 0xdb32, 0x001 0x1510; run 39: the same
+ * after every enable_phy step; radio 0/1 = 0x000c/0x50dd). Values at that
+ * point are seeded (phy_init). A never-written register reads its seed or
+ * 0, logged as unknown. [U]
  *
- * Those conditions are neither sufficient nor necessary. Run 17 met all
- * of them (res_state 0x5ecefbff, srpwr 0x003f1e00, ioctl 0x105, iostatus
- * 0x11006, clk_ctl_st 0x1f0b0342, maccontrol 0x04000400, all = stock) and
- * its ports were latches; run 21 also had stock's ucode loaded. [F] Stock's
- * port is live at its attach read (0x45310c, run 31: PHY 0x000/0x001/0x00b
- * = 0xdb32/0x1510/0x9bd2) with res_state 0x1e4efbdf (no MACPHY_CLK_MAIN,
- * RADIO_PU_MAIN or XTAL_HQ), maccontrol 0, d11 clk_ctl_st 0x150b0040,
- * IOCTL 0x145, i.e. the same resources and clocks as ours. [F] What makes
- * it live is UNKNOWN [U]: every known pre-attach difference has been
- * replayed in ours or removed from stock without changing the outcome
- * (runs 24/25: SR, regcontrol, LHL, PMU/GCI chipcontrol; run 32: per-slice
- * domain power and first-pass attaches; run 33: SECI init). phy-live=auto
- * (default) therefore keeps the ports dead, which is what every run of
- * ours saw [F]; phy-live=on assumes the unknown trigger happened: ports
- * live and the PHY window open whenever the core is up (stock's state at
- * its attach read; the SDR test bench); off = auto. Refuted rules: ucode
- * memory written (runs 21, 31), PHYPLL + FCLKA + IHR_EN (run 31), a
- * first-pass attach (run 32).
+ * Runs 7-37 of ours instead saw latches and echoes (the first read after
+ * a phyversion read returns 0xdb32, later 0xce00 or the last data written)
+ * and slave errors at attach. They ran with the MPU off, so every MMIO
+ * access was Normal memory (bcm4387_mmio_attr): store merging, load/store
+ * reordering and store-to-load forwarding explain that phenomenology, and
+ * the model does not reproduce it. phy-live=off still emulates it (the
+ * latch rules in port_read) for reference only; it is a description of
+ * Normal-memory observations, not of the hardware. phy-live=on/auto
+ * (default) is the Device behaviour above. Refuted earlier rules for the
+ * "trigger": ucode memory written (runs 21, 31), PHYPLL + FCLKA + IHR_EN
+ * (run 31), a first-pass attach (run 32), all measured with Normal MMIO.
+ *
+ * Some PHY registers answer an AXI slave error when read before the PHY is
+ * initialised. [F] runs 38/39 (MPU on, after enable_phy): PHY 0x12e read
+ * back 0x1012 after 0x12e/0x12f were written 0x1012/0x0084, radio 0x07 read
+ * 0x0010 (liveness slot 0x11a = 0x10120010), PHY 0x480 read 0xce00, and the
+ * raw dump read 0x000-0x005 = 0xdb32, 0x1510, 0x0041, 0, 0x0080, 0 and
+ * then took a synchronous external abort (DFSR 0x1008, DFAR 0x180313fe) on
+ * PHY 0x006, in all four images. Only 0x006 is known to fault; which other
+ * registers do is unknown [U] (the rest of the dump, 0x007-0x00f, 0x400-,
+ * 0x480-, 0x720-, was never reached). When the fault clears (after which
+ * part of stock's init) is UNKNOWN [U]: the model keeps it for the whole
+ * boot (phy_preinit_fault), so firmware that reads 0x006 after its own
+ * init is flagged rather than given a guessed value. Queue run 40 (our
+ * capture image with the MPU, raw dump included) crashed the host and gave
+ * no data; its cause is not known. [F]
  */
 static bool port_live(BCM4387MachineState *s, int n)
 {
-    return s->phy_live && !strcmp(s->phy_live, "on");
+    return !s->phy_live || strcmp(s->phy_live, "off");
+}
+
+/* PHY registers known to fault on read before PHY init [F]; see above */
+static const uint16_t phy_preinit_faulting[] = { 0x006 };
+
+static bool phy_preinit_fault(BCM4387MachineState *s, hwaddr a,
+                              unsigned size)
+{
+    int n = d11_core(a);
+    hwaddr off;
+
+    if (n < 0 || !s->strict || !port_live(s, n)) {
+        return false;
+    }
+    off = a - D11_BASE(n);
+    if (off != 0x3fe && !(off == 0x3fc && size == 4)) {
+        return false;
+    }
+    for (int i = 0; i < ARRAY_SIZE(phy_preinit_faulting); i++) {
+        if (s->phy_addr[n] == phy_preinit_faulting[i]) {
+            qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: AXI slave error: d11 %d "
+                          "PHY 0x%04x read before PHY init (runs 38/39) "
+                          "pc~0x%08x\n", n, s->phy_addr[n], bcm4387_pc());
+            return true;
+        }
+    }
+    return false;
 }
 
 static void phy_init(BCM4387MachineState *s)
@@ -585,10 +682,19 @@ static void phy_init(BCM4387MachineState *s)
         port_seed(s, PORT_PHY, n, 0x02, 1);
         port_seed(s, PORT_PHY, n, 0x0b, ncores[n]);
     }
-    /* stock's attach read, slice 0 (run 31; 0x000 also run 18) [F] */
+    /* slice 0 at attach: stock (runs 18, 31) and ours with the MPU (runs
+     * 38, 39) [F] */
     port_seed(s, PORT_PHY, 0, 0x000, 0xdb32);
     port_seed(s, PORT_PHY, 0, 0x001, 0x1510);
+    port_seed(s, PORT_PHY, 0, 0x002, 0x0041);
+    port_seed(s, PORT_PHY, 0, 0x003, 0x0000);
+    port_seed(s, PORT_PHY, 0, 0x004, 0x0080);
+    port_seed(s, PORT_PHY, 0, 0x005, 0x0000);
     port_seed(s, PORT_PHY, 0, 0x00b, 0x9bd2);
+    port_seed(s, PORT_PHY, 0, 0x031, 0x03ff);
+    port_seed(s, PORT_PHY, 0, 0x480, 0xce00);
+    port_seed(s, PORT_RADIO, 0, 0x000, 0x000c);
+    port_seed(s, PORT_RADIO, 0, 0x001, 0x50dd);
 }
 
 static void port_put(BCM4387MachineState *s, int port, int n, uint16_t v)
@@ -1236,10 +1342,15 @@ static MemTxResult trace_read(void *opaque, hwaddr addr, uint64_t *data,
     BCM4387MachineState *s = opaque;
     uint32_t v = 0;
     bool modelled, dropped = false;
-    MemTxResult r = d11_gate(s, addr, false, &dropped);
+    MemTxResult r;
 
+    bcm4387_mmio_attr(addr, false);
+    r = d11_gate(s, addr, false, &dropped);
     if (r != MEMTX_OK) {
         return r;
+    }
+    if (phy_preinit_fault(s, addr, size)) {
+        return MEMTX_ERROR;
     }
     if (phy_port(s, addr, size, false, 0, &v)) {
         *data = v;
@@ -1272,7 +1383,10 @@ static MemTxResult trace_write(void *opaque, hwaddr addr, uint64_t val,
 {
     BCM4387MachineState *s = opaque;
     bool modelled, dropped = false;
-    MemTxResult r = d11_gate(s, addr, true, &dropped);
+    MemTxResult r;
+
+    bcm4387_mmio_attr(addr, true);
+    r = d11_gate(s, addr, true, &dropped);
 
     if (r != MEMTX_OK || dropped) {
         return r;
@@ -1529,6 +1643,8 @@ static void bcm4387_init(MachineState *machine)
     object_property_set_uint(cpuobj, "atcm-region", 0x39, &error_fatal);
     object_property_set_uint(cpuobj, "btcm-region", 0x00800031, &error_fatal);
     ARM_CPU(cpuobj)->reset_sctlr = 0x00e50878;
+    /* MPUIR reads 0xc00 on silicon: 12 data regions (run 38) [F] */
+    object_property_set_uint(cpuobj, "pmsav7-dregion", 12, &error_fatal);
     qdev_realize(DEVICE(cpuobj), NULL, &error_fatal);
     s->cpu = ARM_CPU(cpuobj);
 
@@ -1645,11 +1761,6 @@ static void bcm4387_init(MachineState *machine)
     if (s->phy_live && strcmp(s->phy_live, "auto") &&
         strcmp(s->phy_live, "on") && strcmp(s->phy_live, "off")) {
         error_report("bcm4387: phy-live must be auto, on or off");
-        exit(1);
-    }
-    if (s->mac_pll && strcmp(s->mac_pll, "deny") &&
-        strcmp(s->mac_pll, "grant")) {
-        error_report("bcm4387: mac-pll must be deny or grant");
         exit(1);
     }
     if (s->psm_dead_port && strcmp(s->psm_dead_port, "abort") &&
@@ -1832,7 +1943,6 @@ STR_PROP("iq-source", iq_source)
 STR_PROP("iq-format", iq_format)
 STR_PROP("phy-live", phy_live)
 STR_PROP("psm-dead-port", psm_dead_port)
-STR_PROP("mac-pll", mac_pll)
 
 static void get_atcm(Object *o, Visitor *v, const char *name, void *opaque,
                      Error **errp)
@@ -1915,7 +2025,6 @@ static void bcm4387_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_str(oc, "phy-live", get_phy_live, set_phy_live);
     object_class_property_add_str(oc, "psm-dead-port", get_psm_dead_port,
                                   set_psm_dead_port);
-    object_class_property_add_str(oc, "mac-pll", get_mac_pll, set_mac_pll);
     object_class_property_add(oc, "atcm-size", "uint32", get_atcm, set_atcm,
                               NULL, NULL);
     object_class_property_add_bool(oc, "identity", get_identity, set_identity);

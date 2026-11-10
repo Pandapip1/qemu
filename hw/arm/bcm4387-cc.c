@@ -13,14 +13,12 @@
  *    the backplane runs on HT while HT is up. [B] Bit 25 reads set at
  *    handoff and in every run. [F] (meaning unknown [U])
  *    Bit 24 (CCS_SECI_AVAIL) answers the SECI clock request (bit 8,
- *    CCS_SECICLKREQ) [B] once the FLL LPO runs (pmucontrol_ext
- *    FASTLPO_ENAB, FLL locked) and SECI is enabled (SECI_config bit 2,
- *    SECI_ENAB_SECI_ECI [B]). [I] hypothesis: our firmware's 0x110/0x150
- *    requests left bit 24 clear (queue runs 10, 11) although the FLL
- *    already runs at handoff (pmucontrol_ext 0x14291, run 30 [F]); stock
- *    writes SECI_config 1, 0xd, 0xc, 0x4 (ROM 0x483394.., seq 4391-4401)
- *    before its SECI clock request (ROM 0x483964) and gets 0x030b0152.
- *    SECI_config is ChipCommon state, reset by a reload. [I]
+ *    CCS_SECICLKREQ) [B] while the FLL LPO runs (pmucontrol_ext
+ *    FASTLPO_ENAB, FLL locked; already so at handoff, 0x14291). [F] run 38
+ *    (MPU on): our request (HT_AREQ | ERSRC_REQ0) read 0x030b0152 with no
+ *    SECI init. Runs 10/11 never got bit 24, but ran with Normal-memory
+ *    MMIO; the "SECI_config bit 2 needed" rule fitted to them is
+ *    withdrawn.
  *  - powerctl (srpwr, +0x1e8): PowerOnRequest [12:8] per domain (0 PCIE,
  *    1 ARM/BP, 2 MAC aux, 3 MAC main, 4 MAC scan), ExtPwrStatus [20:16]
  *    and BT status [21] read-only. [B] Domains 0, 1 and the BT bit read on
@@ -174,8 +172,7 @@ static uint32_t clk_ctl_st(Bcm4387CcState *s)
 
     v |= (alp ? CCS_ALPAVAIL : 0) | (ht ? CCS_HTAVAIL | CCS_BP_ON_HT : 0) |
          (!ht && alp ? CCS_BP_ON_ALP : 0);
-    if ((s->clk_req & CCS_SECICLKREQ) && bcm4387_pmu_fll_locked(s->pmu) &&
-        (*cc_reg(s, 0x130) & 0x4)) {
+    if ((s->clk_req & CCS_SECICLKREQ) && bcm4387_pmu_fll_locked(s->pmu)) {
         v |= CCS_SECI_AVAIL;
     }
     return v;
@@ -187,6 +184,7 @@ static MemTxResult cc_read(void *opaque, hwaddr off, uint64_t *data,
     Bcm4387CcState *s = opaque;
     uint32_t v, *r;
 
+    bcm4387_mmio_attr(BCM4387_CC_BASE + off, false);
     if (size != 4) {
         return bcm4387_unknown("cc", BCM4387_CC_BASE, off, false, data, size);
     }
@@ -228,6 +226,7 @@ static MemTxResult cc_write(void *opaque, hwaddr off, uint64_t val,
     Bcm4387CcState *s = opaque;
     uint32_t *r;
 
+    bcm4387_mmio_attr(BCM4387_CC_BASE + off, true);
     if (size != 4) {
         return bcm4387_unknown("cc", BCM4387_CC_BASE, off, true, &val, size);
     }

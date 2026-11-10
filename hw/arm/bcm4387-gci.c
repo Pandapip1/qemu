@@ -232,6 +232,7 @@ static MemTxResult gci_read(void *opaque, hwaddr off, uint64_t *data,
     uint32_t *r, idx = s->index & (GCI_NFILE - 1);
     uint32_t v;
 
+    bcm4387_mmio_attr(BCM4387_GCI_BASE + off, false);
     switch (off) {
     case GCI_INDIRECT:
         bcm4387_pmu_sync_read(s->pmu, BCM4387_GCI_BASE + off);
@@ -303,6 +304,7 @@ static MemTxResult gci_write(void *opaque, hwaddr off, uint64_t val,
     Bcm4387GciState *s = opaque;
     uint32_t *r, idx = s->index & (GCI_NFILE - 1);
 
+    bcm4387_mmio_attr(BCM4387_GCI_BASE + off, true);
     trace_bcm4387_gci_write(off, val);
     switch (off) {
     case GCI_INDIRECT:
