@@ -11,6 +11,7 @@ contrib_plugins = [
 'ips.c',
 'stoptrigger.c',
 'romtrap.c',
+'romcall.c',
 'memwatch.c',
 'mpudump.c',
 'traps.c',
