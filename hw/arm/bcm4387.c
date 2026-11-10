@@ -193,61 +193,37 @@ static bool d11_phypll(BCM4387MachineState *s, int n)
 }
 
 /*
- * Extra master wrappers (PHY agents) of each d11 core, from the silicon EROM:
- * core 0 0x18134000/0x18135000, core 1 0x18137000/0x18138000, core 2 none.
+ * The extra wrappers of d11 slices 0/1 (master 0x18134000/0x18135000 and
+ * 0x18137000/0x18138000, slave 0x18136000/0x18139000): reset_ctl is a plain
+ * register (1 at handoff), everything else reads 0 and ignores writes, in
+ * every power state seen. Stock leaves them at ioctl/reset_ctl/iostatus 0
+ * (phylog v6 snapshot at its first PHY write); our IOCTL writes read back 0
+ * (queue runs 9, 11). Slice 1's are assumed to behave like slice 0's. [F]/[I]
  */
-static const hwaddr d11_agents[3][2] = {
-    { 0x18134000, 0x18135000 }, { 0x18137000, 0x18138000 }, { 0, 0 },
+static const hwaddr d11_extra_wraps[] = {
+    0x18134000, 0x18135000, 0x18136000, 0x18137000, 0x18138000, 0x18139000,
 };
 
-/*
- * PHY-agent wrapper registers with the agents' power domains off: writes do
- * not stick and reads return 0 (queue run 9, srpwr status 0x2b: after
- * reset + IOCTL 0xd the IOCTL read back 0, and the reset wait completed).
- * Assumed to need domains 0x4 and 0x10, the ones missing in run 9; stock
- * powers all MAC domains (0x3f). [F]/[I]
- */
-static bool d11_agent_unpowered(BCM4387MachineState *s, hwaddr a)
+static bool d11_extra_wrap(hwaddr a)
 {
-    for (int n = 0; n < 3; n++) {
-        for (int i = 0; i < 2 && d11_agents[n][i]; i++) {
-            if (a >= d11_agents[n][i] && a < d11_agents[n][i] + 0x1000) {
-                return (srpwr_status(s) & 0x14) != 0x14;
-            }
+    for (int i = 0; i < ARRAY_SIZE(d11_extra_wraps); i++) {
+        if (a >= d11_extra_wraps[i] && a < d11_extra_wraps[i] + 0x1000) {
+            return true;
         }
     }
     return false;
 }
 
 /*
- * The slice's extra wrappers (PHY agents) are out of reset and clocked. ROM
- * ai_core_reset (0x400fac) resets wrapba3, then wrapba2, then the main
- * wrapper; slice 2 has no extra wrappers (treated as up). [F]
- */
-static bool d11_agents_up(BCM4387MachineState *s, int n)
-{
-    for (int i = 0; i < 2 && d11_agents[n][i]; i++) {
-        hwaddr w = d11_agents[n][i];
-
-        if (d11_agent_unpowered(s, w) ||
-            (store_get(s, w + WRAP_RESETCTRL) & 1) ||
-            !(store_get(s, w + WRAP_IOCTL) & 1)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-/*
- * The PHY window (radio port, phyversion, PHY port) answers once the PHY
- * side is clocked: the core's PHYPLL is locked (queue runs 7/8, even with the
- * PHY agents still in reset), or the slice's PHY agents are up (stock reads
- * phyversion that way without a PLL request). Neither: slave error (run 6).
- * [F]/[I: the agents-only path is inferred from stock]
+ * The PHY window (radio port, phyversion, PHY port) answers with the PHYPLL
+ * locked (queue runs 7-9); without it, AXI slave error (run 6). The stock
+ * firmware reads phyversion with no PLL request seen in the model, so it
+ * must enable the window some way we have not identified; strict=off
+ * (exploration) leaves the window open so stock can be traced. [F]
  */
 static bool d11_phy_ready(BCM4387MachineState *s, int n)
 {
-    return d11_phypll(s, n) || (d11_agents[n][0] && d11_agents_up(s, n));
+    return !s->strict || d11_phypll(s, n);
 }
 
 /* index of the d11 core whose register space contains a, or -1 */
@@ -263,8 +239,8 @@ static int d11_core(hwaddr a)
 
 static bool model_read(BCM4387MachineState *s, hwaddr a, uint32_t *v)
 {
-    if (d11_agent_unpowered(s, a)) {
-        *v = 0;
+    if (d11_extra_wrap(a)) {
+        *v = (a & 0xfff) == WRAP_RESETCTRL ? store_get(s, a) : 0;
         return true;
     }
     if (a >= 0x18000000 && a < 0x18100000 && (a & 0xfff) == 0x1e0) {
@@ -281,7 +257,13 @@ static bool model_read(BCM4387MachineState *s, hwaddr a, uint32_t *v)
 
         *v = r | 0x000b0000;
         if (a == CC_BASE + 0x1e0) {
-            *v |= 0x02000000 | ((r & 0x700) << 16);
+            /*
+             * ERSRC 0 (request 0x100, avail bit 24): stock reads 0x030b0152,
+             * but our 0x110 request left it 0x020b0152 (queue run 11); what
+             * stock does differently is unknown, so strict mode does not
+             * raise it and strict=off mirrors the request. [F]
+             */
+            *v |= 0x02000000 | (s->strict ? 0 : (r & 0x700) << 16);
         } else if (n >= 0) {
             *v |= 0x15000000 | (r & 0x100 ? 0x01000000 : 0) |
                   (d11_phypll(s, n) ? 0x0a000000 : 0);
@@ -330,12 +312,15 @@ static bool model_read(BCM4387MachineState *s, hwaddr a, uint32_t *v)
         return true;
     case PMU_BASE + 0x60c: {
         /*
-         * res_state: 0x1e0a83df at handoff; with a d11 PHYPLL up the stock
-         * firmware reads 0x5ecefbff, i.e. resources 0x40c47820 added. [F]
+         * res_state: 0x1e0a83df at handoff; 0x1e4efbdf once all MAC power
+         * domains are requested (srpwr 0x1e, queue run 11: +0x00447800); a
+         * d11 PHYPLL adds 0x40c47820 (stock and run 11: 0x5ecefbff). Partial
+         * domain requests: effect not measured, none modelled. [F]
          */
         bool pll = d11_phypll(s, 0) || d11_phypll(s, 1) || d11_phypll(s, 2);
+        bool macpwr = (srpwr_req(s) & 0x1e) == 0x1e;
 
-        *v = 0x1e0a83df | (pll ? 0x40c47820 : 0);
+        *v = 0x1e0a83df | (macpwr ? 0x00447800 : 0) | (pll ? 0x40c47820 : 0);
         return true;
     }
     case PMU_BASE + 0x610:          /* res_pending: transitions are instant */
@@ -439,10 +424,10 @@ static bool model_write(BCM4387MachineState *s, hwaddr a, uint32_t v)
         store_set(s, a, v);
         return true;
     }
-    if (d11_agent_unpowered(s, a)) {
-        qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: write to unpowered d11 PHY "
-                      "agent wrapper 0x%08" HWADDR_PRIx " dropped pc~0x%08x\n",
-                      a, current_pc());
+    if (d11_extra_wrap(a)) {
+        if ((a & 0xfff) == WRAP_RESETCTRL) {
+            store_set(s, a, v);
+        }
         return true;
     }
     for (n = 0; n < 3; n++) {
@@ -504,8 +489,9 @@ static void port_seed(BCM4387MachineState *s, int port, int n, uint16_t r,
 }
 
 /*
- * Port data while the PHY side is not live (queue runs 8/9): the PHY and
- * radio data registers are latches. The PHY latch resets to 0xce00, the
+ * Port data (queue runs 8, 9, 11): in every state our firmware has reached,
+ * including stock's power, clocks and IOCTL, the PHY and radio data
+ * registers behave as latches (run 11: write A, write B, read A returns B). The PHY latch resets to 0xce00, the
  * radio latch to 0x000c (what "radio ID" regs 0/1 read before any radio
  * write); any write to a data half (16-bit store to +0x3fe/+0x3da, or the
  * high half of a 32-bit store to +0x3fc/+0x3d8) loads the latch, and reads
@@ -517,15 +503,12 @@ static void port_seed(BCM4387MachineState *s, int port, int n, uint16_t r,
  * all later reads returned 0xce00 with no write in between. Modelled as a
  * one-shot: a phyversion read primes the next PHY data read. [I]
  *
- * With the PHY side live (agents up) the real register contents are not known
- * yet: in strict mode every read is logged as unmodelled and returns
- * PHY_UNKNOWN. With strict=off (stock exploration) the ports read back what
- * was written, seeded with the two PHY fields the stock firmware decodes on
+ * What makes the ports live on silicon (stock's PHY works) is not known yet;
+ * strict mode models the latch. With strict=off (stock exploration) the
+ * ports read back what was written, seeded with the two PHY fields the stock firmware decodes on
  * silicon (PHY 0x02 bits[3:0] = 1, PHY 0x0b bits[2:0] = PHY cores 2/2/1,
  * from the per-slice struct at [wlc_hw+4] in fw/dump/ram_identity.bin). [I]
  */
-#define PHY_UNKNOWN     0xdead
-
 static void phy_init(BCM4387MachineState *s)
 {
     static const uint8_t ncores[3] = { 2, 2, 1 };
@@ -564,7 +547,7 @@ static uint16_t port_read(BCM4387MachineState *s, int port, int n)
     gpointer key = PORT_KEY(port, n, a);
     uint16_t v;
 
-    if (!d11_agents_up(s, n)) {
+    if (s->strict) {
         if (port == PORT_RADIO) {
             v = s->radio_latch[n];
         } else if (s->phy_pending[n] >= 0) {
@@ -573,17 +556,10 @@ static uint16_t port_read(BCM4387MachineState *s, int port, int n)
         } else {
             v = s->phy_latch[n];
         }
-    } else if (g_hash_table_contains(s->phyknown, key) &&
-               (s->strict || !g_hash_table_contains(s->phyregs, key))) {
-        v = GPOINTER_TO_UINT(g_hash_table_lookup(s->phyknown, key));
-    } else if (s->strict) {
-        qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: unmodelled %s%d reg 0x%04x "
-                      "read (returns 0x%04x) pc~0x%08x\n",
-                      port == PORT_PHY ? "PHY" : "RAD", n, a, PHY_UNKNOWN,
-                      current_pc());
-        v = PHY_UNKNOWN;
-    } else {
+    } else if (g_hash_table_contains(s->phyregs, key)) {
         v = GPOINTER_TO_UINT(g_hash_table_lookup(s->phyregs, key));
+    } else {
+        v = GPOINTER_TO_UINT(g_hash_table_lookup(s->phyknown, key));
     }
     qemu_log_mask(LOG_UNIMP, "bcm4387: %s%d R 0x%04x -> 0x%04x pc~0x%08x\n",
                   port == PORT_PHY ? "PHY" : "RAD", n, a, v, current_pc());
@@ -1222,6 +1198,9 @@ static void bcm4387_init(MachineState *machine)
     store_set(s, PMU_BASE + 0x608, 0x1613e);
     store_set(s, PMU_BASE + 0x618, 1);
     store_set(s, PMU_BASE + 0x61c, 0x7fffffff);
+    for (int i = 0; i < ARRAY_SIZE(d11_extra_wraps); i++) {
+        store_set(s, d11_extra_wraps[i] + WRAP_RESETCTRL, 1);
+    }
     {
         static const uint32_t iostatus[3] = { 0x11002, 0x11001, 0x11018 };
 
@@ -1231,10 +1210,7 @@ static void bcm4387_init(MachineState *machine)
             store_set(s, D11_WRAP(n) + WRAP_IOSTATUS, iostatus[n]);
             store_set(s, D11_BASE(n) + 0x1e0, 0x40);
             s->d11_phypll_t[n] = -1;
-            for (int i = 0; i < 2 && d11_agents[n][i]; i++) {
-                store_set(s, d11_agents[n][i] + WRAP_IOCTL, 0);
-                store_set(s, d11_agents[n][i] + WRAP_RESETCTRL, 1);
-            }
+
         }
     }
     memory_region_init_io(&s->trace, NULL, &trace_ops, s, "bcm4387.trace",
