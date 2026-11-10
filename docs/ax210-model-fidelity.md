@@ -106,7 +106,11 @@ when run against this model", not a claim about real silicon.
 | W2 | Request/grant pair behind the W1 window | **partial** (F) | Both cores write 1 to `0x8c38` and spin on `0x8c50` bit 0 (LMAC `0x4bdf90`, no timeout; UMAC `0x804865d0`). Model: the grant follows the request bit. No vendor or silicon record. |
 | W3 | SMEM range watcher and the `0xa2b0xx` entropy engine | **partial** (F) | After the `0xfd11` reply the ALIVE builder (`0x8049ea88`) moves engine samples in 512-byte chunks to SMEM `0x437000` (`[0x8047173c]`): `0x8049da44` arms watcher channel 0 (`0xd0c154` range, `0xd0c150` bit 31), `0xc0084a0c` starts the engine through W1 (`0xb044` start, `0xb00c` end, in thirds of a chunk; `0xb008` control `0x61e000`), and `0x80486638` waits without timeout for `0xd02e24` bit 7. The samples are entropy: `0x8047f564` packs bit 0 of each into a `0x840`-bit map at `0x660c00`, or, when `([0xd038c8] & 0xf2) == 0x32` (the value that also skips `BPU_FLUSH` at `0x80493954`, so a simulation/FPGA platform), bit 0 of the software PRNG `0x804a0bc0` (Park-Miller, seed x `0x41a7` mod 2^31) instead. `0x8049da98` loads the first 2048 bits into the paging engine (W4) and raises fatal `0x10023f` if they XOR to 0 or start with `0xbadc0fee`; `0x80493974` seeds the PRNG from word `0x660d04` just before the ALIVE send. Model: engine start with the watcher armed fills the watched range with `qemu_guest_getrandom` words and sets bit 7. |
 | W4 | Paging engine `0xd04800` | **partial** (F) | Takes the entropy at `+0x200`, page length at `+0xc`, per page `+8`/`+4` and a command at `+0`: 1 in the initial page loop (`0xc0084dac`, waits status bit 2), 2 when paging in from host DRAM (`0x8047f0fc`, waits bit 0); `0x8047efd4` polls `[+0x20]` (`0x32` tries, bit 3 error, fatal `0x100230`). Fresh per-boot entropy suggests it protects pages held in host memory. Model: transparent, done bit at once, never an error. |
-| W5 | SHA-2 and RSA engines (`0xa25000`, `0xa24800`) | **no** | Next stop: fatal `0x30c` in `0x804a2228`. `0xa25000` is a SHA-256/512 compression engine (mode at `0xa26410`; big-endian block words to `0xa25000+4i`, SHA-512 upper half at `0xa25080`; `[0xa25060]` bit 0 per block (fatal `0x308`), `& 3 == 2` at the end; digest at `0xa25040` (+`0xa250c0`); software padding `0x804a2054`). `0x804a1ffc`/`0x804a2028` load 64-word operands into `0xa24900`/`0xa24800` (2048-bit, an RSA engine) for the paged-image signature check (`0x804a1978`, fatal `0x100240`). Both are standard algorithms and can be modelled exactly; a correct model would verify Intel's real signature. |
+| W5 | SHA-2 hash engine (`0xa25000`) and ECDSA P-384 engine (`0xa24c00`) | **partial** (F; checked against Intel's signature) | Hash: mode at `0xa26410` (1 = SHA-384, 32-word blocks; 0 = SHA-256), init by 1 at `0xa25064`, big-endian block words at `0xa25000+4i` (SHA-384 words 16-31 at `0xa25080`), count at `0xa25068`, status `0xa25060` (bit 0 busy per block, fatal `0x308`; `& 3 == 2` done, fatal `0x30c`), digest at `0xa25040` (+`0xa250c0`) least significant word first; padding in software (`0x804a2054`). Public-key engine: the signature check `0x804a1978` loads NIST P-384 (G, p, a = p-3, n are literal constants in the code) into operand slots (`0x100 \| 2n` at `+0`, 12 words to `0xa24cac` down to `0xa24c80`): 1/2 G, 3/4 Q, 5 p, 6 a, `0x10` n, `0x11` r, `0x12` digest, `0x13` s; command `0x11e` verifies (busy `+4` bit 0, fatals `0x314`, `0x30f`); all-zero words at `0xa24d00`/`0xa24d80` mean valid (`0xc008bf70`). r, s are range-checked first (fatal `0x312`). Model: FIPS 180-4 / FIPS 186-4 (`hw/arc/ax210-crypto.c`; qtest `sha-engine-fips`). Evidence: of 32 candidate operand layouts exactly one verifies Intel's real signature over the model's SHA-384 of the paged image, with Q on the curve (`scripts/pka_offline.py`); the model uses it and verifies at boot. |
+| G3 | DMA completion interrupt | **partial** (F, I) | Once UMAC enables `0xd02e04` bits 29/30, IRQ5 handler `0xc008214c` takes `[0xd02e24] & [0xd02e04]` and passes bit 29/30 to `0x8049db8c`, which posts the completion a page-in waits for. Summary bits 2, 7, 23, 24 all reach that handler; the model sets bit 2 [?]. |
+| A12 | ARC700 MMU: 4 KB pages, `TLBGetIndex`/`TLBProbe` | **yes** (F + V) | UMAC builds 4 KB entries (`0xc0085010`: PD0 VPN from bit 12, page-in in `0x1000` units) and uses `TLBCommand` 4 (Probe) and 3 (GetIndex) before 1 (Write) (Linux ARC700 MMU commands). The fork asserted on 3/4 and fixed 8 KB pages; both added, the UMAC is configured `mmu-pagesize0=12`, and LMAC (ARC EM) is marked `has-mmu=false` so its reset does not overwrite the page size. |
+| W6 | Remote register read behind W1 | **partial** (F) | Write `(addr & 0x3ffffff) \| bit 29` to `0xc804`, read back (bit 29 still set: fatal `0x93`), data at `0xc800` (LMAC `0x4b7b40`, UMAC). Model: completes at once with the target's model value. |
+| W7 | Paging manager `0xd05000` | **no** | Next stop (one run): fatal `0x100253` in `0x8049dcc0`: after `index << 16` to `0xd05048`, `0xd05080` must show bit 31 within 10 polls (bit 30 mapped, low bits frame); per-page bitmaps at `0xd05100`/`0xd05200`. Boots are not deterministic (cores interleave by host timing), and another run stopped at fatal `0x93` (W6) before W6 was modelled. |
 | K2 | Chip IDs, read-only: `CNVI_AUX_MISC_CHIP` `0xa200b0` = `0x400410`, `SD_REG_VER_GEN2`/`CNVR_AUX_MISC_CHIP` `0xa2b800` = `0x400410`, `WFPM_OTP_CFG1_ADDR` `0xd03098` = `0x80000000` | **yes**, silicon | Three AX210 cards' dmesg: `ref-silicon/fw89-framework16-dmesg.txt` (firmware 89.6b44fa0b, same API version as the model's 89.b20dcd1f: "Detected crf-id 0x400410, cnv-id 0x400410 wfpm id 0x80000000" and `0x00400410 | CNVI_AUX_MISC_CHIP` / `CNVR_AUX_MISC_CHIP`), `ref-silicon/fw67-freebsd262150-dmesg.txt` (same IDs, fw 67), an Intel community log (URL in `ref-silicon/README.md`). `FSEQ_OTP_VERSION` `0xa340fc` = `0xa652` on all three saved cards; the firmware only reads it (UMAC `0x80448cae` branches on `>= 0xa440`); per-card OTP value; the driver reads exactly these registers (`pcie/trans.c`, names and addresses `iwl-prph.h`; WFPM at UMAC periphery offset `0x300000`). UMAC `0x80448ca4` writes the expected IDs to `FSEQ_CNVI_ID` `0xa3408c` / `FSEQ_CNVR_ID` `0xa34090` and compares (`0xa200b0` masked `0xff0fffff`; CNVR through the W1 window as `0xb800`); a mismatch is fatal `0x1013f1`. Now passes on the silicon values (status `0x20000061`, bit 1 clear). Replaces an earlier [I] model of these as write/readback aliases, which the register names contradicted. Tested `/ax210/lmac/indirect-target-chip-ids`. |
 | K3 | Cross-core view of LMAC's `0xa0` page: UMAC `0xc0a0xxxx` == LMAC `0x00a0xxxx` | **yes**, [F] | UMAC `0x804a8b80` builds the LMAC-view address `0xa0a404 + 16*ch` and converts it with `(a & 0xff0fffff) \| 0xc0a00000`, the counterpart of K1's `\| 0xc0e20000` for `0xa2/0xa3`. So D1's DMA engine and Q2's FIFO are LMAC `0xa0a500` / `0xa00500`, and Q1 (`0xa00400`) is the same unit UMAC configures at `0xc0a00400` (`0x804a8b18`: per channel, select `+0x3c`, buffer `+0x34`, size `+0x30`). Models are keyed accordingly. |
 | Q2 | CPU2 (UMAC) TX FIFOs at `0xa00500` (UMAC `0xc0a00500`): `TXF_CPU2_*` (`iwl-prph.h`) | modelled, [I] | Q1's layout in UMAC's own `0xc0a0xxxx` MMIO block (now traced, `0xc0a00000-0xc0a0ffff`): UMAC `0xc008d0a0` selects channel `0xe` at `+0x3c` as LMAC does at `0xa0043c`, free = `max(cap - fill - 8, 0)`, push via `0x804a8d48` to `+0x40`; error `0x100efa` when it does not fit. Modelled as Q1. Tested `/ax210/lmac/msg-fifo-space`. |
@@ -121,16 +125,17 @@ when run against this model", not a claim about real silicon.
 1. Both cores boot from their entry points to their idle states with no
    exception and no fatal error. **Met** up to LMAC's ALIVE report (U2, L2;
    `dual_boot.py`). With Q3 delivery UMAC goes on to request `0xfd11`
-   from LMAC; with Q5, P1, W2-W4 LMAC answers and UMAC stops at fatal
-   `0x30c` (W5: SHA engine not modelled).
+   from LMAC; with Q5, P1, W2-W6, G3, A12 UMAC verifies Intel's
+   signature on the paged image, pages code in from host DRAM and runs
+   the paged initialisation, then stops in the paging manager (W7).
 2. The firmware completes the documented host boot protocol: ALIVE
    interrupt, the driver's RX restock, then the ALIVE notification in a
    host RX buffer with fields matching `fw/api/alive.h` and the ucode's
    region TLVs. **Partly met**: interrupt and restock done (H1); LMAC's report reaches
    UMAC (Q3), LMAC answers `0xfd11` (Q5, P1, W2), and the ALIVE builder
-   then seeds the paging engine from the entropy engine (W3, W4) and
-   verifies the paged image with SHA-2/RSA engines (W5, not modelled);
-   the notification is not yet sent.
+   then seeds the paging engine (W3, W4), verifies the paged image's
+   ECDSA signature (W5) and runs paged code (A12, G3), which needs the
+   paging manager (W7); the notification is not yet sent.
 3. No row graded **contradicts**. **Met** (R2 resolved to silicon values).
 4. Every value with silicon evidence matches it (chip IDs, FSEQ, CSR_HW_REV,
    CNVR SCU registers, ISR registers). **Met** (lmpm_pmg_sel unverified).
@@ -152,7 +157,7 @@ inferred, **?** unknown. N-rows list hardware not modelled at all.
 
 | | yes | partial | no | contradicts | n/a | total |
 |---|---|---|---|---|---|---|
-| 2026-11-09 | 18 | 31 | 9 | 0 | 1 | 59 |
+| 2026-11-09 | 19 | 33 | 10 | 0 | 1 | 63 |
 
 Contradictions resolved in this pass (now **yes**): K2 (write/readback
 aliases vs. read-only chip IDs, by iwl-prph.h names and silicon values),
@@ -205,7 +210,11 @@ space (M3), FSEQ_OTP_VERSION 0 vs `0xa652`.
 | W2 | partial | F | Grant semantics inferred. |
 | W3 | partial | F | Samples are random, not the silicon noise source's statistics. |
 | W4 | partial | F | Pages not transformed or authenticated. |
-| W5 | no | F | SHA-2/RSA engines not modelled; boot stops at fatal `0x30c`. |
+| W5 | partial | F | Exact algorithms; only the paths the firmware uses (SHA-256/384 compression, P-384 verify) are modelled. |
+| G3 | partial | F, I | Summary bit for the DMA group unknown. |
+| A12 | yes | F + V | - |
+| W6 | partial | F | Read only; no write variant seen. |
+| W7 | no | F | Paging manager not modelled. |
 | K2 | yes | S (three cards) + V | - |
 | K3 | yes | F | - |
 | Q2 | partial | V (iwl-prph.h TXF_CPU2_*) | As Q1. |

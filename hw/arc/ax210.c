@@ -113,7 +113,6 @@ static int n_ctrs = 1;
  * 0xa0a51c, pcie/trans.c iwl_trans_pcie_copy_imr_fh): +0x34 is channel 1. */
 #define DMA_BASE  0x00a0a500u      /* UMAC 0xc0a0a500 (K3) */
 #define DMA_STAT  0x00d02e24u   /* UMAC 0xc0d02e24 */
-static uint32_t dma_done;
 static unsigned dma_count;
 
 /* SMEM range watcher and the entropy engine it watches (finding W3, [F]).
@@ -419,6 +418,13 @@ static void sem_update(int core, uint32_t mask, bool request)
  * 0xa27cec bit 8 before the image signature check (fatal 0x313). */
 #define REQ2     0x00a20818u
 #define ACK2     0x00a27cecu
+/* Remote register read behind the window (finding W6, [F]): LMAC 0x4b7b40
+ * and UMAC write (addr & 0x3ffffff) | bit 29 to 0xc804, read it back
+ * (bit 29 still set: fatal 0x93) and take the value from 0xc800. Model:
+ * the read completes at once. */
+#define RRD_CTL  (IND_BASE + 0xc804)
+#define RRD_DATA (IND_BASE + 0xc800)
+#define RRD_GO   (1u << 29)
 
 /* Chip identification (finding K2): read-only, silicon values. AX210 dmesg
  * reads "Detected crf-id 0x400410, cnv-id 0x400410 wfpm id 0x80000000"; the
@@ -578,6 +584,21 @@ static void yield_to_peer(void)
     }
 }
 
+/* DMA completion on IRQ5 (finding G3, [F]): once UMAC enables 0xd02e04
+ * bits 29/30 (0x68020000), the IRQ5 handler 0xc008214c takes
+ * [0xd02e24] & [0xd02e04] and passes bit 29 (channel 2) or 30 (channel 1)
+ * to 0x8049db8c, which posts the completion that a page-in (0x8047f0fc)
+ * waits for. Summary bits 2, 7, 23 and 24 all dispatch to that handler;
+ * which one the hardware sets is [?], the model uses bit 2. */
+#define DMA_IEN    0x00d02e04u
+#define DMA_CAUSE  (1u << 2)
+static uint32_t dma_done;
+
+static bool dma_irq(void)
+{
+    return dma_done && (rs_get(DMA_IEN) & (1u << 29));
+}
+
 static void urxf_update(void)
 {
     CPUARCState *env;
@@ -586,7 +607,7 @@ static void urxf_update(void)
         return;
     }
     env = &ARC_CPU(umac_cs)->env;
-    qemu_set_irq(env->irq[URXF_IRQ], urxf_rd != urxf_wr);
+    qemu_set_irq(env->irq[URXF_IRQ], urxf_rd != urxf_wr || dma_irq());
 }
 
 static void urxf_push(uint32_t w)
@@ -924,7 +945,8 @@ static uint64_t trace_read(void *opaque, hwaddr addr, unsigned size)
         return v;
     }
     if (a == IRQ5_SUM && !hit) {
-        v = rs_get(IRQ5_SUM) | (urxf_rd != urxf_wr ? URXF_CAUSE : 0);
+        v = rs_get(IRQ5_SUM) | (urxf_rd != urxf_wr ? URXF_CAUSE : 0) |
+            (dma_irq() ? DMA_CAUSE : 0);
         trace_log("R.sum", ra, v, size);
         return v;
     }
@@ -982,6 +1004,9 @@ static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     }
     if (a == DMA_STAT && (val & (1u << 29))) {
         dma_done = 0;
+    }
+    if (a == DMA_STAT || a == DMA_IEN) {
+        urxf_update();
     }
     if (a == DMA_STAT) {
         watch_evt &= ~((uint32_t)val & WATCH_EVT);
@@ -1050,6 +1075,18 @@ static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
             g_hash_table_insert(regstore, GUINT_TO_POINTER((guint)ta),
                                 GUINT_TO_POINTER(d));
             trace_log("IND.W", ia, d, 4);
+            if (ta == RRD_CTL && (d & RRD_GO)) {
+                hwaddr t = d & 0x3ffffffu;
+                uint32_t r;
+                if (!chip_id_read(t, &r)) {
+                    r = phy_reg(t);
+                }
+                g_hash_table_insert(regstore, GUINT_TO_POINTER(RRD_DATA),
+                                    GUINT_TO_POINTER(r));
+                g_hash_table_insert(regstore, GUINT_TO_POINTER((guint)ta),
+                                    GUINT_TO_POINTER(d & ~RRD_GO));
+                trace_log("RRD", t, r, 4);
+            }
             if (ta == ENG_CTL && d && (rs_get(WATCH_CTL) & WATCH_ARM)) {
                 hwaddr lo = SMEM_BASE | ((rs_get(WATCH_RANGE) & 0xfff) << 8);
                 hwaddr hi = SMEM_BASE | (rs_get(WATCH_CTL) & 0xfffff);
@@ -1126,6 +1163,7 @@ static void dma_kick(void)
             (unsigned long long)host, dev, len, r1, r2);
     g_free(buf);
     dma_done = 1;
+    urxf_update();
 }
 
 /* Host driver model (finding H1): what iwlwifi leaves in host DRAM and the
@@ -1386,6 +1424,11 @@ static void ax210_init(MachineState *machine)
     /* LMAC programs 13 MPU region pairs (aux 0x422..0x43b, at
      * 0x4be574); ARCv2 MPUs come in power-of-two sizes. Finding M2. */
     object_property_set_uint(OBJECT(lmac), "mpu-numreg", 16, &error_fatal);
+    /* UMAC pages 4 KB blocks (TLB PD0 VPN from bit 12, 0xc0085010;
+     * page-in in 0x1000 units, 0x8047f0fc). Finding A12. */
+    object_property_set_uint(OBJECT(umac), "mmu-pagesize0", 12, &error_fatal);
+    /* LMAC (ARC EM) has an MPU and no MMU (finding M2). */
+    object_property_set_bool(OBJECT(lmac), "has-mmu", false, &error_fatal);
 
     object_property_set_uint(OBJECT(umac), "freq_hz", 1000000, &error_fatal);
     object_property_set_uint(OBJECT(lmac), "freq_hz", 1000000, &error_fatal);

@@ -320,6 +320,16 @@ arc_mmu_aux_set_tlbcmd(const struct arc_aux_reg_detail *aux_reg_detail,
 
         mmu->tlbindex &= ~(TLBINDEX_E | TLBINDEX_RC);
     }
+    if (val == TLB_CMD_GETINDEX || val == TLB_CMD_PROBE) {
+        num_finds = 0;
+        tlb = arc_mmu_lookup_tlb(pd0, matching_mask | PD0_V, mmu,
+                                 &num_finds, &index);
+        if (num_finds == 0 && val == TLB_CMD_PROBE) {
+            mmu->tlbindex = TLBINDEX_E;
+        } else {
+            mmu->tlbindex = index;
+        }
+    }
     if (val == TLB_CMD_DELETE || val == TLB_CMD_INSERT) {
         tlb_flush_page_by_mmuidx_all_cpus_synced(cs, VPN(pd0), 3);
 
@@ -390,6 +400,8 @@ arc_mmu_aux_set_tlbcmd(const struct arc_aux_reg_detail *aux_reg_detail,
            || val == TLB_CMD_READ
            || val == TLB_CMD_WRITENI
            || val == TLB_CMD_IVUTLB
+           || val == TLB_CMD_GETINDEX
+           || val == TLB_CMD_PROBE
            );
 }
 
@@ -718,8 +730,10 @@ void arc_mmu_init_v3(CPUARCState *env)
     env->mmu.v3.tlbcmd = 0;
     env->mmu.v3.scratch_data0 = 0;
 
-    mmu_v3_page_size = cpu->cfg.mmu_page_size_sel0;
-    assert(mmu_v3_page_size == 13);
+    if (cpu->cfg.has_mmu) {
+        mmu_v3_page_size = cpu->cfg.mmu_page_size_sel0;
+        assert(mmu_v3_page_size == 12 || mmu_v3_page_size == 13);
+    }
 
     memset(env->mmu.v3.nTLB, 0, sizeof(env->mmu.v3.nTLB));
 }

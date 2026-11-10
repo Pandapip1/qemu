@@ -59,6 +59,8 @@ extern unsigned char mmu_v3_page_size;
 #define TLB_CMD_WRITE   0x1
 #define TLB_CMD_WRITENI 0x5
 #define TLB_CMD_READ    0x2
+#define TLB_CMD_GETINDEX 0x3
+#define TLB_CMD_PROBE   0x4
 #define TLB_CMD_INSERT  0x7
 #define TLB_CMD_DELETE  0x8
 #define TLB_CMD_IVUTLB  0x6
