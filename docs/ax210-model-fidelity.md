@@ -110,7 +110,9 @@ when run against this model", not a claim about real silicon.
 | G3 | DMA completion interrupt | **partial** (F, I) | Once UMAC enables `0xd02e04` bits 29/30, IRQ5 handler `0xc008214c` takes `[0xd02e24] & [0xd02e04]` and passes bit 29/30 to `0x8049db8c`, which posts the completion a page-in waits for. Summary bits 2, 7, 23, 24 all reach that handler; the model sets bit 2 [?]. |
 | A12 | ARC700 MMU: 4 KB pages, `TLBGetIndex`/`TLBProbe` | **yes** (F + V) | UMAC builds 4 KB entries (`0xc0085010`: PD0 VPN from bit 12, page-in in `0x1000` units) and uses `TLBCommand` 4 (Probe) and 3 (GetIndex) before 1 (Write) (Linux ARC700 MMU commands). The fork asserted on 3/4 and fixed 8 KB pages; both added, the UMAC is configured `mmu-pagesize0=12`, and LMAC (ARC EM) is marked `has-mmu=false` so its reset does not overwrite the page size. |
 | W6 | Remote register read behind W1 | **partial** (F) | Write `(addr & 0x3ffffff) \| bit 29` to `0xc804`, read back (bit 29 still set: fatal `0x93`), data at `0xc800` (LMAC `0x4b7b40`, UMAC). Model: completes at once with the target's model value. |
-| W7 | Paging manager `0xd05000` | **no** | Next stop (one run): fatal `0x100253` in `0x8049dcc0`: after `index << 16` to `0xd05048`, `0xd05080` must show bit 31 within 10 polls (bit 30 mapped, low bits frame); per-page bitmaps at `0xd05100`/`0xd05200`. Boots are not deterministic (cores interleave by host timing), and another run stopped at fatal `0x93` (W6) before W6 was modelled. |
+| W7 | Paging manager `0xd05000` | **partial** (F interface, I policy) | Set up by `0x8049de3c` (`+0`/`+4` SMEM tables `0x635c00`/`0x635e00`, `+0xc` `0xf`, `+8` control, bit 31 pauses). Each page-in registers `(n << 16) \| page` at `+0x40` (`0x8049dbc4`); an evicted page is unregistered by writing it to `+0x44` (`0x8049e022`). To evict, `0x8049dcc0` writes `n << 16` to `+0x48` and polls `+0x80` for bit 31 (fatal `0x100253`): bit 30 = candidate in bits 9:0, rejected if set in the bitmap at `+0x100`; `+0x98` must be 0 (fatal `0x100251`); a non-resident victim is fatal `0x100237`. The hardware ranks pages by access (its SMEM tables); the model cannot see accesses and answers with the oldest registered unlocked page. |
+| Q6 | LMAC block `0xa0d000` stop handshake | **partial** (F; addresses V) | LMAC writes 1/0 to `+8` to start/stop it and waits without timeout for `+0xc` bit 31 after a stop (`0x4d9a9c`). Model: bit 31 reads set while `+8` is 0; the other status bits (busy 2:0, `0x140`) are not modelled. |
+| H2 | Device -> host RX (RFH) and the space grant | **partial** (F device side; V host side) | UMAC sends a notification directly when its queue is empty and space is granted: `(bytes << 16) \| 2` to `0xd05488`, then `0xd02e28 & 0x30000000 == 0x10000000` (`0x804a168c`; `0xd02e28` is write-1-to-clear); otherwise it queues and arms the space interrupt (IRQ5 cause 13, `0xd0549c`). `0x804a1718` writes `len_n_flags` to `0xd00ec0`, words to `0xd00e04`, the last to `0xd00e08`. The RFH puts the packet in the next free host RB as iwlwifi expects on AX210 (`pcie/rx.c`): RB from the free descriptor `{rbid, addr}`, 32-byte completion descriptor (rbid at offset 4), `closed_rb_num`, `CSR_INT_BIT_FH_RX`. Model: grant at once, free space = configured FIFO size (`0xd00e88`), each packet delivered whole. `scripts/check_alive.py` checks the delivered ALIVE field by field. |
 | K2 | Chip IDs, read-only: `CNVI_AUX_MISC_CHIP` `0xa200b0` = `0x400410`, `SD_REG_VER_GEN2`/`CNVR_AUX_MISC_CHIP` `0xa2b800` = `0x400410`, `WFPM_OTP_CFG1_ADDR` `0xd03098` = `0x80000000` | **yes**, silicon | Three AX210 cards' dmesg: `ref-silicon/fw89-framework16-dmesg.txt` (firmware 89.6b44fa0b, same API version as the model's 89.b20dcd1f: "Detected crf-id 0x400410, cnv-id 0x400410 wfpm id 0x80000000" and `0x00400410 | CNVI_AUX_MISC_CHIP` / `CNVR_AUX_MISC_CHIP`), `ref-silicon/fw67-freebsd262150-dmesg.txt` (same IDs, fw 67), an Intel community log (URL in `ref-silicon/README.md`). `FSEQ_OTP_VERSION` `0xa340fc` = `0xa652` on all three saved cards; the firmware only reads it (UMAC `0x80448cae` branches on `>= 0xa440`); per-card OTP value; the driver reads exactly these registers (`pcie/trans.c`, names and addresses `iwl-prph.h`; WFPM at UMAC periphery offset `0x300000`). UMAC `0x80448ca4` writes the expected IDs to `FSEQ_CNVI_ID` `0xa3408c` / `FSEQ_CNVR_ID` `0xa34090` and compares (`0xa200b0` masked `0xff0fffff`; CNVR through the W1 window as `0xb800`); a mismatch is fatal `0x1013f1`. Now passes on the silicon values (status `0x20000061`, bit 1 clear). Replaces an earlier [I] model of these as write/readback aliases, which the register names contradicted. Tested `/ax210/lmac/indirect-target-chip-ids`. |
 | K3 | Cross-core view of LMAC's `0xa0` page: UMAC `0xc0a0xxxx` == LMAC `0x00a0xxxx` | **yes**, [F] | UMAC `0x804a8b80` builds the LMAC-view address `0xa0a404 + 16*ch` and converts it with `(a & 0xff0fffff) \| 0xc0a00000`, the counterpart of K1's `\| 0xc0e20000` for `0xa2/0xa3`. So D1's DMA engine and Q2's FIFO are LMAC `0xa0a500` / `0xa00500`, and Q1 (`0xa00400`) is the same unit UMAC configures at `0xc0a00400` (`0x804a8b18`: per channel, select `+0x3c`, buffer `+0x34`, size `+0x30`). Models are keyed accordingly. |
 | Q2 | CPU2 (UMAC) TX FIFOs at `0xa00500` (UMAC `0xc0a00500`): `TXF_CPU2_*` (`iwl-prph.h`) | modelled, [I] | Q1's layout in UMAC's own `0xc0a0xxxx` MMIO block (now traced, `0xc0a00000-0xc0a0ffff`): UMAC `0xc008d0a0` selects channel `0xe` at `+0x3c` as LMAC does at `0xa0043c`, free = `max(cap - fill - 8, 0)`, push via `0x804a8d48` to `+0x40`; error `0x100efa` when it does not fit. Modelled as Q1. Tested `/ax210/lmac/msg-fifo-space`. |
@@ -123,19 +125,30 @@ when run against this model", not a claim about real silicon.
 ## Acceptance criteria: "accurate enough" (timing out of scope), 2026-11-09
 
 1. Both cores boot from their entry points to their idle states with no
-   exception and no fatal error. **Met** up to LMAC's ALIVE report (U2, L2;
-   `dual_boot.py`). With Q3 delivery UMAC goes on to request `0xfd11`
-   from LMAC; with Q5, P1, W2-W6, G3, A12 UMAC verifies Intel's
-   signature on the paged image, pages code in from host DRAM and runs
-   the paged initialisation, then stops in the paging manager (W7).
+   exception and no fatal error. **Met** (U2, L2; `dual_boot.py`, with
+   `-icount shift=4,sleep=off -seed 1` the run is deterministic): no UMAC
+   fatal reporter (`0x80483948`) or LMAC assert (`0x16ea0`, `0x4dabec`) is
+   reached in 200 s and UMAC ends in its idle loop; the only exceptions
+   are the TLB misses of demand paging (22 instruction, 28 data), each
+   handled and returned from (`-d int`).
 2. The firmware completes the documented host boot protocol: ALIVE
    interrupt, the driver's RX restock, then the ALIVE notification in a
    host RX buffer with fields matching `fw/api/alive.h` and the ucode's
-   region TLVs. **Partly met**: interrupt and restock done (H1); LMAC's report reaches
-   UMAC (Q3), LMAC answers `0xfd11` (Q5, P1, W2), and the ALIVE builder
-   then seeds the paging engine (W3, W4), verifies the paged image's
-   ECDSA signature (W5) and runs paged code (A12, G3), which needs the
-   paging manager (W7); the notification is not yet sent.
+   region TLVs. **Met**: interrupt and restock (H1); LMAC's report reaches
+   UMAC (Q3), LMAC answers `0xfd11` and the later commands (Q5, P1, Q6,
+   W2, W6), UMAC seeds the paging engine (W3, W4), verifies the paged
+   image's ECDSA P-384 signature (W5), pages code in (A12, G3, W7) and
+   sends the notification to the host (H2).
+   `scripts/check_alive.py trace.log fw/... ini_regions.txt` passes all
+   13 checks: one packet, `len_n_flags` `0x94` (`sizeof(iwl_alive_ntf_v7)`
+   `0x90` + header), cmd `0x01`, status `0xcafe`, flags 0, LMAC version =
+   FW_VERSION TLV (`0x59.b20dcd1f`), `error_event_table_ptr` =
+   `error_table_lmac1`, `scd_base_ptr` in chmem, `lmac_data[1]` empty,
+   `error_info_addr` = `error_table_umac`, `umac_data` and `sku_id` equal
+   to the image's own initial data (`0x80478790`: major `0x19`, minor 0;
+   `0x102b020`: zero), imr empty. Not cross-checked against silicon: no
+   saved log shows an ALIVE payload (the dumps' "umac major 0x59" comes
+   from the error table, not ALIVE).
 3. No row graded **contradicts**. **Met** (R2 resolved to silicon values).
 4. Every value with silicon evidence matches it (chip IDs, FSEQ, CSR_HW_REV,
    CNVR SCU registers, ISR registers). **Met** (lmpm_pmg_sel unverified).
@@ -157,7 +170,7 @@ inferred, **?** unknown. N-rows list hardware not modelled at all.
 
 | | yes | partial | no | contradicts | n/a | total |
 |---|---|---|---|---|---|---|
-| 2026-11-09 | 19 | 33 | 10 | 0 | 1 | 63 |
+| 2026-11-09 | 19 | 36 | 9 | 0 | 1 | 65 |
 
 Contradictions resolved in this pass (now **yes**): K2 (write/readback
 aliases vs. read-only chip IDs, by iwl-prph.h names and silicon values),
@@ -214,7 +227,9 @@ space (M3), FSEQ_OTP_VERSION 0 vs `0xa652`.
 | G3 | partial | F, I | Summary bit for the DMA group unknown. |
 | A12 | yes | F + V | - |
 | W6 | partial | F | Read only; no write variant seen. |
-| W7 | no | F | Paging manager not modelled. |
+| W7 | partial | F, I | Eviction order is FIFO, not access-ranked. |
+| Q6 | partial | F | Only the stop bit. |
+| H2 | partial | F, V | Space interrupt path (queued sends) not exercised; MSI-X causes not modelled. |
 | K2 | yes | S (three cards) + V | - |
 | K3 | yes | F | - |
 | Q2 | partial | V (iwl-prph.h TXF_CPU2_*) | As Q1. |

@@ -149,6 +149,64 @@ static uint32_t watch_evt;
 #define PGE_STAT  0x00d04820u
 static uint32_t pge_stat;
 
+/* Paging manager at 0xd05000 (finding W7, [F] interface, [I] policy):
+ * set up by 0x8049de3c (+0/+4 SMEM tables 0x635c00/0x635e00, +0xc 0xf,
+ * +8 control 0x40025008, bit 31 pauses it). Each page-in registers the page
+ * with (n << 16) | page at +0x40 (0x8049dbc4) and unregisters an evicted
+ * page by writing its number to +0x44 (0x8049e022). To evict, 0x8049dcc0 writes
+ * n << 16 to +0x48 and polls +0x80 for bit 31 (10 tries, fatal 0x100253):
+ * bit 30 set means a candidate in bits 9:0, which UMAC rejects if its bit is
+ * set in the bitmap at +0x100 (then retries); +0x98 must read 0 (fatal
+ * 0x100251). The hardware ranks pages by access (its SMEM tables); the model
+ * cannot see accesses and answers with the oldest registered page whose
+ * +0x100 bit is clear. */
+#define PGM_BASE  0x00d05000u
+#define PGM_REG   (PGM_BASE + 0x40)
+#define PGM_UNREG (PGM_BASE + 0x44)
+#define PGM_QUERY (PGM_BASE + 0x48)
+#define PGM_RES   (PGM_BASE + 0x80)
+#define PGM_LOCK  (PGM_BASE + 0x100)
+#define PGM_MAX   1024
+static uint16_t pgm_order[PGM_MAX];
+static unsigned pgm_n;
+static uint32_t pgm_res;
+
+static void pgm_register(uint32_t page, bool add)
+{
+    unsigned i;
+
+    page &= PGM_MAX - 1;
+    for (i = 0; i < pgm_n && pgm_order[i] != page; i++) {
+    }
+    if (i < pgm_n) {
+        memmove(&pgm_order[i], &pgm_order[i + 1],
+                (pgm_n - i - 1) * sizeof(pgm_order[0]));
+        pgm_n--;
+    }
+    if (add && pgm_n < PGM_MAX) {
+        pgm_order[pgm_n++] = page;
+    }
+}
+
+static void pgm_query(void)
+{
+    pgm_res = 1u << 31;
+    for (unsigned i = 0; i < pgm_n; i++) {
+        uint32_t page = pgm_order[i];
+        if (!(rs_get(PGM_LOCK + 4 * (page >> 5)) & (1u << (page & 31)))) {
+            pgm_res |= (1u << 30) | page;
+            break;
+        }
+    }
+    trace_log("PGM.Q", PGM_QUERY, pgm_res, 4);
+}
+
+/* LMAC block at 0xa0d000 (finding Q6, [F]; addresses V): LMAC writes 1 to
+ * +8 to start it and 0 to stop it, then waits without timeout for +0xc
+ * bit 31 (0x4d9a9c). Model: +0xc bit 31 reads set while +8 is 0. */
+#define BLK_CTL   0x00a0d008u
+#define BLK_STAT  0x00a0d00cu
+
 /* SHA-256/384 engine at 0xa25000 (finding W5, [F]): 0x804a2170 writes the
  * mode to 0xa26410 (1 = SHA-384, 32-word blocks; 0 = SHA-256, 16) and 1 to
  * 0xa2506c and 0xa25064; 0x804a2290 reads the word count at 0xa25068, writes
@@ -801,6 +859,22 @@ static void phy_write(hwaddr a, uint32_t val)
 
 #define MBX_BASE 0x00d00000u    /* UMAC 0xc0d00000 */
 static uint32_t host_csr[0x1000];   /* 0x0000-0x3fff */
+#define HRX_FREE  0x00d00e34u
+#define HRX_SIZE  0x00d00e88u
+#define HRX_HDR   0x00d00ec0u
+#define HRX_DATA  0x00d00e04u
+#define HRX_LAST  0x00d00e08u
+static uint32_t hrx_buf[0x1000];
+static unsigned hrx_n;
+static void host_rx_deliver(void);
+/* Before a direct send UMAC requests FIFO space with (bytes << 16) | 2 at
+ * 0xd05488 and requires 0xd02e28 & 0x30000000 == 0x10000000 (0x804a168c);
+ * 0xd02e28 is write-1-to-clear status (0x80493156 clears bit 28, the RX
+ * handler bit 29). Model: the request is granted at once. */
+#define HRX_REQ   0x00d05488u
+#define ISTAT2    0x00d02e28u
+#define HRX_GRANT (1u << 28)
+static uint32_t istat2;
 static void host_alive_restock(void);
 static uint32_t mbx_idx, mbx_data;
 
@@ -888,6 +962,25 @@ static uint64_t trace_read(void *opaque, hwaddr addr, unsigned size)
         v = a == SHA_CNT ? sha_cnt : (sha_done ? 2 : 0);
         trace_log("R.sha", ra, v, size);
         return v;
+    }
+    if (a == ISTAT2 && !hit) {
+        trace_log("R.ist2", ra, istat2, size);
+        return istat2;
+    }
+    if (a == HRX_FREE && !hit) {
+        v = rs_get(HRX_SIZE);
+        trace_log("R.hrx", ra, v, size);
+        return v;
+    }
+    if (a == BLK_STAT && !hit) {
+        v = (rs_get(BLK_STAT) & ~(1u << 31)) |
+            ((rs_get(BLK_CTL) & 1) ? 0 : 1u << 31);
+        trace_log("R.blk", ra, v, size);
+        return v;
+    }
+    if (a == PGM_RES && !hit) {
+        trace_log("R.pgm", ra, pgm_res, size);
+        return pgm_res;
     }
     if (a == PKA_STAT && !hit) {
         v = pka_busy ? 1 : 0;
@@ -1012,6 +1105,28 @@ static void trace_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         watch_evt &= ~((uint32_t)val & WATCH_EVT);
     }
     sha_write(a, (uint32_t)val);
+    if (a == ISTAT2) {
+        istat2 &= ~(uint32_t)val;
+    } else if (a == HRX_REQ && (val & 2)) {
+        istat2 |= HRX_GRANT;
+    }
+    if (a == HRX_HDR) {
+        hrx_buf[0] = (uint32_t)val;
+        hrx_n = 1;
+    } else if ((a == HRX_DATA || a == HRX_LAST) && hrx_n &&
+               hrx_n < ARRAY_SIZE(hrx_buf)) {
+        hrx_buf[hrx_n++] = (uint32_t)val;
+        if (a == HRX_LAST) {
+            host_rx_deliver();
+        }
+    }
+    if (a == PGM_REG) {
+        pgm_register((uint32_t)val & 0x3ff, true);
+    } else if (a == PGM_UNREG) {
+        pgm_register((uint32_t)val & 0x3ff, false);
+    } else if (a == PGM_QUERY) {
+        pgm_query();
+    }
     if (a == PKA_CMD) {
         pka_cmd((uint32_t)val);
     } else if (a >= PKA_DATA && a < PKA_DATA + 0x30 && pka_sel >= 0) {
@@ -1212,7 +1327,48 @@ static void host_csr_write64(unsigned off, uint64_t v)
  * (0xa08080, iwl-fh.h) is given the same value [I]. */
 #define HOST_RX_NBUF    4095
 #define HOST_RX_RBID0   7
-static hwaddr host_rx_bd;
+static hwaddr host_rx_bd, host_rx_used, host_rx_stts;
+static uint32_t host_rx_closed;
+
+/* Device -> host RX (finding H2, [F] device side, V host side): UMAC's
+ * sender 0x8049305c checks the free space at 0xd00e34 (else it arms the
+ * space interrupt via 0xd0549c and waits), writes a packet's len_n_flags to
+ * 0xd00ec0, its words to 0xd00e04 and the last to 0xd00e08. The RFH then
+ * DMAs it into the next free host RB, as iwlwifi expects on AX210
+ * (pcie/rx.c): payload at the RB address from the free descriptor
+ * {rbid, addr}, a 32-byte iwl_rx_completion_desc with the rbid at offset 4
+ * in the used ring, closed_rb_num (le16) in the status area, then
+ * CSR_INT_BIT_FH_RX. Model: the FIFO is drained at once (free space = its
+ * configured size, 0xd00e88), and each packet is delivered whole. */
+
+static void host_rx_deliver(void)
+{
+    uint8_t d[16], cd[32] = { 0 };
+    uint32_t k = host_rx_closed % HOST_RX_NBUF;
+    hwaddr rb;
+
+    if (!host_rx_bd || !hrx_n) {
+        return;
+    }
+    address_space_read(&address_space_memory, host_rx_bd + 16 * k,
+                       MEMTXATTRS_UNSPECIFIED, d, sizeof(d));
+    rb = ldq_le_p(d + 8);
+    for (unsigned i = 0; i < hrx_n; i++) {
+        uint32_t w = cpu_to_le32(hrx_buf[i]);
+        address_space_write(&address_space_memory, rb + 4 * i,
+                            MEMTXATTRS_UNSPECIFIED, &w, 4);
+        trace_log(i ? "HRX.w" : "HRX.P", rb + 4 * i, hrx_buf[i], 4);
+    }
+    stw_le_p(cd + 4, lduw_le_p(d));
+    address_space_write(&address_space_memory, host_rx_used + 32 * k,
+                        MEMTXATTRS_UNSPECIFIED, cd, sizeof(cd));
+    host_rx_closed++;
+    stw_le_p(d, host_rx_closed & 0xfff);
+    address_space_write(&address_space_memory, host_rx_stts,
+                        MEMTXATTRS_UNSPECIFIED, d, 2);
+    host_csr[0x008 >> 2] |= 1u << 31;                   /* CSR_INT_BIT_FH_RX */
+    hrx_n = 0;
+}
 
 static void host_alive_restock(void)
 {
@@ -1276,6 +1432,8 @@ static void ax210_host_driver_init(const char *path)
     /* iwl_pcie_gen2_nic_init(): RX queue and command queue rings. */
     rx_bd = host_alloc(4096 * 16);         /* 2 * IWL_NUM_RBDS_HE transfer descs */
     host_rx_bd = rx_bd;
+    host_rx_used = rx_used;
+    host_rx_stts = rx_stts;
     rx_used = host_alloc(4096 * 32);       /* completion descs */
     rx_stts = host_alloc(HOST_PAGE);
     cmdq = host_alloc(128 * 256);          /* min_txq_size TFDs, 256B format */
