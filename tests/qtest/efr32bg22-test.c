@@ -5811,7 +5811,7 @@ static void test_emu_em2_wdog(void)
 #define EM2_BURTC_VECTOR      (16 + EM2_BURTC_IRQ)
 #define THUMB16_BX_LR         0x4770u
 
-static void test_emu_em2_wfi(void)
+static void emu_em2_wfi(bool lf_stopped)
 {
     QTestState *qts = qtest_initf("-machine efr32bg22 -accel tcg "
                                   "-icount shift=5,sleep=off -S");
@@ -5868,7 +5868,24 @@ static void test_emu_em2_wfi(void)
     qtest_writel(qts, BURTC_BASE + BURTC_IEN + REGISTER_SET_WINDOW,
                  BURTC_IF_COMP);
     qtest_writel(qts, BURTC_BASE + BURTC_CMD, BURTC_CMD_START);
+    if (lf_stopped) {
+        qtest_qmp_assert_success(qts, "{'execute':'qom-set','arguments':"
+                                 "{'path':'" EMU_PERIPH_PATH "',"
+                                 "'property':'x-lf-stopped','value':true}}");
+    }
     qtest_qmp_assert_success(qts, "{'execute':'cont'}");
+    if (lf_stopped) {
+        /* No wake comes, and none is armed: the clock is not warped to its end. */
+        g_usleep(200000);
+        qtest_qmp_assert_success(qts, "{'execute':'stop'}");
+        g_assert_cmphex(qtest_readl(qts, EM2_WFI_RESULT), ==, 0);
+        r = qtest_qmp(qts, "{'execute':'qom-get','arguments':"
+                      "{'path':'" EMU_PERIPH_PATH "','property':'em2-ns'}}");
+        g_assert_cmpint(qdict_get_int(r, "return"), <, INT64_MAX / 2);
+        qobject_unref(r);
+        qtest_quit(qts);
+        return;
+    }
     /* Real time only bounds a hung QEMU; the outcome is fixed by icount. */
     for (unsigned attempt = 0; attempt < 60000; attempt++) {
         if (qtest_readl(qts, EM2_WFI_RESULT)) {
@@ -5887,6 +5904,17 @@ static void test_emu_em2_wfi(void)
     g_assert_cmpuint(qdict_get_int(r, "return"), >, 60 * LF_PERIOD_NS);
     qobject_unref(r);
     qtest_quit(qts);
+}
+
+static void test_emu_em2_wfi(void)
+{
+    emu_em2_wfi(false);
+}
+
+/* With the BURTC's clock stopped (x-lf-stopped) the compare never wakes it. */
+static void test_emu_em2_wfi_lf_stopped(void)
+{
+    emu_em2_wfi(true);
 }
 
 /*
@@ -6173,6 +6201,7 @@ int main(int argc, char **argv)
                    test_emu_em2_not_entered);
     qtest_add_func("/efr32bg22/emu-em2-gpio-latch", test_emu_em2_gpio_latch);
     qtest_add_func("/efr32bg22/emu-em2-wfi", test_emu_em2_wfi);
+    qtest_add_func("/efr32bg22/emu-em2-wfi-lf-stopped", test_emu_em2_wfi_lf_stopped);
     qtest_add_func("/efr32bg22/emu-em2-wdog", test_emu_em2_wdog);
     qtest_add_func("/efr32bg22/euart-em2-hf-mode-holds",
                    test_euart_em2_hf_mode_holds);

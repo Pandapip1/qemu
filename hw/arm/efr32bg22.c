@@ -3958,7 +3958,11 @@ static void efr32_burtc_process(Efr32Periph *s)
     /* Arm last: see the -icount sleep=off note on timers armed in callbacks. */
     next = MIN(efr32_burtc_next_op_edge(s), efr32_burtc_match_edge(s));
     if (next != INT64_MAX) {
-        timer_mod(s->burtc_timer, efr32_burtc_edge_ns(s, next));
+        next = efr32_burtc_edge_ns(s, next);
+    }
+    /* An edge of a stopped clock never comes: arming it would warp icount to the end of time. */
+    if (next != INT64_MAX) {
+        timer_mod(s->burtc_timer, next);
     }
 }
 
