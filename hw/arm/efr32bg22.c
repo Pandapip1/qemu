@@ -4330,7 +4330,6 @@ static void efr32_timer0_rebase(Efr32Periph *s)
 }
 
 static void efr32_timer_schedule(Efr32Periph *s, int i);
-static void efr32_burtc_process(Efr32Periph *s);
 
 /* Clock faults: the TIMERs' counts so far kept, their rate or state changed from now. */
 static void efr32_fault_get_i32(Object *obj, Visitor *v, const char *name, void *opaque,
