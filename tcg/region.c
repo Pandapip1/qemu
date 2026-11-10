@@ -230,6 +230,33 @@ void tcg_tb_insert(TranslationBlock *tb)
     qemu_mutex_unlock(&rt->lock);
 }
 
+/*
+ * A per-thread cache of tcg_tb_lookup() results, keyed by the exact host
+ * address looked up.  Under icount every device access that is not the last
+ * instruction of its TB rewinds through cpu_io_recompile(), which looks up the
+ * TB by the helper's return address; a guest polling a register does that
+ * from the same few addresses over and over, and the tree walk dominated.
+ * Any removal from the trees (tcg_tb_remove, a region reset) bumps the
+ * generation, so a cached TB is only returned while the tree still holds it.
+ * Insertions cannot invalidate an entry: a new TB's code never overlaps a
+ * live one's.
+ */
+#define TB_LOOKUP_CACHE_BITS 8
+
+typedef struct TBLookupCacheEntry {
+    uintptr_t tc_ptr;
+    TranslationBlock *tb;
+    uint64_t gen;
+} TBLookupCacheEntry;
+
+static uint64_t tb_lookup_cache_gen = 1;
+static __thread TBLookupCacheEntry tb_lookup_cache[1 << TB_LOOKUP_CACHE_BITS];
+
+static void tb_lookup_cache_invalidate(void)
+{
+    qatomic_inc(&tb_lookup_cache_gen);
+}
+
 void tcg_tb_remove(TranslationBlock *tb)
 {
     struct tcg_region_tree *rt = tc_ptr_to_region_tree(tb->tc.ptr);
@@ -237,6 +264,7 @@ void tcg_tb_remove(TranslationBlock *tb)
     g_assert(rt != NULL);
     qemu_mutex_lock(&rt->lock);
     q_tree_remove(rt->tree, &tb->tc);
+    tb_lookup_cache_invalidate();
     qemu_mutex_unlock(&rt->lock);
 }
 
@@ -250,14 +278,27 @@ TranslationBlock *tcg_tb_lookup(uintptr_t tc_ptr)
     struct tcg_region_tree *rt = tc_ptr_to_region_tree((void *)tc_ptr);
     TranslationBlock *tb;
     struct tb_tc s = { .ptr = (void *)tc_ptr };
+    TBLookupCacheEntry *e = &tb_lookup_cache[(tc_ptr >> 2) &
+                                             ((1 << TB_LOOKUP_CACHE_BITS) - 1)];
+    uint64_t gen;
 
     if (rt == NULL) {
         return NULL;
     }
 
+    gen = qatomic_load_acquire(&tb_lookup_cache_gen);
+    if (e->tc_ptr == tc_ptr && e->gen == gen) {
+        return e->tb;
+    }
     qemu_mutex_lock(&rt->lock);
     tb = q_tree_lookup(rt->tree, &s);
     qemu_mutex_unlock(&rt->lock);
+    if (tb) {
+        /* Only hits: a later insertion could cover an address that missed. */
+        e->tc_ptr = tc_ptr;
+        e->tb = tb;
+        e->gen = gen;
+    }
     return tb;
 }
 
@@ -323,6 +364,7 @@ static void tcg_region_tree_reset_all(void)
         q_tree_ref(rt->tree);
         q_tree_destroy(rt->tree);
     }
+    tb_lookup_cache_invalidate();
     tcg_region_tree_unlock_all();
 }
 
