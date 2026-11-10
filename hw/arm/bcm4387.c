@@ -123,7 +123,8 @@ struct BCM4387MachineState {
     uint32_t shared;
     uint32_t rng_state;
     uint16_t phy_addr[3], radio_addr[3];
-    GHashTable *phyregs;
+    GHashTable *phyregs;        /* values written through the ports */
+    GHashTable *phyknown;       /* values known (silicon / exploration seeds) */
 
     bool strict;                /* unmodelled MMIO -> AXI slave error */
     MemoryRegion lowtcm, hole;
@@ -198,20 +199,13 @@ static const hwaddr d11_agents[3][2] = {
 };
 
 /*
- * The PHY window answers once the PHY side is clocked: either the core's
- * PHYPLL is locked (our firmware, queue run 7), or the slice's PHY-agent
- * wrappers are out of reset with their clock on (what stock does before its
- * phyversion read; with neither, queue run 6 got a slave error). [I]
+ * The slice's extra wrappers (PHY agents) are out of reset and clocked. ROM
+ * ai_core_reset (0x400fac) resets wrapba3, then wrapba2, then the main
+ * wrapper; slice 2 has no extra wrappers (treated as up). [F]
  */
-static bool d11_phy_ready(BCM4387MachineState *s, int n)
+static bool d11_agents_up(BCM4387MachineState *s, int n)
 {
-    if (d11_phypll(s, n)) {
-        return true;
-    }
-    if (!d11_agents[n][0]) {
-        return false;
-    }
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 2 && d11_agents[n][i]; i++) {
         hwaddr w = d11_agents[n][i];
 
         if ((store_get(s, w + WRAP_RESETCTRL) & 1) ||
@@ -220,6 +214,18 @@ static bool d11_phy_ready(BCM4387MachineState *s, int n)
         }
     }
     return true;
+}
+
+/*
+ * The PHY window (radio port, phyversion, PHY port) answers once the PHY
+ * side is clocked: the core's PHYPLL is locked (queue runs 7/8, even with the
+ * PHY agents still in reset), or the slice's PHY agents are up (stock reads
+ * phyversion that way without a PLL request). Neither: slave error (run 6).
+ * [F]/[I: the agents-only path is inferred from stock]
+ */
+static bool d11_phy_ready(BCM4387MachineState *s, int n)
+{
+    return d11_phypll(s, n) || (d11_agents[n][0] && d11_agents_up(s, n));
 }
 
 /* index of the d11 core whose register space contains a, or -1 */
@@ -463,40 +469,37 @@ enum { PORT_PHY, PORT_RADIO };
 static void port_seed(BCM4387MachineState *s, int port, int n, uint16_t r,
                       uint16_t v)
 {
-    g_hash_table_insert(s->phyregs, PORT_KEY(port, n, r), GUINT_TO_POINTER(v));
+    g_hash_table_insert(s->phyknown, PORT_KEY(port, n, r), GUINT_TO_POINTER(v));
 }
 
 /*
- * Reset values the firmware depends on, from silicon:
- * - PHY 0x02 bits[3:0] = 1 and PHY 0x0b bits[2:0] = number of PHY cores
- *   (2, 2, 1), decoded into the per-slice struct at [wlc_hw+4]
- *   (fw/dump/ram_identity.bin); the rest of those values is unknown (0).
- * - PHY 0x480 reads the PHY version (0xdb32 on slice 0 via the ROM accessor,
- *   queue run 7; other slices assumed to mirror their phyversion too).
- * - radio 0 and 1 read 0x000c each (radio ID 0x000c000c, slice 0, run 7;
- *   assumed the same on the other slices). [F]/[I]
+ * Register values known from silicon: radio 0 and 1 read 0x000c each (radio
+ * ID 0x000c000c, slice 0, runs 7/8; assumed the same on the other slices).
+ * PHY register contents with the PHY agents up are not known yet, so in
+ * strict mode every such read is logged as unmodelled and returns
+ * PHY_UNKNOWN. With strict=off (stock exploration) PHY registers read back
+ * what was written, seeded with the two fields the stock firmware decodes on
+ * silicon (PHY 0x02 bits[3:0] = 1, PHY 0x0b bits[2:0] = PHY cores 2/2/1,
+ * from the per-slice struct at [wlc_hw+4] in fw/dump/ram_identity.bin; the
+ * rest of those values is unknown). [F]/[I]
  */
+#define PHY_UNKNOWN     0xdead
+#define PHY_IN_RESET    0xce00  /* PHY data read with the agents in reset [F] */
+
 static void phy_init(BCM4387MachineState *s)
 {
     static const uint8_t ncores[3] = { 2, 2, 1 };
-    static const uint16_t phyver[3] = { 0xdb32, 0xdb32, 0xdb34 };
 
     s->phyregs = g_hash_table_new(g_direct_hash, g_direct_equal);
+    s->phyknown = g_hash_table_new(g_direct_hash, g_direct_equal);
     for (int n = 0; n < 3; n++) {
-        port_seed(s, PORT_PHY, n, 0x02, 1);
-        port_seed(s, PORT_PHY, n, 0x0b, ncores[n]);
-        port_seed(s, PORT_PHY, n, 0x480, phyver[n]);
         port_seed(s, PORT_RADIO, n, 0, 0x000c);
         port_seed(s, PORT_RADIO, n, 1, 0x000c);
+        if (!s->strict) {
+            port_seed(s, PORT_PHY, n, 0x02, 1);
+            port_seed(s, PORT_PHY, n, 0x0b, ncores[n]);
+        }
     }
-}
-
-static uint16_t port_get(BCM4387MachineState *s, int port, int n)
-{
-    uint16_t a = port == PORT_PHY ? s->phy_addr[n] : s->radio_addr[n];
-
-    return GPOINTER_TO_UINT(g_hash_table_lookup(s->phyregs,
-                                                PORT_KEY(port, n, a)));
 }
 
 static void port_put(BCM4387MachineState *s, int port, int n, uint16_t v)
@@ -506,6 +509,36 @@ static void port_put(BCM4387MachineState *s, int port, int n, uint16_t v)
     g_hash_table_insert(s->phyregs, PORT_KEY(port, n, a), GUINT_TO_POINTER(v));
     qemu_log_mask(LOG_UNIMP, "bcm4387: %s%d W 0x%04x <- 0x%04x pc~0x%08x\n",
                   port == PORT_PHY ? "PHY" : "RAD", n, a, v, current_pc());
+}
+
+/*
+ * A data read through a port. PHY reads while the slice's PHY agents are in
+ * reset return 0xce00 without faulting (queue run 8: regs 0x000-0x00f,
+ * 0x400-0x40f, 0x480-0x48f, 0x720-0x72f, PLL locked, main wrapper only).
+ */
+static uint16_t port_read(BCM4387MachineState *s, int port, int n)
+{
+    uint16_t a = port == PORT_PHY ? s->phy_addr[n] : s->radio_addr[n];
+    gpointer key = PORT_KEY(port, n, a);
+    uint16_t v;
+
+    if (port == PORT_PHY && !d11_agents_up(s, n)) {
+        v = PHY_IN_RESET;
+    } else if (g_hash_table_contains(s->phyknown, key) &&
+               (s->strict || !g_hash_table_contains(s->phyregs, key))) {
+        v = GPOINTER_TO_UINT(g_hash_table_lookup(s->phyknown, key));
+    } else if (s->strict) {
+        qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: unmodelled %s%d reg 0x%04x "
+                      "read (returns 0x%04x) pc~0x%08x\n",
+                      port == PORT_PHY ? "PHY" : "RAD", n, a, PHY_UNKNOWN,
+                      current_pc());
+        v = PHY_UNKNOWN;
+    } else {
+        v = GPOINTER_TO_UINT(g_hash_table_lookup(s->phyregs, key));
+    }
+    qemu_log_mask(LOG_UNIMP, "bcm4387: %s%d R 0x%04x -> 0x%04x pc~0x%08x\n",
+                  port == PORT_PHY ? "PHY" : "RAD", n, a, v, current_pc());
+    return v;
 }
 
 /* Returns true if the access hit a PHY or radio port; *v receives read data. */
@@ -541,14 +574,12 @@ static bool phy_port(BCM4387MachineState *s, hwaddr a, unsigned size,
         return true;
     }
     if (off == 0x3fc || off == 0x3d8) {
-        *v = *areg | (size == 4 ? (uint32_t)port_get(s, port, n) << 16 : 0);
+        *v = *areg;
+        if (size == 4) {
+            *v |= (uint32_t)port_read(s, port, n) << 16;
+        }
     } else {
-        *v = port_get(s, port, n);
-    }
-    if ((off != 0x3fc && off != 0x3d8) || size == 4) {
-        qemu_log_mask(LOG_UNIMP, "bcm4387: %s%d R 0x%04x -> 0x%04x pc~0x%08x\n",
-                      port == PORT_PHY ? "PHY" : "RAD", n, *areg,
-                      port_get(s, port, n), current_pc());
+        *v = port_read(s, port, n);
     }
     return true;
 }
