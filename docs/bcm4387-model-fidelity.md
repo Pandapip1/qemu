@@ -26,9 +26,10 @@ FW boot complete": RTE banner, PCIe MSGBUF attach, wl0/wl1/wl2 attach on
 all three slices, TCAM, both reclaims, ThreadX. At its first PHY write the
 model's res_state (0x5ecefbff) and all 94 PMU/GCI indirect entries dumped
 on silicon (run 14) equal silicon (`scripts/stock_state_check.py`). Runs 9,
-15 and 16 reproduce exactly (`scripts/model_regress.py`); runs 10/11 differ
-only in the raw PHY dump pattern (first read 0x0084, then 0xdb32), which is
-not explained.
+15 and 16 reproduce exactly, and so do runs 10/11 (`scripts/model_regress.py`,
+0 failing): with all slice domains powered, a dead PHY port returns its latch
+only as the first PHY data read after other port activity, and the phyversion
+value for back-to-back reads [I] (bcm4387.c, port_read).
 
 The per-register gap list is generated from the source tables:
 `scripts/strict_gaps.py > fw/trace/strict_gaps.tsv` (sibling repo). Values

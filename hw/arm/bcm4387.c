@@ -120,6 +120,7 @@ struct BCM4387MachineState {
     uint16_t phy_addr[3], radio_addr[3];
     uint16_t phy_latch[3], radio_latch[3];  /* port data latches */
     int32_t phy_pending[3];     /* phyversion value for the next PHY read */
+    bool phy_fresh[3];          /* other port activity since the last PHY read */
     GHashTable *phyregs;        /* values written through the ports */
     GHashTable *phyknown;       /* values known (silicon / exploration seeds) */
     Bcm4387PmuState *pmu;
@@ -173,6 +174,7 @@ static void store_set(BCM4387MachineState *s, hwaddr a, uint32_t v)
 #define WRAP_RESETCTRL  0x800
 
 /* save/restore power domain of each d11 slice (srpwr bit), RAM 0x8491ae [F] */
+#define SLICE_DOMAINS   0x1cu
 static const uint32_t d11_domain[3] = { 0x8, 0x4, 0x10 };
 
 static uint32_t srpwr_status(BCM4387MachineState *s)
@@ -443,10 +445,18 @@ static void port_seed(BCM4387MachineState *s, int port, int n, uint16_t r,
  * return it (after the replay image's writes every PHY read gave its last
  * written 0x004b, every radio read its last written 0x0000). [F]
  *
- * One unexplained detail: in runs 7, 8 and 9 the first PHY read after a
- * phyversion (+0x3e0) read returned the phyversion value (0xdb32), while
- * all later reads returned 0xce00 with no write in between. Modelled as a
- * one-shot: a phyversion read primes the next PHY data read. [I]
+ * In runs 7, 8 and 9 the first PHY read after a phyversion (+0x3e0) read
+ * returned the phyversion value (0xdb32), while all later reads returned
+ * 0xce00 with no write in between. Modelled as a one-shot: a phyversion read
+ * primes the next PHY data read. [I]
+ *
+ * With all slice power domains on (srpwr status 0x1c, runs 10 and 11) a PHY
+ * read returns the latch only as the first PHY data read after other port
+ * activity (a PHY data write, or any radio data access); back-to-back PHY
+ * reads return the phyversion value instead. Fits runs 10/11: liveness read
+ * right after writes -> 0x0084 (latch); after the radio liveness accesses the
+ * dump's first read -> 0x0084, the next 63 -> 0xdb32. With partial power
+ * (runs 8/9) every read returns the latch (64 x 0x004b after the replay). [I]
  *
  * Live ports (port_live) and strict=off read back what was written,
  * seeded with the two PHY fields the stock firmware decodes on
@@ -511,6 +521,7 @@ static void phy_init(BCM4387MachineState *s)
         s->phy_latch[n] = 0xce00;
         s->radio_latch[n] = 0x000c;
         s->phy_pending[n] = -1;
+        s->phy_fresh[n] = true;
         port_seed(s, PORT_PHY, n, 0x02, 1);
         port_seed(s, PORT_PHY, n, 0x0b, ncores[n]);
     }
@@ -526,6 +537,7 @@ static void port_put(BCM4387MachineState *s, int port, int n, uint16_t v)
     } else {
         s->radio_latch[n] = v;
     }
+    s->phy_fresh[n] = true;
     qemu_log_mask(LOG_UNIMP, "bcm4387: %s%d W 0x%04x <- 0x%04x pc~0x%08x "
                   "lr~0x%08x\n", port == PORT_PHY ? "PHY" : "RAD", n, a, v,
                   bcm4387_pc(), bcm4387_lr());
@@ -541,11 +553,18 @@ static uint16_t port_read(BCM4387MachineState *s, int port, int n)
     if (s->strict && !port_live(s, n)) {
         if (port == PORT_RADIO) {
             v = s->radio_latch[n];
-        } else if (s->phy_pending[n] >= 0) {
-            v = s->phy_pending[n];
-            s->phy_pending[n] = -1;
+            s->phy_fresh[n] = true;
         } else {
-            v = s->phy_latch[n];
+            if (s->phy_pending[n] >= 0) {
+                v = s->phy_pending[n];
+                s->phy_pending[n] = -1;
+            } else if (!s->phy_fresh[n] &&
+                       (srpwr_status(s) & SLICE_DOMAINS) == SLICE_DOMAINS) {
+                v = n == 2 ? 0xdb34 : 0xdb32;
+            } else {
+                v = s->phy_latch[n];
+            }
+            s->phy_fresh[n] = false;
         }
     } else if (g_hash_table_contains(s->phyregs, key)) {
         v = GPOINTER_TO_UINT(g_hash_table_lookup(s->phyregs, key));
