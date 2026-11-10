@@ -127,6 +127,7 @@ struct BCM4387MachineState {
     Bcm4387GciState *gci;
     Bcm4387CcState *cc;
     Bcm4387Sc *sc[3];
+    Bcm4387Psm *psm[3];
     char *iq_source, *iq_format;
 
     bool strict;                /* unmodelled MMIO -> AXI slave error */
@@ -374,14 +375,12 @@ static bool model_write(BCM4387MachineState *s, hwaddr a, uint32_t v)
 {
     int n = d11_core(a);
 
-
-    if (n >= 0 && (a == D11_BASE(n) + 0x164 || a == D11_BASE(n) + 0x166) &&
-        !(store_get(s, D11_BASE(n) + 0x160) & 0x7f0000)) {
-        s->ucode_loaded[n] = true;      /* see port_live */
-    }
     if (n >= 0 && (a == D11_BASE(n) + 0x1e0 || a == D11_BASE(n) + 0x120)) {
         store_set(s, a, v);
         d11_mac_request(s, n);
+        if (a == D11_BASE(n) + 0x120) {
+            bcm4387_psm_control(s->psm[n], v);
+        }
         return true;
     }
     if (d11_extra_wrap(a)) {
@@ -396,6 +395,9 @@ static bool model_write(BCM4387MachineState *s, hwaddr a, uint32_t v)
             if ((store_get(s, a) & 1) && !(v & 1)) {
                 s->d11_phyflags[n] =
                     (store_get(s, D11_WRAP(n) + WRAP_IOCTL) & 0xc) == 0xc;
+            }
+            if (!(store_get(s, a) & 1) && (v & 1)) {
+                bcm4387_psm_core_reset(s->psm[n]);
             }
             store_set(s, a, v);
             d11_mac_request(s, n);
@@ -902,18 +904,12 @@ static const struct { hwaddr a; const char *name; } plain_regs[] = {
     { 0x18001c18, "pcie 0xc18" },
     { 0x18001120, "pcie configaddr" }, { 0x18001124, "pcie configdata" },
     { 0x1803115c, "d11.0 machwcap" },
-    { 0x18031160, "d11.0 objaddr" },
-    { 0x18031164, "d11.0 objdata" },
     { 0x1803118c, "d11.0 tsf_cfpstart" },
     { 0x180311a4, "d11.0 machwcap1" },
     { 0x1803215c, "d11.1 machwcap" },
-    { 0x18032160, "d11.1 objaddr" },
-    { 0x18032164, "d11.1 objdata" },
     { 0x1803218c, "d11.1 tsf_cfpstart" },
     { 0x180321a4, "d11.1 machwcap1" },
     { 0x1803315c, "d11.2 machwcap" },
-    { 0x18033160, "d11.2 objaddr" },
-    { 0x18033164, "d11.2 objdata" },
     { 0x1803318c, "d11.2 tsf_cfpstart" },
     { 0x180331a4, "d11.2 machwcap1" },
     { 0x18001010, "pcie 0x010" },
@@ -1105,6 +1101,99 @@ static bool sc_port(BCM4387MachineState *s, hwaddr a, unsigned size, bool wr,
     return hit;
 }
 
+/*
+ * Object memory port (objaddr +0x160, objdata +0x164/+0x166): microcode
+ * memory and SHM of the slice's PSM (bcm4387-psm.c). Selects the PSM does
+ * not model stay plain storage, logged. A write while objaddr selects UCM
+ * also marks the slice's ucode loaded (phy-live=auto, see port_live).
+ */
+static bool obj_port(BCM4387MachineState *s, hwaddr a, unsigned size, bool wr,
+                     uint64_t *v)
+{
+    int n = d11_core(a);
+    hwaddr off = a - D11_BASE(n);
+
+    if (n < 0 || (off != 0x160 && off != 0x164 && off != 0x166)) {
+        return false;
+    }
+    if (wr && off != 0x160 && !(store_get(s, D11_BASE(n) + 0x160) & 0x7f0000)) {
+        s->ucode_loaded[n] = true;
+    }
+    if (wr && off == 0x160) {
+        store_set(s, a, *v);
+    }
+    if (!bcm4387_psm_objmem(s->psm[n], off, size, wr, v)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: d11.%d object memory %c%u "
+                      "+0x%03" HWADDR_PRIx " with objaddr 0x%08x not "
+                      "modelled (plain storage) pc~0x%08x\n", n,
+                      wr ? 'W' : 'R', size * 8, off,
+                      store_get(s, D11_BASE(n) + 0x160), bcm4387_pc());
+        if (wr) {
+            store_set(s, a, *v);
+        } else {
+            *v = store_get(s, a);
+        }
+    }
+    qemu_log_mask(LOG_UNIMP, "bcm4387: OBJ%d %c%u +0x%03" HWADDR_PRIx " %s "
+                  "0x%08" PRIx64 " pc~0x%08x\n", n, wr ? 'W' : 'R', size * 8,
+                  off, wr ? "<-" : "->", *v, bcm4387_pc());
+    return true;
+}
+
+/* the PSM runs on the MAC clock: slice out of reset, clock on, FCLKA [I] */
+static bool psm_hook_clocked(void *opaque, int n)
+{
+    return d11_fclka(opaque, n);
+}
+
+/* IHRs the machine models for the PSM: SampleCollect / template RAM */
+static bool psm_hook_ihr(void *opaque, int n, uint16_t idx, bool wr,
+                         uint16_t *v)
+{
+    BCM4387MachineState *s = opaque;
+    uint64_t v64 = *v;
+
+    if (!bcm4387_sc_access(s->sc[n], 0x400 + 2 * idx, 2, wr, &v64)) {
+        return false;
+    }
+    *v = v64;
+    return true;
+}
+
+/*
+ * The PSM's own PHY and radio ports (IHR 0x91/0x92, 0x94/0x95, see
+ * bcm4387-psm.c) reach the same register files as the host ports. Their
+ * reachability is taken to be the host ports' (port_live); what a PSM access
+ * returns while the PHY is not reachable is unknown, so it is refused. [I]
+ */
+static bool psm_hook_port(void *opaque, int n, int port, bool wr,
+                          uint16_t addr, uint16_t *v)
+{
+    BCM4387MachineState *s = opaque;
+    int p = port ? PORT_RADIO : PORT_PHY;
+    gpointer key = PORT_KEY(p, n, addr);
+
+    if (s->strict && !port_live(s, n)) {
+        return false;
+    }
+    if (wr) {
+        g_hash_table_insert(s->phyregs, key, GUINT_TO_POINTER(*v));
+    } else if (g_hash_table_contains(s->phyregs, key)) {
+        *v = GPOINTER_TO_UINT(g_hash_table_lookup(s->phyregs, key));
+    } else {
+        if (s->strict && !g_hash_table_contains(s->phyknown, key)) {
+            qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: unknown %s%d reg 0x%04x "
+                          "read by the PSM (reset value not known; 0)\n",
+                          p == PORT_PHY ? "PHY" : "RAD", n, addr);
+        }
+        *v = GPOINTER_TO_UINT(g_hash_table_lookup(s->phyknown, key));
+    }
+    qemu_log_mask(LOG_UNIMP, "bcm4387: PSM-%s%d %c 0x%04x %s 0x%04x\n",
+                  p == PORT_PHY ? "PHY" : "RAD", n, wr ? 'W' : 'R', addr,
+                  wr ? "<-" : "->", *v);
+    return true;
+}
+
 static MemTxResult trace_read(void *opaque, hwaddr addr, uint64_t *data,
                               unsigned size, MemTxAttrs attrs)
 {
@@ -1120,7 +1209,8 @@ static MemTxResult trace_read(void *opaque, hwaddr addr, uint64_t *data,
         *data = v;
         return MEMTX_OK;
     }
-    if (sc_port(s, addr, size, false, data)) {
+    if (sc_port(s, addr, size, false, data) ||
+        obj_port(s, addr, size, false, data)) {
         return MEMTX_OK;
     }
     modelled = model_read(s, addr, &v);
@@ -1154,7 +1244,8 @@ static MemTxResult trace_write(void *opaque, hwaddr addr, uint64_t val,
     if (phy_port(s, addr, size, true, val, NULL)) {
         return MEMTX_OK;
     }
-    if (sc_port(s, addr, size, true, &val)) {
+    if (sc_port(s, addr, size, true, &val) ||
+        obj_port(s, addr, size, true, &val)) {
         return MEMTX_OK;
     }
     if (s->strict && !reg_known(addr)) {
@@ -1360,6 +1451,7 @@ static void bcm4387_reset(void *opaque)
     cpu_reset(CPU(s->cpu));
     for (int n = 0; n < 3; n++) {
         bcm4387_sc_reset(s->sc[n]);
+        bcm4387_psm_reset(s->psm[n]);
     }
     /*
      * brcmf_chip_cr4_set_active(): the host writes only image word 0 (the
@@ -1529,8 +1621,14 @@ static void bcm4387_init(MachineState *machine)
             .opaque = s, .phy_live = sc_hook_live, .phyreg = sc_hook_phyreg,
         };
 
+        Bcm4387PsmHooks psm_hooks = {
+            .opaque = s, .clocked = psm_hook_clocked, .ihr = psm_hook_ihr,
+            .port = psm_hook_port,
+        };
+
         for (int n = 0; n < 3; n++) {
             s->sc[n] = bcm4387_sc_new(n, &hooks);
+            s->psm[n] = bcm4387_psm_new(n, &psm_hooks);
         }
         if (s->iq_source) {
             bcm4387_iq_load(s->iq_source, s->iq_format);

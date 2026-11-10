@@ -121,6 +121,12 @@ bcm4387_sc_playctrl(int slice, uint32_t old, uint32_t v) "d11.%d SampleCollect P
 bcm4387_sc_start(int slice, uint32_t start, uint32_t stop, bool sampling) "d11.%d SampleCollect start words 0x%x..0x%x (sampling %d)"
 bcm4387_sc_done(int slice, uint32_t cur) "d11.%d SampleCollect reached StopPtr, CurPtr 0x%x"
 
+# bcm4387-psm.c
+bcm4387_psm_state(int slice, const char *old, const char *st, uint32_t pc, uint64_t insns) "PSM%d %s -> %s pc 0x%04x after %" PRIu64 " instructions"
+bcm4387_psm_insn(int slice, uint32_t pc, uint64_t in) "PSM%d 0x%04x: %016" PRIx64
+bcm4387_psm_ihr(int slice, uint32_t pc, const char *dir, uint32_t idx, uint32_t v) "PSM%d 0x%04x IHR %s 0x%03x 0x%04x"
+bcm4387_psm_port(int slice, uint32_t pc, const char *port, const char *dir, uint32_t addr, uint32_t v) "PSM%d 0x%04x %s %s 0x%04x 0x%04x"
+
 # bcm4387-cc.c
 bcm4387_cc_read(uint64_t off, uint32_t v) "+0x%03" PRIx64 " -> 0x%08x"
 bcm4387_cc_write(uint64_t off, uint64_t v) "+0x%03" PRIx64 " <- 0x%08" PRIx64

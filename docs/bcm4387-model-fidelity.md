@@ -26,7 +26,9 @@ FW boot complete": RTE banner, PCIe MSGBUF attach, wl0/wl1/wl2 attach on
 all three slices, TCAM, both reclaims, ThreadX. At its first PHY write the
 model's res_state (0x5ecefbff) and all 94 PMU/GCI indirect entries dumped
 on silicon (run 14) equal silicon (`scripts/stock_state_check.py`). Runs 9,
-10, 11, 16 and 17 reproduce exactly (`scripts/model_regress.py`, 0 failing):
+10, 11, 16 and 17 reproduce exactly (`scripts/model_regress.py`; runs 19
+and 20 DIFF because their data latches hold values left over from earlier
+runs and reloads, which the model does not carry):
 with all slice domains powered, a dead PHY port returns its latch only as
 the first PHY data read after other port activity, and the phyversion value
 for back-to-back reads [I] (bcm4387.c, port_read).
@@ -48,6 +50,57 @@ the gap file for run 17. The d11 core window is strict: offsets with no
 model are AXI slave errors. `model_regress.py` feeds a 1.25 MHz tone through
 our capture image with `phy-live=on` (see below: our firmware's ports are
 dead under the default rule) and checks the recovered frequency.
+
+### PSM: the d11 microcode CPU as a second core
+
+`bcm4387-psm.c` runs each slice's PSM. The ISA and IHR evidence is in
+notes/33-psm-model.md (sibling repo), taken from stock's rev-85 ucode as stock
+downloads it.
+
+**What the host side does**
+- objaddr/objdata (+0x160/+0x164/+0x166) fill microcode memory (select 0, one
+  64-bit instruction per two 32-bit words, low word first) and SHM (select 1,
+  32-bit word addressing, auto-increment) [B names, I layout].
+- maccontrol MCTL_PSM_RUN / MCTL_PSM_JMP_0 run the PSM and reset its PC [B].
+- Core reset halts the PSM.
+- The PSM executes on a virtual-clock timer while its slice is out of reset
+  with its MAC fast clock (FCLKA) [I]. It runs at an assumed 160 MHz [U].
+
+**What the PSM itself models**
+- The full rev-85 instruction set as far as its semantics are known: 14-bit
+  operands, 32-bit add/sub (opcode bit 5), and jext 0x5f as the
+  unconditional jump [I].
+- The indirect-SHM base registers b0..b6 at IHR 0x221/0x222/0x225/0x226/
+  0x229/0x22a/0x22d [I], and the mul low result at IHR 0x1c7 [I].
+- Its own PHY port (IHR 0x91 data / 0x92 address, opcode 0x102: 0 = read,
+  0x20 = write) and radio port (0x94/0x95) [I]. Both ports reach the same
+  PHY/radio register files as the host ports, gated by `port_live` [I].
+- SampleCollect through IHR i = host +0x400+2i [I].
+
+**Strict aborts.** Every other IHR, every external condition except 0x5f, the
+opcodes with unknown semantics (0x070/0x071 jboh, 0x086, 0x1a4/0x1a5/0x1a6/
+0x1b4, and 0x102 to anything but the port registers), and `nap` (no modelled
+wake source) stop the PSM with "PSMn strict abort". With `strict=off`,
+unknown IHRs become plain storage and conditions read false.
+
+**Stock never starts the PSM in this model.** Its attach-only boot keeps
+maccontrol at 0x04000400 (= silicon at its first PHY write [F]). The PSM is
+started by wlc_up, which needs a host WLC_UP.
+`scripts/psm_bench.py` (sibling repo) plays the host-driven start over qtest:
+1. Stock's core reset.
+2. Stock's own ucode words from the trace.
+3. JMP_0, then IHR_EN | INFRA | PSM_RUN | WAKE (brcmsmac coreinit [B]).
+
+Result, slice 0:
+- `strict=on`: abort at instruction #2, a read of unmodelled IHR 0x1c6
+  (host +0x78c) at pc 0x133f, the init entry.
+- `strict=off`: the PSM writes 0x8002 to IHR 0x1e0 (+0x7c0), sets IHR 0x1f4
+  (+0x7e8) bit 5, and spins forever at pc 0x1347 waiting for 0x1f4 bit 13.
+  That is a request/acknowledge whose other side is unknown [U].
+- It never reaches its PHY port.
+
+Next gaps, in the order the ucode needs them: IHR 0x1c6 bit 5 (warm-start
+flag?), and the 0x1f4 bit 5 -> bit 13 handshake.
 
 ### Enable chain (what the model says makes the PHY usable)
 

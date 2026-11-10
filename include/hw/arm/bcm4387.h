@@ -134,4 +134,26 @@ void bcm4387_sc_reset(Bcm4387Sc *s);
 bool bcm4387_sc_access(Bcm4387Sc *s, hwaddr off, unsigned size, bool wr,
                        uint64_t *val);
 
+/* ---- d11 PSM, the microcode CPU (bcm4387-psm.c) ------------------------- */
+
+typedef struct Bcm4387Psm Bcm4387Psm;
+typedef struct Bcm4387PsmHooks {
+    void *opaque;
+    /* the slice's PSM gets its clock */
+    bool (*clocked)(void *opaque, int slice);
+    /* IHR idx (host d11+0x400+2*idx) if the machine models it */
+    bool (*ihr)(void *opaque, int slice, uint16_t idx, bool wr, uint16_t *v);
+    /* PSM-side PHY (port 0) / radio (port 1) access; false = result unknown */
+    bool (*port)(void *opaque, int slice, int port, bool wr, uint16_t addr,
+                 uint16_t *v);
+} Bcm4387PsmHooks;
+
+Bcm4387Psm *bcm4387_psm_new(int slice, const Bcm4387PsmHooks *hooks);
+void bcm4387_psm_reset(Bcm4387Psm *p);
+void bcm4387_psm_core_reset(Bcm4387Psm *p);
+void bcm4387_psm_control(Bcm4387Psm *p, uint32_t maccontrol);
+/* objaddr +0x160 / objdata +0x164, +0x166; false if not modelled */
+bool bcm4387_psm_objmem(Bcm4387Psm *p, hwaddr off, unsigned size, bool wr,
+                        uint64_t *val);
+
 #endif
