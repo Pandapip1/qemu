@@ -240,8 +240,17 @@ static int d11_core(hwaddr a)
     return -1;
 }
 
+static bool d11_fclka(BCM4387MachineState *s, int n);
+
 static bool model_read(BCM4387MachineState *s, hwaddr a, uint32_t *v)
 {
+    for (int n = 0; n < 3; n++) {
+        if (a == D11_WRAP(n) + WRAP_IOSTATUS) {
+            /* band straps (F) | SISF_FCLKA (bit 2) while d11_fclka() */
+            *v = store_get(s, a) | (d11_fclka(s, n) ? 0x4 : 0);
+            return true;
+        }
+    }
     if (d11_extra_wrap(a)) {
         *v = (a & 0xfff) == WRAP_RESETCTRL ? store_get(s, a) : 0;
         return true;
@@ -319,19 +328,35 @@ static bool model_read(BCM4387MachineState *s, hwaddr a, uint32_t *v)
 static void tcam_program(BCM4387MachineState *s, uint32_t slot);
 
 /*
- * A d11 slice out of reset with its clock on asserts its MAC clock request
- * to the PMU, which then brings up that slice's mac_res_req mask. [I] Stock
- * programs all three MAC request timers (0x15000000, masks = MACPHY_CLK
- * closure of each slice) before its first PHY write, yet silicon has only
- * the main slice's resources up then (res_state 0x5ecefbff, run 11): the
- * timers alone do not hold the request; the main slice is the one out of
- * reset. [F] check.
+ * How a d11 slice asks the PMU for its PHY clock (MACPHY_CLK resource). [I]
+ *  - MAC asleep (maccontrol MCTL_WAKE clear): the clk_ctl_st PHY PLL
+ *    request (0x200) asks for MACPHY_CLK directly. [F] runs 7-11: our
+ *    firmware, maccontrol never written, request 0x342 -> 0x1f0b0342 and
+ *    res_state 0x5ecefbff.
+ *  - out of reset with its clock on, the MAC's own clock request goes
+ *    through the PMU MAC resource request (mac_res_req_timer/mask for this
+ *    slice; see bcm4387-pmu.c): stock reads phyversion (RAM 0x82ee50) with
+ *    only that programmed, before any clk_ctl_st PHY PLL request.
+ *  - MAC held awake (MCTL_WAKE): the clk_ctl_st request no longer reaches
+ *    the PMU, only the MAC resource request does. [F] run 16: maccontrol
+ *    0x04000400 written before the 0x302 request, mac_res_req never
+ *    programmed (0 since the reload) -> clk_ctl_st stuck at 0x150b0342
+ *    (PHY PLL never available). Stock programs mac_res_req (timer
+ *    0x15000000, mask MACPHY_CLK_MAIN closed to 0x56cac1ff) long before it
+ *    sets MCTL_WAKE (bcmdhd si_pmu_set_mac_rsrc_req). [B]
+ *  Aux/scan slices are in reset at stock's first PHY write, which is why
+ *  their programmed MAC requests do not show in res_state (run 11). [F] check
  */
 static void d11_mac_request(BCM4387MachineState *s, int n)
 {
-    bcm4387_pmu_mac_active(s->pmu, n,
-                           !(store_get(s, D11_WRAP(n) + WRAP_RESETCTRL) & 1) &&
-                           (store_get(s, D11_WRAP(n) + WRAP_IOCTL) & 1));
+    bool awake = store_get(s, D11_BASE(n) + 0x120) & (1u << 26);
+    bool up = !(store_get(s, D11_WRAP(n) + WRAP_RESETCTRL) & 1) &&
+              (store_get(s, D11_WRAP(n) + WRAP_IOCTL) & 1);
+
+    bcm4387_pmu_mac_active(s->pmu, n, up);
+    bcm4387_pmu_request(s->pmu, BCM4387_REQ_MAC0 + n,
+                        !awake && (store_get(s, D11_BASE(n) + 0x1e0) & 0x200) ?
+                        BIT(d11_macphy_res[n]) : 0);
 }
 
 static bool model_write(BCM4387MachineState *s, hwaddr a, uint32_t v)
@@ -339,10 +364,9 @@ static bool model_write(BCM4387MachineState *s, hwaddr a, uint32_t v)
     int n = d11_core(a);
 
 
-    if (n >= 0 && a == D11_BASE(n) + 0x1e0) {
+    if (n >= 0 && (a == D11_BASE(n) + 0x1e0 || a == D11_BASE(n) + 0x120)) {
         store_set(s, a, v);
-        bcm4387_pmu_request(s->pmu, BCM4387_REQ_MAC0 + n,
-                            v & 0x200 ? BIT(d11_macphy_res[n]) : 0);
+        d11_mac_request(s, n);
         return true;
     }
     if (d11_extra_wrap(a)) {
@@ -422,12 +446,59 @@ static void port_seed(BCM4387MachineState *s, int port, int n, uint16_t r,
  * all later reads returned 0xce00 with no write in between. Modelled as a
  * one-shot: a phyversion read primes the next PHY data read. [I]
  *
- * What makes the ports live on silicon (stock's PHY works) is not known yet;
- * strict mode models the latch. With strict=off (stock exploration) the
- * ports read back what was written, seeded with the two PHY fields the stock firmware decodes on
+ * Live ports (port_live) and strict=off read back what was written,
+ * seeded with the two PHY fields the stock firmware decodes on
  * silicon (PHY 0x02 bits[3:0] = 1, PHY 0x0b bits[2:0] = PHY cores 2/2/1,
  * from the per-slice struct at [wlc_hw+4] in fw/dump/ram_identity.bin). [I]
  */
+/*
+ * d11 maccontrol (+0x120), bits per bcmdhd 101.10.361 d11.h: MCTL_WAKE
+ * (bit 26) keeps the MAC awake, MCTL_IHR_EN (bit 10) enables its internal
+ * hardware registers, MCTL_PSM_RUN (bit 1) runs the microcode. [B]
+ *
+ * SISF_FCLKA (wrapper iostatus bit 2, "FastClkAvailable", d11.h) [B]: the
+ * MAC has its fast clock. Modelled as: the slice is out of reset with its
+ * clock on, HT is up, and the MAC is held awake (MCTL_WAKE) or its
+ * microcode runs. [I] Fits silicon: stock (maccontrol 0x04000400) reads
+ * iostatus 0x11006 at its first PHY write, our firmware (maccontrol never
+ * written, same power/clocks/IOCTL) 0x11002 (queue run 11).
+ */
+#define MCTL_WAKE       (1u << 26)
+#define MCTL_IHR_EN     (1u << 10)
+#define MCTL_PSM_RUN    (1u << 1)
+
+static bool d11_fclka(BCM4387MachineState *s, int n)
+{
+    uint32_t mctl = store_get(s, D11_BASE(n) + 0x120);
+
+    return !(store_get(s, D11_WRAP(n) + WRAP_RESETCTRL) & 1) &&
+           (store_get(s, D11_WRAP(n) + WRAP_IOCTL) & 1) &&
+           bcm4387_pmu_res_up(s->pmu, BCM4387_RES_HT_AVAIL) &&
+           (mctl & (MCTL_WAKE | MCTL_PSM_RUN));
+}
+
+/*
+ * The PHY and radio data ports reach the PHY/radio register files only with
+ * the slice's PHY clock up (MACPHY_CLK resource) and the MAC's fast clock
+ * (SISF_FCLKA) and internal hardware registers (MCTL_IHR_EN) on; otherwise
+ * they are the latches seen on silicon. [I] Runs 7-11 had MACPHY_CLK_MAIN
+ * up (run 11: res_state 0x5ecefbff, d11 clk_ctl_st 0x1f0b0342) but never
+ * wrote maccontrol and read latches; stock writes maccontrol 0x04000400
+ * (MCTL_WAKE | MCTL_IHR_EN, fn 0x4d2a1c) before its first PHY write and
+ * its PHY works. Which of WAKE and IHR_EN is needed is not separable from
+ * the evidence (stock sets both at once): both are required here.
+ * d11 +0x18c and the 16-bit +0x3e6 (phyanacore in the classic layout),
+ * which stock zeroes before its first PHY write, have no effect modelled
+ * (both are 0 at handoff in the model). [U]
+ * A never-written register reads its seed (below) or 0, logged as
+ * unknown. [U]
+ */
+static bool port_live(BCM4387MachineState *s, int n)
+{
+    return d11_phypll(s, n) && d11_fclka(s, n) &&
+           (store_get(s, D11_BASE(n) + 0x120) & MCTL_IHR_EN);
+}
+
 static void phy_init(BCM4387MachineState *s)
 {
     static const uint8_t ncores[3] = { 2, 2, 1 };
@@ -438,10 +509,8 @@ static void phy_init(BCM4387MachineState *s)
         s->phy_latch[n] = 0xce00;
         s->radio_latch[n] = 0x000c;
         s->phy_pending[n] = -1;
-        if (!s->strict) {
-            port_seed(s, PORT_PHY, n, 0x02, 1);
-            port_seed(s, PORT_PHY, n, 0x0b, ncores[n]);
-        }
+        port_seed(s, PORT_PHY, n, 0x02, 1);
+        port_seed(s, PORT_PHY, n, 0x0b, ncores[n]);
     }
 }
 
@@ -467,7 +536,7 @@ static uint16_t port_read(BCM4387MachineState *s, int port, int n)
     gpointer key = PORT_KEY(port, n, a);
     uint16_t v;
 
-    if (s->strict) {
+    if (s->strict && !port_live(s, n)) {
         if (port == PORT_RADIO) {
             v = s->radio_latch[n];
         } else if (s->phy_pending[n] >= 0) {
@@ -479,6 +548,11 @@ static uint16_t port_read(BCM4387MachineState *s, int port, int n)
     } else if (g_hash_table_contains(s->phyregs, key)) {
         v = GPOINTER_TO_UINT(g_hash_table_lookup(s->phyregs, key));
     } else {
+        if (s->strict && !g_hash_table_contains(s->phyknown, key)) {
+            qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: unknown %s%d reg 0x%04x "
+                          "read (reset value not known; 0) pc~0x%08x\n",
+                          port == PORT_PHY ? "PHY" : "RAD", n, a, bcm4387_pc());
+        }
         v = GPOINTER_TO_UINT(g_hash_table_lookup(s->phyknown, key));
     }
     qemu_log_mask(LOG_UNIMP, "bcm4387: %s%d R 0x%04x -> 0x%04x pc~0x%08x\n",
@@ -762,9 +836,11 @@ static const struct { hwaddr a; const char *name; } plain_regs[] = {
     { 0x18001408, "pcie 0x408" }, { 0x18001410, "pcie 0x410" },
     { 0x18001820, "pcie 0x820" }, { 0x18001824, "pcie 0x824" },
     { 0x18001830, "pcie 0x830" }, { 0x18001c10, "pcie 0xc10" },
+    { 0x18001148, "pcie 0x148 (D2H mailbox? stock writes 0x12345678)" },
+    { 0x18001c30, "pcie 0xc30" },
+    { 0x18001c14, "pcie 0xc14" },
     { 0x18001c18, "pcie 0xc18" },
     { 0x18001120, "pcie configaddr" }, { 0x18001124, "pcie configdata" },
-    { 0x18031120, "d11.0 maccontrol" },
     { 0x18031130, "d11.0 tplatewrptr" },
     { 0x18031134, "d11.0 tplatewrdata" },
     { 0x1803115c, "d11.0 machwcap" },
@@ -772,7 +848,6 @@ static const struct { hwaddr a; const char *name; } plain_regs[] = {
     { 0x18031164, "d11.0 objdata" },
     { 0x1803118c, "d11.0 tsf_cfpstart" },
     { 0x180311a4, "d11.0 machwcap1" },
-    { 0x18032120, "d11.1 maccontrol" },
     { 0x18032130, "d11.1 tplatewrptr" },
     { 0x18032134, "d11.1 tplatewrdata" },
     { 0x1803215c, "d11.1 machwcap" },
@@ -780,7 +855,6 @@ static const struct { hwaddr a; const char *name; } plain_regs[] = {
     { 0x18032164, "d11.1 objdata" },
     { 0x1803218c, "d11.1 tsf_cfpstart" },
     { 0x180321a4, "d11.1 machwcap1" },
-    { 0x18033120, "d11.2 maccontrol" },
     { 0x18033130, "d11.2 tplatewrptr" },
     { 0x18033134, "d11.2 tplatewrdata" },
     { 0x1803315c, "d11.2 machwcap" },
@@ -935,7 +1009,7 @@ static bool reg_known(hwaddr a)
     if (d11_core(a) >= 0) {
         hwaddr o = a - D11_BASE(d11_core(a));
 
-        return o == 0x1e0 || o >= 0x3d8;
+        return o == 0x1e0 || o == 0x120 || o >= 0x3d8;
     }
     return false;
 }
