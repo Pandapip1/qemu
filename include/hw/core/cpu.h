@@ -403,7 +403,8 @@ struct qemu_work_item;
  * while it executes code from [fetch_base, fetch_base + fetch_size), a load
  * or store to [base, base + size) of a range costs that range's extra
  * millicycles per 32-bit transfer.  For memory QEMU maps as RAM, whose
- * accesses never reach a bus model.
+ * accesses never reach a bus model.  A range marked @count also counts its
+ * transfers (CPUState.icount_mem_range_transfers).
  */
 #define ICOUNT_MEM_COST_RANGES 2
 struct IcountMemCosts {
@@ -411,6 +412,7 @@ struct IcountMemCosts {
     struct {
         uint32_t base, size;
         int32_t load_mc, store_mc;
+        bool count;
     } range[ICOUNT_MEM_COST_RANGES];
 };
 
@@ -541,6 +543,12 @@ struct CPUState {
      * (IcountBusModel), for a model that resolves contention per round.
      */
     uint32_t icount_bus_accesses[ICOUNT_BUS_TARGETS];
+    /*
+     * 32-bit transfers in the current round to each icount_mem_costs range
+     * marked .count, loads [0] and stores [1]: RAM traffic a bus model can
+     * weigh against another vCPU's accesses.
+     */
+    uint32_t icount_mem_range_transfers[ICOUNT_MEM_COST_RANGES][2];
     uint64_t random_seed;
     sigjmp_buf jmp_env;
 

@@ -7915,6 +7915,20 @@ static TCGv_i64 gen_icount_mem_cost(DisasContext *s, TCGv_i32 a32,
         cost = tcg_temp_new_i64();
         tcg_gen_subi_i32(in, a32, c->range[i].base);
         tcg_gen_setcondi_i32(TCG_COND_LTU, in, in, c->range[i].size);
+        if (c->range[i].count) {
+            const intptr_t ofs =
+                (intptr_t)offsetof(ArchCPU, parent_obj.icount_mem_range_transfers
+                                   [i][is_store]) -
+                (intptr_t)offsetof(ArchCPU, env);
+            TCGv_i32 n = tcg_temp_new_i32();
+
+            tcg_gen_ld_i32(n, tcg_env, ofs);
+            tcg_gen_add_i32(n, n, in);
+            if ((opc & MO_SIZE) == MO_64) {
+                tcg_gen_add_i32(n, n, in);
+            }
+            tcg_gen_st_i32(n, tcg_env, ofs);
+        }
         tcg_gen_ld_i32(per, tcg_constant_ptr(mc), 0);
         tcg_gen_mul_i32(in, in, per);
         if ((opc & MO_SIZE) == MO_64) {

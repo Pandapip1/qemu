@@ -68,10 +68,13 @@
  * entry itself.  An entry also ends the M0+'s sleep: SEQRAM tenures of the
  * M33 before it cost the M0+ nothing.
  *
- * Not modelled: M33 SRAM and flash accesses are RAM to QEMU (no bus
- * access), so the M33's SRAM traffic does not slow the M0+'s SRAM and
- * peripheral accesses (SS7.74 SS2, +0.7..1.1 and +0.5 cycle); LDMA; the
- * debugger's accesses.
+ * Main SRAM.  The M33's SRAM accesses are RAM to QEMU (no bus access): the
+ * translator counts its SRAM data transfers per round and each M0+ SRAM or
+ * HF APB access pays the SS7.74 SS2 cost scaled by their rate
+ * (seq_m33_sram_mc).  Not modelled: the M33's instruction fetches from
+ * SRAM (SS7.74: an SRAM-resident M33 loop slowed M0+ SRAM loads by 0-1.6
+ * cycles depending on its alignment), the M0+'s SRAM traffic slowing the
+ * M33 (+0.15..0.31 cycle), LDMA, the debugger's accesses.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -168,6 +171,27 @@ static const uint32_t handover_milli[EFR32_IC_PORTS] = {
 #define SEQ_EXCEPTION_SEQRAM_MC 31000
 /* An M33 SEQRAM access every 2.375 cycles is full streaming. */
 #define M33_SEQRAM_STREAM_PERIOD_MC 2375
+/*
+ * The M33's main-SRAM data traffic (SS7.74 SS2 [F], flashrun session:
+ * flash-resident M33 at HCLK, M0+ at RHCLK, M0+ baselines SRAM 5809,
+ * TIMER1 14610, CMU 8210 per 1600 ops).  Streaming, the M33 makes 1600 SRAM
+ * transfers in 2205 cycles.  Per M0+ access that costs: SRAM load 1.090
+ * under M33 loads (7553) and 1.045 under stores (7481); SRAM store 0.641
+ * (6834) and 0.754 (7016); TIMER1 load 0.499 (15408) and CMU load 0.426
+ * (8891) under either.  [I] Below streaming the cost scales with the M33's
+ * transfer rate over the round so far (the translator counts them,
+ * CPUState.icount_mem_range_transfers): QEMU sees RAM traffic only as a
+ * count, not as tenures on the port.
+ */
+#define M33_SRAM_STREAM_PERIOD_MC 1378
+static const uint32_t seq_under_m33_sram_mc[2][2] = {
+    /* M0+ load: under M33 loads, stores; M0+ store: likewise. */
+    { 1090, 1045 },
+    { 641, 754 },
+};
+#define SEQ_TIMER_UNDER_M33_SRAM_MC 499
+#define SEQ_HFPERIPH_UNDER_M33_SRAM_MC 426
+
 /* Tenures older than this before a round start are forgotten. */
 #define HISTORY_PS (2000 * PS_PER_NS)
 
@@ -339,9 +363,42 @@ static int64_t seq_seqram_steal(Efr32Interconnect *ic, int64_t t)
     return mc_ps(ic->rhclk_hz, n * steal);
 }
 
+/* M0+ millicycles one access to @target loses to the M33's SRAM traffic. */
+static uint64_t seq_m33_sram_mc(Efr32Interconnect *ic, Efr32IcTarget target,
+                                bool is_write)
+{
+    CPUState *m33 = ic->cpu[EFR32_IC_M33];
+    const uint32_t *n;
+    uint64_t total, busy_ps, mc;
+    int64_t elapsed;
+
+    if (!m33 || (target != EFR32_IC_SRAM && target != EFR32_IC_TIMER &&
+                 target != EFR32_IC_HFPERIPH)) {
+        return 0;
+    }
+    n = m33->icount_mem_range_transfers[EFR32_IC_M33_SRAM_RANGE];
+    total = (uint64_t)n[0] + n[1];
+    /* The M33's own time: the M0+'s may run past the M33's slice. */
+    elapsed = (m33->icount_time_ns - ic->round_start_ns) * PS_PER_NS +
+              m33->icount_time_fs / FS_PER_PS;
+    if (!total || elapsed <= 0) {
+        return 0;
+    }
+    if (target == EFR32_IC_SRAM) {
+        mc = ((uint64_t)n[0] * seq_under_m33_sram_mc[is_write][0] +
+              (uint64_t)n[1] * seq_under_m33_sram_mc[is_write][1]) / total;
+    } else if (target == EFR32_IC_TIMER) {
+        mc = SEQ_TIMER_UNDER_M33_SRAM_MC;
+    } else {
+        mc = SEQ_HFPERIPH_UNDER_M33_SRAM_MC;
+    }
+    busy_ps = total * mc_ps(ic->hclk_hz, M33_SRAM_STREAM_PERIOD_MC);
+    return mc * MIN(busy_ps, (uint64_t)elapsed) / elapsed;
+}
+
 uint64_t efr32_ic_access(Efr32Interconnect *ic, unsigned m,
                          Efr32IcTarget target, bool m33_code_in_sram,
-                         unsigned *port_out)
+                         bool is_write, unsigned *port_out)
 {
     const Efr32IcTiming *tm = &timing[m][target];
     unsigned port = tm->port;
@@ -362,6 +419,7 @@ uint64_t efr32_ic_access(Efr32Interconnect *ic, unsigned m,
     if (m == EFR32_IC_SEQ) {
         /* The M0+ ran from SEQRAM since its last bus access. */
         core += seq_seqram_steal(ic, t);
+        core += mc_ps(hz, seq_m33_sram_mc(ic, target, is_write));
         r = t + core;
         if (t - ic->last_end_ps[m] > mc_ps(hz, SEQ_BACK_TO_BACK_GAP_MC)) {
             r += mc_ps(hz, SEQ_IDLE_WAIT_MC);
@@ -402,6 +460,8 @@ void efr32_ic_round_end(Efr32Interconnect *ic, int64_t start_ns,
                         int64_t end_ns)
 {
     int64_t horizon = start_ns * PS_PER_NS - HISTORY_PS;
+
+    ic->round_start_ns = end_ns;
 
     /* SEQRAM stolen from the M0+'s local execution in the rest of it. */
     if (ic->cpu[EFR32_IC_SEQ]) {

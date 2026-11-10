@@ -818,6 +818,8 @@ void icount_cpu_clocks_round_end_check(void)
     }
     CPU_FOREACH(cpu) {
         memset(cpu->icount_bus_accesses, 0, sizeof(cpu->icount_bus_accesses));
+        memset(cpu->icount_mem_range_transfers, 0,
+               sizeof(cpu->icount_mem_range_transfers));
     }
     seqlock_write_lock(&timers_state.vm_clock_seqlock,
                        &timers_state.vm_clock_lock);

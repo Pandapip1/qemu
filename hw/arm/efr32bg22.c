@@ -8371,20 +8371,26 @@ static void efr32_mem_costs_update(Efr32Periph *s)
     IcountMemCosts *flash_code = &s->m33_mem_costs[0];
     IcountMemCosts *sram_code = &s->m33_mem_costs[1];
 
+    /*
+     * Main SRAM is counted in both: the interconnect weighs the
+     * M33's SRAM traffic against the M0+'s accesses (efr32_ic_access).
+     */
     *flash_code = (IcountMemCosts) {
         .fetch_base = 0, .fetch_size = EFR32_CODE_REGION_END,
         .range[0] = { 0, EFR32_CODE_REGION_END,
                       EFR32_M33_FLASH_LOAD_WS1_MC + extra_ws, 0 },
+        .range[EFR32_IC_M33_SRAM_RANGE] = { EFR32_IC_SRAM_BASE,
+                      EFR32_IC_SRAM_END - EFR32_IC_SRAM_BASE, 0, 0, true },
     };
     *sram_code = (IcountMemCosts) {
         .fetch_base = EFR32_IC_SRAM_BASE,
         .fetch_size = EFR32_IC_SRAM_END - EFR32_IC_SRAM_BASE,
         .range[0] = { 0, EFR32_CODE_REGION_END,
                       EFR32_M33_SRAM_CODE_FLASH_LOAD_WS1_MC + extra_ws, 0 },
-        .range[1] = { EFR32_IC_SRAM_BASE,
+        .range[EFR32_IC_M33_SRAM_RANGE] = { EFR32_IC_SRAM_BASE,
                       EFR32_IC_SRAM_END - EFR32_IC_SRAM_BASE,
                       EFR32_M33_SRAM_CODE_SRAM_MC,
-                      EFR32_M33_SRAM_CODE_SRAM_MC },
+                      EFR32_M33_SRAM_CODE_SRAM_MC, true },
     };
 }
 
@@ -8448,7 +8454,7 @@ static uint64_t efr32_bus_cost(void *opaque, CPUState *master, uint64_t addr,
     s->ic.rhclk_hz = s->seq_cpuclk ? clock_get_hz(s->seq_cpuclk) : 0;
     s->ic.seq_executing = efr32_seq_executing(s);
     return efr32_ic_access(&s->ic, manager, efr32_ic_target(addr), sram_code,
-                           target);
+                           is_write, target);
 }
 
 static void efr32_bus_round_end(void *opaque, int64_t start_ns,

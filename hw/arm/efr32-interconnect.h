@@ -60,13 +60,18 @@ typedef struct Efr32Interconnect {
     int64_t last_end_ps[EFR32_IC_MANAGERS];
     /* Start of the M0+'s current run of SEQRAM-local execution. */
     int64_t seq_local_from_ps;
+    /* Start of the current per-CPU clock round, ns. */
+    int64_t round_start_ns;
 } Efr32Interconnect;
+
+/* The M33's icount_mem_costs range that is main SRAM (counted). */
+#define EFR32_IC_M33_SRAM_RANGE 1
 
 /* Extra millicycles of @manager for one access to @target at the
  * manager's current time; *port gets the occupancy class. */
 uint64_t efr32_ic_access(Efr32Interconnect *ic, unsigned manager,
                          Efr32IcTarget target, bool m33_code_in_sram,
-                         unsigned *port);
+                         bool is_write, unsigned *port);
 void efr32_ic_round_end(Efr32Interconnect *ic, int64_t start_ns,
                         int64_t end_ns);
 /* Exception entry of the M0+ now, millicycles, under the M33's SEQRAM use. */
