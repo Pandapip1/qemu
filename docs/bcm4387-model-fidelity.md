@@ -10,6 +10,56 @@ Evidence tags: **[F]** fact, observed in a named file/trace/driver line.
 **[I]** inferred, a model built to explain observed firmware control flow.
 **[?]** unknown, not modelled.
 
+## Strict model (2026-11-09) -- current state
+
+The sections after this one describe the early scaffold and are kept for
+history. The model is now split into devices: `bcm4387-pmu.c` (resource
+manager, indirect files, always-on write synchroniser), `bcm4387-gci.c`,
+`bcm4387-cc.c`, and `bcm4387.c` (machine, d11, CR4, wrappers). Each file
+header states what is modelled and why. Evidence classes: **[F]** silicon,
+**[B]** Broadcom/Linux source (bcmdhd 101.10.x: sbchipc.h, hndsoc.h,
+sbgci.h, d11.h, hndpmu.c, siutils.c), **[I]** inferred, **[U]** unknown
+(stored and traced only).
+
+Under `strict=on` the stock firmware boots to "Notify host through MSI -
+FW boot complete": RTE banner, PCIe MSGBUF attach, wl0/wl1/wl2 attach on
+all three slices, TCAM, both reclaims, ThreadX. At its first PHY write the
+model's res_state (0x5ecefbff) and all 94 PMU/GCI indirect entries dumped
+on silicon (run 14) equal silicon (`scripts/stock_state_check.py`). Runs 9,
+15 and 16 reproduce exactly (`scripts/model_regress.py`); runs 10/11 differ
+only in the raw PHY dump pattern (first read 0x0084, then 0xdb32), which is
+not explained.
+
+The per-register gap list is generated from the source tables:
+`scripts/strict_gaps.py > fw/trace/strict_gaps.tsv` (sibling repo). Values
+stock reads that the model lacks are in `fw/trace/strict_unknown_reads.tsv`.
+
+### Enable chain (what the model says makes the PHY usable)
+
+In stock's order, each a single write followed by a read-back of the same
+register (stock's ai_corereg pattern):
+
+1. PMU mac_res_req_mask (+0x68c) = 0x40000000 (MACPHY_CLK_MAIN; the PMU
+   closes the dependencies), mac_res_req_timer (+0x688) = 0x15000000. [F]
+   values from stock, [B] si_pmu_set_mac_rsrc_req.
+2. srpwr request domain 3 (MAC main) or 0x1e; poll status. [F]
+3. d11 core reset with PHY clock+reset held, ioctl to 0x145. [F]
+   With step 1 done, the PHY clock (MACPHY_CLK_MAIN) is up as soon as the
+   core is out of reset with its clock on. [I]
+4. d11 maccontrol (+0x120) = 0x04000400 (MCTL_WAKE | MCTL_IHR_EN). [B]
+   After this the clk_ctl_st PHY PLL request no longer reaches the PMU, so
+   step 1 must come first. [F] run 16. Gives SISF_FCLKA (iostatus 0x11006)
+   and live PHY/radio ports. [I]
+5. Optional, stock does them, no effect modelled: d11 +0x18c = 0, 16-bit
+   +0x3e6 = 0. [U]
+
+ChipCommon ERSRC0 (clk_ctl_st bit 24, CCS_SECI_AVAIL [B]) needs, in the
+model, the FLL LPO: pmucontrol_ext (PMU +0x6d8) |= 0x80, poll GCI
+chipstatus[15] bit 1 (index write 15 to GCI +0x40, read back, read +0x204),
+|= 0x200, then the CC request 0x110. [B] names, [I] that this gates bit 24.
+Before touching any PMU/GCI index register, either read every write back or
+set pmucontrol_ext bit 0 (FAST_TRANS_ENAB) as stock does (0x281). [F] run 15.
+
 ## Evidence sources
 
 1. **brcmfmac driver source** (`drivers/net/wireless/broadcom/brcm80211`):
