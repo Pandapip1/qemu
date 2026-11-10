@@ -350,6 +350,10 @@ void arm_cpu_do_transaction_failed(CPUState *cs, hwaddr physaddr,
 
     fi.ea = arm_extabort_type(response);
     fi.type = ARMFault_SyncExternal;
+    if (cpu->access_error_is_parity && (response & MEMTX_ACCESS_ERROR)) {
+        fi.ea = false;
+        fi.type = ARMFault_SyncParity;
+    }
     arm_deliver_fault(cpu, addr, access_type, mmu_idx, &fi);
 }
 

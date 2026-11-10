@@ -26,6 +26,7 @@
 #include "qemu/units.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
+#include "qemu/bitops.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "qapi/visitor.h"
@@ -37,6 +38,7 @@
 #include "system/address-spaces.h"
 #include "system/reset.h"
 #include "system/system.h"
+#include "system/runstate.h"
 
 #define TYPE_BCM4387_MACHINE MACHINE_TYPE_NAME("bcm4387")
 OBJECT_DECLARE_SIMPLE_TYPE(BCM4387MachineState, BCM4387_MACHINE)
@@ -62,17 +64,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(BCM4387MachineState, BCM4387_MACHINE)
  */
 #define ROM_SIZE        0x19b000
 
-/*
- * Scratch region below RAM for hand-modelled ROM functions (finding Z1). Not
- * real silicon: [SCRATCH_BASE] holds a bump-allocator cursor, allocations are
- * handed out from SCRATCH_BASE + 0x40 upward. [I].
- */
-#define SCRATCH_BASE    0x600000
-#define SCRATCH_SIZE    0x140000
-#define HEAP_START      (SCRATCH_BASE + 0x40)
-
-/* Hot ROM functions hand-modelled as native Thumb stubs patched into the ROM. */
-#define ROM_MALLOC      0x47eadc
 
 /*
  * Firmware ROM-patch table (static image data): entries of {rom_addr,
@@ -92,8 +83,24 @@ OBJECT_DECLARE_SIMPLE_TYPE(BCM4387MachineState, BCM4387_MACHINE)
 #define PMU_BASE        0x18012000
 #define PMU_TIMER       (PMU_BASE + 0x614)
 #define ILP_HZ          32768
-#define EROM_BASE       0x18f00000
+#define EROM_BASE       0x18105000
 #define EROM_SIZE       0x1000
+
+/*
+ * Address 0 is its own ECC-protected TCM (not an alias of 0x740000): the
+ * host writes only image word 0 there, and reading a never-written word
+ * there (e.g. 0x1e0) data-aborts with DFSR 0x409 on silicon. Its size is not
+ * known; model up to the ROM. The hole between the end of ROM and RAM
+ * (0x59b000-0x740000) aborts the same way (seen at 0x59b000 and 0x5a0000). [F]
+ */
+#define LOWTCM_SIZE     ROM_BASE
+#define HOLE_BASE       (ROM_BASE + ROM_SIZE)
+#define HOLE_SIZE       (RAM_BASE - HOLE_BASE)
+
+#define TCAM_SLOTS      1024
+#define SRPWR           (CC_BASE + 0x1e8)
+#define SRPWR_BASE_ON   0x23    /* power-domain status at handoff [F] */
+#define PHYPLL_LOCK_NS  10000   /* PHYPLL "available" this long after request */
 
 struct BCM4387MachineState {
     MachineState parent;
@@ -107,7 +114,7 @@ struct BCM4387MachineState {
     bool relocraw;
 
     ARMCPU *cpu;
-    MemoryRegion atcm, atcm_alias, btcm, socram, rom_mr, erom, scratch, trace;
+    MemoryRegion atcm, btcm, socram, rom_mr, erom, trace;
     GHashTable *store;
     uint32_t cr4_bankidx;
     uint32_t bank_info[8];
@@ -115,8 +122,19 @@ struct BCM4387MachineState {
     QEMUTimer *watch;
     uint32_t shared;
     uint32_t rng_state;
-    uint16_t phy_addr[3];
+    uint16_t phy_addr[3], radio_addr[3];
     GHashTable *phyregs;
+
+    bool strict;                /* unmodelled MMIO -> AXI slave error */
+    MemoryRegion lowtcm, hole;
+    uint8_t *lowtcm_mem;
+    unsigned long *lowtcm_valid;    /* ECC: one bit per written word */
+    uint32_t rstvec;                /* image word 0, written to 0 at reset */
+    uint8_t *rom_pristine;
+    uint32_t tcam_rom[TCAM_SLOTS];  /* programmed ROM address per slot, 0=off */
+    uint32_t tcam_base, tcam_op;
+    bool d11_phyflags[3];   /* left reset with PCLKE|PRST (0xc) held */
+    int64_t d11_phypll_t[3];    /* when PHYPLL was requested, -1 = not */
 };
 
 /* ---- catch-all tracer and modelled backplane registers ------------------ */
@@ -131,8 +149,8 @@ static uint32_t current_pc(void)
 
 static uint32_t chipid(void)
 {
-    /* id 0x4387, rev 7 ("BCM4387 r7" on the console), AXI backplane (1) */
-    return 0x4387 | (7 << 16) | (0 << 20) | (2 << 24) | (1u << 28);
+    /* as read on silicon: id 0x4387, rev 7, AXI backplane (type 1) [F] */
+    return 0x10074387;
 }
 
 static uint32_t store_get(BCM4387MachineState *s, hwaddr a)
@@ -145,18 +163,97 @@ static void store_set(BCM4387MachineState *s, hwaddr a, uint32_t v)
     g_hash_table_insert(s->store, GUINT_TO_POINTER(a), GUINT_TO_POINTER(v));
 }
 
+#define D11_WRAP(n)     (D11_BASE(n) + 0x100000)
+#define WRAP_IOCTL      0x408
+#define WRAP_IOSTATUS   0x500
+#define WRAP_RESETCTRL  0x800
+
+/* save/restore power domain of each d11 slice (srpwr bit), RAM 0x8491ae [F] */
+static const uint32_t d11_domain[3] = { 0x8, 0x4, 0x10 };
+
+static uint32_t srpwr_req(BCM4387MachineState *s)
+{
+    return (store_get(s, SRPWR) >> 8) & 0xff;
+}
+
+/* domains requested are on at once (requesting 0x1e gave status 0x3f) [F] */
+static uint32_t srpwr_status(BCM4387MachineState *s)
+{
+    return SRPWR_BASE_ON | srpwr_req(s);
+}
+
+static bool d11_phypll(BCM4387MachineState *s, int n)
+{
+    return s->d11_phypll_t[n] >= 0 &&
+           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->d11_phypll_t[n] >=
+           PHYPLL_LOCK_NS;
+}
+
+/*
+ * Extra master wrappers (PHY agents) of each d11 core, from the silicon EROM:
+ * core 0 0x18134000/0x18135000, core 1 0x18137000/0x18138000, core 2 none.
+ */
+static const hwaddr d11_agents[3][2] = {
+    { 0x18134000, 0x18135000 }, { 0x18137000, 0x18138000 }, { 0, 0 },
+};
+
+/*
+ * The PHY window answers once the PHY side is clocked: either the core's
+ * PHYPLL is locked (our firmware, queue run 7), or the slice's PHY-agent
+ * wrappers are out of reset with their clock on (what stock does before its
+ * phyversion read; with neither, queue run 6 got a slave error). [I]
+ */
+static bool d11_phy_ready(BCM4387MachineState *s, int n)
+{
+    if (d11_phypll(s, n)) {
+        return true;
+    }
+    if (!d11_agents[n][0]) {
+        return false;
+    }
+    for (int i = 0; i < 2; i++) {
+        hwaddr w = d11_agents[n][i];
+
+        if ((store_get(s, w + WRAP_RESETCTRL) & 1) ||
+            !(store_get(s, w + WRAP_IOCTL) & 1)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* index of the d11 core whose register space contains a, or -1 */
+static int d11_core(hwaddr a)
+{
+    for (int n = 0; n < 3; n++) {
+        if (a >= D11_BASE(n) && a < D11_BASE(n) + 0x1000) {
+            return n;
+        }
+    }
+    return -1;
+}
+
 static bool model_read(BCM4387MachineState *s, hwaddr a, uint32_t *v)
 {
     if (a >= 0x18000000 && a < 0x18100000 && (a & 0xfff) == 0x1e0) {
         /*
-         * clk_ctl_st on every core: clocks are up (silicon ChipCommon reads
-         * 0x020b0040 at reset): ALP avail 0x10000, HT avail 0x20000, backplane
-         * on HT 0x80000; external-resource status [26:24] follows the
-         * request bits [10:8]. [F]/[I]
+         * clk_ctl_st: request bits [15:0] as written; ALP/HT available and
+         * the backplane on HT (0xb0000) as at handoff; resource-available
+         * bits [28:24]. ChipCommon reads 0x020b0040 at handoff and 0x030b0152
+         * with ERSRC request 0x100. A d11 core out of reset reads 0x150b0040;
+         * requesting D11PLL (0x100) adds bit 24 and PHYPLL (0x200) adds bits
+         * 25/27 once the PLL locks (stock: 0x1f0b0342). [F]
          */
         uint32_t r = store_get(s, a) & 0xffff;
+        int n = d11_core(a);
 
-        *v = r | 0x000b0000 | ((r & 0x700) << 16);
+        *v = r | 0x000b0000;
+        if (a == CC_BASE + 0x1e0) {
+            *v |= 0x02000000 | ((r & 0x700) << 16);
+        } else if (n >= 0) {
+            *v |= 0x15000000 | (r & 0x100 ? 0x01000000 : 0) |
+                  (d11_phypll(s, n) ? 0x0a000000 : 0);
+        }
         return true;
     }
     switch (a) {
@@ -196,19 +293,22 @@ static bool model_read(BCM4387MachineState *s, hwaddr a, uint32_t *v)
     case D11_BASE(2) + 0x3e0:
         *v = 0xdb34;
         return true;
-    /*
-     * d11 wrapper iostatus (sflags): PHY band straps SISF_2G_PHY 0x1,
-     * SISF_5G_PHY 0x2, plus SISF_FCLKA 0x4. Inferred from the board NVRAM
-     * (bandcap=2 for slice 0, slice/1/bandcap=1, slice 2 default both). [I]
-     */
-    case D11_BASE(0) + 0x100000 + 0x500:
-        *v = 0x2 | 0x4;
+    case SRPWR:
+        /* save/restore power: request [15:8], status [23:16] [F] */
+        *v = (srpwr_status(s) << 16) | (srpwr_req(s) << 8);
         return true;
-    case D11_BASE(1) + 0x100000 + 0x500:
-        *v = 0x1 | 0x4;
+    case PMU_BASE + 0x60c: {
+        /*
+         * res_state: 0x1e0a83df at handoff; with a d11 PHYPLL up the stock
+         * firmware reads 0x5ecefbff, i.e. resources 0x40c47820 added. [F]
+         */
+        bool pll = d11_phypll(s, 0) || d11_phypll(s, 1) || d11_phypll(s, 2);
+
+        *v = 0x1e0a83df | (pll ? 0x40c47820 : 0);
         return true;
-    case D11_BASE(2) + 0x100000 + 0x500:
-        *v = 0x3 | 0x4;
+    }
+    case PMU_BASE + 0x610:          /* res_pending: transitions are instant */
+        *v = 0;
         return true;
     case CC_RNG + 0x24:             /* RNG_FIFO_COUNT: always full */
         *v = 0x10;
@@ -291,9 +391,49 @@ static bool model_read(BCM4387MachineState *s, hwaddr a, uint32_t *v)
     return false;
 }
 
+static void tcam_program(BCM4387MachineState *s, uint32_t slot);
+
 static bool model_write(BCM4387MachineState *s, hwaddr a, uint32_t v)
 {
+    int n = d11_core(a);
+
+    if (n >= 0 && a == D11_BASE(n) + 0x1e0) {
+        uint32_t old = store_get(s, a);
+
+        if ((v & 0x200) && !(old & 0x200)) {
+            s->d11_phypll_t[n] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        } else if (!(v & 0x200)) {
+            s->d11_phypll_t[n] = -1;
+        }
+        store_set(s, a, v);
+        return true;
+    }
+    for (n = 0; n < 3; n++) {
+        if (a == D11_WRAP(n) + WRAP_RESETCTRL) {
+            /* note whether the core left reset with PHY clock+reset held */
+            if ((store_get(s, a) & 1) && !(v & 1)) {
+                s->d11_phyflags[n] =
+                    (store_get(s, D11_WRAP(n) + WRAP_IOCTL) & 0xc) == 0xc;
+            }
+            store_set(s, a, v);
+            return true;
+        }
+    }
     switch (a) {
+    case CR4_BASE + 0x6c:           /* TCAM replacement base */
+        s->tcam_base = v;
+        store_set(s, a, v);
+        return true;
+    case CR4_BASE + 0x74:           /* TCAM operand: rom address | enable */
+        s->tcam_op = v;
+        store_set(s, a, v);
+        return true;
+    case CR4_BASE + 0x70:           /* TCAM command: 0x20000 | slot = write */
+        store_set(s, a, v);
+        if (v & 0x20000) {
+            tcam_program(s, v & (TCAM_SLOTS - 1));
+        }
+        return true;
     case GCI_BASE + 0x38:
     case GCI_BASE + 0x3c:
         /*
@@ -309,131 +449,374 @@ static bool model_write(BCM4387MachineState *s, hwaddr a, uint32_t v)
     return false;
 }
 
-/* ---- d11 PHY register file (indirect port +0x3fc addr / +0x3fe data) ----- */
-
-#define PHY_KEY(n, r)   GUINT_TO_POINTER(((n) << 16) | (r))
+/* ---- d11 PHY and radio register files (indirect ports) --------------------- */
 
 /*
- * Reset values the firmware depends on, as decoded on silicon into the
- * per-slice struct at [wlc_hw+4] (fw/dump/ram_identity.bin): PHY reg 0x02
- * bits[3:0] = 1 on every slice, PHY reg 0x0b bits[2:0] = number of PHY cores
- * (2, 2, 1). Only those bit fields are known; the rest of each value is 0. [F]
+ * Each d11 slice has a PHY port (address +0x3fc, data +0x3fe; a 32-bit write
+ * to +0x3fc is address | data << 16) and a radio port (address +0x3d8, data
+ * +0x3da). Registers are kept per slice and port; writes are logged as
+ * "PHYn"/"RADn" lines for the trace tooling.
+ */
+enum { PORT_PHY, PORT_RADIO };
+#define PORT_KEY(port, n, r) GUINT_TO_POINTER((port) << 24 | (n) << 16 | (r))
+
+static void port_seed(BCM4387MachineState *s, int port, int n, uint16_t r,
+                      uint16_t v)
+{
+    g_hash_table_insert(s->phyregs, PORT_KEY(port, n, r), GUINT_TO_POINTER(v));
+}
+
+/*
+ * Reset values the firmware depends on, from silicon:
+ * - PHY 0x02 bits[3:0] = 1 and PHY 0x0b bits[2:0] = number of PHY cores
+ *   (2, 2, 1), decoded into the per-slice struct at [wlc_hw+4]
+ *   (fw/dump/ram_identity.bin); the rest of those values is unknown (0).
+ * - PHY 0x480 reads the PHY version (0xdb32 on slice 0 via the ROM accessor,
+ *   queue run 7; other slices assumed to mirror their phyversion too).
+ * - radio 0 and 1 read 0x000c each (radio ID 0x000c000c, slice 0, run 7;
+ *   assumed the same on the other slices). [F]/[I]
  */
 static void phy_init(BCM4387MachineState *s)
 {
     static const uint8_t ncores[3] = { 2, 2, 1 };
+    static const uint16_t phyver[3] = { 0xdb32, 0xdb32, 0xdb34 };
 
     s->phyregs = g_hash_table_new(g_direct_hash, g_direct_equal);
     for (int n = 0; n < 3; n++) {
-        g_hash_table_insert(s->phyregs, PHY_KEY(n, 0x02), GUINT_TO_POINTER(1));
-        g_hash_table_insert(s->phyregs, PHY_KEY(n, 0x0b),
-                            GUINT_TO_POINTER(ncores[n]));
+        port_seed(s, PORT_PHY, n, 0x02, 1);
+        port_seed(s, PORT_PHY, n, 0x0b, ncores[n]);
+        port_seed(s, PORT_PHY, n, 0x480, phyver[n]);
+        port_seed(s, PORT_RADIO, n, 0, 0x000c);
+        port_seed(s, PORT_RADIO, n, 1, 0x000c);
     }
 }
 
-static int phy_slice(hwaddr a)
+static uint16_t port_get(BCM4387MachineState *s, int port, int n)
 {
-    for (int n = 0; n < 3; n++) {
-        if (a >= D11_BASE(n) + 0x3fc && a < D11_BASE(n) + 0x400) {
-            return n;
-        }
-    }
-    return -1;
-}
+    uint16_t a = port == PORT_PHY ? s->phy_addr[n] : s->radio_addr[n];
 
-static uint16_t phy_get(BCM4387MachineState *s, int n)
-{
     return GPOINTER_TO_UINT(g_hash_table_lookup(s->phyregs,
-                                                PHY_KEY(n, s->phy_addr[n])));
+                                                PORT_KEY(port, n, a)));
 }
 
-static void phy_put(BCM4387MachineState *s, int n, uint16_t v)
+static void port_put(BCM4387MachineState *s, int port, int n, uint16_t v)
 {
-    g_hash_table_insert(s->phyregs, PHY_KEY(n, s->phy_addr[n]),
-                        GUINT_TO_POINTER(v));
-    qemu_log_mask(LOG_UNIMP, "bcm4387: PHY%d W 0x%04x <- 0x%04x pc~0x%08x\n",
-                  n, s->phy_addr[n], v, current_pc());
+    uint16_t a = port == PORT_PHY ? s->phy_addr[n] : s->radio_addr[n];
+
+    g_hash_table_insert(s->phyregs, PORT_KEY(port, n, a), GUINT_TO_POINTER(v));
+    qemu_log_mask(LOG_UNIMP, "bcm4387: %s%d W 0x%04x <- 0x%04x pc~0x%08x\n",
+                  port == PORT_PHY ? "PHY" : "RAD", n, a, v, current_pc());
 }
 
-/* Returns true if the access hit a PHY port; *v receives read data. */
+/* Returns true if the access hit a PHY or radio port; *v receives read data. */
 static bool phy_port(BCM4387MachineState *s, hwaddr a, unsigned size,
                      bool wr, uint32_t val, uint32_t *v)
 {
-    int n = phy_slice(a);
+    int n = d11_core(a), port;
     hwaddr off;
+    uint16_t *areg;
 
     if (n < 0) {
         return false;
     }
     off = a - D11_BASE(n);
+    if (off == 0x3fc || off == 0x3fe) {
+        port = PORT_PHY;
+        areg = &s->phy_addr[n];
+    } else if (off == 0x3d8 || off == 0x3da) {
+        port = PORT_RADIO;
+        areg = &s->radio_addr[n];
+    } else {
+        return false;
+    }
     if (wr) {
-        if (off == 0x3fc) {
-            s->phy_addr[n] = val;
+        if (off == 0x3fc || off == 0x3d8) {
+            *areg = val;
             if (size == 4) {
-                phy_put(s, n, val >> 16);
+                port_put(s, port, n, val >> 16);
             }
-        } else if (off == 0x3fe) {
-            phy_put(s, n, val);
+        } else {
+            port_put(s, port, n, val);
         }
         return true;
     }
-    if (off == 0x3fc) {
-        *v = s->phy_addr[n] | (size == 4 ? (uint32_t)phy_get(s, n) << 16 : 0);
+    if (off == 0x3fc || off == 0x3d8) {
+        *v = *areg | (size == 4 ? (uint32_t)port_get(s, port, n) << 16 : 0);
     } else {
-        *v = off == 0x3fe ? phy_get(s, n) : 0;
+        *v = port_get(s, port, n);
     }
-    if (off != 0x3fc || size == 4) {
-        qemu_log_mask(LOG_UNIMP, "bcm4387: PHY%d R 0x%04x -> 0x%04x pc~0x%08x\n",
-                      n, s->phy_addr[n], phy_get(s, n), current_pc());
+    if ((off != 0x3fc && off != 0x3d8) || size == 4) {
+        qemu_log_mask(LOG_UNIMP, "bcm4387: %s%d R 0x%04x -> 0x%04x pc~0x%08x\n",
+                      port == PORT_PHY ? "PHY" : "RAD", n, *areg,
+                      port_get(s, port, n), current_pc());
     }
     return true;
 }
 
-static uint64_t trace_read(void *opaque, hwaddr addr, unsigned size)
+/* ---- ROM-patch (TCAM) unit ----------------------------------------------- */
+
+/*
+ * The firmware programs slots through CR4+0x74 (operand: ROM address | 1 to
+ * enable, 0 to clear) and CR4+0x70 (0x20000 | slot); CR4+0x6c holds the base
+ * of the 8-byte replacement words (0x750000 in stock). Reads of a patched
+ * 8-byte ROM slot then return base + 8 * slot. Model it by copying those RAM
+ * bytes into the ROM when the slot is programmed (restoring the pristine
+ * bytes when it is cleared), so a moved table or a bad slot shows up exactly
+ * as it would on silicon. Later changes to the RAM copy are not tracked. [F]
+ */
+static void tcam_program(BCM4387MachineState *s, uint32_t slot)
+{
+    uint32_t base = s->tcam_base ? s->tcam_base : 0x750000;
+    uint32_t old = s->tcam_rom[slot], rom = s->tcam_op & ~7u;
+    uint8_t buf[8];
+
+    if (old) {
+        address_space_write_rom(&address_space_memory, old,
+                                MEMTXATTRS_UNSPECIFIED,
+                                s->rom_pristine + (old - ROM_BASE), 8);
+        s->tcam_rom[slot] = 0;
+    }
+    if (!(s->tcam_op & 1)) {
+        return;
+    }
+    if (rom < ROM_BASE || rom + 8 > ROM_BASE + ROM_SIZE) {
+        qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: TCAM slot %u: ROM address "
+                      "0x%08x outside the ROM, ignored\n", slot, rom);
+        return;
+    }
+    address_space_read(&address_space_memory, base + 8 * slot,
+                       MEMTXATTRS_UNSPECIFIED, buf, 8);
+    address_space_write_rom(&address_space_memory, rom, MEMTXATTRS_UNSPECIFIED,
+                            buf, 8);
+    s->tcam_rom[slot] = rom;
+}
+
+/* ---- address 0 (ECC TCM) and the unbacked hole above the ROM -------------- */
+
+static MemTxResult lowtcm_read(void *opaque, hwaddr addr, uint64_t *data,
+                               unsigned size, MemTxAttrs attrs)
+{
+    BCM4387MachineState *s = opaque;
+
+    for (hwaddr w = addr >> 2; w <= (addr + size - 1) >> 2; w++) {
+        if (!test_bit(w, s->lowtcm_valid)) {
+            qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: ECC abort: read of "
+                          "never-written TCM word 0x%08" HWADDR_PRIx
+                          " pc~0x%08x\n", w << 2, current_pc());
+            return MEMTX_ACCESS_ERROR;
+        }
+    }
+    *data = ldn_le_p(s->lowtcm_mem + addr, size);
+    return MEMTX_OK;
+}
+
+static MemTxResult lowtcm_write(void *opaque, hwaddr addr, uint64_t data,
+                                unsigned size, MemTxAttrs attrs)
+{
+    BCM4387MachineState *s = opaque;
+
+    stn_le_p(s->lowtcm_mem + addr, size, data);
+    for (hwaddr w = addr >> 2; w <= (addr + size - 1) >> 2; w++) {
+        set_bit(w, s->lowtcm_valid);
+    }
+    return MEMTX_OK;
+}
+
+static const MemoryRegionOps lowtcm_ops = {
+    .read_with_attrs = lowtcm_read,
+    .write_with_attrs = lowtcm_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 4,
+};
+
+static MemTxResult hole_read(void *opaque, hwaddr addr, uint64_t *data,
+                             unsigned size, MemTxAttrs attrs)
+{
+    qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: ECC abort: read of unbacked "
+                  "0x%08" HWADDR_PRIx " pc~0x%08x\n", HOLE_BASE + addr,
+                  current_pc());
+    return MEMTX_ACCESS_ERROR;
+}
+
+/* writes to the hole: not observed on silicon; dropped. [I] */
+static MemTxResult hole_write(void *opaque, hwaddr addr, uint64_t data,
+                              unsigned size, MemTxAttrs attrs)
+{
+    qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: write to unbacked 0x%08"
+                  HWADDR_PRIx " dropped pc~0x%08x\n", HOLE_BASE + addr,
+                  current_pc());
+    return MEMTX_OK;
+}
+
+static const MemoryRegionOps hole_ops = {
+    .read_with_attrs = hole_read,
+    .write_with_attrs = hole_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
+/* ---- bus rules: d11 access, strict whitelist --------------------------------- */
+
+/*
+ * Silicon behaviour of the d11 cores (fw/open queue runs 3-6, notes/50-openfw.md):
+ * - power domain off (srpwr) or core in reset / clock off: AXI slave error.
+ * - core left reset without PHY clock+reset held (ioctl & 0xc) and later
+ *   given bandwidth/0x100 cflags: register reads get no response (stall).
+ * - PHY window (radio port 0x3d8/0x3da, phyversion 0x3e0, PHY port
+ *   0x3fc/0x3fe): slave error until the PHY side is clocked
+ *   (d11_phy_ready). [F]/[I]
+ */
+static MemTxResult d11_gate(BCM4387MachineState *s, hwaddr a)
+{
+    int n = d11_core(a);
+    uint32_t ioctl;
+
+    if (n < 0) {
+        return MEMTX_OK;
+    }
+    ioctl = store_get(s, D11_WRAP(n) + WRAP_IOCTL);
+    if (!(srpwr_status(s) & d11_domain[n])) {
+        qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: AXI slave error: d11 %d "
+                      "power domain off, 0x%08" HWADDR_PRIx " pc~0x%08x\n",
+                      n, a, current_pc());
+        return MEMTX_ERROR;
+    }
+    if ((store_get(s, D11_WRAP(n) + WRAP_RESETCTRL) & 1) || !(ioctl & 1)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: AXI slave error: d11 %d in "
+                      "reset or unclocked, 0x%08" HWADDR_PRIx " pc~0x%08x\n",
+                      n, a, current_pc());
+        return MEMTX_ERROR;
+    }
+    if (!s->d11_phyflags[n] && (ioctl & 0x1c0)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: STALL: d11 %d left reset "
+                      "without PHY flags, 0x%08" HWADDR_PRIx " pc~0x%08x\n",
+                      n, a, current_pc());
+        qemu_system_vmstop_request_prepare();
+        qemu_system_vmstop_request(RUN_STATE_PAUSED);
+        cpu_exit(current_cpu);
+        return MEMTX_OK;
+    }
+    if (a - D11_BASE(n) >= 0x3d8 && !d11_phy_ready(s, n)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: AXI slave error: d11 %d PHY "
+                      "window without PHYPLL, 0x%08" HWADDR_PRIx " pc~0x%08x\n",
+                      n, a, current_pc());
+        return MEMTX_ERROR;
+    }
+    return MEMTX_OK;
+}
+
+/*
+ * Registers the model knows (modelled or plain storage with known
+ * semantics). In strict mode every other access is an AXI slave error, so
+ * firmware that touches something we have not characterised fails visibly.
+ */
+static bool reg_known(hwaddr a)
+{
+    static const struct { hwaddr base, len; } ranges[] = {
+        { CC_BASE + 0x000, 0x08 },      /* chipid, capabilities */
+        { CC_BASE + 0x02c, 0x04 },      /* chipstatus */
+        { CC_BASE + 0x0ac, 0x04 },      /* capabilities_ext */
+        { CC_BASE + 0x0fc, 0x04 },      /* EROM pointer */
+        { CC_BASE + 0x1e0, 0x04 },      /* clk_ctl_st */
+        { SRPWR, 0x04 },
+        { CC_RNG, 0x28 },
+        { CR4_BASE + 0x04, 0x04 }, { CR4_BASE + 0x40, 0x08 },
+        { CR4_BASE + 0x68, 0x10 },      /* TCAM */
+        { PMU_BASE + 0x600, 0x20 },     /* ctl, caps, status, res_* , timer */
+        { GCI_BASE + 0x038, 0x08 },     /* semaphores */
+        { GCI_BASE + 0x310, 0x1c },     /* handshake, OTP control/status */
+        { GCI_BASE + 0xc04, 0x04 }, { GCI_BASE + 0xc1c, 0x08 },  /* LPO */
+        { OOBR_BASE, 0xa00 },
+    };
+
+    for (int i = 0; i < ARRAY_SIZE(ranges); i++) {
+        if (a >= ranges[i].base && a < ranges[i].base + ranges[i].len) {
+            return true;
+        }
+    }
+    if (a >= 0x18100000 && a < 0x18200000) {    /* AI wrappers */
+        hwaddr o = a & 0xfff;
+
+        return o == WRAP_IOCTL || o == WRAP_IOSTATUS || o == WRAP_RESETCTRL ||
+               o == WRAP_RESETCTRL + 4 || (o >= 0x900 && o < 0x940);
+    }
+    if (d11_core(a) >= 0) {
+        hwaddr o = a - D11_BASE(d11_core(a));
+
+        return o == 0x1e0 || o >= 0x3d8;
+    }
+    return false;
+}
+
+static MemTxResult trace_read(void *opaque, hwaddr addr, uint64_t *data,
+                              unsigned size, MemTxAttrs attrs)
 {
     BCM4387MachineState *s = opaque;
     uint32_t v = 0;
     bool modelled;
+    MemTxResult r = d11_gate(s, addr);
 
+    if (r != MEMTX_OK) {
+        return r;
+    }
     if (phy_port(s, addr, size, false, 0, &v)) {
-        return v;
+        *data = v;
+        return MEMTX_OK;
     }
     modelled = model_read(s, addr, &v);
-
     if (!modelled) {
-        gpointer p = g_hash_table_lookup(s->store, GUINT_TO_POINTER(addr));
-        v = GPOINTER_TO_UINT(p);
+        if (s->strict && !reg_known(addr)) {
+            qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: AXI slave error: "
+                          "unmodelled R%u 0x%08" HWADDR_PRIx " pc~0x%08x\n",
+                          size * 8, addr, current_pc());
+            return MEMTX_ERROR;
+        }
+        v = store_get(s, addr);
     }
     qemu_log_mask(LOG_UNIMP, "bcm4387: %s R%u 0x%08" HWADDR_PRIx
                   " -> 0x%08x pc~0x%08x\n", modelled ? "MODEL" : "MMIO ",
                   size * 8, addr, v, current_pc());
-    return v;
+    *data = v;
+    return MEMTX_OK;
 }
 
-static void trace_write(void *opaque, hwaddr addr, uint64_t val,
-                        unsigned size)
+static MemTxResult trace_write(void *opaque, hwaddr addr, uint64_t val,
+                               unsigned size, MemTxAttrs attrs)
 {
     BCM4387MachineState *s = opaque;
     bool modelled;
+    MemTxResult r = d11_gate(s, addr);
 
+    if (r != MEMTX_OK) {
+        return r;
+    }
     if (phy_port(s, addr, size, true, val, NULL)) {
-        return;
+        return MEMTX_OK;
+    }
+    if (s->strict && !reg_known(addr)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: AXI slave error: unmodelled "
+                      "W%u 0x%08" HWADDR_PRIx " <- 0x%08" PRIx64
+                      " pc~0x%08x\n", size * 8, addr, val, current_pc());
+        return MEMTX_ERROR;
     }
     modelled = model_write(s, addr, val);
-
     if (!modelled) {
-        g_hash_table_insert(s->store, GUINT_TO_POINTER(addr),
-                            GUINT_TO_POINTER((uint32_t)val));
+        store_set(s, addr, val);
     }
     qemu_log_mask(LOG_UNIMP, "bcm4387: %s W%u 0x%08" HWADDR_PRIx
                   " <- 0x%08" PRIx64 " pc~0x%08x\n",
                   modelled ? "MODEL" : "MMIO ", size * 8, addr, val,
                   current_pc());
+    return MEMTX_OK;
 }
 
 static const MemoryRegionOps trace_ops = {
-    .read = trace_read,
-    .write = trace_write,
+    .read_with_attrs = trace_read,
+    .write_with_attrs = trace_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid.min_access_size = 1,
     .valid.max_access_size = 4,
@@ -484,38 +867,44 @@ static void oobr_init(BCM4387MachineState *s)
 /* ---- EROM --------------------------------------------------------------- */
 
 /*
- * The chip's enumeration ROM, rebuilt from the firmware's own parse of it in a
- * hardware RAM coredump (fw/dump/ram_identity.bin: the si_info core arrays at
- * 0x8231fc.. and the AXI wrapper list at 0x8b4564). 18 cores: ChipCommon,
- * PCIe Gen2 (0x83c), ARM CR4, 3x d11 (0x812), 0x857, 0x855 x2, 0x85c, 0x841 x5,
- * GCI (0x840), PMU (0x827), the ARM default slave (0xfff) at 0x59b000, plus the
- * ARM bridge components (0x135, 0x31) whose wrappers the firmware error-logs.
- * CIA/CIB words, both slave ports, sizes and every wrapper address are as
- * recorded on silicon; master-port IDs and the bridge windows (which the
- * firmware does not keep) are placeholders. [F]
+ * The chip's enumeration ROM as read on silicon by the open firmware
+ * (fw/dump/erom_silicon.bin, 190 words at 0x18105000 = ChipCommon+0xfc). It
+ * includes 64-bit address descriptors (type 0xD) that a reconstruction from
+ * the firmware's parsed core table lacked. [F]
  */
 static const uint32_t erom_words[] = {
     0x4bf80001, 0x45084411, 0x00000003, 0x18000005, 0x1c000135, 0x04000000,
     0x181000c5, 0x18103185, 0x4bf83c01, 0x47084411, 0x00000103, 0x18001005,
-    0x18002005, 0x08000135, 0x08000000, 0x181010c5, 0x18102185, 0x4bf83e01,
-    0x12084411, 0x00000203, 0x18030005, 0x00000135, 0x0059b000, 0x181300c5,
-    0x1813c185, 0x4bf81201, 0x5508c431, 0x00000303, 0x00000413, 0x00000523,
-    0x18031005, 0xe8800135, 0x00800000, 0x181310c5, 0x181341c5, 0x181352c5,
-    0x18136185, 0x4bf81201, 0x5508c431, 0x00000603, 0x00000713, 0x00000823,
-    0x18032005, 0xe8000135, 0x00800000, 0x181320c5, 0x181371c5, 0x181382c5,
-    0x18139185, 0x4bf81201, 0x55084411, 0x00000903, 0x18033005, 0xe9000135,
-    0x00800000, 0x181330c5, 0x1813a185, 0x4bf85701, 0x02084211, 0x00000a03,
-    0x19000035, 0x01000000, 0x181080c5, 0x18109085, 0x4bf85501, 0x03000201,
-    0x18004005, 0x4bf85501, 0x03000201, 0x18005005, 0x4bf85c01, 0x00000201,
-    0x18006005, 0x4bf84101, 0x09000201, 0x18007005, 0x4bf84001, 0x13000201,
-    0x18010015, 0x4bf82701, 0x27000201, 0x18012005, 0x4bf84101, 0x09000201,
-    0x18013005, 0x4bf84101, 0x09000201, 0x18014005, 0x4bf84101, 0x09000201,
+    0x18002005, 0x18003005, 0x08000135, 0x08000000, 0x0000013d, 0x80000000,
+    0x00000008, 0x80000000, 0x181010c5, 0x18102185, 0x4bf83e01, 0x12084411,
+    0x00000203, 0x18030005, 0x18034025, 0x00000135, 0x0059b000, 0x00740135,
+    0x001f9000, 0x181300c5, 0x1813c185, 0x4bf81201, 0x5508c431, 0x00000303,
+    0x00000413, 0x00000523, 0x18031005, 0xe8800135, 0x00800000, 0x181310c5,
+    0x181341c5, 0x181352c5, 0x18136185, 0x4bf81201, 0x5508c431, 0x00000603,
+    0x00000713, 0x00000823, 0x18032005, 0xe8000135, 0x00800000, 0x181320c5,
+    0x181371c5, 0x181382c5, 0x18139185, 0x4bf81201, 0x55084411, 0x00000903,
+    0x18033005, 0xe9000135, 0x00800000, 0x181330c5, 0x1813a185, 0x4bf85701,
+    0x02084211, 0x00000a03, 0x19000035, 0x01000000, 0x181080c5, 0x18109085,
+    0x4bf85501, 0x03000201, 0x18004005, 0x4bf85501, 0x03000201, 0x18005005,
+    0x4bf85c01, 0x00000201, 0x18006005, 0x4bf84101, 0x09000201, 0x18007005,
+    0x4bf84001, 0x13000201, 0x18010015, 0x4bf82701, 0x27000201, 0x18012005,
+    0x4bf84101, 0x09000201, 0x18013005, 0x4bf84101, 0x09000201, 0x18014005,
+    0x4bf84a01, 0x0c000201, 0x18015005, 0x18016005, 0x18017005, 0x1801c005,
+    0x4bf84a01, 0x0e000201, 0x18018005, 0x1801d005, 0x4bf84a01, 0x0d000201,
+    0x18019005, 0x1801a005, 0x1801b005, 0x1801e005, 0x4bf84101, 0x09000201,
     0x1801f005, 0x4bf84101, 0x09000201, 0x18020005, 0x43b13501, 0x00080201,
-    0x18200045, 0x18106085, 0x43b13501, 0x00080201, 0x18201045, 0x18107085,
-    0x43b13501, 0x00080201, 0x18202045, 0x1813d085, 0x43b03101, 0x00080201,
-    0x18203045, 0x1810a085, 0x43b03101, 0x00084201, 0x18204045, 0x1810b0c5,
-    0x1813e085, 0x43b03101, 0x00084201, 0x18205045, 0x1810c0c5, 0x1813f085,
-    0x43bfff01, 0x00080201, 0x0059b035, 0x001a5000, 0x18104085, 0x0000000f,
+    0x18000075, 0x00006000, 0x18106085, 0x43b13501, 0x00080201, 0x18010075,
+    0x00010000, 0x18020055, 0x18107085, 0x43b13501, 0x00080201, 0x18030075,
+    0x00008000, 0x1813d085, 0x43b36601, 0x00000201, 0x18105005, 0x43b36601,
+    0x00000201, 0x18140005, 0x43b30101, 0x00000201, 0x18200035, 0x00100000,
+    0x43b30101, 0x00000201, 0x18300035, 0x00100000, 0x43b03101, 0x00080011,
+    0x00000b03, 0x1810a085, 0x43b03101, 0x00084011, 0x00000c03, 0x1810b0c5,
+    0x1813e085, 0x43b03101, 0x00084011, 0x00000d03, 0x1810c0c5, 0x1813f085,
+    0x43bfff01, 0x00080201, 0x0059b035, 0x001a5000, 0x00939035, 0x076c7000,
+    0x10000035, 0x08000000, 0x18008035, 0x00008000, 0x18021035, 0x0000f000,
+    0x18038035, 0x000c8000, 0x1810d035, 0x00023000, 0x18141035, 0x000bf000,
+    0x18400035, 0x00c00000, 0x1a000035, 0x02000000, 0x20000035, 0xc8000000,
+    0xe9800035, 0x16800000, 0x18104085, 0x0000000f,
 };
 
 static void erom_build(BCM4387MachineState *s)
@@ -604,44 +993,20 @@ static void watch_shared(void *opaque)
 
 /* ---- machine ------------------------------------------------------------ */
 
-/*
- * A tiny Thumb bump allocator (finding Z1, [I]): r0=size in, r0=pointer out.
- * It reads/advances the cursor word at SCRATCH_BASE and never frees. Assembled
- * from mstub.s; the movw/movt immediates encode SCRATCH_BASE (0x00600000).
- */
-static const uint16_t malloc_stub[] = {
-    0xf240, 0x0300,   /* movw r3, #0x0000      */
-    0xf2c0, 0x0360,   /* movt r3, #0x0060      */
-    0x6819,           /* ldr  r1, [r3]         */
-    0xf100, 0x0007,   /* add.w r0, r0, #7      */
-    0xf020, 0x0007,   /* bic.w r0, r0, #7      */
-    0xeb01, 0x0200,   /* add.w r2, r1, r0      */
-    0x601a,           /* str  r2, [r3]         */
-    0x4608,           /* mov  r0, r1           */
-    0x4770,           /* bx   lr               */
-};
-
-static void install_rom_stub(BCM4387MachineState *s, uint32_t addr,
-                             const uint16_t *code, size_t n)
-{
-    uint16_t *rom = memory_region_get_ram_ptr(&s->rom_mr);
-    uint32_t off = (addr - ROM_BASE) / 2;
-
-    assert(addr >= ROM_BASE && addr + 2 * n <= ROM_BASE + ROM_SIZE);
-    for (size_t i = 0; i < n; i++) {
-        rom[off + i] = cpu_to_le16(code[i]);
-    }
-}
-
 static void bcm4387_reset(void *opaque)
 {
     BCM4387MachineState *s = opaque;
 
     cpu_reset(CPU(s->cpu));
-    /* brcmf_chip_cr4_set_active(): the host writes rstvec to TCM offset 0 */
+    /*
+     * brcmf_chip_cr4_set_active(): the host writes only image word 0 (the
+     * reset vector) to address 0; the rest of that TCM is never written.
+     */
+    memset(s->lowtcm_mem, 0, LOWTCM_SIZE);
+    bitmap_zero(s->lowtcm_valid, LOWTCM_SIZE / 4);
+    stl_le_p(s->lowtcm_mem, s->rstvec);
+    set_bit(0, s->lowtcm_valid);
     s->shared = ram_ld(RAM_TOP - 4);
-    address_space_stl_le(&address_space_memory, SCRATCH_BASE, HEAP_START,
-                         MEMTXATTRS_UNSPECIFIED, NULL);
     timer_mod(s->watch, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
 }
 
@@ -662,21 +1027,32 @@ static void bcm4387_init(MachineState *machine)
         exit(1);
     }
 
+    /*
+     * CP15 as read on silicon at reset: ATCM region 0x39 (base 0, 8 MiB),
+     * BTCM region 0x00800031 (base 0x800000, 2 MiB), SCTLR 0x40e50878 (TE
+     * from cfgte). Never-written TCM words read as ECC (parity) aborts. [F]
+     */
     cpuobj = object_new(machine->cpu_type);
     object_property_set_bool(cpuobj, "cfgte", true, &error_fatal);
-    object_property_set_uint(cpuobj, "atcm-region", 0x1, &error_fatal);
-    object_property_set_uint(cpuobj, "btcm-region",
-                             (RAM_BASE + s->atcm_size) | 0x1, &error_fatal);
+    object_property_set_bool(cpuobj, "access-error-parity", true, &error_fatal);
+    object_property_set_uint(cpuobj, "atcm-region", 0x39, &error_fatal);
+    object_property_set_uint(cpuobj, "btcm-region", 0x00800031, &error_fatal);
+    ARM_CPU(cpuobj)->reset_sctlr = 0x00e50878;
     qdev_realize(DEVICE(cpuobj), NULL, &error_fatal);
     s->cpu = ARM_CPU(cpuobj);
 
-    /* ATCM at 0, aliased at rambase; BTCM follows it up to RAM_TOP */
+    /* RAM: the ATCM part at rambase, BTCM from 0x800000 up to RAM_TOP */
     memory_region_init_ram(&s->atcm, NULL, "bcm4387.atcm", s->atcm_size,
                            &error_fatal);
-    memory_region_add_subregion(sysmem, 0, &s->atcm);
-    memory_region_init_alias(&s->atcm_alias, NULL, "bcm4387.atcm-alias",
-                             &s->atcm, 0, s->atcm_size);
-    memory_region_add_subregion(sysmem, RAM_BASE, &s->atcm_alias);
+    memory_region_add_subregion(sysmem, RAM_BASE, &s->atcm);
+    s->lowtcm_mem = g_malloc0(LOWTCM_SIZE);
+    s->lowtcm_valid = bitmap_new(LOWTCM_SIZE / 4);
+    memory_region_init_io(&s->lowtcm, NULL, &lowtcm_ops, s, "bcm4387.tcm0",
+                          LOWTCM_SIZE);
+    memory_region_add_subregion(sysmem, 0, &s->lowtcm);
+    memory_region_init_io(&s->hole, NULL, &hole_ops, s, "bcm4387.hole",
+                          HOLE_SIZE);
+    memory_region_add_subregion(sysmem, HOLE_BASE, &s->hole);
     memory_region_init_ram(&s->btcm, NULL, "bcm4387.btcm",
                            RAM_SIZE - s->atcm_size, &error_fatal);
     memory_region_add_subregion(sysmem, RAM_BASE + s->atcm_size, &s->btcm);
@@ -709,8 +1085,8 @@ static void bcm4387_init(MachineState *machine)
                            &error_fatal);
     memory_region_add_subregion(sysmem, ROM_BASE, &s->rom_mr);
     {
-        /* Default the whole ROM window to "bx lr" + the malloc stub, then
-         * overlay any real ROM given via rom= on top. rom= is a ';'-separated
+        /* Default the whole ROM window to "bx lr", then overlay any real ROM
+         * given via rom= on top. rom= is a ';'-separated
          * list of chunks, each "path" (loaded at ROM_BASE) or "path@0xADDR"
          * (loaded at that absolute address in the ROM window). Partial chunks
          * are fine; whatever isn't covered stays a stub. */
@@ -719,7 +1095,6 @@ static void bcm4387_init(MachineState *machine)
         for (int i = 0; i < ROM_SIZE / 2; i++) {
             h[i] = cpu_to_le16(0x4770);     /* bx lr */
         }
-        install_rom_stub(s, ROM_MALLOC, malloc_stub, ARRAY_SIZE(malloc_stub));
 
         if (s->rom) {
             g_auto(GStrv) chunks = g_strsplit(s->rom, ";", 0);
@@ -750,9 +1125,8 @@ static void bcm4387_init(MachineState *machine)
         }
     }
 
-    memory_region_init_ram(&s->scratch, NULL, "bcm4387.scratch", SCRATCH_SIZE,
-                           &error_fatal);
-    memory_region_add_subregion(sysmem, SCRATCH_BASE, &s->scratch);
+    s->rom_pristine = g_memdup2(memory_region_get_ram_ptr(&s->rom_mr),
+                                ROM_SIZE);
 
     memory_region_init_rom(&s->erom, NULL, "bcm4387.erom", EROM_SIZE,
                            &error_fatal);
@@ -762,6 +1136,23 @@ static void bcm4387_init(MachineState *machine)
     s->store = g_hash_table_new(g_direct_hash, g_direct_equal);
     oobr_init(s);
     phy_init(s);
+    /* register state at the host->firmware handoff, read on silicon [F] */
+    store_set(s, CC_BASE + 0x1e0, 0x40);
+    store_set(s, PMU_BASE + 0x600, 0x380);
+    store_set(s, PMU_BASE + 0x608, 0x1613e);
+    store_set(s, PMU_BASE + 0x618, 1);
+    store_set(s, PMU_BASE + 0x61c, 0x7fffffff);
+    {
+        static const uint32_t iostatus[3] = { 0x11002, 0x11001, 0x11018 };
+
+        for (int n = 0; n < 3; n++) {
+            store_set(s, D11_WRAP(n) + WRAP_IOCTL, 0);
+            store_set(s, D11_WRAP(n) + WRAP_RESETCTRL, 1);
+            store_set(s, D11_WRAP(n) + WRAP_IOSTATUS, iostatus[n]);
+            store_set(s, D11_BASE(n) + 0x1e0, 0x40);
+            s->d11_phypll_t[n] = -1;
+        }
+    }
     memory_region_init_io(&s->trace, NULL, &trace_ops, s, "bcm4387.trace",
                           UINT64_MAX);
     memory_region_add_subregion_overlap(sysmem, 0, &s->trace, -1000);
@@ -775,12 +1166,7 @@ static void bcm4387_init(MachineState *machine)
      * Identity relocation: force the two ASLR placement helpers (0x8a3e48
      * intra-page, 0x8a3eb8 page) to "movs r0,#0; bx lr" so every section's ASLR
      * offset is 0 and code stays at its link address — matching the hw patch.
-     *
-     * The relocation dispatcher at 0x8a40e4 runs the placed init function (via
-     * blx) and, because the ASLR scheme expects that call not to return here,
-     * tail-calls the panic at 0x8a3ea0. Under identity the placed function is at
-     * its link address and returns normally, so replace that panic tail at
-     * 0x8a4120 with "bx lr" to return to the dispatcher's caller (0x840f72).
+     * (Same two patches as scripts/rompatch.py applies on hardware.)
      */
     {
         g_autofree char *fw = NULL;
@@ -832,18 +1218,20 @@ static void bcm4387_init(MachineState *machine)
             }
             memcpy(fw + op, movs_r0_0, sizeof(movs_r0_0));
         } else if (s->identity && !s->relocate) {
+            /* stock image only: the patch sites must hold the stock bytes */
             static const uint8_t ret0[] = { 0x00, 0x20, 0x70, 0x47 };
-            static const uint8_t bxlr[] = { 0x70, 0x47, 0x00, 0xbf };
+            static const uint8_t orig1[] = { 0x08, 0xb5, 0x07, 0x4b };
+            static const uint8_t orig2[] = { 0x13, 0x4b, 0x70, 0xb5 };
             gsize o1 = 0x8a3e48 - RAM_BASE, o2 = 0x8a3eb8 - RAM_BASE;
-            gsize o3 = 0x8a4120 - RAM_BASE;
 
-            if (o3 + 4 > fwlen) {
-                error_report("bcm4387: firmware too small for identity patch");
-                exit(1);
+            if (o2 + 4 <= fwlen && !memcmp(fw + o1, orig1, 4) &&
+                !memcmp(fw + o2, orig2, 4)) {
+                memcpy(fw + o1, ret0, 4);
+                memcpy(fw + o2, ret0, 4);
+            } else {
+                info_report("bcm4387: not the stock image, identity patch "
+                            "not applied");
             }
-            memcpy(fw + o1, ret0, 4);
-            memcpy(fw + o2, ret0, 4);
-            memcpy(fw + o3, bxlr, 4);
         } else if (s->relocate) {
             /*
              * relocate=on: let the real ASLR relocator run, but force a
@@ -874,27 +1262,7 @@ static void bcm4387_init(MachineState *machine)
             memcpy(fw + o1, intra0, sizeof(intra0));
             memcpy(fw + o2, page_off, sizeof(page_off));
         }
-        /*
-         * Mirror the ROM-patch redirect unit's read-side effect: copy each
-         * veneer from the image into its ROM slot so reads of a patched ROM
-         * address return the veneer, as the firmware's verify at RAM 0x82c3f0
-         * expects. Only meaningful under identity (link addresses) with a real
-         * ROM mapped.
-         */
-        if (s->identity && s->rom) {
-            uint8_t *rom = memory_region_get_ram_ptr(&s->rom_mr);
-
-            for (gsize t = PATCH_TBL - RAM_BASE;
-                 t + 8 <= PATCH_TBL_END - RAM_BASE && t + 8 <= fwlen; t += 8) {
-                uint32_t src = ldl_le_p(fw + t), dst = ldl_le_p(fw + t + 4);
-                gsize so = src - ROM_BASE, vo = dst - RAM_BASE;
-
-                if (src >= ROM_BASE && so + 8 <= ROM_SIZE &&
-                    dst >= RAM_BASE && vo + 8 <= fwlen) {
-                    memcpy(rom + so, fw + vo, 8);
-                }
-            }
-        }
+        s->rstvec = ldl_le_p(fw);
         rom_add_blob_fixed("bcm4387.fw", fw, fwlen, RAM_BASE);
     }
 
@@ -974,12 +1342,23 @@ static void set_relocraw(Object *o, bool v, Error **errp)
     BCM4387_MACHINE(o)->relocraw = v;
 }
 
+static bool get_strict(Object *o, Error **errp)
+{
+    return BCM4387_MACHINE(o)->strict;
+}
+
+static void set_strict(Object *o, bool v, Error **errp)
+{
+    BCM4387_MACHINE(o)->strict = v;
+}
+
 static void bcm4387_instance_init(Object *obj)
 {
     /* CP15 at reset on silicon: ATCM region 0-8 MiB, BTCM base 0x800000 */
     BCM4387_MACHINE(obj)->atcm_size = 0x800000 - RAM_BASE;
     BCM4387_MACHINE(obj)->rng_state = 0x4387c2;
     BCM4387_MACHINE(obj)->identity = true;
+    BCM4387_MACHINE(obj)->strict = true;
 }
 
 static void bcm4387_class_init(ObjectClass *oc, const void *data)
@@ -1003,6 +1382,7 @@ static void bcm4387_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_bool(oc, "identity", get_identity, set_identity);
     object_class_property_add_bool(oc, "relocate", get_relocate, set_relocate);
     object_class_property_add_bool(oc, "relocraw", get_relocraw, set_relocraw);
+    object_class_property_add_bool(oc, "strict", get_strict, set_strict);
 }
 
 static const TypeInfo bcm4387_machine_types[] = {

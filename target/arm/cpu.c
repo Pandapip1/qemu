@@ -1331,6 +1331,10 @@ static const Property arm_cpu_cfgend_property =
 static const Property arm_cpu_cfgte_property =
             DEFINE_PROP_BOOL("cfgte", ARMCPU, cfgte, false);
 
+static const Property arm_cpu_access_error_parity_property =
+            DEFINE_PROP_BOOL("access-error-parity", ARMCPU,
+                             access_error_is_parity, false);
+
 static const Property arm_cpu_has_vfp_property =
             DEFINE_PROP_BOOL("vfp", ARMCPU, has_vfp, true);
 
@@ -1737,6 +1741,8 @@ static void arm_cpu_post_init(Object *obj)
     qdev_property_add_static(DEVICE(obj), &arm_cpu_cfgend_property);
     if (!arm_feature(&cpu->env, ARM_FEATURE_M)) {
         qdev_property_add_static(DEVICE(obj), &arm_cpu_cfgte_property);
+        qdev_property_add_static(DEVICE(obj),
+                                 &arm_cpu_access_error_parity_property);
     }
 }
 

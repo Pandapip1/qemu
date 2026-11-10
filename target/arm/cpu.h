@@ -1149,6 +1149,12 @@ struct ArchCPU {
 
     /* Whether the CFGTE input is high: reset into Thumb with SCTLR.TE set. */
     bool cfgte;
+    /*
+     * Report a memory system MEMTX_ACCESS_ERROR response as a synchronous
+     * parity/ECC abort (short-format FSR 0x409) instead of an external abort;
+     * boards with ECC-protected TCM use it for reads of never-written words.
+     */
+    bool access_error_is_parity;
 
     /* Cortex-R TCM region register reset values (ATCM, BTCM). */
     uint32_t tcm_region_reset[2];
