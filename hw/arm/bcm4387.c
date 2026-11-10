@@ -150,6 +150,11 @@ static uint32_t current_pc(void)
     return cpu_env(current_cpu)->regs[15];
 }
 
+static uint32_t current_lr(void)
+{
+    return current_cpu ? cpu_env(current_cpu)->regs[14] : 0;
+}
+
 static uint32_t chipid(void)
 {
     /* as read on silicon: id 0x4387, rev 7, AXI backplane (type 1) [F] */
@@ -536,8 +541,9 @@ static void port_put(BCM4387MachineState *s, int port, int n, uint16_t v)
     } else {
         s->radio_latch[n] = v;
     }
-    qemu_log_mask(LOG_UNIMP, "bcm4387: %s%d W 0x%04x <- 0x%04x pc~0x%08x\n",
-                  port == PORT_PHY ? "PHY" : "RAD", n, a, v, current_pc());
+    qemu_log_mask(LOG_UNIMP, "bcm4387: %s%d W 0x%04x <- 0x%04x pc~0x%08x "
+                  "lr~0x%08x\n", port == PORT_PHY ? "PHY" : "RAD", n, a, v,
+                  current_pc(), current_lr());
 }
 
 /* A data read through a port (see phy_init for the latch behaviour). */
@@ -590,6 +596,9 @@ static bool phy_port(BCM4387MachineState *s, hwaddr a, unsigned size,
     if (wr) {
         if (off == 0x3fc || off == 0x3d8) {
             *areg = val;
+            qemu_log_mask(LOG_UNIMP, "bcm4387: %s%d A 0x%04x pc~0x%08x "
+                          "lr~0x%08x\n", port == PORT_PHY ? "PHY" : "RAD", n,
+                          (uint16_t)val, current_pc(), current_lr());
             if (size == 4) {
                 port_put(s, port, n, val >> 16);
             }
@@ -834,8 +843,9 @@ static MemTxResult trace_read(void *opaque, hwaddr addr, uint64_t *data,
         v = store_get(s, addr);
     }
     qemu_log_mask(LOG_UNIMP, "bcm4387: %s R%u 0x%08" HWADDR_PRIx
-                  " -> 0x%08x pc~0x%08x\n", modelled ? "MODEL" : "MMIO ",
-                  size * 8, addr, v, current_pc());
+                  " -> 0x%08x pc~0x%08x lr~0x%08x\n",
+                  modelled ? "MODEL" : "MMIO ", size * 8, addr, v,
+                  current_pc(), current_lr());
     *data = v;
     return MEMTX_OK;
 }
@@ -864,9 +874,9 @@ static MemTxResult trace_write(void *opaque, hwaddr addr, uint64_t val,
         store_set(s, addr, val);
     }
     qemu_log_mask(LOG_UNIMP, "bcm4387: %s W%u 0x%08" HWADDR_PRIx
-                  " <- 0x%08" PRIx64 " pc~0x%08x\n",
+                  " <- 0x%08" PRIx64 " pc~0x%08x lr~0x%08x\n",
                   modelled ? "MODEL" : "MMIO ", size * 8, addr, val,
-                  current_pc());
+                  current_pc(), current_lr());
     return MEMTX_OK;
 }
 
