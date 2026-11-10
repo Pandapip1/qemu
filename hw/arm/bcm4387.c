@@ -138,6 +138,8 @@ struct BCM4387MachineState {
     uint32_t tcam_rom[TCAM_SLOTS];  /* programmed ROM address per slot, 0=off */
     uint32_t tcam_base, tcam_op;
     bool d11_phyflags[3];   /* left reset with PCLKE|PRST (0xc) held */
+    bool ucode_loaded[3];   /* ucode memory written through objaddr/objdata */
+    char *phy_live;         /* port liveness: auto, on or off */
 };
 
 /* ---- catch-all tracer and modelled backplane registers ------------------ */
@@ -264,11 +266,16 @@ static bool model_read(BCM4387MachineState *s, hwaddr a, uint32_t *v)
          * d11 clk_ctl_st: request bits [15:0] as written; ALP/HT available
          * and the backplane on HT (0xb0000); bits 24/26/28 read set once the
          * core is out of reset (0x150b0040, meaning unknown); the PHY clock
-         * (request 0x200) adds bits 25/27 once available (stock and run 11:
-         * 0x1f0b0342). [F]
+         * request (0x200) adds bits 25/27 once MACPHY_CLK is up (stock and
+         * run 11: 0x1f0b0342). Not without the request: run 17 has
+         * MACPHY_CLK up through the MAC resource request at core clock
+         * enable and reads 0x150b0040 there. [F] Bit 25 is the status of
+         * request bit 9 in hndsoc.h's CCS_ERSRC_REQ/STS layout [B]; bit 27
+         * is unknown. [U]
          */
-        *v = (store_get(s, a) & 0xffff) | 0x150b0000 |
-             (d11_phypll(s, d11_core(a)) ? 0x0a000000 : 0);
+        *v = store_get(s, a) & 0xffff;
+        *v |= 0x150b0000 |
+              ((*v & 0x200) && d11_phypll(s, d11_core(a)) ? 0x0a000000 : 0);
         return true;
     }
     if (a == CR4_BASE + 0x1e0 || a == 0x18001000 + 0x1e0) {
@@ -368,6 +375,10 @@ static bool model_write(BCM4387MachineState *s, hwaddr a, uint32_t v)
     int n = d11_core(a);
 
 
+    if (n >= 0 && (a == D11_BASE(n) + 0x164 || a == D11_BASE(n) + 0x166) &&
+        !(store_get(s, D11_BASE(n) + 0x160) & 0x7f0000)) {
+        s->ucode_loaded[n] = true;      /* see port_live */
+    }
     if (n >= 0 && (a == D11_BASE(n) + 0x1e0 || a == D11_BASE(n) + 0x120)) {
         store_set(s, a, v);
         d11_mac_request(s, n);
@@ -504,10 +515,37 @@ static bool d11_fclka(BCM4387MachineState *s, int n)
  * (both are 0 at handoff in the model). [U]
  * A never-written register reads its seed (below) or 0, logged as
  * unknown. [U]
+ *
+ * Those conditions are not sufficient: run 17 met all of them (res_state
+ * 0x5ecefbff, srpwr 0x003f1e00, ioctl 0x105, iostatus 0x11006, clk_ctl_st
+ * 0x1f0b0342, maccontrol 0x04000400, +0x18c = +0x3e6 = 0, all = stock) and
+ * its ports were still latches. [F] What else stock does is unknown. It
+ * decodes PHY 0x02/0x0b values at attach that no latch read gives, so its
+ * ports are taken to be live by then. [I] Candidates, all done by stock
+ * before its attach reads and never by our firmware: the d11 ucode
+ * download (objaddr 0x03000000 + 22.5K objdata words per slice), the SHM
+ * test through objaddr 0x10000/+0x166, template RAM writes (+0x130/+0x134),
+ * the PMU/GCI indirect writes, and the blocks at 0x18013000/0x18014000/
+ * 0x1801f000/0x18020000 (fn 0x79b9cc, bit 0 set per slice after its ucode).
+ * phy-live=auto (default) picks the first: a slice's ports go live once its
+ * ucode memory has been written (any objdata write while objaddr selects
+ * UCM, select field [22:16] = 0 in brcmsmac's d11.h [B]); the flag
+ * survives core reset (stock resets slice 0 after its download and does
+ * not reload). [I] unconfirmed; queue run 18 (phylog v8) brackets when
+ * stock's port goes live. phy-live=on drops this condition (assumes the
+ * trigger happened), phy-live=off keeps the ports dead.
  */
+static bool phy_trigger(BCM4387MachineState *s, int n)
+{
+    if (!s->phy_live || !strcmp(s->phy_live, "auto")) {
+        return s->ucode_loaded[n];
+    }
+    return !strcmp(s->phy_live, "on");
+}
+
 static bool port_live(BCM4387MachineState *s, int n)
 {
-    return d11_phypll(s, n) && d11_fclka(s, n) &&
+    return phy_trigger(s, n) && d11_phypll(s, n) && d11_fclka(s, n) &&
            (store_get(s, D11_BASE(n) + 0x120) & MCTL_IHR_EN);
 }
 
@@ -1476,6 +1514,11 @@ static void bcm4387_init(MachineState *machine)
 
         }
     }
+    if (s->phy_live && strcmp(s->phy_live, "auto") &&
+        strcmp(s->phy_live, "on") && strcmp(s->phy_live, "off")) {
+        error_report("bcm4387: phy-live must be auto, on or off");
+        exit(1);
+    }
     bcm4387_strict = s->strict;
     the_machine = s;
     s->pmu = bcm4387_pmu_create(PMU_BASE);
@@ -1641,6 +1684,7 @@ STR_PROP("rom", rom)
 STR_PROP("socram", patch)
 STR_PROP("iq-source", iq_source)
 STR_PROP("iq-format", iq_format)
+STR_PROP("phy-live", phy_live)
 
 static void get_atcm(Object *o, Visitor *v, const char *name, void *opaque,
                      Error **errp)
@@ -1720,6 +1764,7 @@ static void bcm4387_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_str(oc, "socram", get_patch, set_patch);
     object_class_property_add_str(oc, "iq-source", get_iq_source, set_iq_source);
     object_class_property_add_str(oc, "iq-format", get_iq_format, set_iq_format);
+    object_class_property_add_str(oc, "phy-live", get_phy_live, set_phy_live);
     object_class_property_add(oc, "atcm-size", "uint32", get_atcm, set_atcm,
                               NULL, NULL);
     object_class_property_add_bool(oc, "identity", get_identity, set_identity);

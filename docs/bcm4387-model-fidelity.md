@@ -26,10 +26,10 @@ FW boot complete": RTE banner, PCIe MSGBUF attach, wl0/wl1/wl2 attach on
 all three slices, TCAM, both reclaims, ThreadX. At its first PHY write the
 model's res_state (0x5ecefbff) and all 94 PMU/GCI indirect entries dumped
 on silicon (run 14) equal silicon (`scripts/stock_state_check.py`). Runs 9,
-15 and 16 reproduce exactly, and so do runs 10/11 (`scripts/model_regress.py`,
-0 failing): with all slice domains powered, a dead PHY port returns its latch
-only as the first PHY data read after other port activity, and the phyversion
-value for back-to-back reads [I] (bcm4387.c, port_read).
+10, 11, 16 and 17 reproduce exactly (`scripts/model_regress.py`, 0 failing):
+with all slice domains powered, a dead PHY port returns its latch only as
+the first PHY data read after other port activity, and the phyversion value
+for back-to-back reads [I] (bcm4387.c, port_read).
 
 The per-register gap list is generated from the source tables:
 `scripts/strict_gaps.py > fw/trace/strict_gaps.tsv` (sibling repo). Values
@@ -46,7 +46,8 @@ The samples come from `-M bcm4387,...,iq-source=<file>,iq-format=s16|cf32`
 from deterministic noise. Completion semantics are [I] and are listed in
 the gap file for run 17. The d11 core window is strict: offsets with no
 model are AXI slave errors. `model_regress.py` feeds a 1.25 MHz tone through
-our capture image and checks the recovered frequency.
+our capture image with `phy-live=on` (see below: our firmware's ports are
+dead under the default rule) and checks the recovered frequency.
 
 ### Enable chain (what the model says makes the PHY usable)
 
@@ -62,10 +63,26 @@ register (stock's ai_corereg pattern):
    core is out of reset with its clock on. [I]
 4. d11 maccontrol (+0x120) = 0x04000400 (MCTL_WAKE | MCTL_IHR_EN). [B]
    After this the clk_ctl_st PHY PLL request no longer reaches the PMU, so
-   step 1 must come first. [F] run 16. Gives SISF_FCLKA (iostatus 0x11006)
-   and live PHY/radio ports. [I]
+   step 1 must come first. [F] run 16. Gives SISF_FCLKA (iostatus 0x11006).
+   [F] run 17. d11 clk_ctl_st reads 0x150b0040 after step 3 even with
+   MACPHY_CLK up; bits 25/27 need the 0x200 request (0x1f0b0342). [F] run 17
 5. Optional, stock does them, no effect modelled: d11 +0x18c = 0, 16-bit
    +0x3e6 = 0. [U]
+6. **Unknown trigger.** Run 17 did steps 1-5 and matched stock's snapshot
+   in every visible register, yet its PHY/radio ports were still latches.
+   [F] Stock's attach decodes PHY 0x02/0x0b values no latch read gives, so
+   its ports are taken to be live by then. [I] Machine option
+   `phy-live=auto|on|off`: `auto` (default) makes a slice's ports live once
+   its ucode memory has been written (objdata write while objaddr selects
+   UCM, as stock's 0x03000000 download does; sticky across core reset).
+   This choice is **[I], unconfirmed**: stock also does, before its attach
+   reads and unlike our firmware, the SHM test (objaddr 0x10000, +0x166
+   0xaa55/0x55aa/0), template RAM writes (+0x130/+0x134), PMU/GCI indirect
+   writes, and sets bit 0 of +0x4 in the 0x18013000/0x18014000/0x1801f000/
+   0x18020000 blocks (fn 0x79b9cc, once per slice after its ucode); any of
+   these could be the real trigger. Queue run 18 (phylog v8) brackets when
+   stock's port goes live. `on` assumes the trigger happened (steps 1-5
+   suffice; used by the SDR tone check), `off` keeps the ports dead.
 
 ChipCommon ERSRC0 (clk_ctl_st bit 24, CCS_SECI_AVAIL [B]) needs, in the
 model, the FLL LPO: pmucontrol_ext (PMU +0x6d8) |= 0x80, poll GCI
