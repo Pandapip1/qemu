@@ -39,6 +39,7 @@
 #include "system/reset.h"
 #include "system/system.h"
 #include "system/runstate.h"
+#include "hw/arm/bcm4387.h"
 
 #define TYPE_BCM4387_MACHINE MACHINE_TYPE_NAME("bcm4387")
 OBJECT_DECLARE_SIMPLE_TYPE(BCM4387MachineState, BCM4387_MACHINE)
@@ -75,14 +76,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(BCM4387MachineState, BCM4387_MACHINE)
 #define PATCH_TBL_END   0x8a1d70
 
 #define CC_BASE         0x18000000
-#define CC_RNG          (CC_BASE + 0x3c0)
 #define CR4_BASE        0x18030000
 #define D11_BASE(n)     (0x18031000 + (n) * 0x1000)    /* 3 slices */
 #define OOBR_BASE       0x18006000
 #define GCI_BASE        0x18010000
 #define PMU_BASE        0x18012000
-#define PMU_TIMER       (PMU_BASE + 0x614)
-#define ILP_HZ          32768
 #define EROM_BASE       0x18105000
 #define EROM_SIZE       0x1000
 
@@ -99,8 +97,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(BCM4387MachineState, BCM4387_MACHINE)
 
 #define TCAM_SLOTS      1024
 #define SRPWR           (CC_BASE + 0x1e8)
-#define SRPWR_BASE_ON   0x23    /* power-domain status at handoff [F] */
-#define PHYPLL_LOCK_NS  10000   /* PHYPLL "available" this long after request */
 
 struct BCM4387MachineState {
     MachineState parent;
@@ -121,13 +117,14 @@ struct BCM4387MachineState {
     int nab, nbb;
     QEMUTimer *watch;
     uint32_t shared;
-    uint32_t rng_state;
     uint16_t phy_addr[3], radio_addr[3];
     uint16_t phy_latch[3], radio_latch[3];  /* port data latches */
     int32_t phy_pending[3];     /* phyversion value for the next PHY read */
     GHashTable *phyregs;        /* values written through the ports */
     GHashTable *phyknown;       /* values known (silicon / exploration seeds) */
-    GHashTable *banks;          /* indirect register-bank entries */
+    Bcm4387PmuState *pmu;
+    Bcm4387GciState *gci;
+    Bcm4387CcState *cc;
 
     bool strict;                /* unmodelled MMIO -> AXI slave error */
     MemoryRegion lowtcm, hole;
@@ -138,12 +135,14 @@ struct BCM4387MachineState {
     uint32_t tcam_rom[TCAM_SLOTS];  /* programmed ROM address per slot, 0=off */
     uint32_t tcam_base, tcam_op;
     bool d11_phyflags[3];   /* left reset with PCLKE|PRST (0xc) held */
-    int64_t d11_phypll_t[3];    /* when PHYPLL was requested, -1 = not */
 };
 
 /* ---- catch-all tracer and modelled backplane registers ------------------ */
 
-static uint32_t current_pc(void)
+bool bcm4387_strict = true;
+static BCM4387MachineState *the_machine;
+
+uint32_t bcm4387_pc(void)
 {
     if (!current_cpu) {
         return 0;
@@ -151,15 +150,9 @@ static uint32_t current_pc(void)
     return cpu_env(current_cpu)->regs[15];
 }
 
-static uint32_t current_lr(void)
+uint32_t bcm4387_lr(void)
 {
     return current_cpu ? cpu_env(current_cpu)->regs[14] : 0;
-}
-
-static uint32_t chipid(void)
-{
-    /* as read on silicon: id 0x4387, rev 7, AXI backplane (type 1) [F] */
-    return 0x10074387;
 }
 
 static uint32_t store_get(BCM4387MachineState *s, hwaddr a)
@@ -180,22 +173,26 @@ static void store_set(BCM4387MachineState *s, hwaddr a, uint32_t v)
 /* save/restore power domain of each d11 slice (srpwr bit), RAM 0x8491ae [F] */
 static const uint32_t d11_domain[3] = { 0x8, 0x4, 0x10 };
 
-static uint32_t srpwr_req(BCM4387MachineState *s)
-{
-    return (store_get(s, SRPWR) >> 8) & 0xff;
-}
-
-/* domains requested are on at once (requesting 0x1e gave status 0x3f) [F] */
 static uint32_t srpwr_status(BCM4387MachineState *s)
 {
-    return SRPWR_BASE_ON | srpwr_req(s);
+    return bcm4387_cc_srpwr_status(s->cc);
 }
 
+/* MACPHY_CLK resource of each slice: main, aux, scan (bcmdhd rsc_4387) [B] */
+static const uint8_t d11_macphy_res[3] = {
+    BCM4387_RES_MACPHY_CLK_MAIN, BCM4387_RES_MACPHY_CLK_AUX,
+    BCM4387_RES_MACPHY_CLK_SCAN,
+};
+
+/*
+ * A slice's PHY clock (clk_ctl_st request 0x200) asks the PMU for its
+ * MACPHY_CLK resource; the clock is available while that resource is up.
+ * [B] names, [F] check: the main slice's request takes res_state from
+ * 0x1e4efbdf to 0x5ecefbff on silicon (run 11), the closure of MACPHY_CLK_MAIN.
+ */
 static bool d11_phypll(BCM4387MachineState *s, int n)
 {
-    return s->d11_phypll_t[n] >= 0 &&
-           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->d11_phypll_t[n] >=
-           PHYPLL_LOCK_NS;
+    return bcm4387_pmu_res_up(s->pmu, d11_macphy_res[n]);
 }
 
 /*
@@ -243,68 +240,25 @@ static int d11_core(hwaddr a)
     return -1;
 }
 
-static bool bank_access(BCM4387MachineState *s, hwaddr a, bool wr, uint32_t val,
-                        uint32_t *v);
-
 static bool model_read(BCM4387MachineState *s, hwaddr a, uint32_t *v)
 {
-    if (bank_access(s, a, false, 0, v)) {
-        return true;
-    }
     if (d11_extra_wrap(a)) {
         *v = (a & 0xfff) == WRAP_RESETCTRL ? store_get(s, a) : 0;
         return true;
     }
-    if (a >= 0x18000000 && a < 0x18100000 && (a & 0xfff) == 0x1e0) {
+    if (d11_core(a) >= 0 && (a & 0xfff) == 0x1e0) {
         /*
-         * clk_ctl_st: request bits [15:0] as written; ALP/HT available and
-         * the backplane on HT (0xb0000) as at handoff; resource-available
-         * bits [28:24]. ChipCommon reads 0x020b0040 at handoff and 0x030b0152
-         * with ERSRC request 0x100. A d11 core out of reset reads 0x150b0040;
-         * requesting D11PLL (0x100) adds bit 24 and PHYPLL (0x200) adds bits
-         * 25/27 once the PLL locks (stock: 0x1f0b0342). [F]
+         * d11 clk_ctl_st: request bits [15:0] as written; ALP/HT available
+         * and the backplane on HT (0xb0000); bits 24/26/28 read set once the
+         * core is out of reset (0x150b0040, meaning unknown); the PHY clock
+         * (request 0x200) adds bits 25/27 once available (stock and run 11:
+         * 0x1f0b0342). [F]
          */
-        uint32_t r = store_get(s, a) & 0xffff;
-        int n = d11_core(a);
-
-        *v = r | 0x000b0000;
-        if (a == CC_BASE + 0x1e0) {
-            /*
-             * ERSRC 0 (request 0x100, avail bit 24): stock reads 0x030b0152,
-             * but our 0x110 request left it 0x020b0152 (queue run 11); what
-             * stock does differently is unknown, so strict mode does not
-             * raise it and strict=off mirrors the request. [F]
-             */
-            *v |= 0x02000000 | (s->strict ? 0 : (r & 0x700) << 16);
-        } else if (n >= 0) {
-            *v |= 0x15000000 | (r & 0x100 ? 0x01000000 : 0) |
-                  (d11_phypll(s, n) ? 0x0a000000 : 0);
-        }
+        *v = (store_get(s, a) & 0xffff) | 0x150b0000 |
+             (d11_phypll(s, d11_core(a)) ? 0x0a000000 : 0);
         return true;
     }
     switch (a) {
-    case CC_BASE + 0x00:
-        *v = chipid();
-        return true;
-    case CC_BASE + 0xfc:
-        *v = EROM_BASE;
-        return true;
-    /*
-     * Read-only identification registers, at the values the firmware cached
-     * in si_pub on silicon (fw/dump/ram_identity.bin 0x823084..0x8230b4). [F]
-     */
-    case CC_BASE + 0x04:            /* capabilities */
-        *v = 0x18400009;
-        return true;
-    case CC_BASE + 0x2c:            /* chipstatus */
-        *v = 0x0e63be0c;
-        return true;
-    case CC_BASE + 0xac:            /* capabilities_ext */
-        *v = 0x0002044e;
-        return true;
-    case PMU_BASE + 0x604:          /* pmucapabilities (PMU rev 0x27) */
-        *v = 0x9c565f27;
-        return true;
     /*
      * d11 PHY version (regs +0x3e0): analog rev [15:12], PHY type [11:8]
      * (0xb), PHY rev [7:0]. Silicon decodes 0xdb32 for the d11 cores at
@@ -317,35 +271,6 @@ static bool model_read(BCM4387MachineState *s, hwaddr a, uint32_t *v)
     case D11_BASE(2) + 0x3e0:
         *v = d11_core(a) == 2 ? 0xdb34 : 0xdb32;
         s->phy_pending[d11_core(a)] = *v;       /* see phy_init [I] */
-        return true;
-    case SRPWR:
-        /* save/restore power: request [15:8], status [23:16] [F] */
-        *v = (srpwr_status(s) << 16) | (srpwr_req(s) << 8);
-        return true;
-    case PMU_BASE + 0x60c: {
-        /*
-         * res_state: 0x1e0a83df at handoff; 0x1e4efbdf once all MAC power
-         * domains are requested (srpwr 0x1e, queue run 11: +0x00447800); a
-         * d11 PHYPLL adds 0x40c47820 (stock and run 11: 0x5ecefbff). Partial
-         * domain requests: effect not measured, none modelled. [F]
-         */
-        bool pll = d11_phypll(s, 0) || d11_phypll(s, 1) || d11_phypll(s, 2);
-        bool macpwr = (srpwr_req(s) & 0x1e) == 0x1e;
-
-        *v = 0x1e0a83df | (macpwr ? 0x00447800 : 0) | (pll ? 0x40c47820 : 0);
-        return true;
-    }
-    case PMU_BASE + 0x610:          /* res_pending: transitions are instant */
-        *v = 0;
-        return true;
-    case CC_RNG + 0x24:             /* RNG_FIFO_COUNT: always full */
-        *v = 0x10;
-        return true;
-    case CC_RNG + 0x20:             /* RNG_FIFO_DATA: deterministic xorshift */
-        s->rng_state ^= s->rng_state << 13;
-        s->rng_state ^= s->rng_state >> 17;
-        s->rng_state ^= s->rng_state << 5;
-        *v = s->rng_state;
         return true;
     case CR4_BASE + 0x04:
         /*
@@ -373,109 +298,6 @@ static bool model_read(BCM4387MachineState *s, hwaddr a, uint32_t *v)
          */
         *v = 0x80000000;
         return true;
-    case GCI_BASE + 0x310:
-        /*
-         * Handshake status: bit12 acknowledges the request in GCI+0x314 bit15
-         * (written as !want; the firmware then waits for bit12 == want, RAM
-         * 0x76378c). Acknowledge immediately.
-         */
-        *v = (store_get(s, a) & ~(1u << 12)) |
-             (!(store_get(s, GCI_BASE + 0x314) & (1u << 15)) << 12);
-        return true;
-    case GCI_BASE + 0x31c:
-        /*
-         * OTP layout: size code 15 in bits[15:12] (the only one the firmware
-         * accepts, RAM 0x8254c0) and the HW-region offset 0x2e0 in bits[11:0],
-         * which the firmware checks against its own layout template (RAM
-         * 0x82563c).
-         */
-        *v = (store_get(s, a) & ~0xffffu) | 0xf2e0;
-        return true;
-    case GCI_BASE + 0xc20: {
-        /*
-         * LPO control/status (ROM 0x416e18, "LPO is not available"): bit3 holds
-         * the LPO in reset, bit2 enables it; status bits[7:4] read 0 while it
-         * is stopped and >8 once it is running. Report stopped/running at once.
-         */
-        uint32_t c = store_get(s, a) & ~0xf0u;
-
-        *v = c | ((c & 4) && !(c & 8) ? 0xf0 : 0);
-        return true;
-    }
-    case GCI_BASE + 0xc1c:
-        /*
-         * LPO source status (ROM 0x416f50): bits[21:18] are one-hot for the
-         * source selected in GCI+0xc04 bits[10:9]. Follow the selection.
-         */
-        *v = (store_get(s, a) & ~0x3c0000u) |
-             (1u << (18 + ((store_get(s, GCI_BASE + 0xc04) >> 9) & 3)));
-        return true;
-    case PMU_TIMER:
-        /* free-running ILP (32.768 kHz) tick counter; PMU waits time out on it */
-        *v = muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), ILP_HZ,
-                      NANOSECONDS_PER_SECOND);
-        return true;
-    }
-    return false;
-}
-
-/*
- * Indirect register banks: an index register and one or two data registers
- * (PMU chipcontrol 0x650/0x654, regcontrol 0x658/0x65c, pllcontrol
- * 0x660/0x664, res_table_sel 0x620 with res_dep_mask 0x624 and
- * res_updn_timer 0x628; GCI chipcontrol 0x40/0x200). The index reads back
- * what was written; data accesses go to the entry for the current index.
- * Silicon initial values are not known yet (queue run 12 dumps them): an
- * entry never written reads 0xdead with an "unknown" log in strict mode,
- * 0 with strict=off. [F: structure; values pending]
- */
-static const struct {
-    hwaddr index, data;
-} reg_banks[] = {
-    { PMU_BASE + 0x650, PMU_BASE + 0x654 },
-    { PMU_BASE + 0x658, PMU_BASE + 0x65c },
-    { PMU_BASE + 0x660, PMU_BASE + 0x664 },
-    { PMU_BASE + 0x620, PMU_BASE + 0x624 },
-    { PMU_BASE + 0x620, PMU_BASE + 0x628 },
-    { GCI_BASE + 0x040, GCI_BASE + 0x200 },
-};
-
-static gpointer bank_key(hwaddr data, uint32_t index)
-{
-    return (gpointer)(uintptr_t)((uint64_t)data << 32 | index);
-}
-
-/* true if a is a bank index or data register; *v gets the read value */
-static bool bank_access(BCM4387MachineState *s, hwaddr a, bool wr, uint32_t val,
-                        uint32_t *v)
-{
-    for (int i = 0; i < ARRAY_SIZE(reg_banks); i++) {
-        if (a == reg_banks[i].index) {
-            if (wr) {
-                store_set(s, a, val);
-            } else {
-                *v = store_get(s, a);
-            }
-            return true;
-        }
-        if (a == reg_banks[i].data) {
-            uint32_t idx = store_get(s, reg_banks[i].index);
-            gpointer k = bank_key(a, idx);
-
-            if (wr) {
-                g_hash_table_insert(s->banks, k, GUINT_TO_POINTER(val));
-            } else if (g_hash_table_contains(s->banks, k)) {
-                *v = GPOINTER_TO_UINT(g_hash_table_lookup(s->banks, k));
-            } else if (s->strict) {
-                qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: unknown bank entry "
-                              "0x%08" HWADDR_PRIx "[%u] read (returns 0xdead) "
-                              "pc~0x%08x\n", a, idx, current_pc());
-                *v = 0xdead;
-            } else {
-                *v = 0;
-            }
-            return true;
-        }
     }
     return false;
 }
@@ -486,19 +308,11 @@ static bool model_write(BCM4387MachineState *s, hwaddr a, uint32_t v)
 {
     int n = d11_core(a);
 
-    if (bank_access(s, a, true, v, NULL)) {
-        return true;
-    }
 
     if (n >= 0 && a == D11_BASE(n) + 0x1e0) {
-        uint32_t old = store_get(s, a);
-
-        if ((v & 0x200) && !(old & 0x200)) {
-            s->d11_phypll_t[n] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-        } else if (!(v & 0x200)) {
-            s->d11_phypll_t[n] = -1;
-        }
         store_set(s, a, v);
+        bcm4387_pmu_request(s->pmu, BCM4387_REQ_MAC0 + n,
+                            v & 0x200 ? BIT(d11_macphy_res[n]) : 0);
         return true;
     }
     if (d11_extra_wrap(a)) {
@@ -532,14 +346,6 @@ static bool model_write(BCM4387MachineState *s, hwaddr a, uint32_t v)
         if (v & 0x20000) {
             tcam_program(s, v & (TCAM_SLOTS - 1));
         }
-        return true;
-    case GCI_BASE + 0x38:
-    case GCI_BASE + 0x3c:
-        /*
-         * GCI semaphore request / wait registers: writing a bit toggles it
-         * (acquire sets, release clears; ROM 0x4123b4 / 0x41249c).
-         */
-        store_set(s, a, store_get(s, a) ^ v);
         return true;
     case CR4_BASE + 0x40:
         s->cr4_bankidx = v & 0xff;
@@ -615,7 +421,7 @@ static void port_put(BCM4387MachineState *s, int port, int n, uint16_t v)
     }
     qemu_log_mask(LOG_UNIMP, "bcm4387: %s%d W 0x%04x <- 0x%04x pc~0x%08x "
                   "lr~0x%08x\n", port == PORT_PHY ? "PHY" : "RAD", n, a, v,
-                  current_pc(), current_lr());
+                  bcm4387_pc(), bcm4387_lr());
 }
 
 /* A data read through a port (see phy_init for the latch behaviour). */
@@ -640,7 +446,7 @@ static uint16_t port_read(BCM4387MachineState *s, int port, int n)
         v = GPOINTER_TO_UINT(g_hash_table_lookup(s->phyknown, key));
     }
     qemu_log_mask(LOG_UNIMP, "bcm4387: %s%d R 0x%04x -> 0x%04x pc~0x%08x\n",
-                  port == PORT_PHY ? "PHY" : "RAD", n, a, v, current_pc());
+                  port == PORT_PHY ? "PHY" : "RAD", n, a, v, bcm4387_pc());
     return v;
 }
 
@@ -670,7 +476,7 @@ static bool phy_port(BCM4387MachineState *s, hwaddr a, unsigned size,
             *areg = val;
             qemu_log_mask(LOG_UNIMP, "bcm4387: %s%d A 0x%04x pc~0x%08x "
                           "lr~0x%08x\n", port == PORT_PHY ? "PHY" : "RAD", n,
-                          (uint16_t)val, current_pc(), current_lr());
+                          (uint16_t)val, bcm4387_pc(), bcm4387_lr());
             if (size == 4) {
                 port_put(s, port, n, val >> 16);
             }
@@ -739,7 +545,7 @@ static MemTxResult lowtcm_read(void *opaque, hwaddr addr, uint64_t *data,
         if (!test_bit(w, s->lowtcm_valid)) {
             qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: ECC abort: read of "
                           "never-written TCM word 0x%08" HWADDR_PRIx
-                          " pc~0x%08x\n", w << 2, current_pc());
+                          " pc~0x%08x\n", w << 2, bcm4387_pc());
             return MEMTX_ACCESS_ERROR;
         }
     }
@@ -774,7 +580,7 @@ static MemTxResult hole_read(void *opaque, hwaddr addr, uint64_t *data,
 {
     qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: ECC abort: read of unbacked "
                   "0x%08" HWADDR_PRIx " pc~0x%08x\n", HOLE_BASE + addr,
-                  current_pc());
+                  bcm4387_pc());
     return MEMTX_ACCESS_ERROR;
 }
 
@@ -784,7 +590,7 @@ static MemTxResult hole_write(void *opaque, hwaddr addr, uint64_t data,
 {
     qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: write to unbacked 0x%08"
                   HWADDR_PRIx " dropped pc~0x%08x\n", HOLE_BASE + addr,
-                  current_pc());
+                  bcm4387_pc());
     return MEMTX_OK;
 }
 
@@ -795,6 +601,43 @@ static const MemoryRegionOps hole_ops = {
     .valid.min_access_size = 1,
     .valid.max_access_size = 4,
 };
+
+/* ---- shared device helpers ------------------------------------------------ */
+
+int bcm4387_reg_index(const Bcm4387Reg *tab, int n, hwaddr off)
+{
+    for (int i = 0; i < n; i++) {
+        if (tab[i].off == off) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+MemTxResult bcm4387_unknown(const char *dev, hwaddr base, hwaddr off,
+                            bool write, uint64_t *data, unsigned size)
+{
+    BCM4387MachineState *s = the_machine;
+    hwaddr a = base + off;
+
+    if (bcm4387_strict) {
+        qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: AXI slave error: unmodelled "
+                      "%s %c%u 0x%08" HWADDR_PRIx " (%s+0x%03" HWADDR_PRIx ")"
+                      " <- 0x%08" PRIx64 " pc~0x%08x\n", dev, write ? 'W' : 'R',
+                      size * 8, a, dev, off, write ? *data : 0, bcm4387_pc());
+        return MEMTX_ERROR;
+    }
+    if (write) {
+        store_set(s, a, *data);
+    } else {
+        *data = store_get(s, a);
+    }
+    qemu_log_mask(LOG_UNIMP, "bcm4387: MMIO  %c%u 0x%08" HWADDR_PRIx
+                  " %s 0x%08" PRIx64 " pc~0x%08x lr~0x%08x\n",
+                  write ? 'W' : 'R', size * 8, a, write ? "<-" : "->", *data,
+                  bcm4387_pc(), bcm4387_lr());
+    return MEMTX_OK;
+}
 
 /* ---- bus rules: d11 access, strict whitelist --------------------------------- */
 
@@ -819,19 +662,19 @@ static MemTxResult d11_gate(BCM4387MachineState *s, hwaddr a)
     if (!(srpwr_status(s) & d11_domain[n])) {
         qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: AXI slave error: d11 %d "
                       "power domain off, 0x%08" HWADDR_PRIx " pc~0x%08x\n",
-                      n, a, current_pc());
+                      n, a, bcm4387_pc());
         return MEMTX_ERROR;
     }
     if ((store_get(s, D11_WRAP(n) + WRAP_RESETCTRL) & 1) || !(ioctl & 1)) {
         qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: AXI slave error: d11 %d in "
                       "reset or unclocked, 0x%08" HWADDR_PRIx " pc~0x%08x\n",
-                      n, a, current_pc());
+                      n, a, bcm4387_pc());
         return MEMTX_ERROR;
     }
     if (!s->d11_phyflags[n] && (ioctl & 0x1c0)) {
         qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: STALL: d11 %d left reset "
                       "without PHY flags, 0x%08" HWADDR_PRIx " pc~0x%08x\n",
-                      n, a, current_pc());
+                      n, a, bcm4387_pc());
         qemu_system_vmstop_request_prepare();
         qemu_system_vmstop_request(RUN_STATE_PAUSED);
         cpu_exit(current_cpu);
@@ -840,7 +683,7 @@ static MemTxResult d11_gate(BCM4387MachineState *s, hwaddr a)
     if (a - D11_BASE(n) >= 0x3d8 && !d11_phy_ready(s, n)) {
         qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: AXI slave error: d11 %d PHY "
                       "window without PHYPLL, 0x%08" HWADDR_PRIx " pc~0x%08x\n",
-                      n, a, current_pc());
+                      n, a, bcm4387_pc());
         return MEMTX_ERROR;
     }
     return MEMTX_OK;
@@ -854,22 +697,8 @@ static MemTxResult d11_gate(BCM4387MachineState *s, hwaddr a)
 static bool reg_known(hwaddr a)
 {
     static const struct { hwaddr base, len; } ranges[] = {
-        { CC_BASE + 0x000, 0x08 },      /* chipid, capabilities */
-        { CC_BASE + 0x02c, 0x04 },      /* chipstatus */
-        { CC_BASE + 0x0ac, 0x04 },      /* capabilities_ext */
-        { CC_BASE + 0x0fc, 0x04 },      /* EROM pointer */
-        { CC_BASE + 0x1e0, 0x04 },      /* clk_ctl_st */
-        { SRPWR, 0x04 },
-        { CC_RNG, 0x28 },
         { CR4_BASE + 0x04, 0x04 }, { CR4_BASE + 0x40, 0x08 },
         { CR4_BASE + 0x68, 0x10 },      /* TCAM */
-        { PMU_BASE + 0x600, 0x20 },     /* ctl, caps, status, res_* , timer */
-        { PMU_BASE + 0x620, 0x0c },     /* res_table_sel bank */
-        { PMU_BASE + 0x650, 0x18 },     /* chipcontrol/regcontrol/pllcontrol */
-        { GCI_BASE + 0x040, 0x04 }, { GCI_BASE + 0x200, 0x04 },  /* chipctl */
-        { GCI_BASE + 0x038, 0x08 },     /* semaphores */
-        { GCI_BASE + 0x310, 0x1c },     /* handshake, OTP control/status */
-        { GCI_BASE + 0xc04, 0x04 }, { GCI_BASE + 0xc1c, 0x08 },  /* LPO */
         { OOBR_BASE, 0xa00 },
     };
 
@@ -912,7 +741,7 @@ static MemTxResult trace_read(void *opaque, hwaddr addr, uint64_t *data,
         if (s->strict && !reg_known(addr)) {
             qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: AXI slave error: "
                           "unmodelled R%u 0x%08" HWADDR_PRIx " pc~0x%08x\n",
-                          size * 8, addr, current_pc());
+                          size * 8, addr, bcm4387_pc());
             return MEMTX_ERROR;
         }
         v = store_get(s, addr);
@@ -920,7 +749,7 @@ static MemTxResult trace_read(void *opaque, hwaddr addr, uint64_t *data,
     qemu_log_mask(LOG_UNIMP, "bcm4387: %s R%u 0x%08" HWADDR_PRIx
                   " -> 0x%08x pc~0x%08x lr~0x%08x\n",
                   modelled ? "MODEL" : "MMIO ", size * 8, addr, v,
-                  current_pc(), current_lr());
+                  bcm4387_pc(), bcm4387_lr());
     *data = v;
     return MEMTX_OK;
 }
@@ -941,7 +770,7 @@ static MemTxResult trace_write(void *opaque, hwaddr addr, uint64_t val,
     if (s->strict && !reg_known(addr)) {
         qemu_log_mask(LOG_GUEST_ERROR, "bcm4387: AXI slave error: unmodelled "
                       "W%u 0x%08" HWADDR_PRIx " <- 0x%08" PRIx64
-                      " pc~0x%08x\n", size * 8, addr, val, current_pc());
+                      " pc~0x%08x\n", size * 8, addr, val, bcm4387_pc());
         return MEMTX_ERROR;
     }
     modelled = model_write(s, addr, val);
@@ -951,7 +780,7 @@ static MemTxResult trace_write(void *opaque, hwaddr addr, uint64_t val,
     qemu_log_mask(LOG_UNIMP, "bcm4387: %s W%u 0x%08" HWADDR_PRIx
                   " <- 0x%08" PRIx64 " pc~0x%08x lr~0x%08x\n",
                   modelled ? "MODEL" : "MMIO ", size * 8, addr, val,
-                  current_pc(), current_lr());
+                  bcm4387_pc(), bcm4387_lr());
     return MEMTX_OK;
 }
 
@@ -1275,15 +1104,9 @@ static void bcm4387_init(MachineState *machine)
     erom_build(s);
 
     s->store = g_hash_table_new(g_direct_hash, g_direct_equal);
-    s->banks = g_hash_table_new(g_direct_hash, g_direct_equal);
     oobr_init(s);
     phy_init(s);
     /* register state at the host->firmware handoff, read on silicon [F] */
-    store_set(s, CC_BASE + 0x1e0, 0x40);
-    store_set(s, PMU_BASE + 0x600, 0x380);
-    store_set(s, PMU_BASE + 0x608, 0x1613e);
-    store_set(s, PMU_BASE + 0x618, 1);
-    store_set(s, PMU_BASE + 0x61c, 0x7fffffff);
     for (int i = 0; i < ARRAY_SIZE(d11_extra_wraps); i++) {
         store_set(s, d11_extra_wraps[i] + WRAP_RESETCTRL, 1);
     }
@@ -1295,10 +1118,14 @@ static void bcm4387_init(MachineState *machine)
             store_set(s, D11_WRAP(n) + WRAP_RESETCTRL, 1);
             store_set(s, D11_WRAP(n) + WRAP_IOSTATUS, iostatus[n]);
             store_set(s, D11_BASE(n) + 0x1e0, 0x40);
-            s->d11_phypll_t[n] = -1;
 
         }
     }
+    bcm4387_strict = s->strict;
+    the_machine = s;
+    s->pmu = bcm4387_pmu_create(PMU_BASE);
+    s->gci = bcm4387_gci_create(GCI_BASE, s->pmu);
+    s->cc = bcm4387_cc_create(CC_BASE, s->pmu);
     memory_region_init_io(&s->trace, NULL, &trace_ops, s, "bcm4387.trace",
                           UINT64_MAX);
     memory_region_add_subregion_overlap(sysmem, 0, &s->trace, -1000);
@@ -1502,7 +1329,6 @@ static void bcm4387_instance_init(Object *obj)
 {
     /* CP15 at reset on silicon: ATCM region 0-8 MiB, BTCM base 0x800000 */
     BCM4387_MACHINE(obj)->atcm_size = 0x800000 - RAM_BASE;
-    BCM4387_MACHINE(obj)->rng_state = 0x4387c2;
     BCM4387_MACHINE(obj)->identity = true;
     BCM4387_MACHINE(obj)->strict = true;
 }

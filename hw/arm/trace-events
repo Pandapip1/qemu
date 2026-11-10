@@ -96,3 +96,26 @@ z2_aer915_event(int8_t event, int8_t len) "i2c event =0x%x len=%d bytes"
 
 # bcm2838.c
 bcm2838_gic_set_irq(int irq, int level) "gic irq:%d lvl:%d"
+
+# bcm4387-pmu.c
+bcm4387_pmu_read(uint64_t off, uint32_t v) "+0x%03" PRIx64 " -> 0x%08x"
+bcm4387_pmu_write(uint64_t off, uint64_t v) "+0x%03" PRIx64 " <- 0x%08" PRIx64
+bcm4387_pmu_res_state(uint32_t old, uint32_t state, uint32_t want) "res_state 0x%08x -> 0x%08x (requested 0x%08x)"
+bcm4387_pmu_request(int who, uint32_t old, uint32_t mask) "requester %d: 0x%08x -> 0x%08x"
+bcm4387_pmu_select(const char *file, uint32_t idx) "%s index <- %u"
+bcm4387_pmu_file(const char *file, uint32_t idx, uint32_t old, uint64_t v) "%s[%u] 0x%08x -> 0x%08" PRIx64
+bcm4387_pmu_pll_commit(void) "pllcontrol committed (PLLCTL_UPD)"
+bcm4387_aon_sync_land(uint64_t addr, uint32_t v) "always-on write 0x%08" PRIx64 " <- 0x%x landed"
+bcm4387_aon_sync_drop(uint64_t addr, uint32_t v) "always-on write 0x%08" PRIx64 " <- 0x%x dropped (wedged)"
+bcm4387_aon_sync_wedge(uint64_t addr, uint32_t v) "always-on write 0x%08" PRIx64 " <- 0x%x before read-back: register wedged"
+
+# bcm4387-gci.c
+bcm4387_gci_read(uint64_t off, uint32_t v) "+0x%03" PRIx64 " -> 0x%08x"
+bcm4387_gci_write(uint64_t off, uint64_t v) "+0x%03" PRIx64 " <- 0x%08" PRIx64
+bcm4387_gci_index(uint32_t old, uint32_t idx) "indirect index %u -> %u"
+bcm4387_gci_chipctrl(uint32_t idx, uint32_t old, uint64_t v) "chipcontrol[%u] 0x%08x -> 0x%08" PRIx64
+
+# bcm4387-cc.c
+bcm4387_cc_read(uint64_t off, uint32_t v) "+0x%03" PRIx64 " -> 0x%08x"
+bcm4387_cc_write(uint64_t off, uint64_t v) "+0x%03" PRIx64 " <- 0x%08" PRIx64
+bcm4387_cc_srpwr(uint32_t req) "srpwr request domains 0x%x"
