@@ -21,8 +21,9 @@ header states what is modelled and why. Evidence classes: **[F]** silicon,
 sbgci.h, d11.h, hndpmu.c, siutils.c), **[I]** inferred, **[U]** unknown
 (stored and traced only).
 
-Under `strict=on` the stock firmware boots to "Notify host through MSI -
-FW boot complete": RTE banner, PCIe MSGBUF attach, wl0/wl1/wl2 attach on
+Under `strict=on` (with `phy-live=on,mac-pll=grant` since run 31; see
+"Enable chain", steps 4a and 6) the stock firmware boots to "Notify host
+through MSI - FW boot complete": RTE banner, PCIe MSGBUF attach, wl0/wl1/wl2 attach on
 all three slices, TCAM, both reclaims, ThreadX. At its first PHY write the
 model's res_state (0x5ecefbff) and all 94 PMU/GCI indirect entries dumped
 on silicon (run 14) equal silicon (`scripts/stock_state_check.py`). Runs 9,
@@ -127,32 +128,38 @@ register (stock's ai_corereg pattern):
    After this the clk_ctl_st PHY PLL request no longer reaches the PMU
    directly, only through the MAC request. [F] run 16. Gives SISF_FCLKA
    (iostatus 0x11006). [F] run 17.
-4a. Stock's PLL request (ROM 0x4d32c8, 0x4d3eac): clk_ctl_st |= FORCEHT
-   alone, settle (64 us = D11SCC_SLOW2FAST_TRANSITION, 2 ILP [B]), poll HT
-   avail (bit 17), then |= 0x300, settle, poll bits 24|25. The model asserts
-   the MAC request only if 0x200 rises after FORCEHT was set by an earlier
-   write and HT avail was read back from this clk_ctl_st since [I]; our
-   one-shot |= 0x302 is lost [F run 31 hqpll: full mask, 0x150b0342]. The
-   2-ILP time is not checked (guest delay loops do not advance QEMU's
-   virtual clock faithfully); trace event bcm4387_d11_pll_req shows it.
+4a. **PHYPLL grant: unknown.** With WAKE set and the PLL request (0x200)
+   raised, the MAC asserts its request to the PMU; whether it is granted
+   is [U]. Silicon granted it to stock and to every binary built from the
+   bfa8c1f source (runs 17, 21, 28, 29, 33 incl. a 2-byte code shift:
+   4/4 since run 21), and never to any later source (0/11: runs 23, 26-32),
+   with the 0x40000000 mask or stock's full one, with our one-shot |= 0x302
+   or stock's form (FORCEHT alone, 2 ILP settle, HT poll, |= 0x300; ROM
+   0x4d32c8/0x4d3eac), with or without per-slice power and first passes.
+   The model sees identical MMIO from the two source families. Machine
+   option `mac-pll=deny|grant`: `deny` (default) gives the later sources'
+   outcome; `grant` is an assumption (stock, the SDR test bench).
+   **Refuted:** "granted when 0x200 rises after FORCEHT settled and HT was
+   read back" (run 32 seqpll).
 5. Optional, stock does them, no effect modelled: d11 +0x18c = 0, 16-bit
    +0x3e6 = 0. [U]
-6. **Port liveness, unknown trigger.** Run 17 did steps 1-5 and matched
-   stock's snapshot in every visible register, yet its ports were latches
-   [F]; run 21 had stock's ucode loaded too and stayed dead [F]. Stock's
-   port is live at its attach read (run 31: 0xdb32/0x1510/0x9bd2) with
-   res_state 0x1e4efbdf, maccontrol 0, d11 clk_ctl_st 0x150b0040: no
-   PHYPLL, no FCLKA, no IHR_EN, the same resources as ours [F]. So the
-   trigger is in stock's per-boot sequence [U]. `phy-live=auto` (default)
-   takes notes/36 §7.2's first candidate: the slice's core has once left
-   reset without PHY clock/reset held (stock's first-pass attach, IOCTL
-   0x3 -> 0x1, seq 4593-4604) [I, queue run 32]; live ports also open the
-   PHY window without PHYPLL. Refuted earlier choices: ucode memory written
-   (runs 21, 31) and PHYPLL + FCLKA + IHR_EN (run 31). `on` keeps those
-   old conditions without a trigger (the SDR tone check's assumption, run
-   with fw/open/open-seqpll.bin, which uses stock's PLL request form),
-   `off` keeps the ports dead. Stock's slice-0 attach values (PHY 0x000,
-   0x001, 0x00b) are seeded. [F]
+6. **Port liveness: unknown.** Run 17 matched stock's snapshot in every
+   visible register and its ports were latches; stock's port is live at its
+   attach read (run 31: 0xdb32/0x1510/0x9bd2) with the same resources and
+   clocks as ours (res_state 0x1e4efbdf, maccontrol 0, d11 clk_ctl_st
+   0x150b0040, IOCTL 0x145, no PHYPLL). [F] Every known pre-attach
+   difference has been ruled out: SR, regcontrol, LHL, PMU/GCI chipcontrol
+   (runs 24/25), per-slice domain power and first passes (run 32), SECI
+   init (run 33). [F] `phy-live=auto` (default, = `off`) keeps the ports
+   dead, which is what every run of ours saw; `on` assumes the unknown
+   trigger: ports live and the PHY window open whenever the core is up
+   (stock at its attach read; the SDR test bench). **Refuted:** ucode
+   memory written (runs 21, 31), PHYPLL + FCLKA + IHR_EN (run 31), a
+   first-pass attach (run 32 seqprobe). Stock's slice-0 attach values (PHY
+   0x000, 0x001, 0x00b) are seeded. [F] Stock therefore runs in the model
+   under `phy-live=on,mac-pll=grant` (stock_state_check.py, model_regress's
+   snapshot check); without them it aborts at its attach phyversion read
+   (RAM 0x82ee50).
 
 ChipCommon ERSRC0 (clk_ctl_st bit 24, CCS_SECI_AVAIL [B]) needs, in the
 model, the FLL LPO: pmucontrol_ext (PMU +0x6d8) |= 0x80, poll GCI
@@ -194,11 +201,11 @@ every time. Now:
   are up [I]: stock's res_req reads 0x17000000 (run 31), our MAC timers
   0x15000000 also at a failed grant (run 29). [F]
 - **When the MAC asks** (bcm4387.c d11_mac_request): out of reset with its
-  clock on, MCTL_WAKE, and the PHY PLL request raised in stock's form (step
-  4a) [I]. Out of reset alone is not enough [F run 30]. **Refuted, removed:**
-  "ucode memory written asserts it" (my choice after run 30): stock has
-  written its ucode by its attach read and MACPHY_CLK_MAIN is down there
-  (run 31). [F]
+  clock on, MCTL_WAKE and the PLL request 0x200; granted only under
+  `mac-pll=grant` (step 4a). Out of reset alone it does not ask [F run 30].
+  **Refuted, removed:** "ucode memory written asserts it" (run 31: stock's
+  ucode is written by its attach read and MACPHY_CLK_MAIN is down there),
+  "stock's FORCEHT-first request form gets it granted" (run 32).
 - **pmustatus PST_SLOW_WR_PENDING**: set while a posted always-on index
   write is pending, and for 3 ILP cycles after a write to an ILP-domain
   register (pmuwatchdog, res_req_timer, mac_res_req_timer 0/1/2) made with
@@ -233,6 +240,9 @@ every time. Now:
   because the FLL already runs at handoff (0x14291) and runs 10/11 never
   got bit 24: SECI_config bit 2 (SECI_ENAB_SECI_ECI, which stock sets) is
   also required. [I]
+- **d11 extra wrappers' error-log block** (+0x900..+0x93f) is storage:
+  stock's errlogctrl 0x330 reads back on 0x18136900/0x18139900 (run 32,
+  14/14). [F]
 - **PHY window writes without PHYPLL** no longer abort: the attach probe's
   +0x3fc write went through and the +0x3fe read aborted (runs 22/30). [F]
   The write is dropped. [U]
@@ -243,33 +253,34 @@ Regressions (`scripts/model_regress.py`, sibling repo):
 - queued-30/1 macreq SAME (nothing at attach, abort at 0x180313fe);
 - queued-31/2 hqprobe and 3/hqpll SAME (hqpll: stage-1 failure, 0x150b0342,
   with the full mask);
+- queued-32/1 seqpll (stage-1 failure with stock's request form) and 2/
+  seqprobe (attach read abort after first passes) SAME;
 - stock at its first PHY read: the run-31 phylog --hq image
-  (queued-31/1-phylog-hq.bin) run in the model, its attach-time record
-  decoded by scripts/phylog_decode.py and compared line by line with
-  silicon's (ChipCommon FORCEHT masked, as in stock_state_check). It
-  depends on stock's LHL ARM timer (0x3c ILP) having expired by then in
-  virtual time.
-- **Refuted, removed prediction:** "fw/open/open-ctrl.bin (stock's MAC
-  request) reaches PHYPLL" -- run 31 hqpll failed with that request. The
-  current prediction is fw/open/open-seqpll.bin (run 32): PHYPLL with
-  stock's PLL request form, ports live after its first-pass attaches [I].
+  (queued-31/1-phylog-hq.bin) run in the model under
+  `phy-live=on,mac-pll=grant`, its attach-time record decoded by
+  scripts/phylog_decode.py and compared line by line with silicon's
+  (ChipCommon FORCEHT masked, as in stock_state_check). It depends on
+  stock's LHL ARM timer (0x3c ILP) having expired by then in virtual time.
+- **Refuted, removed predictions:** "fw/open/open-ctrl.bin (stock's MAC
+  request) reaches PHYPLL" (run 31), "fw/open/open-seqpll.bin reaches
+  PHYPLL with live ports" (run 32). No prediction is open.
+- SDR tone check: fw/open/open-capture.bin under
+  `phy-live=on,mac-pll=grant`, both stated as assumptions in its PASS line.
 - probes: `pmu_mac_res_req_mask_without_deps` (runs 23/26-29),
   `pmu_mac_res_req_not_granted_at_attach` (run 30),
-  `d11_one_shot_pll_request_full_mask` (run 31); hypotheses
-  `d11_stock_pll_request_full_mask` and `d11_first_pass_then_live` (run
-  32). `d11_ucode_then_live` was removed with the ucode trigger.
+  `d11_one_shot_pll_request_full_mask` (run 31),
+  `d11_stock_pll_request_full_mask` and `d11_first_pass_then_attach_read`
+  (run 32; both were hypotheses with the opposite outcome before run 32).
 
-**Expected divergence: run 21's binaries and run 17.** fw/open/open-run21.bin
-(queued-28/1, queued-29/1), the run-21 replay image (queued-21/2) and the
-run-17 probe (`d11_mac_res_req_then_wake`) got PHYPLL on silicon from the
-one-shot |= 0x302 request, while every later binary with the same MMIO
-sequence did not, with the 0x40000000 mask (runs 23, 26-29) or the full one
-(run 31). The model predicts the failure for all of them. notes/36 §1 shows
-the run21 and ctrl binaries make the same accesses with a few cycles'
-timing difference; the success is attributed to where the one-shot write
-falls in the ILP period (§1a, §7.1) [I], which the model does not reproduce
-and should not. The harness reports these as EXPECTED DIVERGENCE and does
-not count them.
+**Expected divergence: the bfa8c1f binaries and run 17.**
+fw/open/open-run21.bin (queued-28/1, queued-29/1), the run-21 replay image
+(queued-21/2), run 33's shifted copy (queued-33/2) and the run-17 probe
+(`d11_mac_res_req_then_wake`) got PHYPLL on silicon; every later source
+did not, with the same MMIO in the model. Run 33 rules out code layout;
+the cause is unknown [U] (notes/50 run 33 suspects a memory-content
+dependence). The model's default `mac-pll=deny` gives the later sources'
+outcome; the harness reports these as EXPECTED DIVERGENCE and does not
+count them.
 
 ## Evidence sources
 
