@@ -29,6 +29,8 @@
  *    for the source selected in +0xc04 [10:9] (ROM 0x416f50). [I]
  *  - semaphores +0x38/+0x3c: writing a bit toggles it (ROM 0x4123b4 /
  *    0x41249c acquire and release by writing the same bit). [I]
+ *  - CNCB LUTs: +0x484 selects the entry of the 2G (+0x488) and 5G
+ *    (+0x48c) tables (gci_cncb_lut_indirect_addr). [B] layout; [U] effect.
  *  - every other register in gci_regs[] is plain storage: its effect is
  *    not known and it is listed as a gap. [U]
  *
@@ -48,6 +50,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(Bcm4387GciState, BCM4387_GCI)
 #define GCI_CHIPSTS     0x204
 #define GCI_NFILE       32
 #define GCI_OTP         0x1000      /* OTP window, 0x1000 bytes */
+#define GCI_CNCB_LUT_ADDR 0x484
+#define GCI_CNCB_LUT_2G 0x488
+#define GCI_CNCB_LUT_5G 0x48c
 
 /* chipcontrol at handoff = stock's at its first PHY write (run 14) [F] */
 static const struct { uint8_t idx; uint32_t v; } gci_cc_handoff[] = {
@@ -69,9 +74,13 @@ static const Bcm4387Reg gci_regs[] = {
     { 0x058, "gpiointmask", 0, ~0u, "U" },
     { 0x05c, "gpiowakemask", 0, ~0u, "U" },
     { 0x16c, "gci_0x16c", 0, ~0u, "U (stock 0x01000000, RAM 0x48290b)" },
+    { 0x25c, "reset_override", 0, ~0u, "B name; U" },
     { 0x260, "gci_0x260", 0, ~0u, "U (stock pulses 1/0 with the semaphores)" },
     { 0x314, "handshake_req", 0, ~0u, "I see +0x310" },
     { 0x318, "otp_ctrl", 0, ~0u, "U" },
+    { 0x320, "otplayoutextension", 0, 0, "B name; U value (0 assumed)" },
+    { 0x324, "otpcontrol1", 0, ~0u, "B name; U" },
+    { 0x328, "otpprogdata", 0, ~0u, "B name; U" },
     { 0x418, "gci_0x418", 0, ~0u, "U (stock 0x101)" },
     { 0x420, "gci_0x420", 0, ~0u, "U (stock 0x16ec32)" },
     { 0x45c, "gci_0x45c", 0, ~0u, "U" },
@@ -79,6 +88,9 @@ static const Bcm4387Reg gci_regs[] = {
     { 0x464, "gci_0x464", 0, ~0u, "U" },
     { 0x468, "gci_0x468", 0, ~0u, "U" },
     { 0x46c, "gci_0x46c", 0, ~0u, "U" },
+    { 0x47c, "cncb_2g_reset_pulse_width", 0, ~0u, "B name; U" },
+    { 0x480, "cncb_5g_reset_pulse_width", 0, ~0u, "B name; U" },
+    { 0x490, "cncb_glitch_filter_width", 0, ~0u, "B name; U" },
     { 0x500, "gci_0x500", 0, 0, "U read-only, 0 assumed" },
     { 0x514, "gci_0x514", 0, 0, "U read-only, 0 assumed" },
     { 0x738, "gci_0x738", 0, ~0u, "U" },
@@ -89,9 +101,20 @@ static const Bcm4387Reg gci_regs[] = {
     { 0xc00, "gci_0xc00", 0x00000007, 0, "F low byte (si_pub cache); rest U" },
     { 0xc04, "lpo_sel", 0, ~0u, "I see LPO" },
     { 0xc40, "gci_0xc40", 0, ~0u, "U (stock 0x3)" },
+    { 0xc44, "lhl_wl_armtim0_0xc44", 0, ~0u, "B block; U" },
     { 0xc48, "gci_0xc48", 0, ~0u, "U (stock 0x3c)" },
     { 0xc70, "gci_0xc70", 0, ~0u, "U (stock 0x3)" },
     { 0xc78, "gci_0xc78", 0, ~0u, "U" },
+    { 0xc74, "lhl_wl_mactim_0xc74", 0, ~0u, "B block; U" },
+    { 0xc7c, "lhl_wl_mactim_0xc7c", 0, ~0u, "B block; U" },
+    { 0xc84, "lhl_wl_mactim_0xc84", 0, ~0u, "B block; U" },
+    { 0xc8c, "lhl_wl_mactim_0xc8c", 0, ~0u, "B block; U" },
+    { 0xc94, "lhl_wl_mactim_0xc94", 0, ~0u, "B block; U" },
+    { 0xc9c, "lhl_wl_mactim_0xc9c", 0, ~0u, "B block; U" },
+    { 0xc80, "lhl_wl_mactim0_0xc80", 0, ~0u, "B block; U" },
+    { 0xc88, "lhl_wl_mactim_0xc88", 0, ~0u, "B block; U" },
+    { 0xc90, "lhl_wl_mactim_0xc90", 0, ~0u, "B block; U" },
+    { 0xc98, "lhl_wl_mactim_0xc98", 0, ~0u, "B block; U" },
     { 0xd70, "gci_0xd70", 0, ~0u, "U (stock table RAM 0x82b3a7)" },
     { 0xd74, "gci_0xd74", 0, ~0u, "U" },
     { 0xdc4, "gci_0xdc4", 0, ~0u, "U" },
@@ -129,6 +152,7 @@ struct Bcm4387GciState {
     uint32_t chipctrl[GCI_NFILE];
     uint32_t cc_known;          /* chipcontrol entries with a known value */
     uint32_t sema_req, sema_rsv;
+    uint32_t lut_addr, lut[2][1024];
     uint32_t hs_status, otp_layout, lpo_ctl, lpo_status;
 };
 
@@ -184,6 +208,13 @@ static MemTxResult gci_read(void *opaque, hwaddr off, uint64_t *data,
         break;
     case 0x038:
         v = s->sema_req;
+        break;
+    case GCI_CNCB_LUT_ADDR:
+        v = s->lut_addr;
+        break;
+    case GCI_CNCB_LUT_2G:
+    case GCI_CNCB_LUT_5G:
+        v = s->lut[off == GCI_CNCB_LUT_5G][s->lut_addr & 1023];
         break;
     case 0x03c:
         v = s->sema_rsv;
@@ -246,6 +277,13 @@ static MemTxResult gci_write(void *opaque, hwaddr off, uint64_t val,
     case 0x038:
         s->sema_req ^= val;
         return MEMTX_OK;
+    case GCI_CNCB_LUT_ADDR:
+        s->lut_addr = val;
+        return MEMTX_OK;
+    case GCI_CNCB_LUT_2G:
+    case GCI_CNCB_LUT_5G:
+        s->lut[off == GCI_CNCB_LUT_5G][s->lut_addr & 1023] = val;
+        return MEMTX_OK;
     case 0x03c:
         s->sema_rsv ^= val;
         return MEMTX_OK;
@@ -296,6 +334,8 @@ static void gci_reset(DeviceState *dev)
     }
     s->index = 0;
     s->sema_req = s->sema_rsv = 0;
+    s->lut_addr = 0;
+    memset(s->lut, 0, sizeof(s->lut));
     s->hs_status = s->otp_layout = s->lpo_ctl = s->lpo_status = 0;
 }
 

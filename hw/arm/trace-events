@@ -104,6 +104,7 @@ bcm4387_pmu_res_state(uint32_t old, uint32_t state, uint32_t want) "res_state 0x
 bcm4387_pmu_request(int who, uint32_t old, uint32_t mask) "requester %d: 0x%08x -> 0x%08x"
 bcm4387_pmu_select(const char *file, uint32_t idx) "%s index <- %u"
 bcm4387_pmu_file(const char *file, uint32_t idx, uint32_t old, uint64_t v) "%s[%u] 0x%08x -> 0x%08" PRIx64
+bcm4387_pmu_mac_active(int n, bool on) "d11 slice %d MAC clock request %d"
 bcm4387_pmu_pll_commit(void) "pllcontrol committed (PLLCTL_UPD)"
 bcm4387_aon_sync_land(uint64_t addr, uint32_t v) "always-on write 0x%08" PRIx64 " <- 0x%x landed"
 bcm4387_aon_sync_drop(uint64_t addr, uint32_t v) "always-on write 0x%08" PRIx64 " <- 0x%x dropped (wedged)"

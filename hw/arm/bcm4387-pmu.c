@@ -11,8 +11,16 @@
  * Modelled:
  *  - Resources 0..30. A resource is requested by min_res_mask, by one of
  *    the requesters (bcm4387_pmu_request: srpwr power domains, d11 MAC
- *    clock requests, the external/BT side, ChipCommon), or by res_req_mask
- *    while res_req_timer has a force bit set. The PMU brings up the
+ *    clock requests, the external/BT side, ChipCommon), or by the mask of
+ *    a resource request timer while its force ALP/HT/HQ flags are set:
+ *    res_req (the ARM's, always asserted), mac_res_req 0/1/2 while that d11
+ *    slice asserts its clock request (out of reset, clock on; see
+ *    d11_mac_request in bcm4387.c). Stock enables the main PHY this way:
+ *    mac_res_req_timer 0x15000000, mask 0x56cac1ff = MACPHY_CLK_MAIN and
+ *    its dependencies (si_pmu_set_mac_rsrc_req), before its first
+ *    phyversion read. [B] flags/names, [I] the request condition.
+ *    These timers are reset by a reload (handoff res_state lacks resource
+ *    30). [F] The PMU brings up the
  *    dependency closure of everything requested (res_dep_mask table),
  *    limited to max_res_mask, and drops the rest. Transitions complete at
  *    once (res_pending reads 0); timing is not modelled. [B] semantics
@@ -148,16 +156,17 @@ static const Bcm4387Reg pmu_regs[] = {
     { 0x644, "res_req_timer", 0, ~0u, "B; I force bits request res_req_mask" },
     { 0x648, "res_req_mask", 0, ~0u, "B" },
     { 0x64c, "core_cap_ext", 2u << 20, 0, "B field; I 3 MAC req timers" },
-    { 0x688, "mac_res_req_timer", 0, ~0u, "B; U effect" },
-    { 0x68c, "mac_res_req_mask", 0, ~0u, "B; U effect" },
+    { 0x630, "clkstretch", 0, ~0u, "B name; U" },
+    { 0x688, "mac_res_req_timer", 0, ~0u, "B; I force flags request the mask" },
+    { 0x68c, "mac_res_req_mask", 0, ~0u, "B" },
     { 0x6d8, "pmucontrol_ext", 0, ~0u, "B bits; I handoff 0 (run 15)" },
     { 0x6dc, "slowclkperiod", 0, ~0u, "B name; U" },
-    { 0x6f0, "mac_res_req_timer1", 0, ~0u, "B; U effect" },
-    { 0x6f4, "mac_res_req_mask1", 0, ~0u, "B; U effect" },
+    { 0x6f0, "mac_res_req_timer1", 0, ~0u, "B; I as mac_res_req_timer" },
+    { 0x6f4, "mac_res_req_mask1", 0, ~0u, "B" },
     { 0x700, "pmuintmask0", 0, ~0u, "B name; U (no interrupt)" },
     { 0x720, "rsrc_event0", 0, ~0u, "B name; U" },
-    { 0x738, "mac_res_req_timer2", 0, ~0u, "B; U effect" },
-    { 0x73c, "mac_res_req_mask2", 0, ~0u, "B; U effect" },
+    { 0x738, "mac_res_req_timer2", 0, ~0u, "B; I as mac_res_req_timer" },
+    { 0x73c, "mac_res_req_mask2", 0, ~0u, "B" },
     { 0x780, "pmuintctrl0", 0, ~0u, "B name; U" },
     { 0x7e8, "core_cap_ext1", 0, 0, "B name; U value (0 assumed)" },
     { 0x804, "rsrc_substate_trans_tmr", 0, ~0u, "B name; U (per res_table_sel)" },
@@ -189,6 +198,7 @@ struct Bcm4387PmuState {
     uint32_t pll_committed[NFILE];
     uint32_t sel[4];            /* res_table_sel, cc/reg/pll address */
     uint32_t req[BCM4387_REQ_N];
+    bool mac_active[3];         /* d11 slice clock request asserted */
     uint32_t res_state;
     SyncSlot sync[NSYNC];
     bool sync_any_wedged;
@@ -225,6 +235,12 @@ static uint32_t res_closure(Bcm4387PmuState *s, uint32_t m)
     return m;
 }
 
+/* {timer, mask}: res_req, mac_res_req (main), 1 (aux), 2 (scan) */
+static const hwaddr req_timers[][2] = {
+    { PMU_REQ_TIMER, PMU_REQ_MASK }, { 0x688, 0x68c }, { 0x6f0, 0x6f4 },
+    { 0x738, 0x73c },
+};
+
 static void res_update(Bcm4387PmuState *s)
 {
     uint32_t want = *pmu_reg(s, PMU_MIN_RES), old = s->res_state;
@@ -232,9 +248,16 @@ static void res_update(Bcm4387PmuState *s)
     for (int i = 0; i < BCM4387_REQ_N; i++) {
         want |= s->req[i];
     }
-    /* res_req_timer force ALP/HT/HQ bits (26..28) request res_req_mask [I] */
-    if (*pmu_reg(s, PMU_REQ_TIMER) & (7u << 26)) {
-        want |= *pmu_reg(s, PMU_REQ_MASK);
+    /*
+     * Resource request timers: the force ALP/HT/HQ flags (bits 26..28,
+     * MAC_RSRC_REQ_TIMER_FORCE_*; PRRT_*_REQ << 14) request the timer's
+     * mask while set. [B] flags, [I] request held while a flag is set.
+     */
+    for (int i = 0; i < ARRAY_SIZE(req_timers); i++) {
+        if ((i == 0 || s->mac_active[i - 1]) &&
+            (*pmu_reg(s, req_timers[i][0]) & (7u << 26))) {
+            want |= *pmu_reg(s, req_timers[i][1]);
+        }
     }
     s->res_state = res_closure(s, want) & *pmu_reg(s, PMU_MAX_RES) &
                    (RES(NRES) - 1);
@@ -249,6 +272,15 @@ void bcm4387_pmu_request(Bcm4387PmuState *s, Bcm4387PmuReq who,
     if (s->req[who] != mask) {
         trace_bcm4387_pmu_request(who, s->req[who], mask);
         s->req[who] = mask;
+        res_update(s);
+    }
+}
+
+void bcm4387_pmu_mac_active(Bcm4387PmuState *s, int n, bool on)
+{
+    if (s->mac_active[n] != on) {
+        trace_bcm4387_pmu_mac_active(n, on);
+        s->mac_active[n] = on;
         res_update(s);
     }
 }
@@ -428,8 +460,8 @@ static MemTxResult pmu_read(void *opaque, hwaddr off, uint64_t *data,
 
         if (idx >= NFILE || !(s->known[f] & BIT(idx))) {
             qemu_log_mask(LOG_GUEST_ERROR, "bcm4387-pmu: unknown %s[%u] read "
-                          "(0xdead) pc~0x%08x\n", file_name[f], idx,
-                          bcm4387_pc());
+                          "(0xdead) pc~0x%08x lr~0x%08x\n", file_name[f], idx,
+                          bcm4387_pc(), bcm4387_lr());
             v = 0xdead;
         } else {
             v = s->file[f][idx];
@@ -508,6 +540,7 @@ static MemTxResult pmu_write(void *opaque, hwaddr off, uint64_t val,
     case PMU_MAX_RES:
     case PMU_REQ_TIMER:
     case PMU_REQ_MASK:
+    case 0x688: case 0x68c: case 0x6f0: case 0x6f4: case 0x738: case 0x73c:
         res_update(s);
         break;
     }
@@ -549,6 +582,7 @@ static void pmu_reset(DeviceState *dev)
     memset(s->sync, 0, sizeof(s->sync));
     s->sync_any_wedged = false;
     memset(s->req, 0, sizeof(s->req));
+    memset(s->mac_active, 0, sizeof(s->mac_active));
     s->req[BCM4387_REQ_EXTERNAL] = RES(RES_BTMAIN) | RES(RES_DIG) |
                                    RES(RES_ARMCLK) | RES(RES_HT);
     res_update(s);

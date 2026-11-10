@@ -86,6 +86,7 @@ static const Bcm4387Reg cc_regs[] = {
     { 0x130, "SECI_config", 0, ~0u, "B name; U" },
     { 0x138, "SECI_statusmask", 0, ~0u, "B name; U" },
     { 0x18c, "cc_0x18c", 0, ~0u, "U (stock writes 1, ROM 0x4833ef)" },
+    { 0x1c0, "seci_uart_data", 0, ~0u, "B name; U (no UART modelled)" },
     { 0x1c4, "seci_uart_bauddiv", 0, ~0u, "B name; U" },
     { 0x1cc, "seci_uart_lcr", 0, ~0u, "B name; U" },
     { 0x1d0, "seci_uart_mcr", 0, ~0u, "B name; U" },

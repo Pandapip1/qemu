@@ -258,6 +258,20 @@ static bool model_read(BCM4387MachineState *s, hwaddr a, uint32_t *v)
              (d11_phypll(s, d11_core(a)) ? 0x0a000000 : 0);
         return true;
     }
+    if (a == CR4_BASE + 0x1e0 || a == 0x18001000 + 0x1e0) {
+        /*
+         * clk_ctl_st of the other cores: requests as written, ALP/HT
+         * available and the backplane on HT while the PMU has those
+         * resources up (hndsoc.h: "common to all cores to communicate w/PMU
+         * regarding clock control"). [B] Stock reads 0x000b0000 [I].
+         */
+        bool ht = bcm4387_pmu_res_up(s->pmu, BCM4387_RES_HT_AVAIL);
+
+        *v = (store_get(s, a) & 0xffff) |
+             (bcm4387_pmu_res_up(s->pmu, BCM4387_RES_ALP_AVAIL) ? 0x10000 : 0) |
+             (ht ? 0xa0000 : 0);
+        return true;
+    }
     switch (a) {
     /*
      * d11 PHY version (regs +0x3e0): analog rev [15:12], PHY type [11:8]
@@ -304,6 +318,22 @@ static bool model_read(BCM4387MachineState *s, hwaddr a, uint32_t *v)
 
 static void tcam_program(BCM4387MachineState *s, uint32_t slot);
 
+/*
+ * A d11 slice out of reset with its clock on asserts its MAC clock request
+ * to the PMU, which then brings up that slice's mac_res_req mask. [I] Stock
+ * programs all three MAC request timers (0x15000000, masks = MACPHY_CLK
+ * closure of each slice) before its first PHY write, yet silicon has only
+ * the main slice's resources up then (res_state 0x5ecefbff, run 11): the
+ * timers alone do not hold the request; the main slice is the one out of
+ * reset. [F] check.
+ */
+static void d11_mac_request(BCM4387MachineState *s, int n)
+{
+    bcm4387_pmu_mac_active(s->pmu, n,
+                           !(store_get(s, D11_WRAP(n) + WRAP_RESETCTRL) & 1) &&
+                           (store_get(s, D11_WRAP(n) + WRAP_IOCTL) & 1));
+}
+
 static bool model_write(BCM4387MachineState *s, hwaddr a, uint32_t v)
 {
     int n = d11_core(a);
@@ -329,6 +359,12 @@ static bool model_write(BCM4387MachineState *s, hwaddr a, uint32_t v)
                     (store_get(s, D11_WRAP(n) + WRAP_IOCTL) & 0xc) == 0xc;
             }
             store_set(s, a, v);
+            d11_mac_request(s, n);
+            return true;
+        }
+        if (a == D11_WRAP(n) + WRAP_IOCTL) {
+            store_set(s, a, v);
+            d11_mac_request(s, n);
             return true;
         }
     }
@@ -632,7 +668,7 @@ MemTxResult bcm4387_unknown(const char *dev, hwaddr base, hwaddr off,
     } else {
         *data = store_get(s, a);
     }
-    qemu_log_mask(LOG_UNIMP, "bcm4387: MMIO  %c%u 0x%08" HWADDR_PRIx
+    qemu_log_mask(LOG_UNIMP, "bcm4387: MMIO? %c%u 0x%08" HWADDR_PRIx
                   " %s 0x%08" PRIx64 " pc~0x%08x lr~0x%08x\n",
                   write ? 'W' : 'R', size * 8, a, write ? "<-" : "->", *data,
                   bcm4387_pc(), bcm4387_lr());
@@ -694,8 +730,191 @@ static MemTxResult d11_gate(BCM4387MachineState *s, hwaddr a)
  * semantics). In strict mode every other access is an AXI slave error, so
  * firmware that touches something we have not characterised fails visibly.
  */
+/*
+ * Plain registers of the cores without a device of their own: storage only,
+ * effect unknown. Names: brcmsmac d11regs_t / bcmdhd sbchipc.h / brcmfmac
+ * pcie.c where given. Each is a gap (docs/bcm4387-model-fidelity.md). [U]
+ */
+static const struct { hwaddr a; const char *name; } plain_regs[] = {
+    { CR4_BASE + 0x000, "cr4 corecontrol" },
+    { CR4_BASE + 0x014, "cr4 0x014 (read)" },
+    { CR4_BASE + 0x018, "cr4 0x018 (interrupt mask?)" },
+    { CR4_BASE + 0x01c, "cr4 0x01c" },
+    { CR4_BASE + 0x020, "cr4 0x020 (timer intstatus? stock writes 1, ROM 0x414a64)" },
+    { CR4_BASE + 0x024, "cr4 0x024 (read)" },
+    { CR4_BASE + 0x028, "cr4 0x028" },
+    { CR4_BASE + 0x02c, "cr4 0x02c (timer count? ROM 0x414a66)" },
+    { CR4_BASE + 0x1e0, "cr4 clk_ctl_st (requests; avail bits modelled)" },
+    { 0x180011e0, "pcie clk_ctl_st (requests; avail bits modelled)" },
+    { CR4_BASE + 0x050, "cr4 0x050" },
+    { CR4_BASE + 0x098, "cr4 0x098 (ASLR code, 0x400000)" },
+    { CR4_BASE + 0x1e8, "cr4 powerctl" },
+    { 0x18013004, "sr0 sr_control0" }, { 0x18013008, "sr0 sr_control1" },
+    { 0x18014004, "sr1 sr_control0" }, { 0x18014008, "sr1 sr_control1" },
+    { 0x1801f004, "sr2 sr_control0" }, { 0x1801f008, "sr2 sr_control1" },
+    { 0x1801f030, "sr2 0x030" },
+    { 0x18020004, "sr3 sr_control0" }, { 0x18020008, "sr3 sr_control1" },
+    { 0x18001000, "pcie 0x000" }, { 0x180010f8, "pcie 0x0f8" },
+    { 0x180010fc, "pcie 0x0fc" }, { 0x18001100, "pcie 0x100" },
+    { 0x18001104, "pcie 0x104" }, { 0x1800110c, "pcie 0x10c" },
+    { 0x18001110, "pcie 0x110" }, { 0x18001128, "pcie mdio control" },
+    { 0x1800112c, "pcie mdio wrdata" }, { 0x180011c0, "pcie 0x1c0" },
+    { 0x18001408, "pcie 0x408" }, { 0x18001410, "pcie 0x410" },
+    { 0x18001820, "pcie 0x820" }, { 0x18001824, "pcie 0x824" },
+    { 0x18001830, "pcie 0x830" }, { 0x18001c10, "pcie 0xc10" },
+    { 0x18001c18, "pcie 0xc18" },
+    { 0x18001120, "pcie configaddr" }, { 0x18001124, "pcie configdata" },
+    { 0x18031120, "d11.0 maccontrol" },
+    { 0x18031130, "d11.0 tplatewrptr" },
+    { 0x18031134, "d11.0 tplatewrdata" },
+    { 0x1803115c, "d11.0 machwcap" },
+    { 0x18031160, "d11.0 objaddr" },
+    { 0x18031164, "d11.0 objdata" },
+    { 0x1803118c, "d11.0 tsf_cfpstart" },
+    { 0x180311a4, "d11.0 machwcap1" },
+    { 0x18032120, "d11.1 maccontrol" },
+    { 0x18032130, "d11.1 tplatewrptr" },
+    { 0x18032134, "d11.1 tplatewrdata" },
+    { 0x1803215c, "d11.1 machwcap" },
+    { 0x18032160, "d11.1 objaddr" },
+    { 0x18032164, "d11.1 objdata" },
+    { 0x1803218c, "d11.1 tsf_cfpstart" },
+    { 0x180321a4, "d11.1 machwcap1" },
+    { 0x18033120, "d11.2 maccontrol" },
+    { 0x18033130, "d11.2 tplatewrptr" },
+    { 0x18033134, "d11.2 tplatewrdata" },
+    { 0x1803315c, "d11.2 machwcap" },
+    { 0x18033160, "d11.2 objaddr" },
+    { 0x18033164, "d11.2 objdata" },
+    { 0x1803318c, "d11.2 tsf_cfpstart" },
+    { 0x180331a4, "d11.2 machwcap1" },
+    { 0x18001010, "pcie 0x010" },
+    { 0x18001018, "pcie 0x018" },
+    { 0x1800103c, "pcie 0x03c" },
+    { 0x18001040, "pcie 0x040" },
+    { 0x18001044, "pcie 0x044" },
+    { 0x180011ac, "pcie 0x1ac" },
+    { 0x180011b0, "pcie 0x1b0" },
+    { 0x180011b4, "pcie 0x1b4" },
+    { 0x180011b8, "pcie 0x1b8" },
+    { 0x180011bc, "pcie 0x1bc" },
+    { 0x180011c4, "pcie 0x1c4" },
+    { 0x180011c8, "pcie 0x1c8" },
+    { 0x180011cc, "pcie 0x1cc" },
+    { 0x180011e8, "pcie 0x1e8" },
+    { 0x18001200, "pcie 0x200" },
+    { 0x18001204, "pcie 0x204" },
+    { 0x18001208, "pcie 0x208" },
+    { 0x1800120c, "pcie 0x20c" },
+    { 0x18001210, "pcie 0x210" },
+    { 0x18001214, "pcie 0x214" },
+    { 0x18001218, "pcie 0x218" },
+    { 0x1800121c, "pcie 0x21c" },
+    { 0x18001220, "pcie 0x220" },
+    { 0x18001224, "pcie 0x224" },
+    { 0x18001228, "pcie 0x228" },
+    { 0x1800122c, "pcie 0x22c" },
+    { 0x18001230, "pcie 0x230" },
+    { 0x18001234, "pcie 0x234" },
+    { 0x18001238, "pcie 0x238" },
+    { 0x1800123c, "pcie 0x23c" },
+    { 0x18001240, "pcie 0x240" },
+    { 0x18001244, "pcie 0x244" },
+    { 0x18001248, "pcie 0x248" },
+    { 0x1800124c, "pcie 0x24c" },
+    { 0x18001250, "pcie 0x250" },
+    { 0x18001254, "pcie 0x254" },
+    { 0x18001258, "pcie 0x258" },
+    { 0x1800125c, "pcie 0x25c" },
+    { 0x18001260, "pcie 0x260" },
+    { 0x18001264, "pcie 0x264" },
+    { 0x18001268, "pcie 0x268" },
+    { 0x1800126c, "pcie 0x26c" },
+    { 0x18001270, "pcie 0x270" },
+    { 0x18001274, "pcie 0x274" },
+    { 0x1800140c, "pcie 0x40c" },
+    { 0x18001414, "pcie 0x414" },
+    { 0x18001580, "pcie 0x580" },
+    { 0x18001584, "pcie 0x584" },
+    { 0x18001588, "pcie 0x588" },
+    { 0x18001590, "pcie 0x590" },
+    { 0x18001594, "pcie 0x594" },
+    { 0x18001598, "pcie 0x598" },
+    { 0x180015a0, "pcie 0x5a0" },
+    { 0x180015a4, "pcie 0x5a4" },
+    { 0x180015a8, "pcie 0x5a8" },
+    { 0x180015b0, "pcie 0x5b0" },
+    { 0x180015b4, "pcie 0x5b4" },
+    { 0x180015b8, "pcie 0x5b8" },
+    { 0x18001600, "pcie 0x600" },
+    { 0x18001604, "pcie 0x604" },
+    { 0x18001608, "pcie 0x608" },
+    { 0x18001610, "pcie 0x610" },
+    { 0x18001c00, "pcie 0xc00" },
+    { 0x18001c1c, "pcie 0xc1c" },
+    { 0x18001c34, "pcie 0xc34" },
+    { 0x18001c38, "pcie 0xc38" },
+    { 0x18001c60, "pcie 0xc60" },
+    { 0x18001c64, "pcie 0xc64" },
+    { 0x18031098, "d11.0 0x098" },
+    { 0x1803109c, "d11.0 0x09c" },
+    { 0x180310a0, "d11.0 0x0a0" },
+    { 0x180310c0, "d11.0 0x0c0" },
+    { 0x180310c4, "d11.0 0x0c4" },
+    { 0x180310c8, "d11.0 0x0c8" },
+    { 0x180310cc, "d11.0 0x0cc" },
+    { 0x18031220, "d11.0 dma rcv0 control" },
+    { 0x18031224, "d11.0 dma rcv0 ptr" },
+    { 0x18031228, "d11.0 dma rcv0 addrlow" },
+    { 0x18031260, "d11.0 dma rcv1 control" },
+    { 0x18031264, "d11.0 dma rcv1 ptr" },
+    { 0x18031268, "d11.0 dma rcv1 addrlow" },
+    { 0x180312a0, "d11.0 dma rcv2 control" },
+    { 0x180312a4, "d11.0 dma rcv2 ptr" },
+    { 0x180312a8, "d11.0 dma rcv2 addrlow" },
+    { 0x18032098, "d11.1 0x098" },
+    { 0x1803209c, "d11.1 0x09c" },
+    { 0x180320a0, "d11.1 0x0a0" },
+    { 0x180320c0, "d11.1 0x0c0" },
+    { 0x180320c4, "d11.1 0x0c4" },
+    { 0x180320c8, "d11.1 0x0c8" },
+    { 0x180320cc, "d11.1 0x0cc" },
+    { 0x18032220, "d11.1 dma rcv0 control" },
+    { 0x18032224, "d11.1 dma rcv0 ptr" },
+    { 0x18032228, "d11.1 dma rcv0 addrlow" },
+    { 0x18032260, "d11.1 dma rcv1 control" },
+    { 0x18032264, "d11.1 dma rcv1 ptr" },
+    { 0x18032268, "d11.1 dma rcv1 addrlow" },
+    { 0x180322a0, "d11.1 dma rcv2 control" },
+    { 0x180322a4, "d11.1 dma rcv2 ptr" },
+    { 0x180322a8, "d11.1 dma rcv2 addrlow" },
+    { 0x18033098, "d11.2 0x098" },
+    { 0x1803309c, "d11.2 0x09c" },
+    { 0x180330a0, "d11.2 0x0a0" },
+    { 0x180330c0, "d11.2 0x0c0" },
+    { 0x180330c4, "d11.2 0x0c4" },
+    { 0x180330c8, "d11.2 0x0c8" },
+    { 0x180330cc, "d11.2 0x0cc" },
+    { 0x18033220, "d11.2 dma rcv0 control" },
+    { 0x18033224, "d11.2 dma rcv0 ptr" },
+    { 0x18033228, "d11.2 dma rcv0 addrlow" },
+    { 0x18033260, "d11.2 dma rcv1 control" },
+    { 0x18033264, "d11.2 dma rcv1 ptr" },
+    { 0x18033268, "d11.2 dma rcv1 addrlow" },
+    { 0x180332a0, "d11.2 dma rcv2 control" },
+    { 0x180332a4, "d11.2 dma rcv2 ptr" },
+    { 0x180332a8, "d11.2 dma rcv2 addrlow" },
+    { 0x18101000, "pcie wrapper 0x000" }, { 0x18101004, "pcie wrapper 0x004" },
+    { 0x18101064, "pcie wrapper 0x064" },
+};
+
 static bool reg_known(hwaddr a)
 {
+    for (int i = 0; i < ARRAY_SIZE(plain_regs); i++) {
+        if (plain_regs[i].a == (a & ~3)) {
+            return true;
+        }
+    }
     static const struct { hwaddr base, len; } ranges[] = {
         { CR4_BASE + 0x04, 0x04 }, { CR4_BASE + 0x40, 0x08 },
         { CR4_BASE + 0x68, 0x10 },      /* TCAM */
@@ -748,7 +967,7 @@ static MemTxResult trace_read(void *opaque, hwaddr addr, uint64_t *data,
     }
     qemu_log_mask(LOG_UNIMP, "bcm4387: %s R%u 0x%08" HWADDR_PRIx
                   " -> 0x%08x pc~0x%08x lr~0x%08x\n",
-                  modelled ? "MODEL" : "MMIO ", size * 8, addr, v,
+                  modelled ? "MODEL" : reg_known(addr) ? "MMIO " : "MMIO?", size * 8, addr, v,
                   bcm4387_pc(), bcm4387_lr());
     *data = v;
     return MEMTX_OK;
@@ -779,7 +998,7 @@ static MemTxResult trace_write(void *opaque, hwaddr addr, uint64_t val,
     }
     qemu_log_mask(LOG_UNIMP, "bcm4387: %s W%u 0x%08" HWADDR_PRIx
                   " <- 0x%08" PRIx64 " pc~0x%08x lr~0x%08x\n",
-                  modelled ? "MODEL" : "MMIO ", size * 8, addr, val,
+                  modelled ? "MODEL" : reg_known(addr) ? "MMIO " : "MMIO?", size * 8, addr, val,
                   bcm4387_pc(), bcm4387_lr());
     return MEMTX_OK;
 }
