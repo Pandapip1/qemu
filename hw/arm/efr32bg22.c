@@ -916,6 +916,19 @@ struct Efr32Periph
     Object *analog_source;
     /* Fault injection: IADC conversions never complete. */
     uint32_t iadc_stall;
+    /*
+     * Clock faults (qom-set at run time, tests only). The TIMERs' clock off by
+     * x-hf-ppm, TIMER0's stopped (x-timer0-stopped). The BURTC's LF clock off by
+     * x-lf-ppm or stopped (x-lf-stopped), from lf_fault_t0 on, when the LF time it
+     * counts was lf_fault_eff0.
+     */
+    int32_t fault_hf_ppm;
+    bool fault_timer0_stopped;
+    int32_t fault_lf_ppm;
+    bool fault_lf_stopped;
+    bool lf_fault;
+    int64_t lf_fault_t0;
+    int64_t lf_fault_eff0;
     /* IADC conversions in progress, in completion order (efr32_iadc_*). */
     QEMUTimer *iadc_timer;
     struct {
@@ -3759,26 +3772,56 @@ static uint64_t efr32_burtc_hz(Efr32Periph *s)
     }
 }
 
+/*
+ * The LF time the BURTC counts at virtual time @t: @t itself, or after an injected
+ * clock fault, its time then advanced at the faulty rate (or not at all).
+ */
+static int64_t efr32_lf_time(Efr32Periph *s, int64_t t)
+{
+    if (!s->lf_fault || t <= s->lf_fault_t0) {
+        return s->lf_fault ? s->lf_fault_eff0 - (s->lf_fault_t0 - t) : t;
+    }
+    if (s->fault_lf_stopped) {
+        return s->lf_fault_eff0;
+    }
+    return s->lf_fault_eff0 + muldiv64(t - s->lf_fault_t0, 1000000 + s->fault_lf_ppm,
+                                       1000000);
+}
+
+/* The virtual time the LF time @lf is reached (never, with the clock stopped). */
+static int64_t efr32_lf_virtual_time(Efr32Periph *s, int64_t lf)
+{
+    if (!s->lf_fault || lf <= s->lf_fault_eff0) {
+        return s->lf_fault ? s->lf_fault_t0 - (s->lf_fault_eff0 - lf) : lf;
+    }
+    if (s->fault_lf_stopped) {
+        return INT64_MAX;
+    }
+    return s->lf_fault_t0 + muldiv64_round_up(lf - s->lf_fault_eff0, 1000000,
+                                              1000000 + s->fault_lf_ppm);
+}
+
 /* Index of the last LF rising edge at or before @t. */
 static int64_t efr32_burtc_edge_at(Efr32Periph *s, int64_t t)
 {
-    return muldiv64(t, efr32_burtc_hz(s), NANOSECONDS_PER_SECOND);
+    return muldiv64(efr32_lf_time(s, t), efr32_burtc_hz(s), NANOSECONDS_PER_SECOND);
 }
 
 static int64_t efr32_burtc_edge_ns(Efr32Periph *s, int64_t edge)
 {
-    return muldiv64_round_up(edge, NANOSECONDS_PER_SECOND, efr32_burtc_hz(s));
+    return efr32_lf_virtual_time(s, muldiv64_round_up(edge, NANOSECONDS_PER_SECOND,
+                                                      efr32_burtc_hz(s)));
 }
 
 /* Time of the @n-th LF falling edge strictly after @t. */
 static int64_t efr32_burtc_falling_ns(Efr32Periph *s, int64_t t, unsigned n)
 {
     uint64_t hz2 = efr32_burtc_hz(s) * 2;
-    int64_t half = muldiv64(t, hz2, NANOSECONDS_PER_SECOND);
+    int64_t half = muldiv64(efr32_lf_time(s, t), hz2, NANOSECONDS_PER_SECOND);
 
     half += (half & 1) ? 2 : 1; /* first odd half-period index after t */
     half += 2 * (int64_t)(n - 1);
-    return muldiv64_round_up(half, NANOSECONDS_PER_SECOND, hz2);
+    return efr32_lf_virtual_time(s, muldiv64_round_up(half, NANOSECONDS_PER_SECOND, hz2));
 }
 
 static uint32_t efr32_burtc_div(Efr32Periph *s)
@@ -4153,6 +4196,7 @@ static bool efr32_timer_started(Efr32Periph *s, int i)
 static bool efr32_timer_counting(Efr32Periph *s, int i)
 {
     return efr32_timer_started(s, i) && !s->em2 &&
+           !(i == 0 && s->fault_timer0_stopped) &&
            !efr32_debug_frozen(s, efr32_timer_reg(s, i, EFR32_TIMER_CFG) &
                                       EFR32_TIMER_CFG_DEBUGRUN);
 }
@@ -4233,7 +4277,7 @@ static uint64_t efr32_timer_hz(Efr32Periph *s, int i)
     uint32_t presc = (efr32_timer_reg(s, i, EFR32_TIMER_CFG) &
                       EFR32_TIMER_CFG_PRESC_MASK) >> EFR32_TIMER_CFG_PRESC_SHIFT;
 
-    return efr32_em01grpa_hz(s) / (presc + 1);
+    return muldiv64(efr32_em01grpa_hz(s), 1000000 + s->fault_hf_ppm, 1000000) / (presc + 1);
 }
 
 static uint64_t efr32_timer_period(Efr32Periph *s, int i)
@@ -4279,6 +4323,80 @@ static void efr32_timer0_rebase(Efr32Periph *s)
     for (int i = 0; i < EFR32_TIMER_COUNT; i++) {
         efr32_timer_rebase(s, i);
     }
+}
+
+static void efr32_timer_schedule(Efr32Periph *s, int i);
+static void efr32_burtc_process(Efr32Periph *s);
+
+/* Clock faults: the TIMERs' counts so far kept, their rate or state changed from now. */
+static void efr32_fault_get_i32(Object *obj, Visitor *v, const char *name, void *opaque,
+                                Error **errp)
+{
+    visit_type_int32(v, name, (int32_t *)opaque, errp);
+}
+
+static void efr32_fault_get_bool(Object *obj, Visitor *v, const char *name, void *opaque,
+                                 Error **errp)
+{
+    visit_type_bool(v, name, (bool *)opaque, errp);
+}
+
+static void efr32_fault_hf_set(Object *obj, Visitor *v, const char *name, void *opaque,
+                               Error **errp)
+{
+    Efr32Periph *s = EFR32_PERIPH(obj);
+    int32_t ppm;
+    bool stopped;
+
+    if (opaque == &s->fault_hf_ppm) {
+        if (!visit_type_int32(v, name, &ppm, errp)) {
+            return;
+        }
+        if (ppm <= -1000000) {
+            error_setg(errp, "%s: a rate off by -100%% or more is a stopped clock", name);
+            return;
+        }
+    } else if (!visit_type_bool(v, name, &stopped, errp)) {
+        return;
+    }
+    efr32_timer0_rebase(s);
+    if (opaque == &s->fault_hf_ppm) {
+        s->fault_hf_ppm = ppm;
+    } else {
+        s->fault_timer0_stopped = stopped;
+    }
+    for (int i = 0; i < EFR32_TIMER_COUNT; i++) {
+        efr32_timer_schedule(s, i);
+    }
+}
+
+/* Clock faults: the BURTC's LF time so far kept, its rate or state changed from now. */
+static void efr32_fault_lf_set(Object *obj, Visitor *v, const char *name, void *opaque,
+                               Error **errp)
+{
+    Efr32Periph *s = EFR32_PERIPH(obj);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int32_t ppm = s->fault_lf_ppm;
+    bool stopped = s->fault_lf_stopped;
+
+    if (opaque == &s->fault_lf_ppm) {
+        if (!visit_type_int32(v, name, &ppm, errp)) {
+            return;
+        }
+        if (ppm <= -1000000) {
+            error_setg(errp, "%s: a rate off by -100%% or more is a stopped clock", name);
+            return;
+        }
+    } else if (!visit_type_bool(v, name, &stopped, errp)) {
+        return;
+    }
+    efr32_burtc_process(s);
+    s->lf_fault_eff0 = efr32_lf_time(s, now);
+    s->lf_fault_t0 = now;
+    s->lf_fault = true;
+    s->fault_lf_ppm = ppm;
+    s->fault_lf_stopped = stopped;
+    efr32_burtc_process(s);
 }
 
 /*
@@ -8824,6 +8942,15 @@ static void efr32_periph_init(Object *o)
     /* Fault injection (qom-set at run time): conversions never complete. */
     object_property_add_uint32_ptr(o, "x-iadc-stall", &s->iadc_stall,
                                  OBJ_PROP_FLAG_READWRITE);
+    /* Clock faults (qom-set at run time): rate offsets in ppm, stopped clocks. */
+    object_property_add(o, "x-hf-ppm", "int32", efr32_fault_get_i32, efr32_fault_hf_set,
+                        NULL, &s->fault_hf_ppm);
+    object_property_add(o, "x-timer0-stopped", "bool", efr32_fault_get_bool,
+                        efr32_fault_hf_set, NULL, &s->fault_timer0_stopped);
+    object_property_add(o, "x-lf-ppm", "int32", efr32_fault_get_i32, efr32_fault_lf_set,
+                        NULL, &s->fault_lf_ppm);
+    object_property_add(o, "x-lf-stopped", "bool", efr32_fault_get_bool, efr32_fault_lf_set,
+                        NULL, &s->fault_lf_stopped);
     qdev_init_gpio_out_named(DEVICE(o), s->timer_cc_out, "timer-cc",
                              ARRAY_SIZE(s->timer_cc_out));
     qdev_init_gpio_out_named(DEVICE(o), &s->debug_wedge, "debug-wedge", 1);

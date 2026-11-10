@@ -755,6 +755,76 @@ static void timer0_step(int64_t ns)
     qtest_qmp_assert_success(global_qtest, "{'execute':'stop'}");
 }
 
+static void periph_qom_set_int(const char *property, int value)
+{
+    qtest_qmp_assert_success(global_qtest, "{'execute':'qom-set','arguments':"
+                             "{'path':'/machine/soc/periph','property':%s,'value':%d}}",
+                             property, value);
+}
+
+static void periph_qom_set_bool(const char *property, bool value)
+{
+    qtest_qmp_assert_success(global_qtest, "{'execute':'qom-set','arguments':"
+                             "{'path':'/machine/soc/periph','property':%s,'value':%i}}",
+                             property, value);
+}
+
+/*
+ * Clock faults (x-hf-ppm, x-timer0-stopped, x-lf-ppm, x-lf-stopped): the counts so far are
+ * kept and the rate, or the clock, changes from the injection on.
+ */
+static void test_clock_fault_injection(void)
+{
+    uint32_t t0, t1, b0, b1;
+
+    reset_with_radio_clocks();
+    writel(CMU_BASE_ADDR + CMU_EM01GRPACLKCTRL, CMU_EM01GRPACLK_HFXO);
+    writel(TIMER0_NS_BASE + TIMER_EN + REGISTER_SET_WINDOW, TIMER_EN_EN);
+    writel(TIMER0_NS_BASE + TIMER_TOP, 0xffffffff);
+    writel(TIMER0_NS_BASE + TIMER_CMD, TIMER_CMD_START);
+    writel(BURTC_BASE + BURTC_EN + REGISTER_SET_WINDOW, BURTC_EN_EN);
+    writel(BURTC_BASE + BURTC_CMD, BURTC_CMD_START);
+    burtc_edges(BURTC_SYNC_EDGES + 1);
+
+    /* +1000 ppm on the TIMERs' clock: 1 ms at 38.4 MHz counts 38438, not 38400. */
+    periph_qom_set_int("x-hf-ppm", 1000);
+    t0 = readl(TIMER0_BASE + TIMER_CNT);
+    timer0_step(1000000);
+    t1 = readl(TIMER0_BASE + TIMER_CNT);
+    g_assert_cmpuint(t1 - t0, ==, 38438);
+    periph_qom_set_int("x-hf-ppm", 0);
+
+    /* A stopped TIMER0 keeps its count. */
+    periph_qom_set_bool("x-timer0-stopped", true);
+    t0 = readl(TIMER0_BASE + TIMER_CNT);
+    timer0_step(1000000);
+    g_assert_cmpuint(readl(TIMER0_BASE + TIMER_CNT), ==, t0);
+    periph_qom_set_bool("x-timer0-stopped", false);
+    timer0_step(1000000);
+    g_assert_cmpuint(readl(TIMER0_BASE + TIMER_CNT) - t0, ==, 38400);
+
+    /* -50000 ppm on the BURTC's clock: 32768 edges a second become 31129 or 31130. */
+    burtc_align();
+    periph_qom_set_int("x-lf-ppm", -50000);
+    b0 = readl(BURTC_BASE + BURTC_CNT);
+    clock_run(1000000000);
+    b1 = readl(BURTC_BASE + BURTC_CNT);
+    g_assert_cmpuint(b1 - b0, >=, 31129);
+    g_assert_cmpuint(b1 - b0, <=, 31130);
+
+    /* A stopped LF clock: the BURTC counts nothing, and counts again once it restarts. */
+    periph_qom_set_bool("x-lf-stopped", true);
+    b0 = readl(BURTC_BASE + BURTC_CNT);
+    clock_run(1000000);
+    g_assert_cmpuint(readl(BURTC_BASE + BURTC_CNT), ==, b0);
+    periph_qom_set_bool("x-lf-stopped", false);
+    periph_qom_set_int("x-lf-ppm", 0);
+    clock_run(1000000);
+    b1 = readl(BURTC_BASE + BURTC_CNT);
+    g_assert_cmpuint(b1 - b0, >=, 32);
+    g_assert_cmpuint(b1 - b0, <=, 33);
+}
+
 /* TIMER0 is 32-bit (TIMER0_CNTWIDTH = 0x20) and counts HFXO / (PRESC + 1). */
 static void test_timer0_32bit_count_prescale_overflow(void)
 {
@@ -5932,6 +6002,7 @@ int main(int argc, char **argv)
                    test_timer2_counter_and_aliases);
     qtest_add_func("/efr32bg22/timer4-cc0-compare-pending",
                    test_timer4_cc0_compare_pending);
+    qtest_add_func("/efr32bg22/clock-fault-injection", test_clock_fault_injection);
     qtest_add_func("/efr32bg22/timer0-32bit-count-prescale-overflow",
                    test_timer0_32bit_count_prescale_overflow);
     qtest_add_func("/efr32bg22/timer0-cc-output-compare",
